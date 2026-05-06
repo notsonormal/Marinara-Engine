@@ -3,6 +3,7 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -24,12 +25,18 @@ import type {
 } from "@marinara-engine/shared";
 import { getDataDir } from "../../utils/data-dir.js";
 import { downloadFileWithProgress, fetchJson, isAbortError, retry } from "./sidecar-download.js";
+import { assertInsideDir } from "../../utils/security.js";
 
 const execFileAsync = promisify(execFile);
 
 const RUNTIME_DIR = join(getDataDir(), "sidecar-runtime");
 const CURRENT_RUNTIME_PATH = join(RUNTIME_DIR, "current.json");
 const SERVER_LOG_PATH = join(RUNTIME_DIR, "server.log");
+const WINDOWS_CUDA_DLL_PATTERNS = [
+  { label: "cudart64_*.dll", pattern: /^cudart64_\d+\.dll$/i },
+  { label: "cublas64_*.dll", pattern: /^cublas64_\d+\.dll$/i },
+  { label: "cublasLt64_*.dll", pattern: /^cublasLt64_\d+\.dll$/i },
+];
 
 interface GitHubReleaseAsset {
   name: string;
@@ -65,6 +72,7 @@ export interface SidecarRuntimeInstall extends RuntimeRecord {
 interface RuntimeMatch {
   variant: string;
   asset: GitHubReleaseAsset;
+  dependencyAssets?: GitHubReleaseAsset[];
 }
 
 type GpuVendor = "nvidia" | "amd" | "intel";
@@ -106,6 +114,10 @@ function extractVersion(assetName: string): string {
   return match?.[1] ?? "0";
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function isWindowsAsset(assetName: string): boolean {
   return assetName.endsWith(".zip");
 }
@@ -137,6 +149,49 @@ function findExecutableRecursive(dirPath: string, expectedName: string): string 
     }
   }
   return null;
+}
+
+function listFilesRecursive(dirPath: string): string[] {
+  const files: string[] = [];
+  const stack = [dirPath];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    const stat = statSync(current, { throwIfNoEntry: false });
+    if (!stat) continue;
+    if (stat.isFile()) {
+      files.push(current);
+      continue;
+    }
+
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      stack.push(join(current, entry.name));
+    }
+  }
+  return files;
+}
+
+function findMissingWindowsCudaDlls(runtimeDir: string): string[] {
+  const filenames = new Set(listFilesRecursive(runtimeDir).map((file) => basename(file).toLowerCase()));
+  return WINDOWS_CUDA_DLL_PATTERNS.filter(
+    ({ pattern }) => ![...filenames].some((filename) => pattern.test(filename)),
+  ).map(({ label }) => label);
+}
+
+function stageWindowsCudaDlls(runtimeDir: string, executablePath: string): string[] {
+  const executableDir = dirname(executablePath);
+  const files = listFilesRecursive(runtimeDir);
+
+  for (const { pattern } of WINDOWS_CUDA_DLL_PATTERNS) {
+    const matchingFile = files.find((file) => pattern.test(basename(file)));
+    if (!matchingFile) continue;
+
+    const targetPath = join(executableDir, basename(matchingFile));
+    if (!existsSync(targetPath)) {
+      copyFileSync(matchingFile, targetPath);
+    }
+  }
+
+  return findMissingWindowsCudaDlls(executableDir);
 }
 
 function parseBooleanEnv(value: string | undefined): boolean {
@@ -225,7 +280,8 @@ class SidecarRuntimeService {
     const diagnostics = this.getDiagnostics();
     const systemInstall = this.getSystemInstallSync(diagnostics, preference);
     const current = this.getCurrentInstall();
-    const activeInstall = systemInstall ?? (current && this.isInstallUsableForPreference(current, preference) ? current : null);
+    const activeInstall =
+      systemInstall ?? (current && this.isInstallUsableForPreference(current, preference) ? current : null);
     return {
       installed: activeInstall !== null,
       build: activeInstall?.build ?? null,
@@ -336,7 +392,9 @@ class SidecarRuntimeService {
     const preference = options?.preference ?? "auto";
     const systemInstall = await this.getSystemInstall(preference);
     if (preference === "system" && !systemInstall) {
-      throw new Error("No system llama-server was found in PATH. Install llama.cpp separately or choose a bundled runtime.");
+      throw new Error(
+        "No system llama-server was found in PATH. Install llama.cpp separately or choose a bundled runtime.",
+      );
     }
     if (systemInstall && !excludedVariants.has(systemInstall.variant)) {
       return systemInstall;
@@ -361,7 +419,15 @@ class SidecarRuntimeService {
     if (install.source === "system") {
       return !!install.serverPath;
     }
-    return install.platform === process.platform && install.arch === process.arch && existsSync(install.serverPath);
+    if (install.platform !== process.platform || install.arch !== process.arch || !existsSync(install.serverPath)) {
+      return false;
+    }
+
+    if (process.platform === "win32" && /cuda/i.test(install.variant)) {
+      return findMissingWindowsCudaDlls(install.directoryPath).length === 0;
+    }
+
+    return true;
   }
 
   private isInstallUsableForPreference(install: SidecarRuntimeInstall, preference: SidecarRuntimePreference): boolean {
@@ -465,9 +531,13 @@ class SidecarRuntimeService {
       const match = await this.selectBestAsset(release.assets, excludedVariants, preference);
       if (!match) {
         if (preference !== "auto") {
-          throw new Error(`Marinara could not find ${formatRuntimePreference(preference)} for ${process.platform}/${process.arch}.`);
+          throw new Error(
+            `Marinara could not find ${formatRuntimePreference(preference)} for ${process.platform}/${process.arch}.`,
+          );
         }
-        throw new Error(`Your platform (${process.platform}/${process.arch}) is not supported for local inference yet.`);
+        throw new Error(
+          `Your platform (${process.platform}/${process.arch}) is not supported for local inference yet.`,
+        );
       }
 
       const directoryName = `${release.tag_name}-${match.variant}`;
@@ -485,6 +555,30 @@ class SidecarRuntimeService {
         extractDirectory,
         signal: abortController.signal,
         onProgress,
+        resetExtractDirectory: true,
+      });
+      for (const dependencyAsset of match.dependencyAssets ?? []) {
+        const dependencyArchivePath = ensureWithinRuntimeDir(join(RUNTIME_DIR, dependencyAsset.name));
+        try {
+          await this.downloadAndExtractAsset({
+            asset: dependencyAsset,
+            archivePath: dependencyArchivePath,
+            extractDirectory,
+            signal: abortController.signal,
+            onProgress,
+            resetExtractDirectory: false,
+          });
+        } finally {
+          rmSync(dependencyArchivePath, { force: true });
+        }
+      }
+      onProgress?.({
+        phase: "runtime",
+        status: "downloading",
+        downloaded: 0,
+        total: 0,
+        speed: 0,
+        label: "Verifying runtime files",
       });
 
       const executableName = isWindowsAsset(match.asset.name) ? "llama-server.exe" : "llama-server";
@@ -495,6 +589,16 @@ class SidecarRuntimeService {
 
       renameSync(extractDirectory, finalDirectory);
       const finalExecutable = ensureWithinRuntimeDir(join(finalDirectory, relative(extractDirectory, executablePath)));
+      if (process.platform === "win32" && /cuda/i.test(match.variant)) {
+        const missingDlls = stageWindowsCudaDlls(finalDirectory, finalExecutable);
+        if (missingDlls.length > 0) {
+          throw new Error(
+            `The downloaded CUDA sidecar runtime is missing required CUDA DLLs (${missingDlls.join(
+              ", ",
+            )}). Reinstall the local runtime so Marinara can download the CUDA runtime package with bundled DLLs.`,
+          );
+        }
+      }
       if (process.platform !== "win32") {
         try {
           chmodSync(finalExecutable, 0o755);
@@ -545,11 +649,14 @@ class SidecarRuntimeService {
     extractDirectory: string;
     signal: AbortSignal;
     onProgress?: (progress: SidecarDownloadProgress) => void;
+    resetExtractDirectory?: boolean;
   }): Promise<void> {
     let lastError: unknown = null;
 
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      rmSync(options.extractDirectory, { recursive: true, force: true });
+      if (options.resetExtractDirectory ?? true) {
+        rmSync(options.extractDirectory, { recursive: true, force: true });
+      }
       mkdirSync(options.extractDirectory, { recursive: true });
 
       await retry(
@@ -573,6 +680,14 @@ class SidecarRuntimeService {
       );
 
       try {
+        options.onProgress?.({
+          phase: "runtime",
+          status: "downloading",
+          downloaded: 0,
+          total: 0,
+          speed: 0,
+          label: "Extracting runtime files",
+        });
         await this.extractArchive(options.archivePath, options.extractDirectory);
         return;
       } catch (error) {
@@ -591,11 +706,19 @@ class SidecarRuntimeService {
   private async extractArchive(archivePath: string, targetDir: string): Promise<void> {
     if (archivePath.endsWith(".zip")) {
       const zip = new AdmZip(archivePath);
+      for (const entry of zip.getEntries()) {
+        assertInsideDir(targetDir, join(targetDir, entry.entryName));
+      }
       zip.extractAllTo(targetDir, true);
       return;
     }
 
     if (archivePath.endsWith(".tar.gz")) {
+      await execFileAsync("tar", ["-tzf", archivePath], { timeout: 120_000 }).then(({ stdout }) => {
+        for (const entry of stdout.split(/\r?\n/u).filter(Boolean)) {
+          assertInsideDir(targetDir, join(targetDir, entry));
+        }
+      });
       await execFileAsync("tar", ["-xzf", archivePath, "-C", targetDir], { timeout: 120_000 });
       return;
     }
@@ -706,6 +829,21 @@ class SidecarRuntimeService {
     return assets.find((asset) => pattern.test(asset.name)) ?? null;
   }
 
+  private findWindowsCudaDllAsset(
+    assets: GitHubReleaseAsset[],
+    cudaRuntimeAsset: GitHubReleaseAsset,
+  ): GitHubReleaseAsset | null {
+    const cudaVersion = extractVersion(cudaRuntimeAsset.name);
+    if (cudaVersion === "0") {
+      return null;
+    }
+
+    return this.findFirstAsset(
+      assets,
+      new RegExp(`^cudart-llama(?:-.*)?-bin-win-cuda-${escapeRegExp(cudaVersion)}-x64\\.zip$`, "i"),
+    );
+  }
+
   private parseGpuVendors(output: string): GpuVendor[] {
     const vendors = new Set<GpuVendor>();
     const normalized = output.toLowerCase();
@@ -773,8 +911,10 @@ class SidecarRuntimeService {
       return false;
     }
 
-    return parseBooleanEnv(process.env.MARINARA_SIDECAR_USE_SYSTEM_LLAMA) ||
-      parseBooleanEnv(process.env.MARINARA_SIDECAR_USE_SYSTEM_LLAMA_SERVER);
+    return (
+      parseBooleanEnv(process.env.MARINARA_SIDECAR_USE_SYSTEM_LLAMA) ||
+      parseBooleanEnv(process.env.MARINARA_SIDECAR_USE_SYSTEM_LLAMA_SERVER)
+    );
   }
 
   private createSystemInstall(systemPath: string, capabilities: RuntimeCapabilities | null): SidecarRuntimeInstall {
@@ -853,11 +993,12 @@ class SidecarRuntimeService {
     excludedVariants: Set<string>,
     variant: string,
     asset: GitHubReleaseAsset | null,
+    dependencyAssets: GitHubReleaseAsset[] = [],
   ): void {
     if (!asset || excludedVariants.has(variant) || matches.some((match) => match.variant === variant)) {
       return;
     }
-    matches.push({ variant, asset });
+    matches.push({ variant, asset, dependencyAssets });
   }
 
   private buildPreferredVariants(capabilities: RuntimeCapabilities, preference: SidecarRuntimePreference): string[] {
@@ -944,12 +1085,7 @@ class SidecarRuntimeService {
           this.findFirstAsset(assets, /^llama-.*-bin-macos-arm64-kleidiai\.tar\.gz$/i),
       ],
       ["macos-x64-cpu", this.findFirstAsset(assets, /^llama-.*-bin-macos-x64\.tar\.gz$/i)],
-      [
-        "win-x64-cuda",
-        this.pickLatestVersionedAsset(assets, /^(?:cudart-)?llama-.*-bin-win-cuda-[0-9.]+-x64\.zip$/i, {
-          preferPrefix: "cudart-",
-        }),
-      ],
+      ["win-x64-cuda", this.pickLatestVersionedAsset(assets, /^llama(?:-.*)?-bin-win-cuda-[0-9.]+-x64\.zip$/i)],
       ["win-x64-hip", this.findFirstAsset(assets, /^llama-.*-bin-win-hip-x64\.zip$/i)],
       ["win-x64-sycl", this.findFirstAsset(assets, /^llama-.*-bin-win-sycl-x64\.zip$/i)],
       ["win-x64-vulkan", this.findFirstAsset(assets, /^llama-.*-bin-win-vulkan-x64\.zip$/i)],
@@ -964,7 +1100,14 @@ class SidecarRuntimeService {
     ]);
 
     for (const variant of orderedVariants) {
-      this.pushCandidate(matches, excludedVariants, variant, assetByVariant.get(variant) ?? null);
+      const asset = assetByVariant.get(variant) ?? null;
+      const dependencyAssets =
+        variant === "win-x64-cuda" && asset
+          ? [this.findWindowsCudaDllAsset(assets, asset)].filter(
+              (dependencyAsset): dependencyAsset is GitHubReleaseAsset => dependencyAsset !== null,
+            )
+          : [];
+      this.pushCandidate(matches, excludedVariants, variant, asset, dependencyAssets);
     }
 
     return matches[0] ?? null;

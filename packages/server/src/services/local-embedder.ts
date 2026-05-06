@@ -5,21 +5,53 @@
 // locally via ONNX Runtime for zero-cost, zero-config embeddings.
 //
 // Cross-platform:
-//   - onnxruntime-node (native) on Windows, macOS, Linux x64/ARM64
-//   - onnxruntime-web  (WASM)  everywhere else (incl. Termux/Android)
+//   - onnxruntime-node (native) when its platform binding is installed
+//   - disabled gracefully elsewhere (incl. Termux/Android and mismatched
+//     Apple Silicon/Rosetta installs)
 //
 // The model is downloaded once from HuggingFace Hub on first use
 // and cached in data/models/.
-import { join } from "path";
+import { existsSync } from "fs";
+import { createRequire } from "module";
+import { dirname, join } from "path";
 import { DATA_DIR } from "../utils/data-dir.js";
+import { logger } from "../lib/logger.js";
 
 const MODEL_ID = "Xenova/all-MiniLM-L6-v2";
 const CACHE_DIR = join(DATA_DIR, "models");
+const isLite = process.env.MARINARA_LITE === "true" || process.env.MARINARA_LITE === "1";
+const require = createRequire(import.meta.url);
 
 // Singleton state
 let pipeline: any = null;
 let loadingPromise: Promise<any> | null = null;
 let loadFailed = false;
+let nativeBindingChecked = false;
+
+function resolveOnnxRuntimeBindingPath(): string | null {
+  try {
+    const packageJsonPath = require.resolve("onnxruntime-node/package.json");
+    return join(dirname(packageJsonPath), "bin", "napi-v6", process.platform, process.arch, "onnxruntime_binding.node");
+  } catch {
+    return null;
+  }
+}
+
+function hasNativeOnnxRuntimeBinding(): boolean {
+  const bindingPath = resolveOnnxRuntimeBindingPath();
+  if (bindingPath && existsSync(bindingPath)) return true;
+
+  if (!nativeBindingChecked) {
+    nativeBindingChecked = true;
+    logger.info(
+      "[local-embedder] Local memory embeddings disabled: onnxruntime-node native binding is unavailable for %s/%s. Reinstall dependencies with the same Node architecture used to run Marinara.",
+      process.platform,
+      process.arch,
+    );
+  }
+
+  return false;
+}
 
 /**
  * Lazy-load the feature-extraction pipeline.
@@ -27,7 +59,12 @@ let loadFailed = false;
  */
 async function getPipeline(): Promise<any> {
   if (pipeline) return pipeline;
+  if (isLite) return null;
   if (loadFailed) return null;
+  if (!hasNativeOnnxRuntimeBinding()) {
+    loadFailed = true;
+    return null;
+  }
   if (loadingPromise) return loadingPromise;
 
   loadingPromise = (async () => {
@@ -41,7 +78,7 @@ async function getPipeline(): Promise<any> {
       env.allowLocalModels = true;
       env.useBrowserCache = false;
 
-      console.log(`[local-embedder] Loading model ${MODEL_ID}...`);
+      logger.info("[local-embedder] Loading model %s...", MODEL_ID);
       const start = Date.now();
 
       const p = await createPipeline("feature-extraction", MODEL_ID, {
@@ -49,13 +86,13 @@ async function getPipeline(): Promise<any> {
       });
 
       const elapsed = Date.now() - start;
-      console.log(`[local-embedder] Model loaded in ${elapsed}ms`);
+      logger.info("[local-embedder] Model loaded in %dms", elapsed);
 
       pipeline = p;
       return p;
     } catch (err) {
       loadFailed = true;
-      console.warn("[local-embedder] Failed to load local embedding model:", err);
+      logger.warn(err, "[local-embedder] Failed to load local embedding model");
       return null;
     } finally {
       loadingPromise = null;
@@ -86,7 +123,7 @@ export async function localEmbed(texts: string[]): Promise<number[][] | null> {
     }
     return results;
   } catch (err) {
-    console.error("[local-embedder] Embedding failed:", err);
+    logger.error(err, "[local-embedder] Embedding failed");
     return null;
   }
 }
@@ -95,5 +132,7 @@ export async function localEmbed(texts: string[]): Promise<number[][] | null> {
  * Check if the local embedder is available (model loaded or loadable).
  */
 export function isLocalEmbedderAvailable(): boolean {
-  return !loadFailed;
+  if (isLite) return false;
+  if (loadFailed) return false;
+  return hasNativeOnnxRuntimeBinding();
 }

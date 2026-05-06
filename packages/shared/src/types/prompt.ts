@@ -174,6 +174,10 @@ export interface GenerationParameters {
   reasoningEffort: "low" | "medium" | "high" | "maximum" | null;
   /** Output verbosity for models that support it (GPT-5+) */
   verbosity: "low" | "medium" | "high" | null;
+  /** Optional assistant-role prefill appended after the final user message. */
+  assistantPrefill: string;
+  /** Raw provider request parameters merged into the outgoing request body. */
+  customParameters: Record<string, unknown>;
   /** Merge consecutive system messages */
   squashSystemMessages: boolean;
   /** Show model reasoning/thinking */
@@ -208,6 +212,8 @@ export const BUILTIN_MARKERS = {
 export interface ChatMLMessage {
   role: PromptRole;
   content: string;
+  /** Internal context-fitting hint: prompt data is preserved before chat history. */
+  contextKind?: "prompt" | "history" | "injection";
   /** Optional: name of the speaker for multi-character */
   name?: string;
   /** Base64 data URLs for multimodal image inputs */

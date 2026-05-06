@@ -125,16 +125,18 @@ export function useBackgroundAutonomousPolling() {
             // Generate in background (after optional delay)
             generatingForRef.current.add(chat.id);
             const doGenerate = async () => {
+              let receivedTokens = false;
+              let shouldClearAutonomousFlag = true;
               try {
                 // Re-check guard — a generation may have started for this chat
                 // during the busy delay.
                 if (useChatStore.getState().abortControllers.has(chat.id)) {
+                  shouldClearAutonomousFlag = false;
                   generatingForRef.current.delete(chat.id);
                   return;
                 }
 
                 // Use streamEvents to drain the SSE — tokens aren't needed for background chats
-                let receivedTokens = false;
                 for await (const _event of api.streamEvents("/generate", {
                   chatId: chat.id,
                   connectionId: null,
@@ -145,16 +147,6 @@ export function useBackgroundAutonomousPolling() {
 
                 // Only notify if the generation actually produced a message
                 if (!receivedTokens) return;
-
-                // Record assistant activity
-                try {
-                  await api.post("/conversation/activity/assistant", {
-                    chatId: chat.id,
-                    characterId,
-                  });
-                } catch {
-                  /* non-critical */
-                }
 
                 // Reset + refetch messages so the cache has fresh data when the
                 // user navigates to this chat. Without this, TanStack Query
@@ -167,12 +159,14 @@ export function useBackgroundAutonomousPolling() {
                 // Resolve character name for the notification
                 let charName = "Someone";
                 let charAvatar: string | null = null;
+                let charAvatarCrop: { zoom: number; offsetX: number; offsetY: number } | null = null;
                 try {
                   // Find the triggering character's name
                   const charRow = await api.get<RawCharacter>(`/characters/${characterId}`);
                   if (charRow) {
                     const data = typeof charRow.data === "string" ? JSON.parse(charRow.data) : charRow.data;
                     if (data?.name) charName = data.name;
+                    charAvatarCrop = data?.extensions?.avatarCrop ?? null;
                     charAvatar = charRow.avatarPath ?? null;
                   }
                 } catch {
@@ -188,13 +182,20 @@ export function useBackgroundAutonomousPolling() {
                 useChatStore.getState().incrementUnread(chat.id);
 
                 // Add floating avatar notification bubble
-                useChatStore.getState().addNotification(chat.id, charName, charAvatar);
+                useChatStore.getState().addNotification(chat.id, charName, charAvatar, charAvatarCrop);
 
                 // Show a global toast so the user knows even from a different chat
                 toast(`${charName} sent you a message`, { icon: "💬" });
               } catch {
                 // generation failed — non-critical
               } finally {
+                if (!receivedTokens && shouldClearAutonomousFlag) {
+                  try {
+                    await api.post("/conversation/activity/assistant", { chatId: chat.id });
+                  } catch {
+                    /* non-critical */
+                  }
+                }
                 generatingForRef.current.delete(chat.id);
               }
             };

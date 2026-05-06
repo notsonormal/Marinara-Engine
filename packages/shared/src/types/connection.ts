@@ -6,11 +6,13 @@
 export type APIProvider =
   | "openai"
   | "anthropic"
+  | "claude_subscription"
   | "google"
   | "mistral"
   | "cohere"
   | "openrouter"
   | "nanogpt"
+  | "xai"
   | "custom"
   | "image_generation";
 
@@ -45,6 +47,8 @@ export interface APIConnection {
   imageService: string | null;
   /** Default generation parameters for new chats using this connection (JSON) */
   defaultParameters: string | null;
+  /** Hard cap on max_tokens for the API response (for providers with lower limits, e.g. DeepSeek at 8192). */
+  maxTokensOverride: number | null;
   createdAt: string;
   updatedAt: string;
 }

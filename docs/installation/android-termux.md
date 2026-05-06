@@ -15,13 +15,14 @@ pkg update && pkg install -y git nodejs-lts && git clone https://github.com/Past
 ```
 
 This one-liner:
+
 1. Updates Termux packages
-2. Installs Git and Node.js
+2. Installs Git and Node.js LTS. Marinara requires Node.js 24 LTS or newer.
 3. Clones the Marinara Engine repo
 4. Makes the launcher executable
 5. Runs the Termux launcher for the first time
 
-The Termux launcher downloads the prebuilt SQLite native module when available, installs dependencies, builds the app, and starts the server at `http://127.0.0.1:<PORT>` using the `PORT` value from `.env` or the default `7860`.
+The Termux launcher installs dependencies, builds the app, prepares local file-backed storage, and starts the server at `http://127.0.0.1:<PORT>` using the `PORT` value from `.env` or the default `7860`.
 
 > **Note:** The first run takes a few minutes because it builds the app on your device. Subsequent runs are much faster.
 
@@ -40,25 +41,29 @@ cd Marinara-Engine
 
 If you want a dedicated home-screen icon that opens Marinara Engine like a native app, see [android/README.md](../../android/README.md). The APK is a WebView wrapper around the Termux-served app — the Termux server must be running for the APK to work.
 
-## Accessing from Another Device on Your Network
+## Accessing from Another Device
 
-You can use Marinara Engine from a browser on another device on the same Wi-Fi network:
-
-1. Find your Android device's local IP in Settings → Wi-Fi → your network.
-2. The Termux launcher binds to `0.0.0.0` by default, so the app is already reachable on LAN.
-3. Open a browser on the other device and go to `http://<android-ip>:7860`.
+The Termux launcher binds to `0.0.0.0` by default, so the app is already reachable on your local network. See the [FAQ](../FAQ.md#how-do-i-access-marinara-engine-from-my-phone-or-another-device) for step-by-step LAN access instructions.
 
 ## Updating
 
 The `start-termux.sh` launcher automatically updates Marinara Engine on each run:
 
-1. Pulls the latest code from GitHub with `git pull`
+1. Fetches the latest code from GitHub and fast-forwards to `origin/main`
 2. Detects whether the checkout changed
-3. Reinstalls dependencies and rebuilds when needed
-4. Starts the app on the current version
+3. Temporarily stashes tracked local changes if needed, then reapplies them
+4. Reinstalls dependencies and rebuilds when needed
+5. Starts the app on the current version
 
 Simply run `./start-termux.sh` to get the latest version each time.
 
 ### In-App Update Check
 
-You can also go to **Settings → Advanced → Updates** and click **Check for Updates**, then **Apply Update** to trigger a pull and rebuild from within the app.
+You can also go to **Settings → Advanced → Updates** and click **Check for Updates**, then **Apply Update** to trigger a pull and rebuild from within the app. When it finishes, run `./start-termux.sh` again to relaunch the updated build.
+
+---
+
+## See Also
+
+- [Configuration Reference](../CONFIGURATION.md) — environment variables and `.env` setup
+- [Troubleshooting](../TROUBLESHOOTING.md) — common issues and fixes

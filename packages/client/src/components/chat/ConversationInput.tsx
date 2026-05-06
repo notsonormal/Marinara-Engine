@@ -1,32 +1,109 @@
 // ──────────────────────────────────────────────
 // Chat: Conversation Input — Discord-style
 // ──────────────────────────────────────────────
-import { useState, useRef, useCallback, useEffect } from "react";
-import { Send, Smile, StopCircle, X, Plus, ImagePlay, AtSign } from "lucide-react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import {
+  Send,
+  Smile,
+  StopCircle,
+  X,
+  Plus,
+  ImagePlay,
+  AtSign,
+  Users,
+  UserCheck,
+  Languages,
+  Loader2,
+  FileText,
+  RefreshCw,
+} from "lucide-react";
+import { createPortal } from "react-dom";
 import { toast } from "sonner";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { useChatStore } from "../../stores/chat.store";
 import { useUIStore } from "../../stores/ui.store";
 import { useGenerate } from "../../hooks/use-generate";
 import { useApplyRegex } from "../../hooks/use-apply-regex";
-import { useCreateMessage, useChat, chatKeys } from "../../hooks/use-chats";
+import { useCreateMessage, useUpdateMessageExtra, useChat, chatKeys } from "../../hooks/use-chats";
+import { characterKeys } from "../../hooks/use-characters";
 import {
   matchSlashCommand,
   getSlashCompletions,
   type SlashCommand,
   type SlashCommandContext,
 } from "../../lib/slash-commands";
-import { cn } from "../../lib/utils";
+import { isPromptPreviewMacro, resolveInputMacrosForChat } from "../../lib/chat-macros";
+import { cn, getAvatarCropStyle } from "../../lib/utils";
+import { translateDraftText } from "../../lib/draft-translation";
 import { QuickConnectionSwitcher } from "./QuickConnectionSwitcher";
 import { QuickPersonaSwitcher } from "./QuickPersonaSwitcher";
 import { QuickSwitcherMobile } from "./QuickSwitcherMobile";
 import { EmojiPicker } from "../ui/EmojiPicker";
 import { GifPicker } from "../ui/GifPicker";
+import { SpeechToTextButton } from "../ui/SpeechToTextButton";
+import { MariThinkingIndicator } from "./MariThinkingIndicator";
+import { MariCapabilityNotice } from "./MariCapabilityNotice";
+import { SlashCommandFeedback } from "./SlashCommandFeedback";
+import type { Message } from "@marinara-engine/shared";
 
 interface Attachment {
   type: string;
   data: string;
   name: string;
+}
+
+const TEXT_ATTACHMENT_EXTENSIONS = new Set([
+  "csv",
+  "json",
+  "jsonl",
+  "log",
+  "markdown",
+  "md",
+  "txt",
+  "xml",
+  "yaml",
+  "yml",
+]);
+
+function getFileExtension(fileName: string): string {
+  const match = fileName.toLowerCase().match(/\.([a-z0-9]+)$/);
+  return match?.[1] ?? "";
+}
+
+function inferAttachmentType(file: File): string {
+  if (file.type) return file.type;
+  const extension = getFileExtension(file.name);
+  if (extension === "json" || extension === "jsonl") return "application/json";
+  if (extension === "csv") return "text/csv";
+  if (extension === "md" || extension === "markdown") return "text/markdown";
+  if (extension === "xml") return "application/xml";
+  if (extension === "yaml" || extension === "yml") return "application/yaml";
+  if (extension === "txt" || extension === "log") return "text/plain";
+  return "application/octet-stream";
+}
+
+function isSupportedChatAttachment(file: File): boolean {
+  if (file.type.startsWith("image/")) return true;
+  if (file.type.startsWith("text/")) return true;
+  const type = inferAttachmentType(file);
+  if (
+    type === "application/json" ||
+    type === "application/xml" ||
+    type === "application/yaml" ||
+    type === "application/x-yaml"
+  ) {
+    return true;
+  }
+  return TEXT_ATTACHMENT_EXTENSIONS.has(getFileExtension(file.name));
+}
+
+function readFileAsDataUrl(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
 }
 
 /** Convert a GIF (or any image) blob to PNG via canvas, returning a new Blob + data URL */
@@ -74,14 +151,31 @@ async function convertToPng(blob: Blob): Promise<{ blob: Blob; dataUrl: string }
 
 interface ConversationInputProps {
   characterNames?: string[];
+  groupResponseOrder?: string;
+  chatCharacters?: Array<{
+    id: string;
+    name: string;
+    avatarUrl: string | null;
+    avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null;
+    conversationStatus?: "online" | "idle" | "dnd" | "offline";
+    conversationActivity?: string;
+  }>;
+  onPeekPrompt?: () => void;
 }
 
-export function ConversationInput({ characterNames = [] }: ConversationInputProps) {
+export function ConversationInput({
+  characterNames = [],
+  groupResponseOrder,
+  chatCharacters,
+  onPeekPrompt,
+}: ConversationInputProps) {
   const [hasInput, setHasInput] = useState(false);
   const [completions, setCompletions] = useState<SlashCommand[]>([]);
   const [selectedCompletion, setSelectedCompletion] = useState(0);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [pendingAttachmentReads, setPendingAttachmentReads] = useState(0);
+  const [isTranslatingDraft, setIsTranslatingDraft] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [gifOpen, setGifOpen] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -90,10 +184,14 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
   const [mentionCompletions, setMentionCompletions] = useState<string[]>([]);
   const [selectedMention, setSelectedMention] = useState(0);
   const [mentionStartPos, setMentionStartPos] = useState(0);
+  const [charPickerOpen, setCharPickerOpen] = useState(false);
+  const [charPickerPos, setCharPickerPos] = useState<{ left: number; top: number } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const emojiButtonRef = useRef<HTMLButtonElement>(null);
   const gifButtonRef = useRef<HTMLButtonElement>(null);
+  const charPickerBtnRef = useRef<HTMLButtonElement>(null);
+  const charPickerMenuRef = useRef<HTMLDivElement>(null);
   const inputBarRef = useRef<HTMLDivElement>(null);
   const activeChatId = useChatStore((s) => s.activeChatId);
   const { data: activeChat } = useChat(activeChatId);
@@ -106,12 +204,50 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
   const isActuallyGenerating = isStreaming && !delayedCharacterInfo;
   const setInputDraft = useChatStore((s) => s.setInputDraft);
   const clearInputDraft = useChatStore((s) => s.clearInputDraft);
+  const setCurrentInput = useChatStore((s) => s.setCurrentInput);
+  const currentInput = useChatStore((s) => s.currentInput);
   const { generate } = useGenerate();
   const { applyToUserInput } = useApplyRegex();
   const enterToSend = useUIStore((s) => s.enterToSendConvo);
+  const guideGenerations = useUIStore((s) => s.guideGenerations);
+  const impersonateShowQuickButton = useUIStore((s) => s.impersonateShowQuickButton);
+  const speechToTextEnabled = useUIStore((s) => s.speechToTextEnabled);
   const createMessage = useCreateMessage(activeChatId);
+  const updateMessageExtra = useUpdateMessageExtra(activeChatId);
   const qc = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const isReadingAttachments = pendingAttachmentReads > 0;
+  const hasPendingAttachments = isReadingAttachments || attachments.length > 0;
+
+  // Read from the existing infinite-message cache so an empty Send can retry
+  // after a failed generation without adding a second user message.
+  const [, bumpMessagesTick] = useState(0);
+  useEffect(() => {
+    if (!activeChatId) return;
+    const targetKey = JSON.stringify(chatKeys.messages(activeChatId));
+    return qc.getQueryCache().subscribe((event) => {
+      if (JSON.stringify(event.query.queryKey) === targetKey) {
+        bumpMessagesTick((n) => n + 1);
+      }
+    });
+  }, [activeChatId, qc]);
+  const messagesData = qc.getQueryData<InfiniteData<Message[]>>(chatKeys.messages(activeChatId ?? ""));
+  const lastMessageRole = useMemo(() => {
+    const firstPage = messagesData?.pages?.[0];
+    return firstPage?.[firstPage.length - 1]?.role ?? null;
+  }, [messagesData]);
+  const canRetry = !isStreaming && groupResponseOrder !== "manual" && lastMessageRole === "user";
+  const canSubmit = hasInput || attachments.length > 0 || canRetry;
+  const showRetrySendState = canRetry && !hasInput && attachments.length === 0;
+  const sendButtonTitle = isActuallyGenerating ? "Stop generating" : showRetrySendState ? "Retry generation" : "Send";
+
+  const syncInputState = useCallback(
+    (value: string) => {
+      setHasInput(value.trim().length > 0);
+      setCurrentInput(value);
+    },
+    [setCurrentInput],
+  );
 
   // Restore draft
   const prevChatIdRef = useRef<string | null>(null);
@@ -124,50 +260,70 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
       if (textareaRef.current) {
         const draft = activeChatId ? (useChatStore.getState().inputDrafts.get(activeChatId) ?? "") : "";
         textareaRef.current.value = draft;
-        setHasInput(draft.length > 0);
+        syncInputState(draft);
         textareaRef.current.style.height = "auto";
         textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 160)}px`;
       }
     }
-  }, [activeChatId, setInputDraft]);
+  }, [activeChatId, setInputDraft, syncInputState]);
 
   // Save draft on unmount
   useEffect(() => {
     const el = textareaRef.current;
+    const chatId = activeChatId;
     return () => {
-      const id = prevChatIdRef.current;
-      if (id && el?.value) {
-        useChatStore.getState().setInputDraft(id, el.value);
+      if (chatId && el?.value) {
+        useChatStore.getState().setInputDraft(chatId, el.value);
       }
     };
-  }, []);
+  }, [activeChatId]);
 
-  const handleFileUpload = useCallback(async (files: FileList | null) => {
+  const handleFileUpload = useCallback(async (files: FileList | File[] | null) => {
     if (!files) return;
     const MAX_SIZE = 20 * 1024 * 1024;
-    for (const file of Array.from(files)) {
+    const acceptedFiles = Array.from(files).filter((file) => {
       if (file.size > MAX_SIZE) {
         toast.error(`${file.name} exceeds 20 MB limit`);
-        continue;
+        return false;
       }
+      if (!isSupportedChatAttachment(file)) {
+        toast.error(
+          `${file.name || "That file"} is not supported in chat. Attach images or text files like JSON, TXT, Markdown, or CSV.`,
+        );
+        return false;
+      }
+      return true;
+    });
+
+    if (acceptedFiles.length === 0) return;
+    setPendingAttachmentReads((count) => count + acceptedFiles.length);
+
+    for (const file of acceptedFiles) {
+      const displayName = file.name || "pasted-file";
       // Convert GIFs to PNG (Gemini and some providers don't support image/gif)
       if (file.type === "image/gif") {
         try {
           const { dataUrl } = await convertToPng(file);
           setAttachments((prev) => [
             ...prev,
-            { type: "image/png", data: dataUrl, name: file.name.replace(/\.gif$/i, ".png") },
+            { type: "image/png", data: dataUrl, name: displayName.replace(/\.gif$/i, ".png") },
           ]);
         } catch {
-          toast.error(`Failed to convert ${file.name}`);
+          toast.error(`Failed to convert ${displayName}`);
+        } finally {
+          setPendingAttachmentReads((count) => Math.max(0, count - 1));
         }
         continue;
       }
-      const reader = new FileReader();
-      reader.onload = () => {
-        setAttachments((prev) => [...prev, { type: file.type, data: reader.result as string, name: file.name }]);
-      };
-      reader.readAsDataURL(file);
+
+      try {
+        const data = await readFileAsDataUrl(file);
+        setAttachments((prev) => [...prev, { type: inferAttachmentType(file), data, name: displayName }]);
+      } catch {
+        toast.error(`Failed to read ${displayName}`);
+      } finally {
+        setPendingAttachmentReads((count) => Math.max(0, count - 1));
+      }
     }
   }, []);
 
@@ -175,18 +331,16 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
     (e: React.ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (!items || !activeChatId) return;
-      const imageFiles: File[] = [];
+      const files: File[] = [];
       for (const item of Array.from(items)) {
-        if (item.kind === "file" && item.type.startsWith("image/")) {
+        if (item.kind === "file") {
           const file = item.getAsFile();
-          if (file) imageFiles.push(file);
+          if (file) files.push(file);
         }
       }
-      if (imageFiles.length > 0) {
+      if (files.length > 0) {
         e.preventDefault();
-        const dt = new DataTransfer();
-        for (const f of imageFiles) dt.items.add(f);
-        handleFileUpload(dt.files);
+        handleFileUpload(files);
       }
     },
     [activeChatId, handleFileUpload],
@@ -197,11 +351,9 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
       e.preventDefault();
       setIsDragging(false);
       if (!activeChatId) return;
-      const imageFiles = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
-      if (imageFiles.length > 0) {
-        const dt = new DataTransfer();
-        for (const f of imageFiles) dt.items.add(f);
-        handleFileUpload(dt.files);
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length > 0) {
+        handleFileUpload(files);
       }
     },
     [activeChatId, handleFileUpload],
@@ -247,20 +399,45 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
       el.value = `${before}@${name} ${after}`;
       const cursorPos = before.length + name.length + 2; // +2 for @ and space
       el.selectionStart = el.selectionEnd = cursorPos;
-      setHasInput(el.value.length > 0);
+      syncInputState(el.value);
       setMentionQuery(null);
       setMentionCompletions([]);
       el.focus();
     },
-    [mentionStartPos],
+    [mentionStartPos, syncInputState],
   );
 
   const handleSend = useCallback(async () => {
     if (!activeChatId) return;
-    const raw = textareaRef.current?.value.trim() ?? "";
-    if (!raw && attachments.length === 0) {
+    if (isReadingAttachments) {
+      toast.info("Still reading attached files. Send will be ready in a moment.");
       return;
     }
+    const raw = textareaRef.current?.value.trim() ?? "";
+    if (!raw && attachments.length === 0) {
+      if (canRetry) {
+        try {
+          await generate({ chatId: activeChatId, connectionId: null });
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : "Generation failed";
+          toast.error(msg);
+        }
+      }
+      return;
+    }
+
+    if (isPromptPreviewMacro(raw)) {
+      if (textareaRef.current) {
+        textareaRef.current.value = "";
+        textareaRef.current.style.height = "auto";
+      }
+      clearInputDraft(activeChatId);
+      syncInputState("");
+      setAttachments([]);
+      onPeekPrompt?.();
+      return;
+    }
+
     // If already generating for this chat, just save the message without
     // triggering another generation — the in-progress generation will see
     // it (server re-reads messages after any busy delay).
@@ -282,20 +459,33 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
           toast.error("Failed to translate message — sending original");
         }
       }
+      const cachedCharacters = qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list());
+      const cachedPersonas = qc.getQueryData<Array<Record<string, unknown>>>(characterKeys.personas);
+      message = resolveInputMacrosForChat(message, activeChatData, cachedCharacters, cachedPersonas);
       if (textareaRef.current) {
         textareaRef.current.value = "";
         textareaRef.current.style.height = "auto";
       }
-      setHasInput(false);
       clearInputDraft(activeChatId);
-      const currentAttachments = [...attachments];
+      syncInputState("");
+      const currentAttachments = attachments.map((a) => ({
+        type: a.type,
+        data: a.data,
+        filename: a.name,
+        name: a.name,
+      }));
       setAttachments([]);
-      createMessage.mutate({
+      const created = await createMessage.mutateAsync({
         role: "user",
         content: message,
         characterId: null,
-        ...(currentAttachments.length > 0 && { attachments: currentAttachments }),
       });
+      if (currentAttachments.length) {
+        await updateMessageExtra.mutateAsync({
+          messageId: created.id,
+          extra: { attachments: currentAttachments },
+        });
+      }
       return;
     }
 
@@ -310,8 +500,8 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
         characterNames,
       };
       if (textareaRef.current) textareaRef.current.value = "";
-      setHasInput(false);
       clearInputDraft(activeChatId);
+      syncInputState("");
       setAttachments([]);
       const result = await matched.command.execute(matched.args, slashCtx);
       if (result.feedback) {
@@ -339,18 +529,37 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
       }
     }
 
+    const cachedCharacters = qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list());
+    const cachedPersonas = qc.getQueryData<Array<Record<string, unknown>>>(characterKeys.personas);
+    message = resolveInputMacrosForChat(message, activeChat, cachedCharacters, cachedPersonas);
+
     if (textareaRef.current) {
       textareaRef.current.value = "";
       textareaRef.current.style.height = "auto";
     }
-    setHasInput(false);
     clearInputDraft(activeChatId);
+    syncInputState("");
 
-    const pendingAttachments = attachments.map((a) => ({ type: a.type, data: a.data }));
+    const pendingAttachments = attachments.map((a) => ({ type: a.type, data: a.data, filename: a.name, name: a.name }));
     setAttachments([]);
 
     // Extract @mentions from the raw message (before regex transforms)
     const mentioned = extractMentions(raw);
+
+    if (groupResponseOrder === "manual" && mentioned.length === 0) {
+      const created = await createMessage.mutateAsync({
+        role: "user",
+        content: message,
+        characterId: null,
+      });
+      if (pendingAttachments.length) {
+        await updateMessageExtra.mutateAsync({
+          messageId: created.id,
+          extra: { attachments: pendingAttachments },
+        });
+      }
+      return;
+    }
 
     await generate({
       chatId: activeChatId,
@@ -362,15 +571,57 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
   }, [
     activeChatId,
     attachments,
+    canRetry,
+    isReadingAttachments,
     isStreaming,
     generate,
     applyToUserInput,
     extractMentions,
     clearInputDraft,
     createMessage,
+    updateMessageExtra,
     characterNames,
+    groupResponseOrder,
     qc,
+    syncInputState,
+    onPeekPrompt,
   ]);
+
+  const handleImpersonateQuickButton = useCallback(async () => {
+    if (!activeChatId || isStreaming) return;
+    if (hasPendingAttachments) {
+      toast.info("Clear or send attachments before using quick impersonate.");
+      return;
+    }
+    const text = textareaRef.current?.value?.trim() ?? "";
+    if (!text) return;
+    const { impersonatePresetId, impersonateConnectionId, impersonateBlockAgents, impersonatePromptTemplate } =
+      useUIStore.getState();
+    const trimmedPromptTemplate = impersonatePromptTemplate.trim();
+    try {
+      const generated = await generate({
+        chatId: activeChatId,
+        connectionId: null,
+        impersonate: true,
+        userMessage: text,
+        ...(impersonatePresetId ? { impersonatePresetId } : {}),
+        ...(impersonateConnectionId ? { impersonateConnectionId } : {}),
+        ...(impersonateBlockAgents ? { impersonateBlockAgents: true } : {}),
+        ...(trimmedPromptTemplate ? { impersonatePromptTemplate: trimmedPromptTemplate } : {}),
+      });
+      if (generated) {
+        if (textareaRef.current) {
+          textareaRef.current.value = "";
+          textareaRef.current.style.height = "auto";
+        }
+        syncInputState("");
+        clearInputDraft(activeChatId);
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Impersonate failed";
+      toast.error(msg);
+    }
+  }, [activeChatId, isStreaming, hasPendingAttachments, generate, syncInputState, clearInputDraft]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -416,7 +667,7 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
           const cmd = completions[selectedCompletion];
           if (cmd && textareaRef.current) {
             textareaRef.current.value = `/${cmd.name} `;
-            setHasInput(true);
+            syncInputState(textareaRef.current.value);
             setCompletions([]);
           }
           return;
@@ -433,7 +684,16 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
         handleSend();
       }
     },
-    [completions, selectedCompletion, mentionCompletions, selectedMention, insertMention, enterToSend, handleSend],
+    [
+      completions,
+      selectedCompletion,
+      mentionCompletions,
+      selectedMention,
+      insertMention,
+      enterToSend,
+      handleSend,
+      syncInputState,
+    ],
   );
 
   const handleInput = useCallback(() => {
@@ -446,7 +706,7 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
     }, 150);
-    setHasInput(el.value.length > 0);
+    syncInputState(el.value);
 
     // Slash completions
     if (el.value.startsWith("/")) {
@@ -479,23 +739,26 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
       setMentionQuery(null);
       setMentionCompletions([]);
     }
-  }, [characterNames]);
+  }, [characterNames, syncInputState]);
 
   useEffect(() => {
     if (hasInput && feedback) setFeedback(null);
   }, [hasInput, feedback]);
 
-  const handleEmojiSelect = useCallback((emoji: string) => {
-    if (!textareaRef.current) return;
-    const el = textareaRef.current;
-    const start = el.selectionStart;
-    const end = el.selectionEnd;
-    const value = el.value;
-    el.value = value.slice(0, start) + emoji + value.slice(end);
-    el.selectionStart = el.selectionEnd = start + emoji.length;
-    setHasInput(el.value.length > 0);
-    el.focus();
-  }, []);
+  const handleEmojiSelect = useCallback(
+    (emoji: string) => {
+      if (!textareaRef.current) return;
+      const el = textareaRef.current;
+      const start = el.selectionStart;
+      const end = el.selectionEnd;
+      const value = el.value;
+      el.value = value.slice(0, start) + emoji + value.slice(end);
+      el.selectionStart = el.selectionEnd = start + emoji.length;
+      syncInputState(el.value);
+      el.focus();
+    },
+    [syncInputState],
+  );
 
   const handleGifSelect = useCallback(
     async (gifUrl: string) => {
@@ -518,6 +781,11 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
         return;
       }
 
+      if (groupResponseOrder === "manual" && characterNames.length > 1) {
+        createMessage.mutate({ role: "user", content: gifUrl, characterId: null });
+        return;
+      }
+
       await generate({
         chatId: activeChatId,
         connectionId: null,
@@ -525,14 +793,134 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
         ...(gifAttachments ? { attachments: gifAttachments } : {}),
       });
     },
-    [activeChatId, isStreaming, generate, createMessage],
+    [activeChatId, isStreaming, groupResponseOrder, characterNames.length, generate, createMessage],
   );
+
+  const handleCharacterResponse = useCallback(
+    async (characterId: string) => {
+      if (!activeChatId || isStreaming) return;
+      setCharPickerOpen(false);
+      setCharPickerPos(null);
+      try {
+        await generate(
+          guideGenerations && hasInput
+            ? { chatId: activeChatId, connectionId: null, forCharacterId: characterId, generationGuide: currentInput }
+            : { chatId: activeChatId, connectionId: null, forCharacterId: characterId },
+        );
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : "Generation failed";
+        toast.error(msg);
+      }
+    },
+    [activeChatId, isStreaming, generate, guideGenerations, hasInput, currentInput],
+  );
+
+  useEffect(() => {
+    if (!charPickerOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (
+        charPickerMenuRef.current &&
+        !charPickerMenuRef.current.contains(e.target as Node) &&
+        charPickerBtnRef.current &&
+        !charPickerBtnRef.current.contains(e.target as Node)
+      ) {
+        setCharPickerOpen(false);
+        setCharPickerPos(null);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [charPickerOpen]);
+
+  useEffect(() => {
+    if (!charPickerOpen || !charPickerBtnRef.current) return;
+    const rect = charPickerBtnRef.current.getBoundingClientRect();
+    const inputBox = charPickerBtnRef.current.closest(".rounded-2xl") as HTMLElement | null;
+    const anchorTop = inputBox ? inputBox.getBoundingClientRect().top : rect.top;
+    requestAnimationFrame(() => {
+      const menuEl = charPickerMenuRef.current;
+      const menuHeight = menuEl?.offsetHeight || 300;
+      const menuWidth = menuEl?.offsetWidth || 220;
+      let left = rect.right - menuWidth;
+      if (left < 8) left = 8;
+      setCharPickerPos({ left, top: Math.max(8, anchorTop - menuHeight - 4) });
+    });
+  }, [charPickerOpen]);
+
+  const showCharPicker = groupResponseOrder === "manual" && !!chatCharacters && chatCharacters.length > 1;
+  const chatMetadata = activeChat?.metadata
+    ? typeof activeChat.metadata === "string"
+      ? (() => {
+          try {
+            return JSON.parse(activeChat.metadata) as Record<string, unknown>;
+          } catch {
+            return {};
+          }
+        })()
+      : (activeChat.metadata as Record<string, unknown>)
+    : {};
+  const showDraftTranslateButton = chatMetadata.showInputTranslateButton === true;
+
+  const handleTranslateDraft = useCallback(async () => {
+    if (!activeChatId || isTranslatingDraft) return;
+    const raw = textareaRef.current?.value ?? "";
+    if (!raw.trim()) return;
+
+    setIsTranslatingDraft(true);
+    try {
+      const translated = await translateDraftText(raw);
+      if (!translated || !textareaRef.current) return;
+      textareaRef.current.value = translated;
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 160)}px`;
+      syncInputState(translated);
+      setInputDraft(activeChatId, translated);
+      textareaRef.current.focus();
+    } finally {
+      setIsTranslatingDraft(false);
+    }
+  }, [activeChatId, isTranslatingDraft, setInputDraft, syncInputState]);
+
+  const handleSpeechTranscript = useCallback(
+    (transcript: string) => {
+      const el = textareaRef.current;
+      if (!el) return;
+      const start = el.selectionStart ?? el.value.length;
+      const end = el.selectionEnd ?? start;
+      const before = el.value.slice(0, start);
+      const after = el.value.slice(end);
+      const prefix = before && !/\s$/.test(before) ? " " : "";
+      const suffix = after && !/^\s/.test(after) ? " " : "";
+      const nextValue = `${before}${prefix}${transcript}${suffix}${after}`;
+      const nextCursor = before.length + prefix.length + transcript.length;
+
+      el.value = nextValue;
+      el.setSelectionRange(nextCursor, nextCursor);
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+      syncInputState(nextValue);
+      if (activeChatId) setInputDraft(activeChatId, nextValue);
+      el.focus();
+    },
+    [activeChatId, setInputDraft, syncInputState],
+  );
+
+  const statusDotClass = (status?: string) =>
+    status === "offline"
+      ? "bg-gray-400"
+      : status === "dnd"
+        ? "bg-red-500"
+        : status === "idle"
+          ? "bg-yellow-500"
+          : "bg-green-500";
+  const statusLabel = (status?: string) =>
+    status === "offline" ? "Offline" : status === "dnd" ? "Busy" : status === "idle" ? "Away" : null;
 
   return (
     <div className="relative px-3 pb-3">
       {/* Slash command autocomplete */}
       {completions.length > 0 && (
-        <div className="absolute bottom-full left-3 right-3 mb-1 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--card)] shadow-lg">
+        <div className="absolute bottom-full left-3 right-3 z-40 mb-1 max-h-[min(18rem,45dvh)] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--card)] shadow-lg [-webkit-overflow-scrolling:touch]">
           {completions.map((cmd, i) => (
             <button
               key={cmd.name}
@@ -540,19 +928,21 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
                 e.preventDefault();
                 if (textareaRef.current) {
                   textareaRef.current.value = `/${cmd.name} `;
-                  setHasInput(true);
+                  syncInputState(textareaRef.current.value);
                   setCompletions([]);
                   textareaRef.current.focus();
                 }
               }}
               className={cn(
-                "flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors",
+                "flex w-full min-w-0 items-start gap-2 px-3 py-2.5 text-left text-sm transition-colors",
                 i === selectedCompletion ? "bg-foreground/10 text-foreground" : "hover:bg-[var(--accent)]",
               )}
             >
-              <span className="font-mono text-xs">/{cmd.name}</span>
+              <span className="shrink-0 whitespace-nowrap font-mono text-xs">/{cmd.name}</span>
               {cmd.description && (
-                <span className="truncate text-[0.6875rem] text-[var(--muted-foreground)]">{cmd.description}</span>
+                <span className="min-w-0 flex-1 text-[0.6875rem] leading-snug text-[var(--muted-foreground)] [overflow-wrap:anywhere]">
+                  {cmd.description}
+                </span>
               )}
             </button>
           ))}
@@ -583,28 +973,22 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
 
       {/* Feedback toast */}
       {feedback && (
-        <div className="absolute bottom-full left-3 right-3 mb-2 flex justify-center">
-          <div className="flex w-full items-start gap-2 rounded-lg bg-foreground/15 px-3 py-2 text-xs font-medium text-foreground shadow-md">
-            <span className="flex-1 whitespace-pre-wrap">{feedback}</span>
-            <button
-              onClick={() => setFeedback(null)}
-              className="rounded p-0.5 opacity-60 transition-opacity hover:opacity-100"
-              aria-label="Dismiss"
-            >
-              <X size="0.75rem" />
-            </button>
-          </div>
+        <div className="absolute bottom-full left-3 right-3 z-50 mb-2">
+          <SlashCommandFeedback feedback={feedback} onDismiss={() => setFeedback(null)} />
         </div>
       )}
 
       {/* Attachment preview */}
-      {attachments.length > 0 && (
+      {(attachments.length > 0 || isReadingAttachments) && (
         <div className="mb-2 flex flex-wrap gap-2">
           {attachments.map((att, i) => (
             <div
               key={i}
               className="flex items-center gap-1.5 rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs ring-1 ring-[var(--border)]"
             >
+              {att.type.startsWith("image/") ? null : (
+                <FileText size="0.875rem" className="shrink-0 text-[var(--muted-foreground)]" />
+              )}
               <span className="max-w-[120px] truncate">{att.name}</span>
               <button
                 onClick={() => setAttachments((prev) => prev.filter((_, idx) => idx !== i))}
@@ -614,8 +998,18 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
               </button>
             </div>
           ))}
+          {isReadingAttachments && (
+            <div className="flex items-center gap-1.5 rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
+              <Loader2 size="0.875rem" className="animate-spin" />
+              Reading file...
+            </div>
+          )}
         </div>
       )}
+
+      {/* Mari capability + thinking indicators */}
+      <MariCapabilityNotice />
+      <MariThinkingIndicator />
 
       {/* Input bar */}
       <div
@@ -624,17 +1018,21 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
         className={cn(
-          "relative flex items-center gap-1.5 rounded-2xl border-2 px-2.5 py-2.5 transition-all duration-200 sm:gap-2 sm:px-4 bg-black/40",
-          isDragging ? "border-blue-400/50 bg-blue-500/10 shadow-lg shadow-blue-500/10" : "border-foreground/25",
+          "relative flex items-center gap-1.5 rounded-2xl border-2 px-2.5 py-2.5 transition-all duration-200 sm:gap-2 sm:px-4 bg-[var(--card)] dark:bg-black/40",
+          isDragging ? "border-blue-400/50 bg-blue-500/10 shadow-lg shadow-blue-500/10" : "border-[var(--border)]",
         )}
       >
         {/* Attach button */}
         <input
           ref={fileInputRef}
           type="file"
+          accept="image/*,.txt,.md,.markdown,.json,.jsonl,.csv,.log,.xml,.yaml,.yml"
           multiple
           className="hidden"
-          onChange={(e) => handleFileUpload(e.target.files)}
+          onChange={(e) => {
+            void handleFileUpload(e.target.files);
+            e.target.value = "";
+          }}
         />
         <button
           onClick={() => fileInputRef.current?.click()}
@@ -656,17 +1054,21 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
         <textarea
           ref={textareaRef}
           placeholder={
-            characterNames.length > 1 && chatName
-              ? `Message ${chatName}, / for commands`
-              : characterNames.length > 0
-                ? `Message @${characterNames[0]}, / for commands`
-                : "Message..."
+            groupResponseOrder === "manual"
+              ? characterNames.length > 0
+                ? `Message freely; @${characterNames[0]} to get a reply`
+                : "Message freely..."
+              : characterNames.length > 1 && chatName
+                ? `Message ${chatName}, / for commands`
+                : characterNames.length > 0
+                  ? `Message @${characterNames[0]}, / for commands`
+                  : "Message..."
           }
           rows={1}
           onInput={handleInput}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
-          className="max-h-[12.5rem] min-w-0 flex-1 resize-none bg-transparent py-0 text-[1rem] leading-normal text-[#c3c2c2] outline-none placeholder:text-foreground/30"
+          className="max-h-[12.5rem] min-w-0 flex-1 resize-none bg-transparent py-0 text-[1rem] leading-normal text-[var(--foreground)] outline-none placeholder:text-foreground/30"
         />
 
         {/* Right actions */}
@@ -723,22 +1125,151 @@ export function ConversationInput({ characterNames = [] }: ConversationInputProp
             />
           </div>
 
+          {showCharPicker && (
+            <button
+              ref={charPickerBtnRef}
+              onClick={() => setCharPickerOpen((v) => !v)}
+              className={cn(
+                "flex h-8 w-8 items-center justify-center rounded-full transition-colors",
+                guideGenerations && hasInput
+                  ? "text-[var(--primary)] bg-[var(--primary)]/15 ring-1 ring-[var(--primary)]/30 hover:bg-[var(--primary)]/20"
+                  : charPickerOpen
+                    ? "text-foreground bg-foreground/10"
+                    : "text-foreground/70 hover:bg-foreground/10 hover:text-foreground",
+              )}
+              title={
+                guideGenerations && hasInput ? "Trigger character response (guided)" : "Trigger character response"
+              }
+            >
+              <Users size="1rem" />
+            </button>
+          )}
+
+          {impersonateShowQuickButton && (
+            <button
+              onClick={handleImpersonateQuickButton}
+              disabled={!hasInput || isStreaming || !activeChatId || hasPendingAttachments}
+              className={cn(
+                "flex h-8 w-8 items-center justify-center rounded-full transition-colors",
+                hasInput && activeChatId && !isStreaming && !hasPendingAttachments
+                  ? "text-[var(--primary)] hover:bg-[var(--primary)]/15"
+                  : "text-foreground/20",
+              )}
+              title="Generate as {{user}} using this text as direction"
+            >
+              <UserCheck size="1rem" />
+            </button>
+          )}
+
+          {showDraftTranslateButton && (
+            <button
+              type="button"
+              onClick={() => void handleTranslateDraft()}
+              disabled={!activeChatId || !hasInput || isTranslatingDraft}
+              className={cn(
+                "flex h-8 w-8 items-center justify-center rounded-full transition-colors",
+                hasInput && !isTranslatingDraft
+                  ? "text-foreground/70 hover:bg-foreground/10 hover:text-foreground"
+                  : "text-foreground/25",
+              )}
+              title="Translate draft"
+            >
+              {isTranslatingDraft ? <Loader2 size="1rem" className="animate-spin" /> : <Languages size="1rem" />}
+            </button>
+          )}
+
+          {speechToTextEnabled && (
+            <SpeechToTextButton
+              disabled={!activeChatId}
+              onTranscript={handleSpeechTranscript}
+              className="rounded-full"
+              iconSize={16}
+            />
+          )}
+
           <button
             onClick={isActuallyGenerating ? () => useChatStore.getState().stopGeneration() : handleSend}
+            disabled={!isActuallyGenerating && (isReadingAttachments || !activeChatId || !canSubmit)}
+            aria-label={sendButtonTitle}
             className={cn(
               "flex h-8 w-8 items-center justify-center rounded-xl transition-all duration-200",
               isActuallyGenerating
                 ? "text-foreground hover:opacity-80"
-                : hasInput || attachments.length > 0
+                : canSubmit && !isReadingAttachments
                   ? "text-foreground hover:text-foreground/80 active:scale-90"
                   : "text-foreground/20",
             )}
-            title={isActuallyGenerating ? "Stop generating" : "Send"}
+            title={sendButtonTitle}
           >
-            {isActuallyGenerating ? <StopCircle size="1rem" /> : <Send size="0.9375rem" />}
+            {isActuallyGenerating ? (
+              <StopCircle size="1rem" />
+            ) : showRetrySendState ? (
+              <RefreshCw size="0.9375rem" />
+            ) : (
+              <Send size="0.9375rem" />
+            )}
           </button>
         </div>
       </div>
+      {showCharPicker &&
+        charPickerOpen &&
+        createPortal(
+          <div
+            ref={charPickerMenuRef}
+            className="fixed z-[9999] flex max-h-[320px] min-w-[220px] max-w-[280px] flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)] shadow-2xl"
+            style={
+              charPickerPos ? { left: charPickerPos.left, top: charPickerPos.top } : { visibility: "hidden" as const }
+            }
+          >
+            <div className="flex items-center justify-center border-b border-[var(--border)] px-3 py-2 text-[0.6875rem] font-semibold">
+              Trigger Response
+            </div>
+            <div className="overflow-y-auto p-1">
+              {chatCharacters!.map((char) => (
+                <button
+                  key={char.id}
+                  onClick={() => handleCharacterResponse(char.id)}
+                  className={cn(
+                    "flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-all hover:bg-[var(--accent)]",
+                    (char.conversationStatus === "dnd" || char.conversationStatus === "offline") && "opacity-60",
+                  )}
+                >
+                  <div className="relative shrink-0">
+                    {char.avatarUrl ? (
+                      <span className="block h-7 w-7 overflow-hidden rounded-full">
+                        <img
+                          src={char.avatarUrl}
+                          alt={char.name}
+                          className="h-full w-full object-cover"
+                          style={getAvatarCropStyle(char.avatarCrop)}
+                        />
+                      </span>
+                    ) : (
+                      <div className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--secondary)] text-[0.6875rem] font-semibold text-[var(--muted-foreground)]">
+                        {(char.name || "?")[0].toUpperCase()}
+                      </div>
+                    )}
+                    <span
+                      className={cn(
+                        "absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-full ring-2 ring-[var(--card)]",
+                        statusDotClass(char.conversationStatus),
+                      )}
+                    />
+                  </div>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs">{char.name}</span>
+                    {(char.conversationActivity || statusLabel(char.conversationStatus)) && (
+                      <span className="block truncate text-[0.625rem] text-[var(--muted-foreground)]">
+                        {char.conversationActivity || statusLabel(char.conversationStatus)}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

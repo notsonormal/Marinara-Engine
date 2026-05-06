@@ -17,8 +17,9 @@ dist/
 .env.local
 .env.production
 
-# Local pnpm config (created by start-termux.sh for platform fixes)
-.npmrc
+# Project pnpm config is tracked. The Termux launcher may append local platform
+# fixes to it on Android installs.
+!.npmrc
 
 # IDE
 .vscode/settings.json
@@ -42,6 +43,8 @@ packages/server/data/
 
 # Build output
 release/
+release-artifacts/
 
 # Installer artifacts are published on GitHub Releases, not tracked in source
 installer/*.exe
+win/installer/*.exe

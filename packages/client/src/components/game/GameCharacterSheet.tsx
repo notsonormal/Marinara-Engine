@@ -8,6 +8,7 @@ import {
   Info,
   Pencil,
   Plus,
+  RefreshCw,
   Save,
   Shield,
   Sparkles,
@@ -17,7 +18,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { cn } from "../../lib/utils";
+import { cn, getAvatarCropStyle } from "../../lib/utils";
 
 export interface GameCharacterSheetGameCard {
   shortDescription: string;
@@ -39,6 +40,7 @@ export interface CharacterSheetCard {
   status?: string;
   level?: number;
   avatarUrl?: string | null;
+  avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null;
   stats?: Array<{ name: string; value: number; max?: number; color?: string }>;
   inventory?: Array<{ name: string; quantity?: number; location?: string }>;
   customFields?: Record<string, string>;
@@ -49,6 +51,8 @@ interface GameCharacterSheetProps {
   card: CharacterSheetCard;
   onClose: () => void;
   onSave?: (gameCard: GameCharacterSheetGameCard | undefined) => Promise<void> | void;
+  onRegenerate?: () => Promise<void> | void;
+  isRegenerating?: boolean;
 }
 
 interface GameCardDraft {
@@ -81,24 +85,81 @@ const TEXT_INPUT_CLASS =
 const NUMBER_INPUT_CLASS =
   "w-full rounded-lg border border-[var(--border)] bg-[var(--secondary)]/60 px-2.5 py-1.5 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--primary)]/40";
 
+function normalizeTextValue(value: unknown) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function normalizeNumberValue(value: unknown, fallback: number) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : fallback;
+}
+
+function normalizeDraftListSource(value: unknown) {
+  const entries = Array.isArray(value) ? value.map((entry) => normalizeTextValue(entry).trim()).filter(Boolean) : [];
+  return entries.length > 0 ? entries : [""];
+}
+
+function normalizeDraftExtraEntries(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return [{ key: "", value: "" }];
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([key, entryValue]) => ({
+      key: normalizeTextValue(key).trim(),
+      value: normalizeTextValue(entryValue).trim(),
+    }))
+    .filter((entry) => entry.key || entry.value);
+
+  return entries.length > 0 ? entries : [{ key: "", value: "" }];
+}
+
+function normalizeDraftAttributes(value: unknown) {
+  if (!Array.isArray(value)) {
+    return DEFAULT_ATTRIBUTES.map((attr) => ({ ...attr }));
+  }
+
+  const entries = value
+    .map((entry) => {
+      if (!entry || typeof entry !== "object") return null;
+      const raw = entry as Record<string, unknown>;
+      const name = normalizeTextValue(raw.name).trim();
+      if (!name) return null;
+      return {
+        name,
+        value: normalizeNumberValue(raw.value, 0),
+      };
+    })
+    .filter((entry): entry is { name: string; value: number } => !!entry);
+
+  return entries;
+}
+
 function createDraft(gameCard?: GameCharacterSheetGameCard): GameCardDraft {
+  // Stored sheets can contain AI-generated or legacy values, so coerce them before binding to form inputs.
+  const rawGameCard = gameCard as (Record<string, unknown> & { rpgStats?: Record<string, unknown> }) | undefined;
+  const rawRpgStats =
+    rawGameCard?.rpgStats && typeof rawGameCard.rpgStats === "object" && !Array.isArray(rawGameCard.rpgStats)
+      ? rawGameCard.rpgStats
+      : undefined;
+  const rawHp =
+    rawRpgStats?.hp && typeof rawRpgStats.hp === "object" && !Array.isArray(rawRpgStats.hp)
+      ? (rawRpgStats.hp as Record<string, unknown>)
+      : undefined;
+
   return {
-    shortDescription: gameCard?.shortDescription ?? "",
-    class: gameCard?.class ?? "",
-    abilities: gameCard?.abilities?.length ? [...gameCard.abilities] : [""],
-    strengths: gameCard?.strengths?.length ? [...gameCard.strengths] : [""],
-    weaknesses: gameCard?.weaknesses?.length ? [...gameCard.weaknesses] : [""],
-    extraEntries:
-      gameCard && Object.keys(gameCard.extra ?? {}).length > 0
-        ? Object.entries(gameCard.extra).map(([key, value]) => ({ key, value }))
-        : [{ key: "", value: "" }],
-    rpgStatsEnabled: !!gameCard?.rpgStats,
-    attributes:
-      gameCard?.rpgStats?.attributes && gameCard.rpgStats.attributes.length > 0
-        ? gameCard.rpgStats.attributes.map((attr) => ({ name: attr.name, value: attr.value }))
-        : DEFAULT_ATTRIBUTES.map((attr) => ({ ...attr })),
-    hpValue: gameCard?.rpgStats?.hp.value ?? 100,
-    hpMax: gameCard?.rpgStats?.hp.max ?? 100,
+    shortDescription: normalizeTextValue(rawGameCard?.shortDescription).trim(),
+    class: normalizeTextValue(rawGameCard?.class).trim(),
+    abilities: normalizeDraftListSource(rawGameCard?.abilities),
+    strengths: normalizeDraftListSource(rawGameCard?.strengths),
+    weaknesses: normalizeDraftListSource(rawGameCard?.weaknesses),
+    extraEntries: normalizeDraftExtraEntries(rawGameCard?.extra),
+    rpgStatsEnabled: !!rawRpgStats,
+    attributes: normalizeDraftAttributes(rawRpgStats?.attributes),
+    hpValue: normalizeNumberValue(rawHp?.value, 100),
+    hpMax: Math.max(1, normalizeNumberValue(rawHp?.max, 100)),
   };
 }
 
@@ -131,16 +192,15 @@ function normalizeDraft(draft: GameCardDraft): GameCharacterSheetGameCard | unde
     }))
     .filter((attr) => attr.name);
 
-  const rpgStats =
-    draft.rpgStatsEnabled && attributes.length > 0
-      ? {
-          attributes,
-          hp: {
-            value: Math.max(0, draft.hpValue),
-            max: Math.max(1, draft.hpMax),
-          },
-        }
-      : undefined;
+  const rpgStats = draft.rpgStatsEnabled
+    ? {
+        attributes,
+        hp: {
+          value: Math.max(0, draft.hpValue),
+          max: Math.max(1, draft.hpMax),
+        },
+      }
+    : undefined;
 
   const hasContent =
     !!shortDescription ||
@@ -190,7 +250,13 @@ function SectionHeader({ icon, title, className }: { icon: React.ReactNode; titl
   );
 }
 
-export function GameCharacterSheet({ card, onClose, onSave }: GameCharacterSheetProps) {
+export function GameCharacterSheet({
+  card,
+  onClose,
+  onSave,
+  onRegenerate,
+  isRegenerating = false,
+}: GameCharacterSheetProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [draft, setDraft] = useState<GameCardDraft>(() => createDraft(card.gameCard));
@@ -201,12 +267,16 @@ export function GameCharacterSheet({ card, onClose, onSave }: GameCharacterSheet
     setDraft(createDraft(card.gameCard));
   }, [card]);
 
-  const gc = card.gameCard;
-  const previewGameCard = isEditing ? normalizeDraft(draft) : gc;
-  const hasRpgStats =
+  const previewGameCard = isEditing ? normalizeDraft(draft) : normalizeDraft(createDraft(card.gameCard));
+  const hasRpgAttributes =
     previewGameCard?.rpgStats &&
     Array.isArray(previewGameCard.rpgStats.attributes) &&
     previewGameCard.rpgStats.attributes.length > 0;
+  const hasRpgHp =
+    previewGameCard?.rpgStats?.hp &&
+    (Number.isFinite(Number(previewGameCard.rpgStats.hp.value)) ||
+      Number.isFinite(Number(previewGameCard.rpgStats.hp.max)));
+  const hasRpgStats = Boolean(hasRpgAttributes || hasRpgHp);
   const hasPersistentSheetData = hasGameData(previewGameCard) || hasRpgStats;
   const hasAnyData =
     hasPersistentSheetData ||
@@ -301,14 +371,19 @@ export function GameCharacterSheet({ card, onClose, onSave }: GameCharacterSheet
     }
   };
 
+  const handleRegenerate = async () => {
+    if (!onRegenerate || isSaving || isRegenerating) return;
+    await onRegenerate();
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
       <div
         className="relative mx-4 flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        {onSave && (
-          <div className="absolute right-12 top-3 z-10 flex items-center gap-2">
+        {(onSave || onRegenerate) && (
+          <div className="absolute right-12 top-3 z-10 flex flex-wrap items-center justify-end gap-2">
             {isEditing ? (
               <>
                 <button
@@ -328,13 +403,29 @@ export function GameCharacterSheet({ card, onClose, onSave }: GameCharacterSheet
                 </button>
               </>
             ) : (
-              <button
-                onClick={() => setIsEditing(true)}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)]/90 px-3 py-1.5 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
-              >
-                <Pencil size={13} />
-                Edit Sheet
-              </button>
+              <>
+                {onRegenerate && (
+                  <button
+                    onClick={() => void handleRegenerate()}
+                    disabled={isRegenerating || isSaving}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)]/90 px-3 py-1.5 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)] disabled:cursor-wait disabled:opacity-60"
+                    title="Regenerate this sheet from character and current game context"
+                  >
+                    <RefreshCw size={13} className={cn(isRegenerating && "animate-spin")} />
+                    {isRegenerating ? "Regenerating..." : "Regenerate Sheet"}
+                  </button>
+                )}
+                {onSave && (
+                  <button
+                    onClick={() => setIsEditing(true)}
+                    disabled={isRegenerating}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)]/90 px-3 py-1.5 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)] disabled:opacity-60"
+                  >
+                    <Pencil size={13} />
+                    Edit Sheet
+                  </button>
+                )}
+              </>
             )}
           </div>
         )}
@@ -349,17 +440,20 @@ export function GameCharacterSheet({ card, onClose, onSave }: GameCharacterSheet
         <div className="relative border-b border-[var(--border)] bg-[var(--secondary)]/50 px-5 py-4">
           <div className="flex items-center gap-4">
             {card.avatarUrl ? (
-              <img
-                src={card.avatarUrl}
-                alt={card.title}
-                className="h-20 w-20 rounded-xl border-2 border-[var(--border)] object-cover shadow-xl"
-              />
+              <span className="block h-20 w-20 overflow-hidden rounded-xl border-2 border-[var(--border)] shadow-xl">
+                <img
+                  src={card.avatarUrl}
+                  alt={card.title}
+                  className="h-full w-full object-cover"
+                  style={getAvatarCropStyle(card.avatarCrop)}
+                />
+              </span>
             ) : (
               <div className="flex h-20 w-20 items-center justify-center rounded-xl border-2 border-[var(--border)] bg-[var(--secondary)] text-2xl font-bold text-[var(--muted-foreground)]">
                 {card.title[0]}
               </div>
             )}
-            <div className="min-w-0 flex-1 pr-28">
+            <div className="min-w-0 flex-1 pr-36 sm:pr-64">
               <h2 className="truncate text-lg font-bold text-[var(--foreground)]">{card.title}</h2>
               {previewGameCard?.class && (
                 <p className="text-xs font-medium text-[var(--primary)]">{previewGameCard.class}</p>
@@ -685,36 +779,45 @@ export function GameCharacterSheet({ card, onClose, onSave }: GameCharacterSheet
                 title="Attributes"
                 className="text-[var(--muted-foreground)]"
               />
-              <div className="mb-3 grid grid-cols-3 gap-2">
-                {previewGameCard.rpgStats.attributes.map((attr) => (
-                  <div
-                    key={attr.name}
-                    className="flex flex-col items-center rounded-lg border border-[var(--border)] bg-[var(--secondary)]/50 px-2 py-1.5"
-                  >
-                    <span className="text-[0.5625rem] font-bold uppercase tracking-widest text-[var(--muted-foreground)]">
-                      {attr.name}
-                    </span>
-                    <span className="text-lg font-bold leading-tight text-[var(--foreground)]">{attr.value}</span>
-                  </div>
-                ))}
-              </div>
-              <div>
-                <div className="mb-0.5 flex items-center justify-between text-xs">
-                  <span className="font-medium text-[var(--foreground)]/80">HP</span>
-                  <span className="font-mono text-[var(--muted-foreground)]">
-                    {previewGameCard.rpgStats.hp.value}/{previewGameCard.rpgStats.hp.max}
-                  </span>
+              {hasRpgAttributes && (
+                <div className="mb-3 grid grid-cols-3 gap-2">
+                  {previewGameCard.rpgStats.attributes.map((attr) => (
+                    <div
+                      key={attr.name}
+                      className="flex flex-col items-center rounded-lg border border-[var(--border)] bg-[var(--secondary)]/50 px-2 py-1.5"
+                    >
+                      <span className="text-[0.5625rem] font-bold uppercase tracking-widest text-[var(--muted-foreground)]">
+                        {attr.name}
+                      </span>
+                      <span className="text-lg font-bold leading-tight text-[var(--foreground)]">{attr.value}</span>
+                    </div>
+                  ))}
                 </div>
-                <div className="h-2.5 overflow-hidden rounded-full bg-[var(--secondary)] ring-1 ring-[var(--border)]">
-                  <div
-                    className="h-full rounded-full transition-all"
-                    style={{
-                      width: `${(previewGameCard.rpgStats.hp.value / Math.max(1, previewGameCard.rpgStats.hp.max)) * 100}%`,
-                      background: "#ef4444",
-                    }}
-                  />
-                </div>
-              </div>
+              )}
+              {hasRpgHp &&
+                (() => {
+                  const hpMax = Math.max(1, Number(previewGameCard.rpgStats.hp.max) || 1);
+                  const hpValue = Math.max(0, Math.min(hpMax, Number(previewGameCard.rpgStats.hp.value) || 0));
+                  return (
+                    <div>
+                      <div className="mb-0.5 flex items-center justify-between text-xs">
+                        <span className="font-medium text-[var(--foreground)]/80">HP</span>
+                        <span className="font-mono text-[var(--muted-foreground)]">
+                          {hpValue}/{hpMax}
+                        </span>
+                      </div>
+                      <div className="h-2.5 overflow-hidden rounded-full bg-[var(--secondary)] ring-1 ring-[var(--border)]">
+                        <div
+                          className="h-full rounded-full transition-all"
+                          style={{
+                            width: `${(hpValue / hpMax) * 100}%`,
+                            background: "#ef4444",
+                          }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })()}
             </div>
           )}
 

@@ -7,6 +7,7 @@
 // roleplay chat, and returns a summary memory when concluded.
 // ──────────────────────────────────────────────
 import type { FastifyInstance } from "fastify";
+import { logger } from "../lib/logger.js";
 import { readdirSync, existsSync } from "fs";
 import { join, extname } from "path";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
@@ -14,13 +15,16 @@ import { createConnectionsStorage } from "../services/storage/connections.storag
 import { createCharactersStorage } from "../services/storage/characters.storage.js";
 import { createGameStateStorage } from "../services/storage/game-state.storage.js";
 import { createLLMProvider } from "../services/llm/provider-registry.js";
+import { stripConversationPromptTimestamps } from "../services/conversation/transcript-sanitize.js";
 import { DATA_DIR } from "../utils/data-dir.js";
-import type { ChatMessage } from "../services/llm/base-provider.js";
+import type { ChatCompletionResult, ChatMessage } from "../services/llm/base-provider.js";
 import type {
   SceneCreateRequest,
   SceneCreateResponse,
   SceneConcludeRequest,
   SceneConcludeResponse,
+  SceneForkRequest,
+  SceneForkResponse,
   ScenePlanRequest,
   ScenePlanResponse,
   SceneFullPlan,
@@ -64,6 +68,9 @@ async function resolveConnection(
     const providerDef = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
     baseUrl = providerDef?.defaultBaseUrl ?? "";
   }
+  // Claude (Subscription) uses the local Claude Agent SDK and has no HTTP
+  // endpoint — return a sentinel so the gate passes. The provider ignores it.
+  if (!baseUrl && conn.provider === "claude_subscription") baseUrl = "claude-agent-sdk://local";
   if (!baseUrl) throw new Error("No base URL configured for this connection");
 
   return { conn, baseUrl };
@@ -127,10 +134,89 @@ function listAvailableBackgrounds(): string[] {
   return readdirSync(BG_DIR).filter((f) => ALLOWED_BG_EXTS.has(extname(f).toLowerCase()));
 }
 
+/** Parse chat metadata regardless of whether storage returned JSON text or an object. */
+function parseMetadata(chat: { metadata?: string | Record<string, unknown> | null }): Record<string, unknown> {
+  if (!chat.metadata) return {};
+  if (typeof chat.metadata !== "string") return chat.metadata;
+  try {
+    const parsed = JSON.parse(chat.metadata);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (error) {
+    logger.warn({ err: error }, "[scene] Ignoring malformed chat metadata");
+    return {};
+  }
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Normalize stored character IDs into a string array for copied roleplay chats. */
+function parseCharacterIds(characterIds: unknown): string[] {
+  if (Array.isArray(characterIds)) return characterIds.map(String).filter(Boolean);
+  if (typeof characterIds === "string") {
+    try {
+      const parsed = JSON.parse(characterIds);
+      return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+/** Scene lifecycle keys that must not be copied into standalone roleplay metadata. */
+const SCENE_FORK_METADATA_EXCLUDE = new Set([
+  "sceneOriginChatId",
+  "sceneInitiatorCharId",
+  "sceneDescription",
+  "sceneScenario",
+  "sceneSystemPrompt",
+  "sceneRating",
+  "sceneStatus",
+  "sceneConversationContext",
+  "sceneRelationshipHistory",
+  "sceneBackground",
+  "activeSceneChatId",
+  "sceneBusyCharIds",
+]);
+
+/** Copy only safe non-scene metadata when creating a standalone roleplay fork. */
+function buildRoleplayForkMetadata(sceneMeta: Record<string, unknown>) {
+  const next: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(sceneMeta)) {
+    if (SCENE_FORK_METADATA_EXCLUDE.has(key) || key.startsWith("scene")) continue;
+    next[key] = value;
+  }
+  return next;
+}
+
+/** Build hidden continuity context from user-safe scene fields for the forked chat. */
+function buildForkContextMessage(sceneMeta: Record<string, unknown>, includePreSceneSummary: boolean) {
+  if (!includePreSceneSummary) return null;
+
+  const parts: string[] = [];
+  if (typeof sceneMeta.sceneDescription === "string" && sceneMeta.sceneDescription.trim()) {
+    parts.push(`Scene premise:\n${sceneMeta.sceneDescription.trim()}`);
+  }
+  if (typeof sceneMeta.sceneRelationshipHistory === "string" && sceneMeta.sceneRelationshipHistory.trim()) {
+    parts.push(`Relationship continuity:\n${sceneMeta.sceneRelationshipHistory.trim()}`);
+  }
+  if (typeof sceneMeta.sceneConversationContext === "string" && sceneMeta.sceneConversationContext.trim()) {
+    parts.push(`Pre-scene conversation context:\n${sceneMeta.sceneConversationContext.trim()}`);
+  }
+
+  if (!parts.length) return null;
+  return [`The following continuity was preserved when this scene became a standalone roleplay.`, "", ...parts].join(
+    "\n\n",
+  );
+}
+
 // ──────────────────────────────────────────────
 // Routes
 // ──────────────────────────────────────────────
 
+/** Register routes for planning, creating, ending, and forking scenes. */
 export async function sceneRoutes(app: FastifyInstance) {
   const chats = createChatsStorage(app.db);
   const connections = createConnectionsStorage(app.db);
@@ -149,11 +235,9 @@ export async function sceneRoutes(app: FastifyInstance) {
     if (!originChat) return reply.status(404).send({ error: "Origin chat not found" });
 
     // Resolve participants — use plan's characterIds if present, else all origin chars
-    const originCharIds: string[] =
-      typeof originChat.characterIds === "string"
-        ? JSON.parse(originChat.characterIds)
-        : (originChat.characterIds as string[]);
-    const finalParticipantIds = plan.characterIds?.length ? plan.characterIds : originCharIds;
+    const originCharIds = parseCharacterIds(originChat.characterIds);
+    const plannedCharIds = parseCharacterIds(plan.characterIds);
+    const finalParticipantIds = plannedCharIds.length ? plannedCharIds : originCharIds;
 
     const finalSystemPrompt = plan.systemPrompt + "\n" + SCENE_GUIDELINES;
 
@@ -175,18 +259,16 @@ export async function sceneRoutes(app: FastifyInstance) {
     const initiatorName = initiatorCharId ? await getCharacterName(chars, initiatorCharId) : "User";
     const recentMsgs = await getRecentMessages(chats, originChatId, 30);
     const historyText = recentMsgs
-      .map((m) => `${m.role === "user" ? personaName : initiatorName}: ${m.content}`)
+      .map((m) => `${m.role === "user" ? personaName : initiatorName}: ${stripConversationPromptTimestamps(m.content)}`)
       .join("\n\n")
       .slice(-3000);
 
     // Store scene metadata on the new chat (single write)
     // Inherit lorebooks from origin chat
-    const originMeta =
-      typeof originChat.metadata === "string" ? JSON.parse(originChat.metadata) : (originChat.metadata ?? {});
+    const originMeta = parseMetadata(originChat);
     const originLorebookIds = Array.isArray(originMeta.activeLorebookIds) ? originMeta.activeLorebookIds : [];
 
-    const existingMeta =
-      typeof sceneChat.metadata === "string" ? JSON.parse(sceneChat.metadata) : (sceneChat.metadata ?? {});
+    const existingMeta = parseMetadata(sceneChat);
     await chats.updateMetadata(sceneChat.id, {
       ...existingMeta,
       sceneOriginChatId: originChatId,
@@ -249,21 +331,24 @@ export async function sceneRoutes(app: FastifyInstance) {
     const sceneChat = await chats.getById(sceneChatId);
     if (!sceneChat) return reply.status(404).send({ error: "Scene chat not found" });
 
-    const sceneMeta =
-      typeof sceneChat.metadata === "string" ? JSON.parse(sceneChat.metadata) : (sceneChat.metadata ?? {});
+    const sceneMeta = parseMetadata(sceneChat);
 
-    const originChatId = sceneMeta.sceneOriginChatId;
+    const originChatId = typeof sceneMeta.sceneOriginChatId === "string" ? sceneMeta.sceneOriginChatId : null;
     if (!originChatId) return reply.status(400).send({ error: "Not a scene chat (no origin)" });
 
     // Resolve connection
     const { conn, baseUrl } = await resolveConnection(connections, connectionId, sceneChat.connectionId);
-    const provider = createLLMProvider(conn.provider, baseUrl, conn.apiKey, conn.maxContext, conn.openrouterProvider);
+    const provider = createLLMProvider(
+      conn.provider,
+      baseUrl,
+      conn.apiKey,
+      conn.maxContext,
+      conn.openrouterProvider,
+      conn.maxTokensOverride,
+    );
 
     // Build context
-    const characterIds: string[] =
-      typeof sceneChat.characterIds === "string"
-        ? JSON.parse(sceneChat.characterIds)
-        : (sceneChat.characterIds as string[]);
+    const characterIds = parseCharacterIds(sceneChat.characterIds);
     const characterCtx = await buildCharacterContext(chars, characterIds);
     const { personaName, personaCtx } = await buildPersonaContext(chars);
 
@@ -314,16 +399,31 @@ export async function sceneRoutes(app: FastifyInstance) {
       },
     ];
 
-    const result = await provider.chatComplete(summaryPrompt, {
-      model: conn.model,
-      temperature: 0.8,
-      maxTokens: 1024,
-    });
+    let result: ChatCompletionResult;
+    try {
+      result = await provider.chatComplete(summaryPrompt, {
+        model: conn.model,
+        temperature: 0.8,
+        maxTokens: 1024,
+      });
+    } catch (error) {
+      logger.error(
+        { err: error, sceneChatId, provider: conn.provider, model: conn.model },
+        "[scene] Failed to generate scene summary",
+      );
+      return reply.status(502).send({ error: `Scene summary failed: ${getErrorMessage(error)}` });
+    }
 
     const summary = (result.content ?? "").trim();
+    if (!summary) {
+      logger.warn({ sceneChatId, provider: conn.provider, model: conn.model }, "[scene] Scene summary was empty");
+      return reply.status(502).send({ error: "Scene summary failed: the model returned an empty response." });
+    }
 
     // 1. Inject the summary as a message in the ORIGIN conversation
-    const initiatorCharId = sceneMeta.sceneInitiatorCharId ?? characterIds[0] ?? null;
+    const sceneInitiatorCharId =
+      typeof sceneMeta.sceneInitiatorCharId === "string" ? sceneMeta.sceneInitiatorCharId : null;
+    const initiatorCharId = sceneInitiatorCharId ?? characterIds[0] ?? null;
     await chats.createMessage({
       chatId: originChatId,
       role: "narrator",
@@ -333,22 +433,30 @@ export async function sceneRoutes(app: FastifyInstance) {
 
     // 2. Store as a permanent memory on each participating character
     for (const charId of characterIds) {
-      const charRow = await chars.getById(charId);
-      if (!charRow) continue;
-      const charData = typeof charRow.data === "string" ? JSON.parse(charRow.data) : charRow.data;
-      const extensions = { ...(charData.extensions ?? {}) };
-      const memories: Array<{ from: string; fromCharId: string; summary: string; createdAt: string }> =
-        extensions.characterMemories ?? [];
+      try {
+        const charRow = await chars.getById(charId);
+        if (!charRow) continue;
+        const charData = typeof charRow.data === "string" ? JSON.parse(charRow.data) : charRow.data;
+        const extensions = { ...(charData.extensions ?? {}) };
+        const existingMemories = extensions.characterMemories;
+        const memories: Array<{ from: string; fromCharId: string; summary: string; createdAt: string }> = Array.isArray(
+          existingMemories,
+        )
+          ? [...existingMemories]
+          : [];
 
-      memories.push({
-        from: personaName,
-        fromCharId: "scene",
-        summary: `[Scene on ${dateStr}] ${summary}`,
-        createdAt: now.toISOString(),
-      });
+        memories.push({
+          from: personaName,
+          fromCharId: "scene",
+          summary: `[Scene on ${dateStr}] ${summary}`,
+          createdAt: now.toISOString(),
+        });
 
-      extensions.characterMemories = memories;
-      await chars.update(charId, { extensions } as any);
+        extensions.characterMemories = memories;
+        await chars.update(charId, { extensions } as any, undefined, { skipVersionSnapshot: true });
+      } catch (error) {
+        logger.warn({ err: error, sceneChatId, charId }, "[scene] Failed to store scene summary memory");
+      }
     }
 
     // 3. Mark scene as concluded
@@ -357,8 +465,7 @@ export async function sceneRoutes(app: FastifyInstance) {
     // 4. Clean up origin chat metadata — remove scene busy state
     const originChat = await chats.getById(originChatId);
     if (originChat) {
-      const originMeta =
-        typeof originChat.metadata === "string" ? JSON.parse(originChat.metadata) : (originChat.metadata ?? {});
+      const originMeta = parseMetadata(originChat);
       delete originMeta.activeSceneChatId;
       delete originMeta.sceneBusyCharIds;
       await chats.updateMetadata(originChatId, originMeta);
@@ -381,17 +488,15 @@ export async function sceneRoutes(app: FastifyInstance) {
     const sceneChat = await chats.getById(sceneChatId);
     if (!sceneChat) return reply.status(404).send({ error: "Scene chat not found" });
 
-    const sceneMeta =
-      typeof sceneChat.metadata === "string" ? JSON.parse(sceneChat.metadata) : (sceneChat.metadata ?? {});
+    const sceneMeta = parseMetadata(sceneChat);
 
-    const originChatId = sceneMeta.sceneOriginChatId;
+    const originChatId = typeof sceneMeta.sceneOriginChatId === "string" ? sceneMeta.sceneOriginChatId : null;
     if (!originChatId) return reply.status(400).send({ error: "Not a scene chat (no origin)" });
 
     // 1. Clean up origin chat metadata — remove scene busy state
     const originChat = await chats.getById(originChatId);
     if (originChat) {
-      const originMeta =
-        typeof originChat.metadata === "string" ? JSON.parse(originChat.metadata) : (originChat.metadata ?? {});
+      const originMeta = parseMetadata(originChat);
       delete originMeta.activeSceneChatId;
       delete originMeta.sceneBusyCharIds;
       await chats.updateMetadata(originChatId, originMeta);
@@ -406,6 +511,190 @@ export async function sceneRoutes(app: FastifyInstance) {
     return { originChatId };
   });
 
+  // Copy an active scene into a standalone roleplay chat. Clone leaves the
+  // original scene running; convert detaches and deletes the original scene
+  // without generating summaries or character memory. The new chat preserves
+  // narrative continuity only; scene lifecycle metadata is stripped.
+  app.post<{ Body: SceneForkRequest }>("/fork", async (req, reply) => {
+    const {
+      sceneChatId,
+      mode,
+      upToMessageId,
+      includePreSceneSummary = true,
+      includeParticipationGuide = true,
+    } = req.body ?? ({} as SceneForkRequest);
+
+    if (!sceneChatId) return reply.status(400).send({ error: "sceneChatId is required" });
+    if (mode !== "clone" && mode !== "convert") {
+      return reply.status(400).send({ error: "mode must be 'clone' or 'convert'" });
+    }
+    if (mode === "convert" && upToMessageId) {
+      return reply.status(400).send({ error: "Convert cannot be limited to a message" });
+    }
+
+    const sceneChat = await chats.getById(sceneChatId);
+    if (!sceneChat) return reply.status(404).send({ error: "Scene chat not found" });
+
+    const sceneMeta = parseMetadata(sceneChat);
+    const originChatId = typeof sceneMeta.sceneOriginChatId === "string" ? sceneMeta.sceneOriginChatId : null;
+    const isActiveScene = sceneMeta.sceneStatus === "active";
+    // Clone accepts inactive scene-like chats with an origin so old scene
+    // transcripts can still be recovered into standalone roleplay chats.
+    if (!isActiveScene && !originChatId) {
+      return reply.status(400).send({ error: "Not a scene chat" });
+    }
+    // Convert needs an origin to clear active scene state; clone can copy an
+    // orphaned scene-like chat without altering its source.
+    if (mode === "convert" && !originChatId) {
+      return reply.status(400).send({ error: "convert requires originChatId" });
+    }
+
+    // Sort explicitly before validating/slicing `upToMessageId` so "clone from
+    // here" always copies a chronological prefix even if storage ordering changes.
+    const sceneMessages = (await chats.listMessages(sceneChatId)).sort(
+      (a: { createdAt: string }, b: { createdAt: string }) =>
+        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+    );
+    if (upToMessageId && !sceneMessages.some((msg) => msg.id === upToMessageId)) {
+      return reply.status(400).send({ error: "Message is not part of this scene" });
+    }
+
+    const newChat = await chats.create({
+      name: `${sceneChat.name.startsWith("Scene: ") ? sceneChat.name.replace(/^Scene:\s*/, "") : sceneChat.name} - ${
+        mode === "clone" ? "clone" : "converted"
+      }`,
+      mode: "roleplay",
+      characterIds: parseCharacterIds(sceneChat.characterIds),
+      groupId: sceneChat.groupId,
+      personaId: sceneChat.personaId,
+      promptPresetId: sceneChat.promptPresetId,
+      connectionId: sceneChat.connectionId,
+    });
+    if (!newChat) return reply.status(500).send({ error: "Failed to create roleplay chat" });
+
+    try {
+      await chats.updateMetadata(newChat.id, {
+        ...parseMetadata(newChat),
+        ...buildRoleplayForkMetadata(sceneMeta),
+      });
+
+      const copiedMessages: Array<{
+        role: "user" | "assistant" | "system" | "narrator";
+        characterId: string | null;
+        content: string;
+        extra?: unknown;
+        activeSwipeIndex?: number;
+        swipeExtra?: unknown;
+        swipes?: Array<{
+          index: number;
+          content: string;
+          extra?: unknown;
+          createdAt?: string | null;
+        }>;
+        createdAt?: string | null;
+      }> = [];
+
+      const continuity = buildForkContextMessage(sceneMeta, includePreSceneSummary);
+      if (continuity) {
+        // Hidden narrator context remains available to prompt assembly while
+        // staying out of the standalone roleplay transcript.
+        copiedMessages.push({
+          role: "narrator",
+          characterId: null,
+          content: continuity,
+          extra: {
+            displayText: null,
+            isGenerated: true,
+            tokenCount: null,
+            generationInfo: null,
+            hiddenFromUser: true,
+          },
+        });
+      }
+
+      let skippedParticipationGuide = false;
+      for (const msg of sceneMessages) {
+        if (!includeParticipationGuide && !skippedParticipationGuide && msg.role === "narrator") {
+          // /scene/create writes the generated participation guide as the first
+          // narrator message; this option skips only that generated guide.
+          skippedParticipationGuide = true;
+          if (upToMessageId && msg.id === upToMessageId) break;
+          continue;
+        }
+
+        let content = msg.content;
+        let extra = msg.extra;
+        let swipeExtra: unknown = undefined;
+        let createdAt = msg.createdAt;
+        const swipes = await chats.getSwipes(msg.id);
+        const copiedSwipes = swipes.map(
+          (swipe: { index: number; content: string; extra?: unknown; createdAt?: string | null }) => ({
+            index: swipe.index,
+            content: swipe.content,
+            extra: swipe.extra,
+            createdAt: swipe.createdAt,
+          }),
+        );
+        const activeSwipe = swipes.find(
+          (s: { index: number; content?: string; extra?: unknown; createdAt?: string }) =>
+            s.index === msg.activeSwipeIndex,
+        );
+        if (activeSwipe) {
+          content = activeSwipe.content ?? content;
+          extra = activeSwipe.extra ?? extra;
+          // Keep swipe metadata independent; createMessagesBatch supplies the
+          // empty default when the selected swipe has no metadata of its own.
+          swipeExtra = activeSwipe.extra;
+          createdAt = activeSwipe.createdAt ?? createdAt;
+        }
+
+        copiedMessages.push({
+          role: msg.role as "user" | "assistant" | "system" | "narrator",
+          characterId: msg.characterId,
+          content,
+          extra,
+          activeSwipeIndex: msg.activeSwipeIndex,
+          swipeExtra,
+          swipes: copiedSwipes,
+          createdAt,
+        });
+
+        if (upToMessageId && msg.id === upToMessageId) break;
+      }
+
+      await chats.createMessagesBatch(newChat.id, copiedMessages);
+
+      if (mode === "convert" && originChatId) {
+        const originChat = await chats.getById(originChatId);
+        if (originChat) {
+          const originMeta = parseMetadata(originChat);
+          delete originMeta.activeSceneChatId;
+          delete originMeta.sceneBusyCharIds;
+          await chats.updateMetadata(originChatId, originMeta);
+        } else {
+          logger.info("[scene/fork] Origin chat %s missing during convert of scene %s", originChatId, sceneChatId);
+        }
+
+        await chats.disconnectChat(sceneChatId);
+        await chats.remove(sceneChatId);
+      }
+    } catch (err) {
+      try {
+        await chats.remove(newChat.id);
+      } catch (cleanupErr) {
+        logger.warn(cleanupErr, "[scene/fork] Failed to clean up partial fork chat %s", newChat.id);
+      }
+      logger.error(err, "[scene/fork] Failed to create fork chat %s from scene %s", newChat.id, sceneChatId);
+      return reply.status(500).send({ error: "Failed to fork scene" });
+    }
+
+    return {
+      chatId: newChat.id,
+      originChatId,
+      mode,
+    } satisfies SceneForkResponse;
+  });
+
   // ───────────────────────── PLAN (user-initiated) ─────────────────────────
   // The user typed /scene with a prompt. The LLM plans the full scene setup
   // including system prompt, first message, background, rating, etc.
@@ -416,7 +705,14 @@ export async function sceneRoutes(app: FastifyInstance) {
     if (!chat) return reply.status(404).send({ error: "Chat not found" });
 
     const { conn, baseUrl } = await resolveConnection(connections, connectionId, chat.connectionId);
-    const provider = createLLMProvider(conn.provider, baseUrl, conn.apiKey, conn.maxContext, conn.openrouterProvider);
+    const provider = createLLMProvider(
+      conn.provider,
+      baseUrl,
+      conn.apiKey,
+      conn.maxContext,
+      conn.openrouterProvider,
+      conn.maxTokensOverride,
+    );
 
     const characterIds: string[] =
       typeof chat.characterIds === "string" ? JSON.parse(chat.characterIds) : (chat.characterIds as string[]);
@@ -433,7 +729,7 @@ export async function sceneRoutes(app: FastifyInstance) {
     // Get recent conversation for context
     const recentMsgs = await getRecentMessages(chats, chatId, 20);
     const historyText = recentMsgs
-      .map((m) => `${m.role === "user" ? personaName : "Character"}: ${m.content}`)
+      .map((m) => `${m.role === "user" ? personaName : "Character"}: ${stripConversationPromptTimestamps(m.content)}`)
       .join("\n\n");
 
     const planPrompt: ChatMessage[] = [
@@ -532,7 +828,8 @@ export async function sceneRoutes(app: FastifyInstance) {
       }
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : "Unknown error";
-      console.error("[scene/plan] Failed to parse LLM response as JSON:", errMsg, "\nRaw response:", raw.slice(0, 500));
+      logger.error(e, "[scene/plan] Failed to parse LLM response as JSON");
+      logger.debug("[scene/plan] Raw unparsable LLM output (first 500 chars): %s", raw.slice(0, 500));
       return {
         plan: null,
         error: `Model didn't return valid JSON. Try again — sometimes models need a second attempt. (${errMsg})`,

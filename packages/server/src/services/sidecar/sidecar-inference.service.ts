@@ -136,12 +136,24 @@ function extractChoiceContent(
   };
 }
 
+function getRuntimeGenerationSettings() {
+  const config = sidecarModelService.getConfig();
+  return {
+    maxTokens: Math.max(64, Math.floor(config.maxTokens)),
+    temperature: Math.min(2, Math.max(0, config.temperature)),
+    topP: Math.min(1, Math.max(Number.EPSILON, config.topP)),
+    topK: Math.max(0, Math.floor(config.topK)),
+  };
+}
+
 async function streamChatCompletion(options: {
   messages: SidecarMessage[];
   maxTokens: number;
   responseFormat?: Record<string, unknown>;
 }): Promise<string> {
   const baseUrl = await sidecarProcessService.ensureReady();
+  const generation = getRuntimeGenerationSettings();
+  const maxTokens = Math.min(Math.max(1, Math.floor(options.maxTokens)), generation.maxTokens);
   const response = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: "POST",
     headers: {
@@ -151,10 +163,10 @@ async function streamChatCompletion(options: {
       model: getRequestModel(),
       stream: true,
       messages: options.messages,
-      max_tokens: options.maxTokens,
-      temperature: 1.0,
-      top_p: 0.95,
-      top_k: 64,
+      max_tokens: maxTokens,
+      temperature: generation.temperature,
+      top_p: generation.topP,
+      ...(generation.topK > 0 ? { top_k: generation.topK } : {}),
       ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
     }),
     signal: AbortSignal.timeout(5 * 60_000),
@@ -239,7 +251,7 @@ export async function runTestMessage(): Promise<SidecarTestMessageOutput> {
 
     const config = sidecarModelService.getConfig();
     const shouldKeepRunning = config.useForTrackers || config.useForGameScene;
-    const baseUrl = await sidecarProcessService.ensureReady(true);
+    const baseUrl = await sidecarProcessService.ensureReady({ forceStart: true });
     const nonce = `marinara-${randomUUID().slice(0, 8)}`;
 
     try {
@@ -322,22 +334,6 @@ export async function unloadModel(): Promise<void> {
   await sidecarProcessService.stop();
 }
 
-const SCENE_WIDGET_UPDATE_SCHEMA = {
-  type: "object" as const,
-  properties: {
-    widgetId: { type: "string" as const },
-    value: { type: ["number", "string"] as const },
-    count: { type: "number" as const },
-    add: { type: "string" as const },
-    remove: { type: "string" as const },
-    running: { type: "boolean" as const },
-    seconds: { type: "number" as const },
-    statName: { type: "string" as const },
-  },
-  required: ["widgetId"] as const,
-  additionalProperties: false as const,
-};
-
 const SCENE_ANALYSIS_SCHEMA = {
   type: "object" as const,
   properties: {
@@ -359,11 +355,6 @@ const SCENE_ANALYSIS_SCHEMA = {
         additionalProperties: false as const,
       },
     },
-    widgetUpdates: {
-      type: "array" as const,
-      maxItems: 20,
-      items: SCENE_WIDGET_UPDATE_SCHEMA,
-    },
     segmentEffects: {
       type: "array" as const,
       maxItems: 20,
@@ -379,32 +370,115 @@ const SCENE_ANALYSIS_SCHEMA = {
             items: { type: "string" as const },
             maxItems: 3,
           },
-          expressions: {
-            type: "object" as const,
-            additionalProperties: { type: "string" as const },
-          },
-          widgetUpdates: {
+          directions: {
             type: "array" as const,
-            items: SCENE_WIDGET_UPDATE_SCHEMA,
-            maxItems: 10,
+            maxItems: 1,
+            items: {
+              type: "object" as const,
+              properties: {
+                effect: {
+                  type: "string" as const,
+                  enum: [
+                    "flash",
+                    "screen_shake",
+                    "pulse",
+                    "slow_zoom",
+                    "impact_zoom",
+                    "tilt",
+                    "desaturate",
+                    "chromatic_aberration",
+                    "film_grain",
+                    "rain_streaks",
+                    "spotlight",
+                    "focus",
+                    "vignette",
+                    "letterbox",
+                    "color_grade",
+                  ] as const,
+                },
+                duration: { type: "number" as const },
+                intensity: { type: "number" as const },
+                target: {
+                  type: "string" as const,
+                  enum: ["background", "content", "all"] as const,
+                },
+                params: {
+                  type: "object" as const,
+                  additionalProperties: { type: "string" as const },
+                },
+              },
+              required: ["effect"] as const,
+              additionalProperties: false as const,
+            },
           },
         },
         required: ["segment"] as const,
         additionalProperties: false as const,
       },
     },
+    directions: {
+      type: "array" as const,
+      maxItems: 8,
+      items: {
+        type: "object" as const,
+        properties: {
+          effect: {
+            type: "string" as const,
+            enum: [
+              "fade_from_black",
+              "fade_to_black",
+              "flash",
+              "screen_shake",
+              "blur",
+              "vignette",
+              "letterbox",
+              "color_grade",
+              "focus",
+              "pulse",
+              "slow_zoom",
+              "impact_zoom",
+              "tilt",
+              "desaturate",
+              "chromatic_aberration",
+              "film_grain",
+              "rain_streaks",
+              "spotlight",
+            ] as const,
+          },
+          duration: { type: "number" as const },
+          intensity: { type: "number" as const },
+          target: {
+            type: "string" as const,
+            enum: ["background", "content", "all"] as const,
+          },
+          params: {
+            type: "object" as const,
+            additionalProperties: { type: "string" as const },
+          },
+        },
+        required: ["effect"] as const,
+        additionalProperties: false as const,
+      },
+    },
+    illustration: {
+      type: ["object", "null"] as const,
+      properties: {
+        segment: { type: "number" as const },
+        prompt: { type: "string" as const },
+        characters: {
+          type: "array" as const,
+          maxItems: 6,
+          items: { type: "string" as const },
+        },
+        reason: { type: "string" as const },
+        slug: { type: "string" as const },
+      },
+      required: ["prompt"] as const,
+      additionalProperties: false as const,
+    },
   },
   additionalProperties: false as const,
-  required: [
-    "background",
-    "music",
-    "ambient",
-    "weather",
-    "timeOfDay",
-    "reputationChanges",
-    "widgetUpdates",
-    "segmentEffects",
-  ] as const,
+  required: ["background", "music", "ambient", "weather", "timeOfDay", "reputationChanges", "segmentEffects"] as const,
 };
 
 export async function analyzeScene(systemPrompt: string, userPrompt: string): Promise<SceneAnalysis> {

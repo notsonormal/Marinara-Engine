@@ -34,6 +34,18 @@ export const PROVIDERS: Record<APIProvider, ProviderDefinition> = {
     usesAuthHeader: false,
     apiKeyHeader: "x-api-key",
   },
+  claude_subscription: {
+    id: "claude_subscription",
+    name: "Claude (Subscription)",
+    // No base URL — the Claude Agent SDK reads credentials stored locally by the
+    // Claude Code CLI (`claude login`) and routes requests through Anthropic's
+    // first-party endpoints on behalf of the signed-in Pro / Max account.
+    defaultBaseUrl: "",
+    modelsEndpoint: "",
+    supportsStreaming: true,
+    usesAuthHeader: false,
+    apiKeyHeader: null,
+  },
   google: {
     id: "google",
     name: "Google Gemini",
@@ -55,7 +67,7 @@ export const PROVIDERS: Record<APIProvider, ProviderDefinition> = {
   cohere: {
     id: "cohere",
     name: "Cohere",
-    defaultBaseUrl: "https://api.cohere.com/v2",
+    defaultBaseUrl: "https://api.cohere.ai/compatibility/v1",
     modelsEndpoint: "/models",
     supportsStreaming: true,
     usesAuthHeader: true,
@@ -74,6 +86,15 @@ export const PROVIDERS: Record<APIProvider, ProviderDefinition> = {
     id: "nanogpt",
     name: "NanoGPT",
     defaultBaseUrl: "https://nano-gpt.com/api/v1",
+    modelsEndpoint: "/models",
+    supportsStreaming: true,
+    usesAuthHeader: true,
+    apiKeyHeader: null,
+  },
+  xai: {
+    id: "xai",
+    name: "xAI / Grok",
+    defaultBaseUrl: "https://api.x.ai/v1",
     modelsEndpoint: "/models",
     supportsStreaming: true,
     usesAuthHeader: true,

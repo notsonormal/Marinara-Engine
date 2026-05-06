@@ -107,7 +107,7 @@ Transition guide:
 - none: instant swap (neutral reset, very minor change).
 Instructions:
 1. ONLY include characters listed in <available_sprites>. If a character is not listed there, do NOT include them.
-2. The characterId MUST be the exact ID string from the parentheses, e.g. if the entry says "Dottore (abc123): happy, sad" then characterId must be "abc123".
+2. The characterId MUST be the exact ID string from the parentheses, e.g. if the entry says "Dottore (abc123): happy, sad" then characterId must be "abc123". Never invent, reuse, or copy a different ID from chat history.
 3. When a character's emotion is ambiguous, pick the closest available expression name rather than guessing a generic one.`,
 
   /* ────────────────────────────────────────── */
@@ -225,7 +225,7 @@ Prompt quality rules:
 5. If nothing noteworthy was established this turn, return: { "updates": [] }
 6. DEDUPLICATION, CRITICAL: Check the <existing_entries> list of existing lorebook entries before creating anything. If an entry with the same or a very similar name already exists, use "update" instead of "create". NEVER create a second entry for a subject that's already covered. Prefer updating and enriching an existing entry over making a new one.
 7. LOCKED ENTRIES: Entries marked as locked CANNOT be modified. Do not emit updates targeting locked entry names. Respect the user's protection.
-8. When updating an existing entry, MERGE new information with the existing content. Do NOT replace or erase existing details. Add the new facts while keeping everything that was already there.
+8. When updating an existing entry, do NOT rewrite the full entry. Return only the durable additions in "newFacts"; the app will append them to the existing content without erasing old details. Use "content" for creates, or only for an update when the existing entry is empty or malformed.
 9. CHAT SUMMARY AWARENESS: If a <chat_summary> block is provided, it contains information already captured by the summary system. Do NOT create lorebook entries for facts that are only restated from the summary and not newly established in the latest messages. Only record genuinely new lore not already covered by the summary.
 Output format:
 {
@@ -233,13 +233,44 @@ Output format:
     {
       "action": "create|update",
       "entryName": "string — name of the entry (must match existing name exactly when updating)",
-      "content": "string — the lore content to store (when updating: include ALL existing info plus new details)",
+      "content": "string — full lore content for creates; for updates, only use this if replacing an empty or malformed entry is truly necessary",
+      "newFacts": ["string — for updates only: atomic new facts to append to the existing entry without rewriting it"],
       "keys": ["string — activation keywords for this entry"],
       "tag": "string — category tag (character, location, item, faction, event, lore)",
       "reason": "string — why this should be recorded."
     }
   ]
 }`,
+
+  /* ────────────────────────────────────────── */
+  "card-evolution-auditor": `Detect when the active character card has drifted from what has been established in the roleplay and propose precise field edits for the user's review.
+
+You are comparing the <character_cards> block (the current cards as they are persisted) against the recent messages. Look for facts that have been stated, enacted, or decided on-screen that now contradict or meaningfully extend a card's existing fields. Examples: a character quit their job, moved cities, changed their hair, adopted a pet, lost an eye, changed their mind about something core to their personality.
+
+Rules:
+1. Propose edits ONLY for durable changes — things that are still true going forward. Ignore momentary states (moods, current location in a scene, what they're wearing right now).
+2. NEVER fabricate. If the narrative hasn't clearly established a change to a field, do not touch that field.
+3. Targetable fields: description, personality, scenario, first_mes, mes_example, creator_notes, system_prompt, post_history_instructions, backstory, appearance. Do NOT edit name.
+4. Every update MUST include the exact characterId from the matching <character id="..."> tag in <character_cards>.
+5. Each edit must quote the EXACT oldText currently on the card (copy it verbatim from the matching <character> tag in <character_cards>) so stale proposals can be detected. If the current field doesn't contain the sentence you're rewriting, skip this edit.
+6. Keep newText minimal and surgical — rewrite only the sentence or clause that changed, preserving the rest of the field's voice and content.
+7. If nothing durable has changed, return: { "updates": [] }
+
+Output format (strict JSON, no prose outside the object):
+{
+  "updates": [
+    {
+      "action": "update",
+      "characterId": "exact character id from the matching <character> tag",
+      "field": "description",
+      "oldText": "exact existing text from the card",
+      "newText": "proposed replacement text",
+      "reason": "one sentence — what in the roleplay triggered this"
+    }
+  ]
+}
+
+IMPORTANT: These edits will be shown to the user for manual approval. Be conservative. A false positive (suggesting a change that isn't warranted) is worse than a false negative (missing one).`,
 
   /* ────────────────────────────────────────── */
   "prompt-reviewer": `Analyze the assembled system prompt BEFORE generation for quality issues.
@@ -367,18 +398,18 @@ Schema:
 }
 1. Stats range from 0 to 100 (percentage-based). Never set any stat below 0 or above 100.
 2. Changes must be proportional to what actually happened. Don't swing wildly over minor events.
-  2a. Small routine actions = small changes (1–5%):
+  2a. Small routine actions = small changes (1–10%):
     Walking around → Energy -1 to -3%, Hygiene -1 to -2%
     Eating a snack → Satiety +5 to +10%
     Brief rest → Energy +3 to +5%
-  2b. Moderate events = moderate changes (5–15%):
+  2b. Moderate events = moderate changes (10–50%):
     A full meal → Satiety +20 to +40%
     A short nap → Energy +10 to +20%
     Getting splashed with water → Hygiene -10 to -15%
-  2c. Major events = large changes (15–40%):
-    Falling into mud → Hygiene -20 to -40%
-    Full night's sleep → Energy +40 to +60%
-    Taking a bath/shower → Hygiene → 95–100%
+  2c. Major events = large changes (50–100%):
+    Falling into mud → Hygiene -50%
+    Full night's sleep → Energy → 95–100%
+    Taking a bath/shower → Hygiene → 95–100%s
 3. Time passage naturally decays stats: Energy, Satiety, and Hygiene decrease slowly over time, even without events.
 4. Preserve previous values and only adjust what the narrative warrants. If nothing relevant happened, return the previous values unchanged.
 5. Track the player persona's current status — a short phrase summarising what they are doing or their condition.
@@ -406,7 +437,7 @@ Schema:
   html: `If fitting, include inline HTML, CSS, and JS segments whenever they enhance visual storytelling (in-world screens, posters, books, letters, signs, crests, labels, maps, and so on). Style them to match the setting's theme (fantasy parchment, sci-fi terminals, etc.), keep text readable, and embed all assets directly (inline SVGs only, no external scripts, libraries, or fonts). Use these elements freely and naturally as characters would encounter them: animations, 3D effects, pop-ups, dropdowns, mock websites, and anything that brings the world to life. Do NOT wrap HTML/CSS/JS in code fences.`,
 
   /* ────────────────────────────────────────── */
-  "chat-summary": `Produce NEW summary content covering ONLY the latest events not yet captured in the existing summary.
+  "chat-summary": `Stop the roleplay immediately. You are now about to create a summary. Produce NEW summary content covering ONLY the latest events not yet captured in the existing summary.
 1. Do NOT rewrite or rephrase the existing summary. Do NOT repeat information already covered.
 2. Focus on:
    - New plot events and turning points since the last summary.
@@ -514,6 +545,32 @@ What to include:
 - Item descriptions or properties for items in play.
 - Relevant backstory or events that inform the current scene.
 Output the extracted knowledge directly as organized text, no JSON, no wrapping tags. Keep it compact. Aim for the minimum text needed to convey all relevant facts. If nothing in the source material is relevant, output: "No relevant information found."`,
+
+  /* ────────────────────────────────────────── */
+  "knowledge-router": `You are a knowledge router. Your job is to pick which lorebook entries are relevant to the current conversation, by ID. You do NOT summarize, rewrite, or quote entry content — that work happens elsewhere.
+You receive:
+1. The recent conversation messages (so you know what topics, characters, locations, or events are currently in play).
+2. A catalog of available lorebook entries inside <entry_catalog> tags. Each entry has an id, name, optional keys, and a short summary (either the user-written description or a snippet of the entry's content as a fallback).
+Your task:
+1. READ the recent conversation carefully. Identify the key topics, characters, locations, items, events, and themes that are currently active or under discussion.
+2. SCAN the catalog. For each entry, ask: "Is this entry relevant to what is happening RIGHT NOW in the conversation?"
+3. SELECT the relevant entry IDs. Be inclusive but not exhaustive — pick entries that would meaningfully help the main model write the next response. Skip entries that are tangential, off-topic, or already covered by another selected entry.
+4. ORDER your selection by relevance, most relevant first.
+What to select:
+- Entries about characters currently present or directly mentioned.
+- Entries about the location where the scene is taking place.
+- Entries about lore, history, factions, or world rules that apply to the current situation.
+- Entries about items, abilities, or relationships in play.
+What NOT to do:
+- Do NOT summarize, paraphrase, or quote entry content. Only return IDs.
+- Do NOT invent IDs. Only return IDs that appear in <entry_catalog>.
+- Do NOT include entries that are clearly unrelated to the current scene.
+Respond ONLY with valid JSON.
+Schema:
+{
+  "entryIds": ["string — entry id from the catalog", "..."]
+}
+If no entries are relevant, respond with: { "entryIds": [] }`,
 
   /* ────────────────────────────────────────── */
   haptic: `You control the user's connected intimate toys via Buttplug.io.

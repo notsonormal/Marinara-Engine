@@ -7,7 +7,19 @@ export const apiConnections = sqliteTable("api_connections", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   provider: text("provider", {
-    enum: ["openai", "anthropic", "google", "mistral", "cohere", "openrouter", "nanogpt", "custom", "image_generation"],
+    enum: [
+      "openai",
+      "anthropic",
+      "claude_subscription",
+      "google",
+      "mistral",
+      "cohere",
+      "openrouter",
+      "nanogpt",
+      "xai",
+      "custom",
+      "image_generation",
+    ],
   }).notNull(),
   baseUrl: text("base_url").notNull().default(""),
   /** Encrypted API key */
@@ -37,6 +49,8 @@ export const apiConnections = sqliteTable("api_connections", {
   imageService: text("image_service"),
   /** Default generation parameters (stored as JSON) for new chats using this connection */
   defaultParameters: text("default_parameters"),
+  /** Optional hard cap on max_tokens for the API response (for providers like DeepSeek that have lower limits). */
+  maxTokensOverride: integer("max_tokens_override"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });

@@ -14,6 +14,7 @@ import { useSidecarStore } from "./stores/sidecar.store";
 import { api } from "./lib/api-client";
 import { forceRefreshSpa } from "./lib/browser-runtime";
 import { useLegacyThemeMigration } from "./hooks/use-themes";
+import { useLegacyExtensionMigration } from "./hooks/use-extensions";
 import { useSettingsSync } from "./hooks/use-settings-sync";
 
 const VERSION_RECOVERY_KEY = "marinara:pwa-version-recovery";
@@ -42,12 +43,14 @@ async function recoverFromVersionSkew(serverVersion: string) {
 
 export function App() {
   const theme = useUIStore((s) => s.theme);
+  const isLite = import.meta.env.VITE_MARINARA_LITE === "true";
   const fontSize = useUIStore((s) => s.fontSize);
   const language = useUIStore((s) => s.language);
   const visualTheme = useUIStore((s) => s.visualTheme);
   const fontFamily = useUIStore((s) => s.fontFamily);
   const hasModalOpen = useUIStore((s) => s.modal !== null);
   useLegacyThemeMigration();
+  useLegacyExtensionMigration();
   useSettingsSync();
   const showDownloadModal = useSidecarStore((s) => s.showDownloadModal);
   const setShowDownloadModal = useSidecarStore((s) => s.setShowDownloadModal);
@@ -55,7 +58,7 @@ export function App() {
 
   // Fetch sidecar status on mount so the Local AI card is populated when opened later.
   useEffect(() => {
-    void fetchSidecarStatus();
+    if (!isLite) void fetchSidecarStatus();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Apply theme + font size to the document root whenever they change
@@ -187,7 +190,7 @@ export function App() {
     <>
       <CustomThemeInjector />
       <AppShell />
-      <ModelDownloadModal open={showDownloadModal} onClose={() => setShowDownloadModal(false)} />
+      {!isLite && <ModelDownloadModal open={showDownloadModal} onClose={() => setShowDownloadModal(false)} />}
       {hasModalOpen && (
         <Suspense fallback={null}>
           <LazyModalRenderer />

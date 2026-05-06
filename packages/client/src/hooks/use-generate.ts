@@ -5,11 +5,210 @@ import { useCallback } from "react";
 import { useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "../lib/api-client";
+import { agentKeys } from "./use-agents";
+import type { PendingCardUpdate } from "../stores/agent.store";
+import {
+  EDITABLE_CHARACTER_CARD_FIELDS,
+  type CharacterCardFieldUpdate,
+  type EditableCharacterCardField,
+} from "@marinara-engine/shared";
 
 /** Show a persistent, copyable error toast and log to console */
 function showError(msg: string) {
   console.error("[Generation]", msg);
   toast.error(msg, { duration: 15000 });
+}
+
+const shownAgentWarnings = new Set<string>();
+
+function showAgentWarning(raw: unknown) {
+  const data = raw && typeof raw === "object" ? (raw as { code?: unknown; message?: unknown }) : null;
+  const message = typeof data?.message === "string" ? data.message : "Agent warning";
+  const warningKey = `${typeof data?.code === "string" ? data.code : "agent_warning"}:${message}`;
+  console.warn("[Agent warning]", raw);
+  if (shownAgentWarnings.has(warningKey)) return;
+  shownAgentWarnings.add(warningKey);
+  toast.warning(message, { duration: 20000 });
+}
+
+const editableCharacterCardFieldSet = new Set<string>(EDITABLE_CHARACTER_CARD_FIELDS);
+/**
+ * Validate one entry in the Card Evolution Auditor's `updates` array and coerce
+ * it to a typed CharacterCardFieldUpdate. LLM output can be messy, so we drop
+ * anything that doesn't parse cleanly.
+ */
+function parseCardFieldUpdate(raw: unknown): CharacterCardFieldUpdate | null {
+  if (!raw || typeof raw !== "object") return null;
+  const u = raw as Record<string, unknown>;
+  if (u.action !== "update") return null;
+  if (typeof u.characterId !== "string" || u.characterId.trim().length === 0) return null;
+  if (typeof u.field !== "string" || !editableCharacterCardFieldSet.has(u.field)) return null;
+  if (typeof u.oldText !== "string") return null;
+  if (typeof u.newText !== "string") return null;
+  if (u.oldText === u.newText) return null;
+  return {
+    characterId: u.characterId.trim(),
+    action: "update",
+    field: u.field as EditableCharacterCardField,
+    oldText: u.oldText,
+    newText: u.newText,
+    reason: typeof u.reason === "string" ? u.reason : "",
+  };
+}
+
+function parseCharacterRowData(raw: unknown): Record<string, unknown> | null {
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+  if (raw && typeof raw === "object") return raw as Record<string, unknown>;
+  return null;
+}
+
+type CachedCharacterRow = {
+  id?: string;
+  data?: unknown;
+  avatarPath?: string | null;
+  name?: string;
+};
+
+function resolveCachedCharacterIdentity(
+  qc: QueryClient,
+  characterId: string | null | undefined,
+  fallbackName: string | null | undefined = "Character",
+): {
+  name: string | null;
+  avatarUrl: string | null;
+  avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null;
+} {
+  if (!characterId) return { name: fallbackName, avatarUrl: null };
+
+  const detail = qc.getQueryData<CachedCharacterRow>(characterKeys.detail(characterId));
+  const list = qc.getQueryData<CachedCharacterRow[]>(characterKeys.list());
+  const row = detail ?? list?.find((character) => character.id === characterId);
+  const parsed = parseCharacterRowData(row?.data);
+  const name =
+    (parsed && typeof parsed.name === "string" && parsed.name.trim()) ||
+    (typeof row?.name === "string" && row.name.trim()) ||
+    fallbackName ||
+    "Character";
+  const avatarCrop =
+    parsed &&
+    typeof parsed.extensions === "object" &&
+    parsed.extensions &&
+    "avatarCrop" in parsed.extensions
+      ? ((parsed.extensions as { avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null }).avatarCrop ??
+        null)
+      : null;
+
+  return {
+    name,
+    avatarUrl: row?.avatarPath ?? null,
+    avatarCrop,
+  };
+}
+
+function latestAssistantMessage(messages: Iterable<Message>): Message | null {
+  let latest: Message | null = null;
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    if (!latest || new Date(message.createdAt).getTime() >= new Date(latest.createdAt).getTime()) {
+      latest = message;
+    }
+  }
+  return latest;
+}
+
+/**
+ * Build one or more PendingCardUpdate batches from a character_card_update
+ * agent result. Each batch is scoped to a single characterId so the approval
+ * modal can review and apply updates without ownership heuristics.
+ */
+async function buildPendingCardUpdates(
+  qc: QueryClient,
+  chatId: string,
+  agentName: string,
+  rawData: unknown,
+): Promise<PendingCardUpdate[]> {
+  const data = rawData && typeof rawData === "object" ? (rawData as Record<string, unknown>) : null;
+  const rawUpdates = data && Array.isArray(data.updates) ? (data.updates as unknown[]) : [];
+  const updates = rawUpdates.map(parseCardFieldUpdate).filter((u): u is CharacterCardFieldUpdate => u !== null);
+  if (updates.length === 0) return [];
+
+  const chat = qc.getQueryData<Chat>(chatKeys.detail(chatId));
+  // characterIds is sometimes serialized as a JSON string on the wire —
+  // accept either shape to avoid a .map crash on group chats.
+  const rawChatCharIds = (chat as { characterIds?: unknown })?.characterIds;
+  let chatCharacterIds: string[] = [];
+  if (Array.isArray(rawChatCharIds)) {
+    chatCharacterIds = rawChatCharIds.filter((v): v is string => typeof v === "string");
+  } else if (typeof rawChatCharIds === "string") {
+    try {
+      const parsed = JSON.parse(rawChatCharIds);
+      if (Array.isArray(parsed)) chatCharacterIds = parsed.filter((v): v is string => typeof v === "string");
+    } catch {
+      /* leave empty */
+    }
+  }
+  if (chatCharacterIds.length === 0) return [];
+  const chatCharacterIdSet = new Set(chatCharacterIds);
+
+  // Prime the characters list cache if empty so we can resolve names.
+  let characters = qc.getQueryData<Array<{ id: string; data?: unknown; name?: string }>>(characterKeys.list());
+  if (!characters) {
+    try {
+      characters = await qc.fetchQuery({
+        queryKey: characterKeys.list(),
+        queryFn: () => api.get<Array<{ id: string; data?: unknown; name?: string }>>("/characters"),
+      });
+    } catch {
+      characters = undefined;
+    }
+  }
+  const chatCharacters = new Map(
+    chatCharacterIds.map((id) => {
+      const row = characters?.find((character) => character.id === id);
+      const parsed = parseCharacterRowData(row?.data);
+      return [id, { row, parsed }] as const;
+    }),
+  );
+
+  const groupedUpdates = new Map<string, CharacterCardFieldUpdate[]>();
+  for (const update of updates) {
+    if (!chatCharacterIdSet.has(update.characterId)) continue;
+
+    const existing = groupedUpdates.get(update.characterId) ?? [];
+    existing.push(update);
+    groupedUpdates.set(update.characterId, existing);
+  }
+
+  if (groupedUpdates.size === 0) return [];
+
+  const timestamp = Date.now();
+  return chatCharacterIds.flatMap((characterId, index) => {
+    const grouped = groupedUpdates.get(characterId);
+    if (!grouped || grouped.length === 0) return [];
+
+    const character = chatCharacters.get(characterId);
+    const characterName =
+      (character?.parsed && typeof character.parsed.name === "string" && character.parsed.name) ||
+      character?.row?.name ||
+      "Character";
+
+    return [
+      {
+        id: `card-update-${characterId}-${timestamp}-${index}`,
+        characterId,
+        characterName,
+        updates: grouped,
+        agentName,
+        timestamp: timestamp + index,
+      },
+    ];
+  });
 }
 import { useChatStore } from "../stores/chat.store";
 import { useAgentStore } from "../stores/agent.store";
@@ -19,12 +218,17 @@ import { useTranslationStore } from "../stores/translation.store";
 import { useUIStore } from "../stores/ui.store";
 import { chatKeys } from "./use-chats";
 import { characterKeys } from "./use-characters";
+import { lorebookKeys } from "./use-lorebooks";
 import { playNotificationPing } from "../lib/notification-sound";
 import { stripGmTagsKeepReadables } from "../lib/game-tag-parser";
 import type { Chat, GameMap, Message } from "@marinara-engine/shared";
 
 function sortMessagesByCreatedAt(messages: Message[]): Message[] {
-  return [...messages].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  return [...messages].sort((a, b) => {
+    const createdAtOrder = new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+    if (createdAtOrder !== 0) return createdAtOrder;
+    return 0;
+  });
 }
 
 function upsertPersistedMessages(qc: QueryClient, chatId: string, incoming: Message[]) {
@@ -56,7 +260,7 @@ function upsertPersistedMessages(qc: QueryClient, chatId: string, incoming: Mess
       if (pages.length === 0) {
         pages.push(missing);
       } else {
-        pages[0] = [...pages[0], ...missing];
+        pages[0] = sortMessagesByCreatedAt([...pages[0], ...missing]);
       }
     }
 
@@ -85,7 +289,7 @@ function appendMissingPersistedMessages(qc: QueryClient, chatId: string, incomin
     if (pages.length === 0) {
       pages.push(missing);
     } else {
-      pages[0] = [...pages[0], ...missing];
+      pages[0] = sortMessagesByCreatedAt([...pages[0], ...missing]);
     }
 
     return { ...old, pages };
@@ -143,28 +347,62 @@ function parseChatMetadata(metadata: Chat["metadata"] | string | null | undefine
   return metadata as Record<string, unknown>;
 }
 
+function slugifyGameMapId(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+}
+
+function getGameMapId(map: GameMap | null | undefined, fallbackIndex = 0): string | null {
+  if (!map) return null;
+  const explicit = map.id?.trim();
+  if (explicit) return explicit;
+  return slugifyGameMapId(map.name || "") || `map-${fallbackIndex + 1}`;
+}
+
+function withGameMapCollection(metadata: Record<string, unknown>, map: GameMap): Record<string, unknown> {
+  const mapId = getGameMapId(map);
+  const existingMaps = Array.isArray(metadata.gameMaps) ? (metadata.gameMaps as GameMap[]) : [];
+  const nextMaps = [...existingMaps];
+  const existingIndex = nextMaps.findIndex((entry, index) => getGameMapId(entry, index) === mapId);
+
+  if (existingIndex >= 0) {
+    nextMaps[existingIndex] = map;
+  } else {
+    nextMaps.push(map);
+  }
+
+  return {
+    ...metadata,
+    gameMap: map,
+    gameMaps: nextMaps,
+    activeGameMapId: mapId,
+  };
+}
+
 function applyGameMapUpdate(qc: QueryClient, chatId: string, map: GameMap) {
   qc.setQueryData<Chat | undefined>(chatKeys.detail(chatId), (current) => {
     if (!current) return current;
+    const metadata = withGameMapCollection(parseChatMetadata(current.metadata as Chat["metadata"] | string), map);
     return {
       ...current,
-      metadata: {
-        ...parseChatMetadata(current.metadata as Chat["metadata"] | string),
-        gameMap: map,
-      } as Chat["metadata"],
+      metadata: metadata as Chat["metadata"],
     };
   });
 
   const chatStore = useChatStore.getState();
   if (chatStore.activeChat?.id === chatId) {
+    const metadata = withGameMapCollection(
+      parseChatMetadata(chatStore.activeChat.metadata as Chat["metadata"] | string),
+      map,
+    );
     chatStore.setActiveChat({
       ...chatStore.activeChat,
-      metadata: {
-        ...parseChatMetadata(chatStore.activeChat.metadata as Chat["metadata"] | string),
-        gameMap: map,
-      } as Chat["metadata"],
+      metadata: metadata as Chat["metadata"],
     });
-    useGameModeStore.getState().setCurrentMap(map);
+    useGameModeStore.getState().upsertMap(map, true);
   }
 }
 
@@ -178,8 +416,11 @@ export function useGenerate() {
   const qc = useQueryClient();
   // Use individual selectors to avoid re-rendering on every store change
   const setStreaming = useChatStore((s) => s.setStreaming);
+  const setMariPhase = useChatStore((s) => s.setMariPhase);
   const setStreamBuffer = useChatStore((s) => s.setStreamBuffer);
   const clearStreamBuffer = useChatStore((s) => s.clearStreamBuffer);
+  const appendThinkingBuffer = useChatStore((s) => s.appendThinkingBuffer);
+  const clearThinkingBuffer = useChatStore((s) => s.clearThinkingBuffer);
   const setRegenerateMessageId = useChatStore((s) => s.setRegenerateMessageId);
   const setStreamingCharacterId = useChatStore((s) => s.setStreamingCharacterId);
   const setTypingCharacterName = useChatStore((s) => s.setTypingCharacterName);
@@ -191,10 +432,9 @@ export function useGenerate() {
   const addEchoMessage = useAgentStore((s) => s.addEchoMessage);
   const setCyoaChoices = useAgentStore((s) => s.setCyoaChoices);
   const clearCyoaChoices = useAgentStore((s) => s.clearCyoaChoices);
+  const enqueuePendingCardUpdate = useAgentStore((s) => s.enqueuePendingCardUpdate);
   const setFailedAgentTypes = useAgentStore((s) => s.setFailedAgentTypes);
   const clearFailedAgentTypes = useAgentStore((s) => s.clearFailedAgentTypes);
-  const addDebugEntry = useAgentStore((s) => s.addDebugEntry);
-  const clearDebugLog = useAgentStore((s) => s.clearDebugLog);
   const setGameState = useGameStateStore((s) => s.setGameState);
 
   const generate = useCallback(
@@ -206,14 +446,17 @@ export function useGenerate() {
       userMessage?: string;
       regenerateMessageId?: string;
       impersonate?: boolean;
-      attachments?: Array<{ type: string; data: string }>;
+      attachments?: Array<{ type: string; data: string; filename?: string; name?: string }>;
       mentionedCharacterNames?: string[];
       forCharacterId?: string;
+      generationGuide?: string;
+      impersonatePresetId?: string;
+      impersonateConnectionId?: string;
+      impersonateBlockAgents?: boolean;
+      impersonatePromptTemplate?: string;
     }) => {
-      // Prevent concurrent generations for the SAME chat — stops race conditions
-      // where autonomous messaging + user input both fire generate at once.
-      // Different chats CAN generate concurrently (e.g. idle/DnD delay in chat A
-      // while the user sends in chat B).
+      // Prevent concurrent generations for the same chat. Different chats may
+      // keep generating in the background while the user navigates elsewhere.
       // Uses the shared abortControllers map as the source of truth so ALL callers
       // of useGenerate() coordinate (the old per-instance useRef could diverge).
       if (useChatStore.getState().abortControllers.has(params.chatId)) {
@@ -228,6 +471,7 @@ export function useGenerate() {
       // Create an AbortController so the stop button can cancel this generation
       const abortController = new AbortController();
       useChatStore.getState().setAbortController(params.chatId, abortController);
+      useChatStore.getState().clearThinkingBuffer(params.chatId);
 
       // Helper: returns true when this generation's chat is the one the user is viewing.
       // Used to guard global UI state updates (typing indicator, delayed info, stream
@@ -239,11 +483,10 @@ export function useGenerate() {
       // tracked only by abortControllers.
       if (isActiveChat()) {
         setStreaming(true, params.chatId);
-        clearStreamBuffer();
+        clearStreamBuffer(params.chatId);
         clearThoughtBubbles();
         clearCyoaChoices();
         clearFailedAgentTypes();
-        clearDebugLog();
         setRegenerateMessageId(params.regenerateMessageId ?? null);
       }
       console.warn("[Generate] Starting generation for chat:", params.chatId);
@@ -261,6 +504,11 @@ export function useGenerate() {
             id: string;
             isActive: string | boolean;
             name: string;
+            description?: string;
+            personality?: string;
+            scenario?: string;
+            backstory?: string;
+            appearance?: string;
             avatarPath?: string | null;
             nameColor?: string;
             dialogueColor?: string;
@@ -279,6 +527,11 @@ export function useGenerate() {
           ? {
               personaId: snapshotPersona.id,
               name: snapshotPersona.name,
+              description: snapshotPersona.description || "",
+              personality: snapshotPersona.personality || "",
+              scenario: snapshotPersona.scenario || "",
+              backstory: snapshotPersona.backstory || "",
+              appearance: snapshotPersona.appearance || "",
               avatarUrl: snapshotPersona.avatarPath || null,
               nameColor: snapshotPersona.nameColor || null,
               dialogueColor: snapshotPersona.dialogueColor || null,
@@ -299,8 +552,8 @@ export function useGenerate() {
         qc.setQueryData<InfiniteData<Message[]>>(chatKeys.messages(params.chatId), (old) => {
           if (!old?.pages) return old;
           const pages = [...old.pages];
-          // First page holds newest messages — append to it
-          pages[0] = [...(pages[0] ?? []), optimisticMsg];
+          // First page holds newest messages; merge and re-sort to guarantee order.
+          pages[0] = sortMessagesByCreatedAt([...(pages[0] ?? []), optimisticMsg]);
           return { ...old, pages };
         });
       }
@@ -310,14 +563,12 @@ export function useGenerate() {
       // immediately, we feed them character-by-character from a queue
       // at a controlled rate so the text "types out" smoothly.
       // Speed is controlled by the user's streamingSpeed setting (1–100).
-      // Conversation mode still renders complete messages, but the transport
-      // should follow the user's streaming preference.
-      const isConversationMode = useChatStore.getState().activeChat?.mode === "conversation";
       const transportStreaming = useUIStore.getState().enableStreaming;
-      const streamingEnabled = isConversationMode ? false : transportStreaming;
+      const streamingEnabled = transportStreaming;
       let fullBuffer = ""; // What the user sees (or accumulates silently when streaming is off)
       let pendingText = ""; // Tokens waiting to be typed out
       let receivedContent = false; // Whether any actual message content was received
+      let receivedThinking = false; // Whether provider-native thinking chunks were received
       let typingActive = false;
       let typewriterDone: (() => void) | null = null;
       let rafId = 0;
@@ -333,8 +584,7 @@ export function useGenerate() {
       // States: "detect" (start of response, looking for opening tag),
       //         "inside" (inside a think block, suppressing tokens),
       //         "done" (think block closed or no think tag found — passthrough).
-      // Think-tag filtering disabled — skip straight to passthrough
-      let thinkState: string = "done";
+      let thinkState: string = streamingEnabled ? "detect" : "done";
       let thinkBuf = ""; // Raw token accumulator during detect/inside phases
       let thinkCloseTag = "</think>";
       const THINK_OPEN_RE = /^(\s*)(<(think(?:ing)?)>|<\|channel>thought\b)/i;
@@ -369,7 +619,7 @@ export function useGenerate() {
         fullBuffer += pendingText;
         pendingText = "";
         typingActive = false;
-        if (streamingEnabled && fullBuffer && isActiveChat()) setStreamBuffer(fullBuffer);
+        if (streamingEnabled && fullBuffer) setStreamBuffer(fullBuffer, params.chatId);
       };
 
       const startTypewriter = () => {
@@ -393,15 +643,27 @@ export function useGenerate() {
           const batch = pendingText.slice(0, n);
           pendingText = pendingText.slice(n);
           fullBuffer += batch;
-          if (isActiveChat()) setStreamBuffer(fullBuffer);
+          setStreamBuffer(fullBuffer, params.chatId);
           rafId = requestAnimationFrame(tick);
         };
         rafId = requestAnimationFrame(tick);
       };
 
+      // Safety net: guarantees the Mari work-status pill clears for this
+      // chat on every termination path (done, error, abort, unexpected
+      // throw). The assistant_commands_end SSE event is still the primary
+      // clear; this just keeps state sane when the stream dies mid-window.
+      const clearMariPhaseForThisChat = () => {
+        setMariPhase(params.chatId, "idle");
+        window.dispatchEvent(
+          new CustomEvent("marinara:mari-phase", {
+            detail: { chatId: params.chatId, phase: "idle" },
+          }),
+        );
+      };
+
       try {
-        const debugMode = useUIStore.getState().debugMode;
-        const userStatus = useUIStore.getState().userStatus;
+        const { userStatus, userActivity, debugMode, trimIncompleteModelOutput } = useUIStore.getState();
 
         // Flush any pending game-state widget edits so the server sees them before committing
         const flushPatch = useGameStateStore.getState().flushPatch;
@@ -409,11 +671,12 @@ export function useGenerate() {
 
         for await (const event of api.streamEvents(
           "/generate",
-          { ...params, debugMode, userStatus, streaming: transportStreaming },
+          { ...params, userStatus, userActivity, debugMode, trimIncompleteModelOutput, streaming: transportStreaming },
           abortController.signal,
         )) {
           switch (event.type) {
             case "token": {
+              const isFirstToken = !receivedContent;
               receivedContent = true;
               // Always clear per-chat indicators so switching back shows nothing
               useChatStore.getState().setPerChatTyping(params.chatId, null);
@@ -422,6 +685,18 @@ export function useGenerate() {
                 setTypingCharacterName(null); // Clear typing indicator once response starts
                 setDelayedCharacterInfo(null); // Clear delayed indicator too
                 useChatStore.getState().setGenerationPhase(null); // Clear phase indicator
+              }
+              // Fire the "Mari is thinking…" pill on the first token — that's
+              // the same moment "X is typing…" clears, so the two indicators
+              // never overlap. Also seed the per-chat phase in the store so
+              // the indicator can restore the pill on chat-switch-back.
+              if (isFirstToken) {
+                setMariPhase(params.chatId, "thinking");
+                window.dispatchEvent(
+                  new CustomEvent("marinara:mari-phase", {
+                    detail: { chatId: params.chatId, phase: "thinking" },
+                  }),
+                );
               }
 
               let chunk = event.data as string;
@@ -457,10 +732,18 @@ export function useGenerate() {
                 const closeIdx = thinkBuf.toLowerCase().indexOf(thinkCloseTag.toLowerCase());
                 if (closeIdx !== -1) {
                   // Found closing tag — everything after it is visible content
+                  const thinkingChunk = thinkBuf.slice(0, closeIdx);
+                  if (thinkingChunk) appendThinkingBuffer(thinkingChunk, params.chatId);
                   thinkState = "done";
                   chunk = thinkBuf.slice(closeIdx + thinkCloseTag.length).trimStart();
                   thinkBuf = "";
                 } else {
+                  const holdback = Math.max(0, thinkCloseTag.length - 1);
+                  const emitLength = Math.max(0, thinkBuf.length - holdback);
+                  if (emitLength > 0) {
+                    appendThinkingBuffer(thinkBuf.slice(0, emitLength), params.chatId);
+                    thinkBuf = thinkBuf.slice(emitLength);
+                  }
                   chunk = ""; // still inside — suppress
                 }
               }
@@ -482,6 +765,11 @@ export function useGenerate() {
               break;
             }
 
+            case "agent_warning": {
+              showAgentWarning(event.data);
+              break;
+            }
+
             case "progress": {
               if (!isActiveChat()) break;
               const phase = (event.data as { phase?: string })?.phase;
@@ -497,52 +785,6 @@ export function useGenerate() {
               const label = phase ? (labels[phase] ?? null) : null;
               if (label) {
                 useChatStore.getState().setGenerationPhase(label);
-              }
-              break;
-            }
-
-            case "agent_debug": {
-              // Only update debug UI for the active chat
-              if (!isActiveChat()) break;
-              const debug = event.data as {
-                phase: string;
-                agents?: Array<{ type: string; name: string; model: string; maxTokens: number }>;
-                batchMaxTokens?: number;
-                results?: Array<{
-                  agentType: string;
-                  success: boolean;
-                  error: string | null;
-                  durationMs: number;
-                  tokensUsed: number;
-                  resultType: string;
-                }>;
-              };
-              addDebugEntry({ timestamp: Date.now(), ...debug });
-
-              // Log to browser console (matches debug_prompt / debug_usage style)
-              if (debug.agents) {
-                const agentList = debug.agents.map((a) => `${a.name} (${a.model}, ${a.maxTokens}t)`).join(", ");
-                console.log(
-                  `%c[Debug] Agent ${debug.phase}: ${debug.agents.length} agent(s)` +
-                    (debug.batchMaxTokens ? ` · batch max ${debug.batchMaxTokens.toLocaleString()}t` : ""),
-                  "color: #f59e0b; font-weight: bold",
-                );
-                console.log(`  ${agentList}`);
-              }
-              if (debug.results) {
-                const ok = debug.results.filter((r) => r.success).length;
-                const fail = debug.results.length - ok;
-                console.groupCollapsed(
-                  `%c[Debug] Agent results: ${ok} succeeded, ${fail} failed`,
-                  fail > 0 ? "color: #f87171; font-weight: bold" : "color: #34d399; font-weight: bold",
-                );
-                for (const r of debug.results) {
-                  console.log(
-                    `  ${r.success ? "✓" : "✗"} ${r.agentType} — ${(r.durationMs / 1000).toFixed(1)}s, ${r.tokensUsed}t` +
-                      (r.error ? ` — ${r.error}` : ""),
-                  );
-                }
-                console.groupEnd();
               }
               break;
             }
@@ -569,6 +811,10 @@ export function useGenerate() {
                   `[Agent] ✗ ${result.agentName} (${result.agentType}) — ${result.error ?? "unknown error"}`,
                   result.data,
                 );
+              }
+
+              if (result.success) {
+                qc.invalidateQueries({ queryKey: agentKeys.customRuns(params.chatId) });
               }
 
               // Only update agent/game/UI stores for the active chat so a
@@ -611,6 +857,21 @@ export function useGenerate() {
                     setCyoaChoices(choices);
                   }
                 }
+              }
+
+              // Character card updates are never applied automatically — enqueue
+              // them for the user-approval modal. (Card Evolution Auditor.)
+              if (result.success && result.resultType === "character_card_update") {
+                buildPendingCardUpdates(qc, params.chatId, result.agentName, result.data)
+                  .then((pendingEntries) => {
+                    if (pendingEntries.length > 0) {
+                      for (const pending of pendingEntries) {
+                        enqueuePendingCardUpdate(pending);
+                      }
+                      useUIStore.getState().openModal("character-card-update");
+                    }
+                  })
+                  .catch((err) => console.warn("[Agent] Failed to build card update entry:", err));
               }
 
               // Apply background change — validate filename exists before applying
@@ -685,72 +946,23 @@ export function useGenerate() {
               break;
             }
 
-            case "debug_prompt": {
-              const payload = event.data as { messages?: unknown[]; parameters?: Record<string, unknown> } | unknown[];
-              // Handle both old (messages array) and new (object with messages + parameters) formats
-              const messages = Array.isArray(payload) ? payload : payload.messages;
-              const params = Array.isArray(payload) ? null : payload.parameters;
-              const msgArr = Array.isArray(messages) ? messages : [];
-              console.group(
-                "%c[Debug] Prompt sent to model (%d messages)" +
-                  (params ? ` — ${params.model} (${params.provider})` : ""),
-                "color: #f59e0b; font-weight: bold",
-                msgArr.length,
-              );
-              if (params) {
-                console.log("%cParameters", "color: #60a5fa; font-weight: bold", params);
-              }
-              for (let i = 0; i < msgArr.length; i++) {
-                const m = msgArr[i] as { role?: string; content?: string };
-                const role = (m.role ?? "unknown").toUpperCase();
-                const color =
-                  role === "SYSTEM"
-                    ? "#a78bfa"
-                    : role === "USER"
-                      ? "#60a5fa"
-                      : role === "ASSISTANT"
-                        ? "#34d399"
-                        : "#f59e0b";
-                console.log(
-                  `%c[${i + 1}/${msgArr.length}] ${role}`,
-                  `color: ${color}; font-weight: bold`,
-                  m.content ?? m,
+            case "thinking": {
+              const chunk = event.data as string;
+              if (!chunk) break;
+              const isFirstThinking = !receivedThinking;
+              receivedThinking = true;
+              appendThinkingBuffer(chunk, params.chatId);
+              if (isFirstThinking && isActiveChat()) {
+                setTypingCharacterName(null);
+                setDelayedCharacterInfo(null);
+                useChatStore.getState().setGenerationPhase(null);
+                setMariPhase(params.chatId, "thinking");
+                window.dispatchEvent(
+                  new CustomEvent("marinara:mari-phase", {
+                    detail: { chatId: params.chatId, phase: "thinking" },
+                  }),
                 );
               }
-              console.groupEnd();
-              break;
-            }
-
-            case "debug_usage": {
-              const usage = event.data as {
-                tokensPrompt: number | null;
-                tokensCompletion: number | null;
-                tokensTotal: number | null;
-                tokensCachedPrompt: number | null;
-                tokensCacheWritePrompt: number | null;
-                durationMs: number | null;
-                finishReason: string | null;
-              };
-              const parts: string[] = [];
-              if (usage.tokensPrompt != null) parts.push(`prompt: ${usage.tokensPrompt.toLocaleString()}`);
-              if (usage.tokensCompletion != null) parts.push(`completion: ${usage.tokensCompletion.toLocaleString()}`);
-              if (usage.tokensTotal != null) parts.push(`total: ${usage.tokensTotal.toLocaleString()}`);
-              if ((usage.tokensCachedPrompt ?? 0) > 0) {
-                parts.push(`cached: ${usage.tokensCachedPrompt!.toLocaleString()}`);
-              }
-              if ((usage.tokensCacheWritePrompt ?? 0) > 0) {
-                parts.push(`cache write: ${usage.tokensCacheWritePrompt!.toLocaleString()}`);
-              }
-              if (usage.durationMs != null) parts.push(`${(usage.durationMs / 1000).toFixed(1)}s`);
-              if (usage.finishReason) parts.push(`finish: ${usage.finishReason}`);
-              const tokenInfo = parts.length > 0 ? parts.join(" · ") : "no usage data";
-              console.log("%c[Debug] Token usage — %s", "color: #34d399; font-weight: bold", tokenInfo);
-              break;
-            }
-
-            case "thinking": {
-              // Thinking chunks are streamed from the server but persisted in message extra
-              // — the UI picks them up after query invalidation on "done". Nothing to buffer here.
               break;
             }
 
@@ -770,25 +982,23 @@ export function useGenerate() {
                     startTypewriter();
                   });
                 }
+                const previousGroupMessage = latestAssistantMessage(persistedMessages.values());
+
                 // Pick up the just-saved message from the previous character
                 await refreshMessagesAuthoritatively(qc, params.chatId, persistedMessages.values());
                 // Increment unread if user navigated away during group generation
                 const activeNow = useChatStore.getState().activeChatId;
                 if (activeNow !== params.chatId) {
                   useChatStore.getState().incrementUnread(params.chatId);
-                  // Show floating avatar notification bubble
-                  const charDetail = qc.getQueryData<{ avatarPath?: string | null }>(
-                    characterKeys.detail(turn.characterId),
+                  const identity = resolveCachedCharacterIdentity(
+                    qc,
+                    previousGroupMessage?.characterId ?? null,
+                    (previousGroupMessage as (Message & { characterName?: string | null }) | null)?.characterName ??
+                      null,
                   );
-                  // Detail cache may be empty — fall back to list cache
-                  let avatarPath = charDetail?.avatarPath ?? null;
-                  if (!avatarPath) {
-                    const charList = qc.getQueryData<Array<{ id: string; avatarPath?: string | null }>>(
-                      characterKeys.list(),
-                    );
-                    avatarPath = charList?.find((c) => c.id === turn.characterId)?.avatarPath ?? null;
-                  }
-                  useChatStore.getState().addNotification(params.chatId, turn.characterName, avatarPath);
+                  useChatStore
+                    .getState()
+                    .addNotification(params.chatId, identity.name ?? "Character", identity.avatarUrl, identity.avatarCrop);
                   const chatList = qc.getQueryData<Chat[]>(chatKeys.list());
                   const thisChat = chatList?.find((c) => c.id === params.chatId);
                   const isRpMode = thisChat?.mode === "roleplay" || thisChat?.mode === "visual_novel";
@@ -802,10 +1012,11 @@ export function useGenerate() {
                 // Reset the stream buffer for the new character
                 fullBuffer = "";
                 pendingText = "";
-                thinkState = "done";
+                thinkState = streamingEnabled ? "detect" : "done";
                 thinkBuf = "";
                 thinkCloseTag = "</think>";
-                if (isActiveChat()) setStreamBuffer("");
+                setStreamBuffer("", params.chatId);
+                clearThinkingBuffer(params.chatId);
               }
 
               if (isActiveChat()) setStreamingCharacterId(turn.characterId);
@@ -857,20 +1068,25 @@ export function useGenerate() {
               break;
             }
 
+            case "metadata_patch": {
+              qc.invalidateQueries({ queryKey: chatKeys.detail(params.chatId) });
+              break;
+            }
+
             case "text_rewrite": {
               // Consistency Editor replaced the message — update displayed text
               const rw = event.data as { editedText?: string; changes?: Array<{ description: string }> };
               if (rw.editedText) {
-                if (streamingEnabled && isActiveChat()) {
+                if (streamingEnabled) {
                   // Drain any pending typewriter first
                   if (pendingText.length > 0 || typingActive) {
                     cancelAnimationFrame(rafId);
                     pendingText = "";
                     typingActive = false;
                   }
-                  setStreamBuffer(rw.editedText);
                 }
                 fullBuffer = rw.editedText;
+                if (streamingEnabled) setStreamBuffer(rw.editedText, params.chatId);
               }
               break;
             }
@@ -878,13 +1094,13 @@ export function useGenerate() {
             case "content_replace": {
               // Server stripped character commands — replace the displayed content
               const cleanContent = event.data as string;
-              if (streamingEnabled && isActiveChat()) {
+              if (streamingEnabled) {
                 cancelAnimationFrame(rafId);
                 pendingText = "";
                 typingActive = false;
-                setStreamBuffer(cleanContent);
               }
               fullBuffer = cleanContent;
+              if (streamingEnabled) setStreamBuffer(cleanContent, params.chatId);
               break;
             }
 
@@ -1014,6 +1230,23 @@ export function useGenerate() {
               break;
             }
 
+            case "assistant_commands_start": {
+              const commandData = event.data as { professorMariCommandCount?: number } | undefined;
+              if ((commandData?.professorMariCommandCount ?? 0) <= 0) break;
+              setMariPhase(params.chatId, "updating");
+              window.dispatchEvent(
+                new CustomEvent("marinara:mari-phase", {
+                  detail: { chatId: params.chatId, phase: "updating" },
+                }),
+              );
+              break;
+            }
+
+            case "assistant_commands_end": {
+              clearMariPhaseForThisChat();
+              break;
+            }
+
             case "assistant_action": {
               const actionData = event.data as { action: string; [key: string]: unknown };
               if (actionData.action === "persona_created") {
@@ -1028,9 +1261,18 @@ export function useGenerate() {
               } else if (actionData.action === "character_updated") {
                 toast(`Updated character: ${actionData.name}`, { icon: "✏️" });
                 qc.invalidateQueries({ queryKey: characterKeys.list() });
+              } else if (actionData.action === "lorebook_created") {
+                const entryCount = Number(actionData.entryCount ?? 0);
+                toast(`Created lorebook: ${actionData.name}${entryCount > 0 ? ` (${entryCount} entries)` : ""}`, {
+                  icon: "📚",
+                });
+                qc.invalidateQueries({ queryKey: lorebookKeys.all });
               } else if (actionData.action === "chat_created") {
                 toast(`Started ${actionData.mode} chat with ${actionData.characterName}`, { icon: "💬" });
                 qc.invalidateQueries({ queryKey: ["chats"] });
+              } else if (actionData.action === "data_fetched") {
+                const fetchType = (actionData.fetchType as string) ?? "data";
+                toast(`Fetched ${fetchType}: ${actionData.name}`, { icon: "📋" });
               } else if (actionData.action === "navigate") {
                 const panel = actionData.panel as string;
                 const tab = actionData.tab as string | null;
@@ -1044,6 +1286,7 @@ export function useGenerate() {
 
             case "done": {
               if (isActiveChat()) setProcessing(false);
+              clearMariPhaseForThisChat();
               break;
             }
 
@@ -1091,6 +1334,7 @@ export function useGenerate() {
               // Flush pending text so the user sees what arrived before the error
               flushTypewriterBuffer();
               if (isActiveChat()) setProcessing(false);
+              clearMariPhaseForThisChat();
               showError((event.data as string) || "Generation failed");
               window.dispatchEvent(new CustomEvent("marinara:generation-error", { detail: { chatId: params.chatId } }));
               break;
@@ -1120,7 +1364,7 @@ export function useGenerate() {
           });
         }
         // Final flush — ensure full content is set (only for the viewed chat)
-        if (streamingEnabled && isActiveChat()) setStreamBuffer(fullBuffer + pendingText);
+        if (streamingEnabled) setStreamBuffer(fullBuffer + pendingText, params.chatId);
       } catch (error) {
         // Flush everything instantly on error so user sees what arrived
         flushTypewriterBuffer();
@@ -1130,6 +1374,9 @@ export function useGenerate() {
         showError(msg);
         window.dispatchEvent(new CustomEvent("marinara:generation-error", { detail: { chatId: params.chatId } }));
       } finally {
+        // Stream has terminated (done, error, abort, or unexpected throw) —
+        // guarantee the Mari indicator clears even if the end SSE never arrived.
+        clearMariPhaseForThisChat();
         // Cancel any pending animation frame to prevent leaks
         cancelAnimationFrame(rafId);
 
@@ -1170,32 +1417,13 @@ export function useGenerate() {
               : Array.isArray(rawIds)
                 ? rawIds
                 : [];
-          const firstCharId = parsedIds[0];
-          if (firstCharId) {
-            const charDetail = qc.getQueryData<{ data?: { name?: string } | string; avatarPath?: string | null }>(
-              characterKeys.detail(firstCharId),
-            );
-            // Detail cache may be empty — fall back to the always-populated list cache
-            let charAvatar = charDetail?.avatarPath ?? null;
-            let charName = "Character";
-            if (charDetail) {
-              const parsed = typeof charDetail.data === "string" ? JSON.parse(charDetail.data) : charDetail.data;
-              charName = parsed?.name ?? "Character";
-            }
-            if (!charAvatar || charName === "Character") {
-              const charList = qc.getQueryData<
-                Array<{ id: string; data?: string | { name?: string }; avatarPath?: string | null }>
-              >(characterKeys.list());
-              const fromList = charList?.find((c) => c.id === firstCharId);
-              if (fromList) {
-                if (!charAvatar) charAvatar = fromList.avatarPath ?? null;
-                if (charName === "Character") {
-                  const p = typeof fromList.data === "string" ? JSON.parse(fromList.data) : fromList.data;
-                  charName = p?.name ?? "Character";
-                }
-              }
-            }
-            useChatStore.getState().addNotification(params.chatId, charName, charAvatar);
+          const notifiedMessage = latestAssistantMessage(persistedMessages.values());
+          const notifiedCharacterId = notifiedMessage?.characterId ?? parsedIds[0] ?? null;
+          if (notifiedCharacterId) {
+            const identity = resolveCachedCharacterIdentity(qc, notifiedCharacterId);
+            useChatStore
+              .getState()
+              .addNotification(params.chatId, identity.name ?? "Character", identity.avatarUrl, identity.avatarCrop);
           }
           const isRp = chat?.mode === "roleplay" || chat?.mode === "visual_novel";
           const soundEnabled = isRp
@@ -1223,9 +1451,10 @@ export function useGenerate() {
             // await resolves — preventing both duplicate-flash and empty-flash.
             await refreshMessagesAuthoritatively(qc, params.chatId, persistedMessages.values());
             setStreaming(false);
-            clearStreamBuffer();
+            clearStreamBuffer(params.chatId);
           } else {
             await refreshMessagesAuthoritatively(qc, params.chatId, persistedMessages.values());
+            clearStreamBuffer(params.chatId);
           }
           if (isActiveChat()) {
             setProcessing(false);
@@ -1300,8 +1529,11 @@ export function useGenerate() {
     [
       qc,
       setStreaming,
+      setMariPhase,
       setStreamBuffer,
       clearStreamBuffer,
+      appendThinkingBuffer,
+      clearThinkingBuffer,
       setRegenerateMessageId,
       setStreamingCharacterId,
       setTypingCharacterName,
@@ -1313,23 +1545,29 @@ export function useGenerate() {
       addEchoMessage,
       setCyoaChoices,
       clearCyoaChoices,
+      enqueuePendingCardUpdate,
       clearFailedAgentTypes,
       setFailedAgentTypes,
-      addDebugEntry,
-      clearDebugLog,
       setGameState,
     ],
   );
 
   const retryAgents = useCallback(
-    async (chatId: string, agentTypes: string[], options?: { lorebookKeeperBackfill?: boolean }) => {
+    async (
+      chatId: string,
+      agentTypes: string[],
+      options?: {
+        lorebookKeeperBackfill?: boolean;
+        forMessageId?: string;
+        secretPlotRerollMode?: "full" | "turn_only";
+      },
+    ) => {
       const isActiveChat = () => useChatStore.getState().activeChatId === chatId;
       const abortController = new AbortController();
       useChatStore.getState().setAbortController(chatId, abortController);
       setProcessing(true);
       clearFailedAgentTypes();
       clearThoughtBubbles();
-      clearDebugLog();
 
       try {
         let hasError = false;
@@ -1340,10 +1578,17 @@ export function useGenerate() {
             agentTypes,
             streaming: useUIStore.getState().enableStreaming,
             lorebookKeeperBackfill: options?.lorebookKeeperBackfill === true,
+            ...(options?.forMessageId ? { forMessageId: options.forMessageId } : {}),
+            ...(options?.secretPlotRerollMode ? { secretPlotRerollMode: options.secretPlotRerollMode } : {}),
           },
           abortController.signal,
         )) {
           switch (event.type) {
+            case "agent_warning": {
+              showAgentWarning(event.data);
+              break;
+            }
+
             case "agent_result": {
               const result = event.data as {
                 agentType: string;
@@ -1368,6 +1613,10 @@ export function useGenerate() {
                 );
               }
 
+              if (result.success) {
+                qc.invalidateQueries({ queryKey: agentKeys.customRuns(chatId) });
+              }
+
               addResult(result.agentType, {
                 agentId: result.agentType,
                 agentType: result.agentType,
@@ -1378,6 +1627,18 @@ export function useGenerate() {
                 success: result.success,
                 error: result.error,
               });
+              if (result.success && result.resultType === "character_card_update") {
+                buildPendingCardUpdates(qc, chatId, result.agentName, result.data)
+                  .then((pendingEntries) => {
+                    if (pendingEntries.length > 0) {
+                      for (const pending of pendingEntries) {
+                        enqueuePendingCardUpdate(pending);
+                      }
+                      useUIStore.getState().openModal("character-card-update");
+                    }
+                  })
+                  .catch((err) => console.warn("[Agent] Failed to build card update entry:", err));
+              }
               if (result.success && result.data) {
                 const bubble = formatAgentBubble(result.agentType, result.agentName, result.data);
                 if (bubble) addThoughtBubble(result.agentType, result.agentName, bubble);
@@ -1385,6 +1646,13 @@ export function useGenerate() {
                   const d = result.data as Record<string, unknown>;
                   const reactions = (d.reactions as Array<{ characterName: string; reaction: string }>) ?? [];
                   for (const r of reactions) addEchoMessage(r.characterName, r.reaction);
+                }
+                // CYOA re-roll: push the freshly generated choices into the store
+                // so the buttons in CyoaChoices.tsx swap in immediately.
+                if (result.agentType === "cyoa") {
+                  const d = result.data as Record<string, unknown>;
+                  const choices = (d.choices as Array<{ label: string; text: string }>) ?? [];
+                  if (choices.length > 0 && isActiveChat()) setCyoaChoices(choices);
                 }
                 if (result.resultType === "background_change") {
                   const bg = result.data as { chosen?: string | null };
@@ -1538,9 +1806,10 @@ export function useGenerate() {
       addResult,
       addThoughtBubble,
       addEchoMessage,
+      enqueuePendingCardUpdate,
       clearFailedAgentTypes,
-      clearDebugLog,
       clearThoughtBubbles,
+      setCyoaChoices,
       setFailedAgentTypes,
       setProcessing,
       setGameState,

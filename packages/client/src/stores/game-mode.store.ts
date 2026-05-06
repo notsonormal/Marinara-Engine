@@ -24,6 +24,10 @@ interface GameModeStore {
   gameState: GameActiveState;
   /** Current map. */
   currentMap: GameMap | null;
+  /** All known maps for this game. */
+  maps: GameMap[];
+  /** ID of the map the party is currently on. */
+  activeMapId: string | null;
   /** NPCs discovered in this game. */
   npcs: GameNpc[];
   /** Whether the setup wizard is showing. */
@@ -48,6 +52,9 @@ interface GameModeStore {
   setActiveGame: (gameId: string | null, sessionChatId?: string | null, partyChatId?: string | null) => void;
   setGameState: (state: GameActiveState) => void;
   setCurrentMap: (map: GameMap | null) => void;
+  setMaps: (maps: GameMap[], activeMapId?: string | null) => void;
+  upsertMap: (map: GameMap, active?: boolean) => void;
+  setActiveMap: (mapId: string | null) => void;
   setNpcs: (npcs: GameNpc[]) => void;
   setSetupActive: (active: boolean) => void;
   setSetupStep: (step: number) => void;
@@ -76,12 +83,112 @@ function debouncedPersistWidgets(chatId: string, widgets: HudWidget[]) {
   }, 1000);
 }
 
+const MAX_LIST_WIDGET_ITEMS = 5;
+
+function normalizeListWidgetItem(value: string): string {
+  return value
+    .trim()
+    .replace(/^["']+|["']+$/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[.!?;,:]+$/g, "")
+    .toLowerCase();
+}
+
+function appendListWidgetItem(items: string[], nextItem: string): string[] {
+  const cleaned = nextItem.trim();
+  if (!cleaned) return items;
+
+  const normalizedNewItem = normalizeListWidgetItem(cleaned);
+  const dedupedItems = items.filter((item) => normalizeListWidgetItem(item) !== normalizedNewItem);
+  return [...dedupedItems, cleaned].slice(-MAX_LIST_WIDGET_ITEMS);
+}
+
+function removeListWidgetItem(items: string[], target: string): string[] {
+  const normalizedTarget = normalizeListWidgetItem(target);
+  if (!normalizedTarget) return items;
+
+  const exactMatchIndex = items.findIndex((item) => normalizeListWidgetItem(item) === normalizedTarget);
+  if (exactMatchIndex >= 0) {
+    return items.filter((_, index) => index !== exactMatchIndex);
+  }
+
+  const partialMatches = items
+    .map((item, index) => ({ index, normalized: normalizeListWidgetItem(item) }))
+    .filter(({ normalized }) => normalized.includes(normalizedTarget) || normalizedTarget.includes(normalized));
+
+  if (partialMatches.length !== 1) return items;
+  return items.filter((_, index) => index !== partialMatches[0]!.index);
+}
+
+function buildTrackedNpcStub(name: string, avatarUrl: string): GameNpc {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+
+  return {
+    id: slug || `npc-${Date.now()}`,
+    name,
+    emoji: "👤",
+    description: "",
+    location: "",
+    reputation: 0,
+    met: true,
+    notes: [],
+    avatarUrl,
+  };
+}
+
+function slugifyMapId(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+}
+
+function getMapId(map: GameMap | null | undefined, fallbackIndex = 0): string | null {
+  if (!map) return null;
+  const explicit = map.id?.trim();
+  if (explicit) return explicit;
+  return slugifyMapId(map.name || "") || `map-${fallbackIndex + 1}`;
+}
+
+function withMapId(map: GameMap, existingMaps: readonly GameMap[] = []): GameMap {
+  const explicit = map.id?.trim();
+  if (explicit) return explicit === map.id ? map : { ...map, id: explicit };
+
+  const usedIds = new Set(existingMaps.map((entry, index) => getMapId(entry, index)).filter(Boolean) as string[]);
+  const base = slugifyMapId(map.name || "") || "map";
+  let id = base;
+  let suffix = 2;
+  while (usedIds.has(id)) {
+    id = `${base}-${suffix++}`;
+  }
+  return { ...map, id };
+}
+
+function upsertMapList(maps: readonly GameMap[], map: GameMap): GameMap[] {
+  const mapId = getMapId(map);
+  if (!mapId) return [...maps, map];
+
+  const index = maps.findIndex((entry, entryIndex) => getMapId(entry, entryIndex) === mapId);
+  if (index < 0) return [...maps, map];
+
+  const next = [...maps];
+  next[index] = map;
+  return next;
+}
+
 const INITIAL_STATE = {
   activeGameId: null,
   activeSessionChatId: null,
   partyChatId: null,
   gameState: "exploration" as GameActiveState,
   currentMap: null,
+  maps: [],
+  activeMapId: null,
   npcs: [],
   isSetupActive: false,
   setupStep: 0,
@@ -100,7 +207,51 @@ export const useGameModeStore = create<GameModeStore>((set) => ({
   setActiveGame: (gameId, sessionChatId, partyChatId) =>
     set({ activeGameId: gameId, activeSessionChatId: sessionChatId ?? null, partyChatId: partyChatId ?? null }),
   setGameState: (state) => set({ gameState: state }),
-  setCurrentMap: (map) => set({ currentMap: map }),
+  setCurrentMap: (map) =>
+    set((s) => {
+      if (!map) return { currentMap: null, activeMapId: null };
+      const mapWithId = withMapId(map, s.maps);
+      const mapId = getMapId(mapWithId);
+      return {
+        currentMap: mapWithId,
+        maps: upsertMapList(s.maps, mapWithId),
+        activeMapId: mapId,
+      };
+    }),
+  setMaps: (maps, activeMapId) =>
+    set((s) => {
+      const normalizedMaps = maps.reduce<GameMap[]>((acc, map) => {
+        const mapWithId = withMapId(map, acc);
+        return upsertMapList(acc, mapWithId);
+      }, []);
+      const preferredId =
+        activeMapId ??
+        s.activeMapId ??
+        getMapId(s.currentMap) ??
+        (normalizedMaps[0] ? getMapId(normalizedMaps[0]) : null);
+      const currentMap =
+        normalizedMaps.find((map, index) => getMapId(map, index) === preferredId) ?? normalizedMaps[0] ?? null;
+      return {
+        maps: normalizedMaps,
+        currentMap,
+        activeMapId: currentMap ? getMapId(currentMap) : null,
+      };
+    }),
+  upsertMap: (map, active = true) =>
+    set((s) => {
+      const mapWithId = withMapId(map, s.maps);
+      const mapId = getMapId(mapWithId);
+      return {
+        maps: upsertMapList(s.maps, mapWithId),
+        ...(active ? { currentMap: mapWithId, activeMapId: mapId } : {}),
+      };
+    }),
+  setActiveMap: (mapId) =>
+    set((s) => {
+      if (!mapId) return { activeMapId: null, currentMap: null };
+      const currentMap = s.maps.find((map, index) => getMapId(map, index) === mapId) ?? s.currentMap;
+      return { activeMapId: mapId, currentMap };
+    }),
   setNpcs: (npcs) =>
     set((s) => {
       // Preserve existing avatarUrls: the incoming list may come from a stale
@@ -121,12 +272,32 @@ export const useGameModeStore = create<GameModeStore>((set) => ({
       return { npcs: merged };
     }),
   patchNpcAvatars: (avatars) =>
-    set((s) => ({
-      npcs: s.npcs.map((npc) => {
+    set((s) => {
+      let modified = false;
+      const nextNpcs = s.npcs.map((npc) => {
         const match = avatars.find((a) => a.name.toLowerCase() === npc.name.toLowerCase());
-        return match ? { ...npc, avatarUrl: match.avatarUrl } : npc;
-      }),
-    })),
+        if (match && !npc.avatarUrl) {
+          modified = true;
+          return { ...npc, avatarUrl: match.avatarUrl };
+        }
+        return npc; // preserve reference — no churn
+      });
+
+      for (const avatar of avatars) {
+        const exists = nextNpcs.some((npc) => npc.name.toLowerCase() === avatar.name.toLowerCase());
+        if (!exists) {
+          nextNpcs.push(buildTrackedNpcStub(avatar.name, avatar.avatarUrl));
+          modified = true;
+        }
+      }
+
+      // Return the SAME state reference when nothing actually changed.
+      // Zustand skips subscriber notification on reference equality, which
+      // prevents infinite render loops caused by useEffect → store update →
+      // useSyncExternalStore synchronous re-subscription → repeat.
+      if (!modified) return s;
+      return { npcs: nextNpcs };
+    }),
   setSetupActive: (active) => set({ isSetupActive: active }),
   setSetupStep: (step) => set({ setupStep: step }),
   setDiceRollResult: (result) => set({ diceRollResult: result }),
@@ -160,17 +331,20 @@ export const useGameModeStore = create<GameModeStore>((set) => ({
         }
 
         // Handle list/inventory add/remove
-        if (changes.add) {
-          if (w.type === "list") {
-            newConfig.items = [...(newConfig.items ?? []), changes.add];
-          } else if (w.type === "inventory_grid") {
+        if (w.type === "list") {
+          let nextItems = [...(newConfig.items ?? [])];
+          if (changes.remove) {
+            nextItems = removeListWidgetItem(nextItems, changes.remove);
+          }
+          if (changes.add) {
+            nextItems = appendListWidgetItem(nextItems, changes.add);
+          }
+          newConfig.items = nextItems;
+        } else {
+          if (changes.add && w.type === "inventory_grid") {
             newConfig.contents = [...(newConfig.contents ?? []), { name: changes.add, quantity: 1 }];
           }
-        }
-        if (changes.remove) {
-          if (w.type === "list") {
-            newConfig.items = (newConfig.items ?? []).filter((i) => i !== changes.remove);
-          } else if (w.type === "inventory_grid") {
+          if (changes.remove && w.type === "inventory_grid") {
             newConfig.contents = (newConfig.contents ?? []).filter((c) => c.name !== changes.remove);
           }
         }

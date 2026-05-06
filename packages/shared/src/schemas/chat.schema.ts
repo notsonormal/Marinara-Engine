@@ -29,21 +29,33 @@ export const generateRequestSchema = z.object({
   userMessage: z.string().nullable().default(null),
   regenerateMessageId: z.string().nullable().default(null),
   connectionId: z.string().nullable().default(null),
-  debugMode: z.boolean().optional().default(false),
+
   impersonate: z.boolean().optional().default(false),
   streaming: z.boolean().optional().default(true),
   userStatus: z.enum(["active", "idle", "dnd"]).optional().default("active"),
+  userActivity: z.string().max(120).optional().default(""),
   mentionedCharacterNames: z.array(z.string()).optional().default([]),
   forCharacterId: z.string().nullable().optional().default(null),
+  generationGuide: z.string().nullable().optional().default(null),
+  debugMode: z.boolean().optional().default(false),
+  trimIncompleteModelOutput: z.boolean().optional().default(false),
   attachments: z
     .array(
       z.object({
         type: z.string(),
         data: z.string(),
+        filename: z.string().optional(),
+        name: z.string().optional(),
       }),
     )
     .optional()
     .default([]),
+
+  // Impersonate overrides (applied only when impersonate=true)
+  impersonatePresetId: z.string().nullish(),
+  impersonateConnectionId: z.string().nullish(),
+  impersonateBlockAgents: z.boolean().optional().default(false),
+  impersonatePromptTemplate: z.string().optional(),
 });
 
 // Auto-summarization entries — shape-only validation (no length caps).

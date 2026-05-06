@@ -17,6 +17,7 @@ export interface MarkerContext {
   db: DB;
   chatId: string;
   characterIds: string[];
+  personaId?: string | null;
   personaName: string;
   personaDescription: string;
   personaFields?: {
@@ -40,6 +41,8 @@ export interface MarkerContext {
   chatEmbedding?: number[] | null;
   /** Per-chat ephemeral state overrides for lorebook entries (from chat metadata). */
   entryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
+  /** Generation trigger labels used by per-entry lorebook include/exclude filters. */
+  generationTriggers?: string[];
   /** Collector for lorebook depth entries — populated during expansion, consumed by the assembler. */
   lorebookDepthEntries?: Array<{ content: string; role: "system" | "user" | "assistant"; depth: number }>;
   /** Collector for updated entry state overrides after ephemeral processing — saved to chat metadata by caller. */
@@ -224,9 +227,11 @@ async function expandLorebook(config: MarkerConfig, ctx: MarkerContext): Promise
   const result = await processLorebooks(ctx.db, ctx.chatMessages, null, {
     chatId: ctx.chatId,
     characterIds: ctx.characterIds,
+    personaId: ctx.personaId ?? null,
     activeLorebookIds: ctx.activeLorebookIds,
     chatEmbedding: ctx.chatEmbedding ?? null,
     entryStateOverrides: ctx.entryStateOverrides,
+    generationTriggers: ctx.generationTriggers ?? ["chat"],
   });
 
   // Collect updated per-chat entry state overrides for the caller to persist
@@ -316,7 +321,7 @@ async function expandChatHistory(config: MarkerConfig, ctx: MarkerContext): Prom
 
   // Chat history is special — it returns multiple messages to be inserted directly,
   // not a single content block. The assembler handles this.
-  return { content: "", messages };
+  return { content: "", messages: messages.map((message) => ({ ...message, contextKind: "history" as const })) };
 }
 
 // ── Dialogue Examples ──────────────────────────

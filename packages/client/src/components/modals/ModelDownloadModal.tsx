@@ -7,7 +7,21 @@
 // ──────────────────────────────────────────────
 
 import { useEffect, useState } from "react";
-import { BrainCircuit, Check, ChevronDown, ChevronUp, Download, HardDrive, Loader2, MessageSquare, Search, Server, Settings2, X, Zap } from "lucide-react";
+import {
+  BrainCircuit,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Download,
+  HardDrive,
+  Loader2,
+  MessageSquare,
+  Search,
+  Server,
+  Settings2,
+  X,
+  Zap,
+} from "lucide-react";
 import type { SidecarBackend, SidecarQuantization, SidecarRuntimePreference } from "@marinara-engine/shared";
 import { Modal } from "../ui/Modal.js";
 import { useSidecarStore } from "../../stores/sidecar.store.js";
@@ -65,6 +79,14 @@ function describeGpuLayers(gpuLayers: number): string {
   if (gpuLayers === -1) return "Auto offload";
   if (gpuLayers === 0) return "CPU only";
   return `${gpuLayers} GPU layers`;
+}
+
+function formatCompactTokens(value: number): string {
+  if (value >= 1000) {
+    const shortened = value / 1000;
+    return `${Number.isInteger(shortened) ? shortened.toFixed(0) : shortened.toFixed(1)}k`;
+  }
+  return String(value);
 }
 
 function getRuntimePreferenceOptions(platform: string, arch: string): SidecarRuntimePreference[] {
@@ -132,7 +154,6 @@ export function ModelDownloadModal({ open, onClose }: Props) {
     listHuggingFaceModels,
     clearCustomModels,
     cancelDownload,
-    unloadModel,
     restartRuntime,
     installRuntime,
     sendTestMessage,
@@ -154,6 +175,11 @@ export function ModelDownloadModal({ open, onClose }: Props) {
   const [gpuLayersModeDraft, setGpuLayersModeDraft] = useState<"auto" | "cpu" | "custom">(
     config.gpuLayers === -1 ? "auto" : config.gpuLayers === 0 ? "cpu" : "custom",
   );
+  const [contextSizeInput, setContextSizeInput] = useState(String(config.contextSize));
+  const [maxTokensInput, setMaxTokensInput] = useState(String(config.maxTokens));
+  const [temperatureInput, setTemperatureInput] = useState(String(config.temperature));
+  const [topPInput, setTopPInput] = useState(String(config.topP));
+  const [topKInput, setTopKInput] = useState(String(config.topK));
 
   const activeBackend = runtime.backend ?? config.backend;
   const isSystemRuntime = runtime.source === "system";
@@ -167,16 +193,17 @@ export function ModelDownloadModal({ open, onClose }: Props) {
   const hasModel = modelDownloaded;
   const activeModelName = hasModel ? modelDisplayName : null;
   const shouldAutoStart = config.useForTrackers || config.useForGameScene;
+  const isBlockingSetup = isDownloading || status === "downloading_runtime";
   const isPreparingServer =
-    hasModel && shouldAutoStart && !inferenceReady && (status === "starting_server" || status === "downloaded");
-  const isSetupBusy = isDownloading || status === "downloading_runtime" || isPreparingServer;
+    runtime.installed && hasModel && shouldAutoStart && !inferenceReady && status === "starting_server";
+  const showSetupProgress = isBlockingSetup || isPreparingServer;
   const canFinish = status === "ready" && inferenceReady;
   const runtimePreferenceOptions = getRuntimePreferenceOptions(platform, arch);
   const gpuLayersMode = gpuLayersModeDraft;
   const quickRuntimeSummary =
     activeBackend === "mlx"
-      ? "MLX runtime"
-      : `${formatRuntimePreferenceLabel(config.runtimePreference)} • ${describeGpuLayers(config.gpuLayers)}`;
+      ? `MLX runtime • ${formatCompactTokens(config.contextSize)} ctx • ${formatCompactTokens(config.maxTokens)} max`
+      : `${formatRuntimePreferenceLabel(config.runtimePreference)} • ${describeGpuLayers(config.gpuLayers)} • ${formatCompactTokens(config.contextSize)} ctx • ${formatCompactTokens(config.maxTokens)} max`;
 
   useEffect(() => {
     if (!open) {
@@ -210,6 +237,14 @@ export function ModelDownloadModal({ open, onClose }: Props) {
   }, [config.gpuLayers]);
 
   useEffect(() => {
+    setContextSizeInput(String(config.contextSize));
+    setMaxTokensInput(String(config.maxTokens));
+    setTemperatureInput(String(config.temperature));
+    setTopPInput(String(config.topP));
+    setTopKInput(String(config.topK));
+  }, [config.contextSize, config.maxTokens, config.temperature, config.topP, config.topK]);
+
+  useEffect(() => {
     if (status === "server_error" || testMessageResult) {
       setShowRuntimeSettings(true);
     }
@@ -237,19 +272,21 @@ export function ModelDownloadModal({ open, onClose }: Props) {
           ? "Downloading a private uv bootstrap and creating an isolated MLX environment inside Marinara's sidecar runtime folder."
           : "Downloading the official local runtime for this device."
         : activeBackend === "mlx"
-          ? "Starting the MLX server and populating Marinara's local model cache. The first run can take a few minutes."
-          : "Loading the model and starting the local sidecar server. This can take a few seconds.";
+          ? "Starting the MLX server in the background. You can close this window while Marinara finishes booting it."
+          : "Starting the local sidecar server in the background. You can close this window while Marinara finishes booting it.";
   const runtimeStatusLabel = canFinish
     ? "Ready"
-    : isSetupBusy
+    : isBlockingSetup
       ? "Setting up now"
-      : status === "server_error"
-        ? "Setup error"
-        : runtime.installed
-          ? isSystemRuntime
-            ? "Using system runtime"
-            : "Installed"
-          : "Not downloaded yet";
+      : isPreparingServer
+        ? "Starting runtime"
+        : status === "server_error"
+          ? "Setup error"
+          : runtime.installed
+            ? isSystemRuntime
+              ? "Using system runtime"
+              : "Installed"
+            : "Not downloaded yet";
 
   const handleSkip = () => {
     markPrompted();
@@ -307,17 +344,76 @@ export function ModelDownloadModal({ open, onClose }: Props) {
     void updateConfig({ gpuLayers: parsed });
   };
 
-  const handleCancelSetup = () => {
-    if (isPreparingServer) {
-      void unloadModel();
+  const handleApplyGenerationSettings = () => {
+    const parsedContextSize = Number.parseInt(contextSizeInput, 10);
+    const parsedMaxTokens = Number.parseInt(maxTokensInput, 10);
+    const parsedTemperature = Number.parseFloat(temperatureInput);
+    const parsedTopP = Number.parseFloat(topPInput);
+    const parsedTopK = Number.parseInt(topKInput, 10);
+
+    if (
+      !Number.isFinite(parsedContextSize) ||
+      parsedContextSize < 512 ||
+      parsedContextSize > 32768 ||
+      !Number.isFinite(parsedMaxTokens) ||
+      parsedMaxTokens < 64 ||
+      parsedMaxTokens > 32768 ||
+      !Number.isFinite(parsedTemperature) ||
+      parsedTemperature < 0 ||
+      parsedTemperature > 2 ||
+      !Number.isFinite(parsedTopP) ||
+      parsedTopP <= 0 ||
+      parsedTopP > 1 ||
+      !Number.isFinite(parsedTopK) ||
+      parsedTopK < 0 ||
+      parsedTopK > 500
+    ) {
       return;
     }
 
+    void updateConfig({
+      contextSize: parsedContextSize,
+      maxTokens: parsedMaxTokens,
+      temperature: parsedTemperature,
+      topP: parsedTopP,
+      topK: parsedTopK,
+    });
+  };
+
+  const parsedContextSize = Number.parseInt(contextSizeInput, 10);
+  const parsedMaxTokens = Number.parseInt(maxTokensInput, 10);
+  const parsedTemperature = Number.parseFloat(temperatureInput);
+  const parsedTopP = Number.parseFloat(topPInput);
+  const parsedTopK = Number.parseInt(topKInput, 10);
+  const generationSettingsValid =
+    Number.isFinite(parsedContextSize) &&
+    parsedContextSize >= 512 &&
+    parsedContextSize <= 32768 &&
+    Number.isFinite(parsedMaxTokens) &&
+    parsedMaxTokens >= 64 &&
+    parsedMaxTokens <= 32768 &&
+    Number.isFinite(parsedTemperature) &&
+    parsedTemperature >= 0 &&
+    parsedTemperature <= 2 &&
+    Number.isFinite(parsedTopP) &&
+    parsedTopP > 0 &&
+    parsedTopP <= 1 &&
+    Number.isFinite(parsedTopK) &&
+    parsedTopK >= 0 &&
+    parsedTopK <= 500;
+  const generationSettingsDirty =
+    contextSizeInput !== String(config.contextSize) ||
+    maxTokensInput !== String(config.maxTokens) ||
+    temperatureInput !== String(config.temperature) ||
+    topPInput !== String(config.topP) ||
+    topKInput !== String(config.topK);
+
+  const handleCancelSetup = () => {
     void cancelDownload();
   };
 
   return (
-    <Modal open={open} onClose={isSetupBusy ? () => {} : onClose} title="Local AI Model" width="max-w-2xl">
+    <Modal open={open} onClose={onClose} title="Local AI Model" width="max-w-2xl">
       <div className="flex flex-col gap-5">
         <div className="flex items-start gap-3">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-purple-500/10">
@@ -380,7 +476,9 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                     : "Install and configure the runtime here, then choose a model below."}
               </div>
               {status === "server_error" && (
-                <div className="mt-2 text-xs text-amber-200">Runtime startup failed. Open Runtime Settings for details.</div>
+                <div className="mt-2 text-xs text-amber-200">
+                  Runtime startup failed. Open Runtime Settings for details.
+                </div>
               )}
             </div>
             <button
@@ -393,7 +491,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
             </button>
           </div>
 
-          {!isSetupBusy && (
+          {!showSetupProgress && (
             <div className="mt-3 flex flex-wrap gap-2">
               {!runtime.installed ? (
                 <button
@@ -411,7 +509,11 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       className="flex items-center justify-center gap-2 rounded-xl bg-purple-500/15 px-4 py-2 text-sm font-medium text-purple-300 transition-colors hover:bg-purple-500/25"
                     >
                       <Loader2 size="0.875rem" />
-                      {status === "server_error" ? "Retry Startup" : inferenceReady ? "Restart Runtime" : "Start Runtime"}
+                      {status === "server_error"
+                        ? "Retry Startup"
+                        : inferenceReady
+                          ? "Restart Runtime"
+                          : "Start Runtime"}
                     </button>
                   )}
                   {canReinstallRuntime && (
@@ -459,7 +561,9 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       <div className="relative">
                         <select
                           value={config.runtimePreference}
-                          onChange={(event) => handleRuntimePreferenceChange(event.target.value as SidecarRuntimePreference)}
+                          onChange={(event) =>
+                            handleRuntimePreferenceChange(event.target.value as SidecarRuntimePreference)
+                          }
                           className="w-full appearance-none rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 pr-10 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
                         >
                           {runtimePreferenceOptions.map((option) => (
@@ -493,7 +597,9 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       <div className="relative">
                         <select
                           value={gpuLayersMode}
-                          onChange={(event) => handleGpuLayersModeChange(event.target.value as "auto" | "cpu" | "custom")}
+                          onChange={(event) =>
+                            handleGpuLayersModeChange(event.target.value as "auto" | "cpu" | "custom")
+                          }
                           className="w-full appearance-none rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 pr-10 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
                         >
                           <option value="auto">Auto offload</option>
@@ -528,18 +634,110 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                         </div>
                       )}
                       <div className="text-xs text-[var(--muted-foreground)]/70">
-                        Auto tries max offload first, CPU only disables GPU use, and custom lets you cap how many layers go to the GPU.
+                        Auto tries max offload first, CPU only disables GPU use, and custom lets you cap how many layers
+                        go to the GPU.
                       </div>
                     </>
                   )}
                 </div>
               </div>
 
+              <div className="rounded-xl border border-[var(--border)] bg-[var(--card)]/50 p-4">
+                <div className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                  Inference Settings
+                </div>
+                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-[0.6875rem] font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                      Context Window
+                    </span>
+                    <input
+                      value={contextSizeInput}
+                      onChange={(event) => setContextSizeInput(event.target.value.replace(/[^\d]/g, ""))}
+                      inputMode="numeric"
+                      placeholder="8192"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                    />
+                  </label>
+
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-[0.6875rem] font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                      Max Response Tokens
+                    </span>
+                    <input
+                      value={maxTokensInput}
+                      onChange={(event) => setMaxTokensInput(event.target.value.replace(/[^\d]/g, ""))}
+                      inputMode="numeric"
+                      placeholder="4096"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                    />
+                  </label>
+
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-[0.6875rem] font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                      Temperature
+                    </span>
+                    <input
+                      value={temperatureInput}
+                      onChange={(event) => setTemperatureInput(event.target.value.replace(/[^0-9.]/g, ""))}
+                      inputMode="decimal"
+                      placeholder="0.3"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                    />
+                  </label>
+
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-[0.6875rem] font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                      Top P
+                    </span>
+                    <input
+                      value={topPInput}
+                      onChange={(event) => setTopPInput(event.target.value.replace(/[^0-9.]/g, ""))}
+                      inputMode="decimal"
+                      placeholder="0.95"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                    />
+                  </label>
+
+                  <label className="flex flex-col gap-1.5 md:max-w-[12rem]">
+                    <span className="text-[0.6875rem] font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                      Top K
+                    </span>
+                    <input
+                      value={topKInput}
+                      onChange={(event) => setTopKInput(event.target.value.replace(/[^\d]/g, ""))}
+                      inputMode="numeric"
+                      placeholder="64"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                    />
+                  </label>
+                </div>
+                <div className="mt-3 flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-stretch">
+                  <div className="text-xs text-[var(--muted-foreground)]/70">
+                    Max response tokens caps how much the local runtime can generate. If it is too large relative to the
+                    context window, Marinara has to trim more of the prompt to make room.
+                  </div>
+                  <button
+                    onClick={handleApplyGenerationSettings}
+                    disabled={!generationSettingsValid || !generationSettingsDirty}
+                    className="flex shrink-0 items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--card)]/70 px-4 py-2 text-sm text-[var(--foreground)] transition-colors hover:bg-[var(--card)] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Apply Settings
+                  </button>
+                </div>
+              </div>
+
               {runtime.installed && (
                 <div className="flex flex-col gap-1 rounded-xl border border-[var(--border)] bg-[var(--card)]/50 p-3 text-xs text-[var(--muted-foreground)]/75">
                   <span>Status: {runtimeStatusLabel}</span>
-                  {runtime.build && runtime.variant && <span>Runtime build: {runtime.build} • {runtime.variant}</span>}
-                  {isSystemRuntime && runtime.systemPath && <span>Using system llama-server: {runtime.systemPath}</span>}
+                  {runtime.build && runtime.variant && (
+                    <span>
+                      Runtime build: {runtime.build} • {runtime.variant}
+                    </span>
+                  )}
+                  {isSystemRuntime && runtime.systemPath && (
+                    <span>Using system llama-server: {runtime.systemPath}</span>
+                  )}
                 </div>
               )}
 
@@ -589,7 +787,9 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       : "border-red-500/25 bg-red-500/5"
                   }`}
                 >
-                  <div className={`text-sm font-medium ${testMessageResult.success ? "text-emerald-300" : "text-red-300"}`}>
+                  <div
+                    className={`text-sm font-medium ${testMessageResult.success ? "text-emerald-300" : "text-red-300"}`}
+                  >
                     Local Test Message {testMessageResult.success ? "Succeeded" : "Failed"}
                   </div>
                   <div className="mt-1 text-xs text-[var(--muted-foreground)]/75">{testMessageResult.latencyMs}ms</div>
@@ -597,7 +797,8 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                     <div className="mt-3 flex flex-col gap-3">
                       {testMessageResult.nonce && (
                         <div className="text-xs text-[var(--muted-foreground)]/75">
-                          Verification token: <span className="font-mono text-[var(--foreground)]">{testMessageResult.nonce}</span>
+                          Verification token:{" "}
+                          <span className="font-mono text-[var(--foreground)]">{testMessageResult.nonce}</span>
                           {testMessageResult.nonceVerified ? " • echoed by model" : " • not echoed"}
                         </div>
                       )}
@@ -606,7 +807,8 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                           {testMessageResult.usage && (
                             <span>
                               Usage: prompt {testMessageResult.usage.promptTokens ?? "?"}, completion{" "}
-                              {testMessageResult.usage.completionTokens ?? "?"}, total {testMessageResult.usage.totalTokens ?? "?"}
+                              {testMessageResult.usage.completionTokens ?? "?"}, total{" "}
+                              {testMessageResult.usage.totalTokens ?? "?"}
                             </span>
                           )}
                           {testMessageResult.usage && testMessageResult.timings && <span> • </span>}
@@ -618,7 +820,9 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                           )}
                         </div>
                       )}
-                      {!!testMessageResult.messageContent && <ResponseBlock label="Message Content" value={testMessageResult.messageContent} />}
+                      {!!testMessageResult.messageContent && (
+                        <ResponseBlock label="Message Content" value={testMessageResult.messageContent} />
+                      )}
                       {!!testMessageResult.reasoningContent && (
                         <ResponseBlock label="Reasoning Content" value={testMessageResult.reasoningContent} />
                       )}
@@ -639,7 +843,9 @@ export function ModelDownloadModal({ open, onClose }: Props) {
 
               {runtimeDiagnostics && (
                 <div className="rounded-xl border border-[var(--border)] bg-[var(--card)]/50 p-3">
-                  <div className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">Diagnostics</div>
+                  <div className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                    Diagnostics
+                  </div>
                   <div className="mt-2 flex flex-col gap-1 text-xs text-[var(--muted-foreground)]/75">
                     {runtimeDiagnostics.gpuVendors.length > 0 && (
                       <span>Detected GPU vendors: {runtimeDiagnostics.gpuVendors.join(", ")}</span>
@@ -659,8 +865,12 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                         ? " none"
                         : ""}
                     </span>
-                    {runtimeDiagnostics.systemLlamaPath && <span>System llama-server: {runtimeDiagnostics.systemLlamaPath}</span>}
-                    {runtimeDiagnostics.launchCommand && <span>Last launch command: {runtimeDiagnostics.launchCommand}</span>}
+                    {runtimeDiagnostics.systemLlamaPath && (
+                      <span>System llama-server: {runtimeDiagnostics.systemLlamaPath}</span>
+                    )}
+                    {runtimeDiagnostics.launchCommand && (
+                      <span>Last launch command: {runtimeDiagnostics.launchCommand}</span>
+                    )}
                   </div>
                 </div>
               )}
@@ -668,7 +878,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
           )}
         </div>
 
-        {isSetupBusy && (
+        {showSetupProgress && (
           <div className="rounded-xl border border-purple-400/25 bg-purple-500/5 p-4">
             <div className="flex items-start gap-3">
               <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-purple-500/15">
@@ -708,7 +918,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
           </div>
         )}
 
-        {!isSetupBusy && (
+        {!isBlockingSetup && (
           <>
             <div className="flex flex-col gap-2">
               <span className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
@@ -875,7 +1085,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
         )}
 
         <div className="flex items-center gap-2">
-          {isSetupBusy ? (
+          {isBlockingSetup ? (
             <button
               onClick={handleCancelSetup}
               className="flex w-full items-center justify-center gap-2 rounded-xl border border-[var(--border)] px-4 py-2.5 text-sm text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)]"
@@ -902,7 +1112,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
           )}
         </div>
 
-        {!hasModel && !isSetupBusy && (
+        {!hasModel && !isBlockingSetup && (
           <div className="rounded-xl border border-[var(--border)] bg-[var(--card)]/50 p-3">
             <span className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
               What the local model handles

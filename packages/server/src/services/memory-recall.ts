@@ -4,11 +4,13 @@
 // Chunks conversation messages into groups, embeds them, and provides
 // semantic recall: given a query, find the most relevant past
 // conversation fragments from specified chats.
-import { eq, desc, sql, and } from "drizzle-orm";
+import { eq, desc, and, gt, inArray, isNotNull } from "drizzle-orm";
 import type { DB } from "../db/connection.js";
 import { messages, memoryChunks } from "../db/schema/index.js";
 import { newId, now } from "../utils/id-generator.js";
 import { localEmbed } from "./local-embedder.js";
+import { logger } from "../lib/logger.js";
+const isLite = process.env.MARINARA_LITE === "true" || process.env.MARINARA_LITE === "1";
 
 /** How many messages per chunk. */
 const CHUNK_SIZE = 5;
@@ -55,6 +57,7 @@ export async function chunkAndEmbedMessages(
   /** Map from role → display name. Used to format "Name: content" lines. */
   nameMap: { userName: string; characterNames: Record<string, string> },
 ): Promise<void> {
+  if (isLite) return;
   // Find the last chunk for this chat to know where to start
   const lastChunk = await db
     .select({ lastMessageAt: memoryChunks.lastMessageAt })
@@ -68,7 +71,7 @@ export async function chunkAndEmbedMessages(
   // Get messages that haven't been chunked yet
   const conditions = [eq(messages.chatId, chatId)];
   if (after) {
-    conditions.push(sql`${messages.createdAt} > ${after}`);
+    conditions.push(gt(messages.createdAt, after));
   }
   const unchunked = await db
     .select({
@@ -135,7 +138,7 @@ export async function chunkAndEmbedMessages(
     });
   }
 
-  console.log(`[memory-recall] Created ${chunksToCreate.length} chunk(s) for chat ${chatId}`);
+  logger.debug("[memory-recall] Created %d chunk(s) for chat %s", chunksToCreate.length, chatId);
 }
 
 /**
@@ -148,6 +151,7 @@ export async function recallMemories(
   chatIds: string[],
   topK: number = DEFAULT_TOP_K,
 ): Promise<RecalledMemory[]> {
+  if (isLite) return [];
   if (chatIds.length === 0) return [];
 
   // Embed the query using local model
@@ -170,13 +174,8 @@ export async function recallMemories(
       lastMessageAt: memoryChunks.lastMessageAt,
     })
     .from(memoryChunks)
-    .where(
-      sql`${memoryChunks.chatId} IN (${sql.join(
-        matchingChatIds.map((id) => sql`${id}`),
-        sql`, `,
-      )}) AND ${memoryChunks.embedding} IS NOT NULL`,
-    )
-    .orderBy(sql`${memoryChunks.lastMessageAt} DESC`)
+    .where(and(inArray(memoryChunks.chatId, matchingChatIds), isNotNull(memoryChunks.embedding)))
+    .orderBy(desc(memoryChunks.lastMessageAt))
     .limit(MAX_CHUNKS);
 
   if (chunks.length === 0) return [];

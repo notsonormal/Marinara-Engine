@@ -10,7 +10,7 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
-import { type SpritePlacement, type SpriteSide } from "@marinara-engine/shared";
+import { type SceneForkMode, type SpritePlacement, type SpriteSide } from "@marinara-engine/shared";
 import {
   FolderOpen,
   Globe,
@@ -34,6 +34,7 @@ import { useActiveLorebookEntries } from "../../hooks/use-lorebooks";
 import { ChatMessage } from "./ChatMessage";
 import { ChatInput } from "./ChatInput";
 import { CyoaChoices } from "./CyoaChoices";
+import { ChatBranchSelector } from "./ChatBranchSelector";
 import { EndSceneBar } from "./SceneBanner";
 import { ChatCommonOverlays } from "./ChatCommonOverlays";
 import type {
@@ -85,6 +86,11 @@ const AuthorNotesPanel = lazy(async () => {
   const module = await import("./ChatRoleplayPanels");
   return { default: module.AuthorNotesPanel };
 });
+
+const PANEL_BACKDROP =
+  "fixed inset-0 z-[9999] flex items-center justify-center p-4 max-md:pt-[max(1rem,env(safe-area-inset-top))]";
+const PANEL_CONTAINER =
+  "relative max-h-[calc(100dvh-4rem)] w-full max-w-sm overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--card)] p-3 shadow-2xl shadow-black/40 animate-message-in";
 
 function WeatherEffectsConnected() {
   const gs = useGameStateStore((s) => s.current);
@@ -172,6 +178,7 @@ function StreamingIndicator({
   groupChatMode?: string;
 }) {
   const streamBuffer = useChatStore((s) => s.streamBuffer);
+  const thinkingBuffer = useChatStore((s) => s.thinkingBuffer);
   const streamingCharacterId = useChatStore((s) => s.streamingCharacterId);
 
   return (
@@ -182,9 +189,15 @@ function StreamingIndicator({
           chatId: activeChatId,
           role: "assistant",
           characterId: streamingCharacterId ?? chatCharIds[0] ?? null,
-          content: streamBuffer || "",
+          content: streamBuffer || (thinkingBuffer ? "Thinking..." : ""),
           activeSwipeIndex: 0,
-          extra: { displayText: null, isGenerated: true, tokenCount: 0, generationInfo: null },
+          extra: {
+            displayText: null,
+            isGenerated: true,
+            tokenCount: 0,
+            generationInfo: null,
+            thinking: thinkingBuffer || null,
+          },
           createdAt: new Date().toISOString(),
         }}
         isStreaming
@@ -205,11 +218,24 @@ function RegeneratingMessageContent({
   msg: MessageWithSwipes;
 } & Omit<ComponentProps<typeof ChatMessage>, "message" | "isStreaming">) {
   const streamBuffer = useChatStore((s) => s.streamBuffer);
+  const thinkingBuffer = useChatStore((s) => s.thinkingBuffer);
   // Strip old-swipe attachments so a previous illustration doesn't linger
   // while the new swipe's text is streaming in.
   const parsedExtra = typeof msg.extra === "string" ? JSON.parse(msg.extra) : (msg.extra ?? {});
-  const cleanExtra = { ...parsedExtra, attachments: null };
-  return <ChatMessage message={{ ...msg, extra: cleanExtra, content: streamBuffer || "" }} isStreaming {...rest} />;
+  const cleanExtra = { ...parsedExtra, attachments: null, thinking: thinkingBuffer || parsedExtra.thinking };
+  return (
+    <ChatMessage
+      message={{ ...msg, extra: cleanExtra, content: streamBuffer || (thinkingBuffer ? "Thinking..." : "") }}
+      isStreaming
+      {...rest}
+    />
+  );
+}
+
+/** True for stored context messages that should feed generation but not render in the transcript. */
+function isHiddenFromUser(message: MessageWithSwipes) {
+  const extra = typeof message.extra === "string" ? JSON.parse(message.extra) : (message.extra ?? {});
+  return extra.hiddenFromUser === true;
 }
 
 function RpToolbarButton({
@@ -258,6 +284,7 @@ function ToolbarMenu({ children }: { children: ReactNode }) {
     if (!open) return;
     const handle = (e: MouseEvent) => {
       const target = e.target as Node;
+      if (target instanceof Element && target.closest("[data-chat-branch-popover]")) return;
       if (btnRef.current?.contains(target) || popRef.current?.contains(target)) return;
       setOpen(false);
     };
@@ -272,9 +299,9 @@ function ToolbarMenu({ children }: { children: ReactNode }) {
         <button
           onClick={() => setOpen(!open)}
           className={cn(
-            "flex w-9 items-center justify-center rounded-xl border bg-black/40 p-1.5 text-foreground/60 backdrop-blur-md transition-all hover:bg-black/60 hover:text-foreground",
+            "flex w-9 items-center justify-center rounded-xl border bg-[var(--card)] p-1.5 text-foreground/60 backdrop-blur-md transition-all hover:bg-[var(--accent)] hover:text-foreground",
             "border-foreground/10",
-            open && "bg-black/60 border-foreground/20 text-foreground",
+            open && "bg-[var(--accent)] border-foreground/20 text-foreground",
           )}
           title="More options"
         >
@@ -284,7 +311,7 @@ function ToolbarMenu({ children }: { children: ReactNode }) {
           createPortal(
             <div
               ref={popRef}
-              className="fixed z-[9999] flex w-9 flex-col items-center gap-0.5 rounded-xl border border-foreground/10 bg-black/80 p-1 shadow-xl backdrop-blur-xl animate-message-in"
+              className="fixed z-[9999] flex w-9 flex-col items-center gap-0.5 rounded-xl border border-foreground/10 bg-[var(--card)] p-1 shadow-xl backdrop-blur-xl animate-message-in"
               style={{ top: pos.top, right: pos.right }}
               onClick={() => setOpen(false)}
             >
@@ -396,15 +423,12 @@ function WorldInfoButton({ chatId }: { chatId: string | null }) {
         (isMobile ? (
           createPortal(
             <div
-              className="fixed inset-0 z-[9999] flex items-center justify-center p-4 max-md:pt-[max(1rem,env(safe-area-inset-top))]"
+              className={PANEL_BACKDROP}
               onMouseDown={(e) => e.stopPropagation()}
               onTouchStart={(e) => e.stopPropagation()}
             >
               <div className="absolute inset-0 bg-black/30" onClick={() => setOpen(false)} />
-              <div
-                className="relative max-h-[calc(100dvh-4rem)] w-full max-w-sm overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--card)] p-3 shadow-2xl shadow-black/40 animate-message-in"
-                onClick={(e) => e.stopPropagation()}
-              >
+              <div className={PANEL_CONTAINER} onClick={(e) => e.stopPropagation()}>
                 <Suspense
                   fallback={
                     <div className="flex items-center gap-2 py-4 text-xs text-[var(--muted-foreground)]">
@@ -486,15 +510,12 @@ function AuthorNotesButton({ chatId, chatMeta }: { chatId: string | null; chatMe
         (isMobile ? (
           createPortal(
             <div
-              className="fixed inset-0 z-[9999] flex items-center justify-center p-4 max-md:pt-[max(1rem,env(safe-area-inset-top))]"
+              className={PANEL_BACKDROP}
               onMouseDown={(e) => e.stopPropagation()}
               onTouchStart={(e) => e.stopPropagation()}
             >
               <div className="absolute inset-0 bg-black/30" onClick={() => setOpen(false)} />
-              <div
-                className="relative max-h-[calc(100dvh-4rem)] w-full max-w-sm overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--card)] p-3 shadow-2xl shadow-black/40 animate-message-in"
-                onClick={(e) => e.stopPropagation()}
-              >
+              <div className={PANEL_CONTAINER} onClick={(e) => e.stopPropagation()}>
                 <Suspense
                   fallback={
                     <div className="flex items-center gap-2 py-4 text-xs text-[var(--muted-foreground)]">
@@ -537,6 +558,7 @@ function AuthorNotesButton({ chatId, chatMeta }: { chatId: string | null; chatMe
   );
 }
 
+/** Props for the full roleplay surface, including scene lifecycle and fork controls. */
 type RoleplaySurfaceProps = {
   activeChatId: string;
   chat: ChatData | null | undefined;
@@ -554,6 +576,8 @@ type RoleplaySurfaceProps = {
   spriteCharacterIds: string[];
   spriteExpressions: Record<string, string>;
   spritePlacements: Record<string, SpritePlacement>;
+  spriteScale: number;
+  spriteOpacity: number;
   hasCustomSpritePlacements: boolean;
   spriteArrangeMode: boolean;
   enabledAgentTypes: Set<string>;
@@ -592,15 +616,21 @@ type RoleplaySurfaceProps = {
   onEdit: (messageId: string, content: string) => void;
   onSetActiveSwipe: (messageId: string, index: number) => void;
   onToggleConversationStart: (messageId: string, current: boolean) => void;
+  onToggleHiddenFromAI: (messageId: string, current: boolean) => void;
   onPeekPrompt: () => void;
   onBranch?: (messageId: string) => void;
+  onCloneSceneFromHere?: (messageId: string) => void;
+  isCloneSceneFromHereDisabled?: boolean;
   onToggleSelectMessage: (toggle: MessageSelectionToggle) => void;
   onSummaryContextSizeChange: (size: number) => void;
   onRerunTrackers: () => void;
+  onRerunSingleTracker: (agentType: string) => void;
   onRetryFailedAgents?: () => void;
   onStartEncounter: () => void;
   onConcludeScene: () => void;
   onAbandonScene: () => void;
+  onForkScene: (sceneChatId: string, mode: SceneForkMode) => void;
+  isForkingScene?: boolean;
   onOpenSettings: () => void;
   onOpenFiles: () => void;
   onOpenGallery: () => void;
@@ -645,6 +675,8 @@ export function ChatRoleplaySurface({
   spriteCharacterIds,
   spriteExpressions,
   spritePlacements,
+  spriteScale,
+  spriteOpacity,
   hasCustomSpritePlacements,
   spriteArrangeMode,
   enabledAgentTypes,
@@ -683,15 +715,21 @@ export function ChatRoleplaySurface({
   onEdit,
   onSetActiveSwipe,
   onToggleConversationStart,
+  onToggleHiddenFromAI,
   onPeekPrompt,
   onBranch,
+  onCloneSceneFromHere,
+  isCloneSceneFromHereDisabled,
   onToggleSelectMessage,
   onSummaryContextSizeChange,
   onRerunTrackers,
+  onRerunSingleTracker,
   onRetryFailedAgents,
   onStartEncounter,
   onConcludeScene,
   onAbandonScene,
+  onForkScene,
+  isForkingScene,
   onOpenSettings,
   onOpenFiles,
   onOpenGallery,
@@ -740,6 +778,8 @@ export function ChatRoleplaySurface({
               spriteExpressions={spriteExpressions}
               spritePlacements={spritePlacements}
               editing={spriteArrangeMode}
+              spriteScale={spriteScale}
+              spriteOpacity={spriteOpacity}
               onExpressionChange={onExpressionChange}
               onPlacementChange={onSpritePlacementChange}
             />
@@ -762,15 +802,24 @@ export function ChatRoleplaySurface({
                         chatId={chat.id}
                         characterCount={chatCharIds.length}
                         layout="top"
+                        isStreaming={isStreaming}
                         onRetriggerTrackers={onRerunTrackers}
                         onRetryFailedAgents={onRetryFailedAgents}
+                        onRerunSingleTracker={onRerunSingleTracker}
                         enabledAgentTypes={enabledAgentTypes}
                         manualTrackers={!!chatMeta.manualTrackers}
+                        injectionSourceMessages={messages}
                       />
                     </Suspense>
                   </div>
                 )}
                 <div className="pointer-events-auto ml-auto flex shrink-0 items-center gap-1.5">
+                  <ChatBranchSelector
+                    activeChatId={activeChatId}
+                    activeChatName={chat?.name}
+                    groupId={chat?.groupId ?? null}
+                    variant="roleplay"
+                  />
                   <ToolbarMenu>
                     <SummaryButton
                       chatId={chat?.id ?? null}
@@ -832,64 +881,83 @@ export function ChatRoleplaySurface({
                         chatId={chat.id}
                         characterCount={chatCharIds.length}
                         layout="top"
+                        isStreaming={isStreaming}
                         onRetriggerTrackers={onRerunTrackers}
                         onRetryFailedAgents={onRetryFailedAgents}
+                        onRerunSingleTracker={onRerunSingleTracker}
                         enabledAgentTypes={enabledAgentTypes}
                         manualTrackers={!!chatMeta.manualTrackers}
                         mobileCompact
+                        injectionSourceMessages={messages}
                       />
                     </Suspense>
-                    <ToolbarMenu>
-                      <SummaryButton
-                        chatId={chat?.id ?? null}
-                        summary={chatMeta.summary ?? null}
-                        summaryContextSize={summaryContextSize}
-                        onContextSizeChange={onSummaryContextSizeChange}
-                      />
-                      <WorldInfoButton chatId={chat?.id ?? null} />
-                      <AuthorNotesButton chatId={chat?.id ?? null} chatMeta={chatMeta} />
-                      <RpToolbarButton
-                        icon={<FolderOpen size="0.875rem" />}
-                        title="Manage Chat Files"
-                        onClick={onOpenFiles}
-                      />
-                      {expressionAgentEnabled && spriteCharacterIds.length > 0 && (
-                        <RpToolbarButton
-                          icon={<Move size="0.875rem" />}
-                          title={spriteArrangeMode ? "Finish arranging sprites" : "Arrange sprites"}
-                          onClick={onToggleSpriteArrange}
+                    <div className="flex items-center gap-1.5">
+                      <ToolbarMenu>
+                        <ChatBranchSelector
+                          activeChatId={activeChatId}
+                          activeChatName={chat?.name}
+                          groupId={chat?.groupId ?? null}
+                          variant="roleplay"
+                          compact
                         />
-                      )}
-                      {expressionAgentEnabled && spriteCharacterIds.length > 0 && (
-                        <RpToolbarButton
-                          icon={<FlipHorizontal2 size="0.875rem" />}
-                          title={
-                            hasCustomSpritePlacements
-                              ? `Mirror sprites to the ${spritePosition === "left" ? "right" : "left"}`
-                              : `Sprite default side: ${spritePosition}`
-                          }
-                          onClick={onToggleSpritePosition}
+                        <SummaryButton
+                          chatId={chat?.id ?? null}
+                          summary={chatMeta.summary ?? null}
+                          summaryContextSize={summaryContextSize}
+                          onContextSizeChange={onSummaryContextSizeChange}
                         />
-                      )}
-                      <RpToolbarButton icon={<Image size="0.875rem" />} title="Gallery" onClick={onOpenGallery} />
-                      {chat?.connectedChatId && (
+                        <WorldInfoButton chatId={chat?.id ?? null} />
+                        <AuthorNotesButton chatId={chat?.id ?? null} chatMeta={chatMeta} />
                         <RpToolbarButton
-                          icon={<ArrowRightLeft size="0.875rem" />}
-                          title={linkedChatName ? `Switch to ${linkedChatName}` : "Connected chat"}
-                          onClick={() => useChatStore.getState().setActiveChatId(chat.connectedChatId!)}
+                          icon={<FolderOpen size="0.875rem" />}
+                          title="Manage Chat Files"
+                          onClick={onOpenFiles}
                         />
-                      )}
-                      <RpToolbarButton
-                        icon={<Settings2 size="0.875rem" />}
-                        title="Chat Settings"
-                        onClick={onOpenSettings}
-                      />
-                    </ToolbarMenu>
+                        {expressionAgentEnabled && spriteCharacterIds.length > 0 && (
+                          <RpToolbarButton
+                            icon={<Move size="0.875rem" />}
+                            title={spriteArrangeMode ? "Finish arranging sprites" : "Arrange sprites"}
+                            onClick={onToggleSpriteArrange}
+                          />
+                        )}
+                        {expressionAgentEnabled && spriteCharacterIds.length > 0 && (
+                          <RpToolbarButton
+                            icon={<FlipHorizontal2 size="0.875rem" />}
+                            title={
+                              hasCustomSpritePlacements
+                                ? `Mirror sprites to the ${spritePosition === "left" ? "right" : "left"}`
+                                : `Sprite default side: ${spritePosition}`
+                            }
+                            onClick={onToggleSpritePosition}
+                          />
+                        )}
+                        <RpToolbarButton icon={<Image size="0.875rem" />} title="Gallery" onClick={onOpenGallery} />
+                        {chat?.connectedChatId && (
+                          <RpToolbarButton
+                            icon={<ArrowRightLeft size="0.875rem" />}
+                            title={linkedChatName ? `Switch to ${linkedChatName}` : "Connected chat"}
+                            onClick={() => useChatStore.getState().setActiveChatId(chat.connectedChatId!)}
+                          />
+                        )}
+                        <RpToolbarButton
+                          icon={<Settings2 size="0.875rem" />}
+                          title="Chat Settings"
+                          onClick={onOpenSettings}
+                        />
+                      </ToolbarMenu>
+                    </div>
                   </div>
                 )}
                 {chat && !chatMeta.enableAgents && (
                   <div className="flex w-full items-center justify-end gap-1.5 px-2 pb-1 pt-2">
                     <ToolbarMenu>
+                      <ChatBranchSelector
+                        activeChatId={activeChatId}
+                        activeChatName={chat?.name}
+                        groupId={chat?.groupId ?? null}
+                        variant="roleplay"
+                        compact
+                      />
                       <SummaryButton
                         chatId={chat?.id ?? null}
                         summary={chatMeta.summary ?? null}
@@ -942,7 +1010,7 @@ export function ChatRoleplaySurface({
                     <button
                       onClick={onLoadMore}
                       disabled={isFetchingNextPage}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-foreground/10 bg-black/40 px-3 py-1.5 text-xs font-medium text-foreground/70 backdrop-blur-sm transition-all hover:bg-foreground/10 hover:text-foreground/90 disabled:opacity-50"
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-foreground/10 bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-foreground/70 backdrop-blur-sm transition-all hover:bg-[var(--accent)] hover:text-foreground/90 disabled:opacity-50"
                     >
                       {isFetchingNextPage ? (
                         <Loader2 size="0.75rem" className="animate-spin" />
@@ -956,11 +1024,12 @@ export function ChatRoleplaySurface({
 
                 {isLoading && (
                   <div className="flex flex-col items-center gap-3 py-12">
-                    <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/60" />
+                    <div className="h-8 w-8 animate-spin rounded-full border-2 border-foreground/20 border-t-white/60" />
                   </div>
                 )}
 
                 {messages?.map((msg, i) => {
+                  if (isHiddenFromUser(msg)) return null;
                   const isRegenerating = isStreaming && regenerateMessageId === msg.id;
                   return (
                     <div
@@ -980,8 +1049,11 @@ export function ChatRoleplaySurface({
                           onEdit={onEdit}
                           onSetActiveSwipe={onSetActiveSwipe}
                           onToggleConversationStart={onToggleConversationStart}
+                          onToggleHiddenFromAI={onToggleHiddenFromAI}
                           onPeekPrompt={onPeekPrompt}
                           onBranch={onBranch}
+                          onCloneSceneFromHere={onCloneSceneFromHere}
+                          isCloneSceneFromHereDisabled={isCloneSceneFromHereDisabled}
                           isLastAssistantMessage={msg.id === lastAssistantMessageId}
                           characterMap={characterMap}
                           personaInfo={personaInfo}
@@ -1005,8 +1077,11 @@ export function ChatRoleplaySurface({
                           onEdit={onEdit}
                           onSetActiveSwipe={onSetActiveSwipe}
                           onToggleConversationStart={onToggleConversationStart}
+                          onToggleHiddenFromAI={onToggleHiddenFromAI}
                           onPeekPrompt={onPeekPrompt}
                           onBranch={onBranch}
+                          onCloneSceneFromHere={onCloneSceneFromHere}
+                          isCloneSceneFromHereDisabled={isCloneSceneFromHereDisabled}
                           isLastAssistantMessage={msg.id === lastAssistantMessageId}
                           characterMap={characterMap}
                           personaInfo={personaInfo}
@@ -1051,6 +1126,8 @@ export function ChatRoleplaySurface({
                     originChatId={chatMeta.sceneOriginChatId}
                     onConclude={onConcludeScene}
                     onAbandon={onAbandonScene}
+                    onFork={onForkScene}
+                    isForking={isForkingScene}
                   />
                 )}
                 {combatAgentEnabled && (
@@ -1066,6 +1143,7 @@ export function ChatRoleplaySurface({
                   </div>
                 )}
                 <ChatInput
+                  key={activeChatId}
                   mode={isRoleplay ? "roleplay" : "conversation"}
                   characterNames={characterNames}
                   groupResponseOrder={
@@ -1075,12 +1153,20 @@ export function ChatRoleplaySurface({
                   }
                   chatCharacters={
                     chatCharIds.length > 1
-                      ? chatCharIds.map((id) => {
-                          const info = characterMap.get(id);
-                          return { id, name: info?.name ?? "Unknown", avatarUrl: info?.avatarUrl ?? null };
-                        })
+                      ? chatCharIds
+                          .filter((id) => characterMap.has(id))
+                          .map((id) => {
+                            const info = characterMap.get(id)!;
+                            return {
+                              id,
+                              name: info.name,
+                              avatarUrl: info.avatarUrl ?? null,
+                              avatarCrop: info.avatarCrop ?? null,
+                            };
+                          })
                       : undefined
                   }
+                  onPeekPrompt={onPeekPrompt}
                 />
               </div>
             </div>

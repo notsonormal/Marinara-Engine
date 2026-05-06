@@ -7,6 +7,16 @@ export interface MacroContext {
   char: string;
   /** All characters in the chat */
   characters: string[];
+  /** Full per-character card fields for grouped macro expansion */
+  characterProfiles?: Array<{
+    name: string;
+    description?: string;
+    personality?: string;
+    backstory?: string;
+    appearance?: string;
+    scenario?: string;
+    example?: string;
+  }>;
   /** Custom variables from prompt toggle groups */
   variables: Record<string, string>;
   /** Last user input message (for {{input}}) */
@@ -17,6 +27,27 @@ export interface MacroContext {
   model?: string;
   /** Agent data keyed by agent type (for {{agent::TYPE}}) */
   agentData?: Record<string, string>;
+  /** Current character card fields used by macros like {{description}} */
+  characterFields?: {
+    description?: string;
+    personality?: string;
+    backstory?: string;
+    appearance?: string;
+    scenario?: string;
+    example?: string;
+  };
+  /** Active persona card fields used by {{persona}} */
+  personaFields?: {
+    description?: string;
+    personality?: string;
+    backstory?: string;
+    appearance?: string;
+    scenario?: string;
+  };
+}
+
+export interface ResolveMacroOptions {
+  trimResult?: boolean;
 }
 
 export interface SupportedMacroDefinition {
@@ -25,10 +56,26 @@ export interface SupportedMacroDefinition {
   description: string;
 }
 
+const CHARACTER_MACRO_PATTERN =
+  /\{\{(?:char|charName|description|personality|backstory|appearance|scenario|example)\}\}/i;
+
 export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
-  { category: "Identity", syntax: "{{user}} / {{persona}}", description: "Current user or persona name" },
+  { category: "Identity", syntax: "{{user}}", description: "Current user or persona name" },
+  { category: "Identity", syntax: "{{userName}}", description: "Alias for {{user}}" },
+  {
+    category: "Identity",
+    syntax: "{{persona}}",
+    description: "Active persona description, personality, backstory, appearance, and scenario joined by new lines",
+  },
   { category: "Identity", syntax: "{{char}}", description: "Current character name" },
+  { category: "Identity", syntax: "{{charName}}", description: "Alias for {{char}}" },
   { category: "Identity", syntax: "{{characters}}", description: "All character names, comma-separated" },
+  { category: "Character", syntax: "{{description}}", description: "Current character description" },
+  { category: "Character", syntax: "{{personality}}", description: "Current character personality" },
+  { category: "Character", syntax: "{{backstory}}", description: "Current character backstory" },
+  { category: "Character", syntax: "{{appearance}}", description: "Current character appearance" },
+  { category: "Character", syntax: "{{scenario}}", description: "Current character scenario" },
+  { category: "Character", syntax: "{{example}}", description: "Current character example dialogue" },
   { category: "Context", syntax: "{{input}}", description: "Most recent user message" },
   { category: "Context", syntax: "{{model}}", description: "Current model name" },
   { category: "Context", syntax: "{{chatId}}", description: "Current chat ID" },
@@ -39,6 +86,7 @@ export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
   { category: "Time", syntax: "{{weekday}}", description: "Current weekday name" },
   { category: "Random", syntax: "{{random}}", description: "Random number from 0 to 100" },
   { category: "Random", syntax: "{{random:X:Y}}", description: "Random number between X and Y" },
+  { category: "Random", syntax: "{{random::A::B::C}}", description: "Randomly choose one of the provided options" },
   { category: "Random", syntax: "{{roll:XdY}}", description: "Dice roll total such as 2d6" },
   { category: "Variables", syntax: "{{getvar::name}}", description: "Read a dynamic variable" },
   { category: "Variables", syntax: "{{setvar::name::value}}", description: "Set a dynamic variable" },
@@ -75,13 +123,76 @@ export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
   },
 ];
 
+function resolveCharacterScopedMacros(
+  template: string,
+  profile: NonNullable<MacroContext["characterProfiles"]>[number],
+): string {
+  return template
+    .replace(/\{\{char(?:Name)?\}\}/gi, profile.name)
+    .replace(/\{\{description\}\}/gi, profile.description ?? "")
+    .replace(/\{\{personality\}\}/gi, profile.personality ?? "")
+    .replace(/\{\{backstory\}\}/gi, profile.backstory ?? "")
+    .replace(/\{\{appearance\}\}/gi, profile.appearance ?? "")
+    .replace(/\{\{scenario\}\}/gi, profile.scenario ?? "")
+    .replace(/\{\{example\}\}/gi, profile.example ?? "");
+}
+
+function expandBracketedCharacterBlocks(template: string, ctx: MacroContext): string {
+  const profiles = ctx.characterProfiles ?? [];
+  if (profiles.length <= 1 || !CHARACTER_MACRO_PATTERN.test(template)) {
+    return template;
+  }
+
+  const lines = template.split(/\r?\n/);
+  const expandedLines: string[] = [];
+  let changed = false;
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    if (line.trim() !== "[") {
+      expandedLines.push(line);
+      continue;
+    }
+
+    let endIndex = index + 1;
+    while (endIndex < lines.length && lines[endIndex]!.trim() !== "]") {
+      endIndex += 1;
+    }
+
+    if (endIndex >= lines.length) {
+      expandedLines.push(line);
+      continue;
+    }
+
+    const block = lines.slice(index, endIndex + 1).join("\n");
+    if (!CHARACTER_MACRO_PATTERN.test(block)) {
+      expandedLines.push(...lines.slice(index, endIndex + 1));
+      index = endIndex;
+      continue;
+    }
+
+    changed = true;
+    expandedLines.push(
+      ...profiles
+        .map((profile) => resolveCharacterScopedMacros(block, profile))
+        .join("\n")
+        .split("\n"),
+    );
+    index = endIndex;
+  }
+
+  return changed ? expandedLines.join("\n") : template;
+}
+
 /**
  * Replace macros in a prompt string with their values.
  *
  * Supported macros (SillyTavern-compatible):
- *  - {{user}} / {{persona}} — user's display name
+ *  - {{user}} — user's display name
+ *  - {{persona}} — active persona description, personality, backstory, appearance, and scenario joined by new lines
  *  - {{char}} — current character name
  *  - {{characters}} — comma-separated list of all character names
+ *  - {{description}} / {{personality}} / {{backstory}} / {{appearance}} / {{scenario}} / {{example}} — current character card fields
  *  - {{date}} — current real date (YYYY-MM-DD)
  *  - {{time}} — current real time (HH:MM)
  *  - {{datetime}} — full ISO datetime string
@@ -89,6 +200,7 @@ export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
  *  - {{isotime}} — ISO timestamp
  *  - {{random}} — random number 0-100
  *  - {{random:X:Y}} — random number X-Y
+ *  - {{random::A::B::C}} — random choice from A, B, C
  *  - {{roll:XdY}} — dice roll (e.g. {{roll:2d6}})
  *  - {{getvar::name}} — read a dynamic variable
  *  - {{setvar::name::value}} — set a variable
@@ -107,21 +219,39 @@ export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
  *  - {{uppercase}}...{{/uppercase}} — convert to uppercase
  *  - {{lowercase}}...{{/lowercase}} — convert to lowercase
  */
-export function resolveMacros(template: string, ctx: MacroContext): string {
+export function resolveMacros(template: string, ctx: MacroContext, options: ResolveMacroOptions = {}): string {
   let result = template;
+  const personaText = [
+    ctx.personaFields?.description,
+    ctx.personaFields?.personality,
+    ctx.personaFields?.backstory,
+    ctx.personaFields?.appearance,
+    ctx.personaFields?.scenario,
+  ]
+    .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
+    .join("\n");
 
   // ── Comments — strip first so they don't interfere ──
   result = result.replace(/\{\{\/\/[^}]*\}\}/g, "");
+
+  // ── Multi-character bracket blocks — expand before global substitutions ──
+  result = expandBracketedCharacterBlocks(result, ctx);
 
   // ── No-op & banned ──
   result = result.replace(/\{\{noop\}\}/gi, "");
   result = result.replace(/\{\{banned\s+"[^"]*"\}\}/gi, "");
 
   // ── Static substitutions ──
-  result = result.replace(/\{\{user\}\}/gi, ctx.user);
-  result = result.replace(/\{\{persona\}\}/gi, ctx.user);
-  result = result.replace(/\{\{char\}\}/gi, ctx.char);
+  result = result.replace(/\{\{user(?:Name)?\}\}/gi, ctx.user);
+  result = result.replace(/\{\{persona\}\}/gi, personaText);
+  result = result.replace(/\{\{char(?:Name)?\}\}/gi, ctx.char);
   result = result.replace(/\{\{characters\}\}/gi, ctx.characters.join(", "));
+  result = result.replace(/\{\{description\}\}/gi, ctx.characterFields?.description ?? "");
+  result = result.replace(/\{\{personality\}\}/gi, ctx.characterFields?.personality ?? "");
+  result = result.replace(/\{\{backstory\}\}/gi, ctx.characterFields?.backstory ?? "");
+  result = result.replace(/\{\{appearance\}\}/gi, ctx.characterFields?.appearance ?? "");
+  result = result.replace(/\{\{scenario\}\}/gi, ctx.characterFields?.scenario ?? "");
+  result = result.replace(/\{\{example\}\}/gi, ctx.characterFields?.example ?? "");
   result = result.replace(/\{\{input\}\}/gi, ctx.lastInput ?? "");
   result = result.replace(/\{\{model\}\}/gi, ctx.model ?? "");
   result = result.replace(/\{\{chatId\}\}/gi, ctx.chatId ?? "");
@@ -139,8 +269,16 @@ export function resolveMacros(template: string, ctx: MacroContext): string {
   result = result.replace(/\{\{isotime\}\}/gi, now.toISOString());
   result = result.replace(/\{\{weekday\}\}/gi, now.toLocaleDateString("en-US", { weekday: "long" }));
 
-  // ── Random numbers ──
+  // ── Random values ──
   result = result.replace(/\{\{random\}\}/gi, () => String(Math.floor(Math.random() * 101)));
+  result = result.replace(/\{\{random::([^}]*)\}\}/gi, (_, body) => {
+    const choices = String(body)
+      .split("::")
+      .map((choice) => choice.trim())
+      .filter(Boolean);
+    if (choices.length === 0) return "";
+    return choices[Math.floor(Math.random() * choices.length)] ?? "";
+  });
   result = result.replace(/\{\{random:(\d+):(\d+)\}\}/gi, (_, min, max) => {
     const lo = parseInt(min, 10);
     const hi = parseInt(max, 10);
@@ -156,26 +294,32 @@ export function resolveMacros(template: string, ctx: MacroContext): string {
     return String(total);
   });
 
-  // ── Variable operations ──
-  result = result.replace(/\{\{getvar::(\w+)\}\}/gi, (_, name) => {
-    return ctx.variables[name] ?? "";
-  });
-  result = result.replace(/\{\{setvar::(\w+)::([^}]*)\}\}/gi, (_, name, val) => {
-    ctx.variables[name] = val;
-    return "";
-  });
-  result = result.replace(/\{\{addvar::(\w+)::([^}]*)\}\}/gi, (_, name, val) => {
-    ctx.variables[name] = (ctx.variables[name] ?? "") + val;
-    return "";
-  });
-  result = result.replace(/\{\{incvar::(\w+)\}\}/gi, (_, name) => {
-    ctx.variables[name] = String((parseInt(ctx.variables[name] ?? "0", 10) || 0) + 1);
-    return "";
-  });
-  result = result.replace(/\{\{decvar::(\w+)\}\}/gi, (_, name) => {
-    ctx.variables[name] = String((parseInt(ctx.variables[name] ?? "0", 10) || 0) - 1);
-    return "";
-  });
+  // ── Variable operations — resolve left-to-right so lorebook entries can set values for later entries. ──
+  result = result.replace(
+    /\{\{(?:(getvar|incvar|decvar)::([\w.-]+)|(setvar|addvar)::([\w.-]+)::([^}]*))\}\}/gi,
+    (_, readOp, readName, writeOp, writeName, val) => {
+      const op = String(readOp ?? writeOp).toLowerCase();
+      const name = String(readName ?? writeName);
+      switch (op) {
+        case "getvar":
+          return ctx.variables[name] ?? "";
+        case "setvar":
+          ctx.variables[name] = val ?? "";
+          return "";
+        case "addvar":
+          ctx.variables[name] = (ctx.variables[name] ?? "") + (val ?? "");
+          return "";
+        case "incvar":
+          ctx.variables[name] = String((parseInt(ctx.variables[name] ?? "0", 10) || 0) + 1);
+          return "";
+        case "decvar":
+          ctx.variables[name] = String((parseInt(ctx.variables[name] ?? "0", 10) || 0) - 1);
+          return "";
+        default:
+          return "";
+      }
+    },
+  );
 
   // ── Case transforms ──
   result = result.replace(/\{\{uppercase\}\}([\s\S]*?)\{\{\/uppercase\}\}/gi, (_, inner) =>
@@ -209,7 +353,9 @@ export function resolveMacros(template: string, ctx: MacroContext): string {
     return val !== undefined ? val : match; // leave unknown macros as-is
   });
 
-  result = result.trim();
+  if (options.trimResult !== false) {
+    result = result.trim();
+  }
 
   return result;
 }

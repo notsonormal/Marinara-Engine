@@ -3,11 +3,13 @@
 // ──────────────────────────────────────────────
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api-client";
+import type { CharacterCardVersion } from "@marinara-engine/shared";
 
 export const characterKeys = {
   all: ["characters"] as const,
   list: () => [...characterKeys.all, "list"] as const,
   detail: (id: string) => [...characterKeys.all, "detail", id] as const,
+  versions: (id: string) => [...characterKeys.detail(id), "versions"] as const,
   gallery: (id: string) => [...characterKeys.all, "gallery", id] as const,
   personas: ["personas"] as const,
   groups: ["character-groups"] as const,
@@ -46,11 +48,55 @@ export function useCreateCharacter() {
 export function useUpdateCharacter() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, ...data }: { id: string; data?: Record<string, unknown>; avatarPath?: string }) =>
-      api.patch(`/characters/${id}`, data),
+    mutationFn: ({
+      id,
+      ...data
+    }: {
+      id: string;
+      data?: Record<string, unknown>;
+      avatarPath?: string;
+      comment?: string;
+      versionSource?: string;
+      versionReason?: string;
+      skipVersionSnapshot?: boolean;
+    }) => api.patch(`/characters/${id}`, data),
     onSuccess: (_data, variables) => {
       qc.invalidateQueries({ queryKey: characterKeys.list() });
       qc.invalidateQueries({ queryKey: characterKeys.detail(variables.id) });
+      qc.invalidateQueries({ queryKey: characterKeys.versions(variables.id) });
+    },
+  });
+}
+
+export function useCharacterVersions(id: string | null) {
+  return useQuery({
+    queryKey: characterKeys.versions(id ?? ""),
+    queryFn: () => api.get<CharacterCardVersion[]>(`/characters/${id}/versions`),
+    enabled: !!id,
+    staleTime: 60_000,
+  });
+}
+
+export function useRestoreCharacterVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, versionId }: { id: string; versionId: string }) =>
+      api.post(`/characters/${id}/versions/${versionId}/restore`, {}),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: characterKeys.list() });
+      qc.invalidateQueries({ queryKey: characterKeys.detail(variables.id) });
+      qc.invalidateQueries({ queryKey: characterKeys.versions(variables.id) });
+    },
+  });
+}
+
+export function useDeleteCharacterVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, versionId }: { id: string; versionId: string }) =>
+      api.delete(`/characters/${id}/versions/${versionId}`),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: characterKeys.versions(variables.id) });
     },
   });
 }
@@ -165,9 +211,31 @@ export function useCharacterGalleryImages(characterId: string | null) {
 export function useUploadCharacterGalleryImage(characterId: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (formData: FormData) =>
-      api.upload<CharacterGalleryImage>(`/characters/${characterId}/gallery/upload`, formData),
-    onSuccess: () => {
+    mutationFn: async (files: File[]) => {
+      const uploads = await Promise.allSettled(
+        files.map((file) => {
+          const formData = new FormData();
+          formData.append("file", file);
+          return api.upload<CharacterGalleryImage>(`/characters/${characterId}/gallery/upload`, formData);
+        }),
+      );
+
+      const successfulUploads = uploads.filter(
+        (result): result is PromiseFulfilledResult<CharacterGalleryImage> => result.status === "fulfilled",
+      );
+
+      if (successfulUploads.length !== uploads.length) {
+        const failedCount = uploads.length - successfulUploads.length;
+        throw new Error(
+          failedCount === 1
+            ? "One character gallery image failed to upload."
+            : `${failedCount} character gallery images failed to upload.`,
+        );
+      }
+
+      return successfulUploads.map((result) => result.value);
+    },
+    onSettled: () => {
       qc.invalidateQueries({ queryKey: characterKeys.gallery(characterId) });
     },
   });
@@ -237,7 +305,22 @@ export function useUpdatePersona() {
       altDescriptions?: string;
       tags?: string;
     }) => api.patch(`/characters/personas/${id}`, data),
-    onSuccess: () => qc.invalidateQueries({ queryKey: characterKeys.personas }),
+    onSuccess: (updatedPersona, variables) => {
+      qc.setQueryData<unknown[] | undefined>(characterKeys.personas, (old) => {
+        if (!Array.isArray(old)) return old;
+        const updatedId = (updatedPersona as { id?: string } | null)?.id ?? variables.id;
+        if (!updatedId) return old;
+
+        return old.map((p) => {
+          const row = p as Record<string, unknown> & { id?: string };
+          if (row?.id !== updatedId) return p;
+          if (!updatedPersona || typeof updatedPersona !== "object") return p;
+          return { ...row, ...(updatedPersona as Record<string, unknown>) };
+        });
+      });
+
+      qc.invalidateQueries({ queryKey: characterKeys.personas });
+    },
   });
 }
 

@@ -11,9 +11,9 @@ export class LocalSidecarProvider extends BaseLLMProvider {
   }
 
   private async createDelegate(): Promise<OpenAIProvider> {
-    const baseUrl = await sidecarProcessService.ensureReady(true);
+    const baseUrl = await sidecarProcessService.ensureReady({ forceStart: true });
     const contextSize = sidecarModelService.getConfig().contextSize;
-    return new OpenAIProvider(`${baseUrl}/v1`, "local-sidecar", contextSize, null);
+    return new OpenAIProvider(`${baseUrl}/v1`, "local-sidecar", contextSize, null, null, "local-sidecar");
   }
 
   private getRequestModel(): string {
@@ -23,10 +23,25 @@ export class LocalSidecarProvider extends BaseLLMProvider {
     );
   }
 
+  private applyRuntimeSettings(options: ChatOptions): ChatOptions {
+    const config = sidecarModelService.getConfig();
+    const requestedMaxTokens =
+      typeof options.maxTokens === "number" && Number.isFinite(options.maxTokens)
+        ? Math.max(1, Math.floor(options.maxTokens))
+        : undefined;
+    return {
+      ...options,
+      maxTokens: requestedMaxTokens !== undefined ? Math.min(requestedMaxTokens, config.maxTokens) : config.maxTokens,
+      temperature: config.temperature,
+      topP: config.topP,
+      topK: config.topK,
+    };
+  }
+
   async *chat(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<string, LLMUsage | void, unknown> {
     const delegate = await this.createDelegate();
     return yield* delegate.chat(messages, {
-      ...options,
+      ...this.applyRuntimeSettings(options),
       model: this.getRequestModel(),
     });
   }
@@ -34,7 +49,7 @@ export class LocalSidecarProvider extends BaseLLMProvider {
   async chatComplete(messages: ChatMessage[], options: ChatOptions): Promise<ChatCompletionResult> {
     const delegate = await this.createDelegate();
     return delegate.chatComplete(messages, {
-      ...options,
+      ...this.applyRuntimeSettings(options),
       model: this.getRequestModel(),
     });
   }

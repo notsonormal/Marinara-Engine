@@ -35,8 +35,10 @@ import { useCharacters, usePersonas } from "../../hooks/use-characters";
 import { useConnections } from "../../hooks/use-connections";
 import { usePageActivity } from "../../hooks/use-page-activity";
 import { api } from "../../lib/api-client";
+import { parseCharacterDisplayData } from "../../lib/character-display";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { useGameStateStore } from "../../stores/game-state.store";
+import { toast } from "sonner";
 import { BookOpen, HelpCircle, MessageSquare, Theater } from "lucide-react";
 import type { SpritePlacement, SpriteSide } from "@marinara-engine/shared";
 import { useUIStore } from "../../stores/ui.store";
@@ -48,13 +50,58 @@ import { useEncounterStore } from "../../stores/encounter.store";
 import { APP_VERSION } from "@marinara-engine/shared";
 import { BUILT_IN_AGENTS } from "@marinara-engine/shared";
 import { useTranslationStore } from "../../stores/translation.store";
+import { ttsService } from "../../lib/tts-service";
+import { useTTSConfig } from "../../hooks/use-tts";
+import { buildTTSMessageText, resolveTTSVoiceForSpeaker } from "../../lib/tts-dialogue";
 import { mirrorSpritePlacements, normalizeSpritePlacements } from "./sprite-placement";
 import type { CharacterMap, MessageSelectionToggle, MessageWithSwipes, PeekPromptData } from "./chat-area.types";
 import { RecentChats } from "./RecentChats";
+import { HomeFaq } from "./HomeFaq";
 import { NewChatConnectionGate } from "./NewChatConnectionGate";
 import { ChatCommonOverlays } from "./ChatCommonOverlays";
 
 export type { CharacterMap };
+
+const normalizeSpriteDisplayValue = (value: unknown, fallback: number, min: number, max: number): number => {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(min, Math.min(max, numeric));
+};
+
+const parseMetadataRecord = (raw: unknown): Record<string, any> => {
+  if (!raw) return {};
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return typeof raw === "object" ? (raw as Record<string, any>) : {};
+};
+
+const INTUITIVE_SWIPE_MIN_DISTANCE = 56;
+const INTUITIVE_SWIPE_MAX_VERTICAL_DRIFT = 44;
+
+const shouldIgnoreIntuitiveSwipeTarget = (target: EventTarget | null): boolean => {
+  if (!(target instanceof Element)) return false;
+  return Boolean(
+    target.closest(
+      [
+        "input",
+        "textarea",
+        "select",
+        "button",
+        "a",
+        '[contenteditable="true"]',
+        '[role="button"]',
+        "[data-radix-popper-content-wrapper]",
+        "[data-no-intuitive-swipe]",
+      ].join(", "),
+    ),
+  );
+};
 
 const ChatConversationSurface = lazy(async () => {
   const module = await import("./ChatConversationSurface");
@@ -78,14 +125,19 @@ export function ChatArea() {
   const isStreaming = isStreamingGlobal && streamingChatId === activeChatId;
   const isPageActive = usePageActivity();
   const regenerateMessageId = useChatStore((s) => s.regenerateMessageId);
+  const currentInput = useChatStore((s) => s.currentInput);
   const chatBackground = useUIStore((s) => s.chatBackground);
   const weatherEffects = useUIStore((s) => s.weatherEffects);
   const messagesPerPage = useUIStore((s) => s.messagesPerPage);
   const centerCompact = useUIStore((s) => s.centerCompact);
+  const guideGenerations = useUIStore((s) => s.guideGenerations);
+  const intuitiveSwipeNavigation = useUIStore((s) => s.intuitiveSwipeNavigation);
+  const intuitiveSwipeRerollLatest = useUIStore((s) => s.intuitiveSwipeRerollLatest);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const prevScrollHeightRef = useRef(0);
   const isLoadingMoreRef = useRef(false);
+  const intuitiveTouchStartRef = useRef<{ x: number; y: number; target: EventTarget | null } | null>(null);
   // Tracks whether the initial load stagger animation has played.
   // After the first render with messages, new/re-mounted messages
   // skip the entry animation to avoid a visible flash on refetch.
@@ -107,19 +159,27 @@ export function ChatArea() {
   // Game mode loads ALL messages (no pagination) so the in-game log
   // shows the full session history instead of only the latest page.
   const isGameChat = (chat as unknown as { mode?: string })?.mode === "game";
+  const messagePageSize = isGameChat ? 0 : messagesPerPage;
   const {
     data: msgData,
     isLoading,
     fetchNextPage,
     hasNextPage,
     isFetchingNextPage,
-  } = useChatMessages(activeChatId, isGameChat ? 0 : messagesPerPage);
+    refetch: refetchMessages,
+  } = useChatMessages(activeChatId, messagePageSize, !!chat);
   const messages = useMemo<MessageWithSwipes[] | undefined>(
     () => (msgData ? [...msgData.pages].reverse().flat() : undefined),
     [msgData],
   );
   const { data: messageCountData } = useChatMessageCount(activeChatId);
   const totalMessageCount = messageCountData?.count ?? messages?.length ?? 0;
+  const loadedMessageCount = messages?.length ?? 0;
+  useEffect(() => {
+    if (!isGameChat || loadedMessageCount <= 0) return;
+    if (totalMessageCount <= loadedMessageCount) return;
+    void refetchMessages();
+  }, [isGameChat, loadedMessageCount, refetchMessages, totalMessageCount]);
   const messageOffset = messages ? totalMessageCount - messages.length : 0;
   const messageIdByOrderIndex = useMemo(() => {
     const map = new Map<number, string>();
@@ -187,6 +247,12 @@ export function ChatArea() {
         const parsed = typeof char.data === "string" ? JSON.parse(char.data) : char.data;
         map.set(char.id, {
           name: parsed.name ?? "Unknown",
+          description: parsed.description ?? "",
+          personality: parsed.personality ?? "",
+          backstory: parsed.extensions?.backstory ?? "",
+          appearance: parsed.extensions?.appearance ?? "",
+          scenario: parsed.scenario ?? "",
+          example: parsed.mes_example ?? "",
           avatarUrl: char.avatarPath ?? null,
           nameColor: parsed.extensions?.nameColor || undefined,
           dialogueColor: parsed.extensions?.dialogueColor || undefined,
@@ -225,6 +291,12 @@ export function ChatArea() {
       id: string;
       isActive: string | boolean;
       name: string;
+      description?: string;
+      personality?: string;
+      scenario?: string;
+      backstory?: string;
+      appearance?: string;
+      altDescriptions?: string;
       avatarPath?: string | null;
       nameColor?: string;
       dialogueColor?: string;
@@ -238,8 +310,26 @@ export function ChatArea() {
       (chatPersonaId ? personas.find((p) => p.id === chatPersonaId) : null) ??
       (!isGame ? personas.find((p) => p.isActive === "true" || p.isActive === true) : null);
     if (!persona) return undefined;
+    let description = persona.description ?? "";
+    if (persona.altDescriptions) {
+      try {
+        const altDescriptions = JSON.parse(persona.altDescriptions) as Array<{ active?: boolean; content?: string }>;
+        for (const altDescription of altDescriptions) {
+          if (altDescription?.active && typeof altDescription.content === "string" && altDescription.content.trim()) {
+            description = [description, altDescription.content.trim()].filter(Boolean).join("\n");
+          }
+        }
+      } catch {
+        /* ignore malformed JSON */
+      }
+    }
     return {
       name: persona.name,
+      description,
+      personality: persona.personality || undefined,
+      scenario: persona.scenario || undefined,
+      backstory: persona.backstory || undefined,
+      appearance: persona.appearance || undefined,
       avatarUrl: persona.avatarPath || undefined,
       nameColor: persona.nameColor || undefined,
       dialogueColor: persona.dialogueColor || undefined,
@@ -256,17 +346,19 @@ export function ChatArea() {
   const chatMode = rawMode ?? lastModeRef.current;
   const isRoleplay = chatMode === "roleplay" || chatMode === "visual_novel";
   const { startEncounter } = useEncounter();
-  const { concludeScene, abandonScene } = useScene();
+  const { concludeScene, abandonScene, forkScene, isForking } = useScene();
   const encounterActive = useEncounterStore((s) => s.active || s.showConfigModal);
 
   // Sprite sidebar settings from chat metadata
   const chatMeta = useMemo(() => {
     if (!chat) return {};
     const raw = (chat as unknown as { metadata?: string | Record<string, unknown> }).metadata;
-    return typeof raw === "string" ? JSON.parse(raw) : (raw ?? {});
+    return parseMetadataRecord(raw);
   }, [chat]);
   const spriteCharacterIds: string[] = Array.isArray(chatMeta.spriteCharacterIds) ? chatMeta.spriteCharacterIds : [];
   const spritePosition: SpriteSide = chatMeta.spritePosition === "right" ? "right" : "left";
+  const spriteScale = normalizeSpriteDisplayValue(chatMeta.spriteScale, 1, 0.5, 1.75);
+  const spriteOpacity = normalizeSpriteDisplayValue(chatMeta.spriteOpacity, 1, 0.15, 1);
   const spritePlacements = useMemo(
     () => normalizeSpritePlacements(chatMeta.spritePlacements),
     [chatMeta.spritePlacements],
@@ -337,27 +429,41 @@ export function ChatArea() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id, msgPageCount]);
 
-  // Restore per-chat background from metadata when switching chats.
-  // If the new chat has a saved background, apply it; otherwise keep the current
-  // background so newly-created chats don't flash to black.
+  // Sync chat background from metadata when switching chats. Set the UI store
+  // to whatever the chat's metadata says — including null. The previous version
+  // only set on truthy values, leaving the global chatBackground stale when
+  // switching to a chat whose metadata has been cleared, which made a removed
+  // background re-appear after a chat switch round-trip.
   useEffect(() => {
-    const bg = chatMeta.background as string | undefined;
-    if (bg) {
-      useUIStore.getState().setChatBackground(`/api/backgrounds/file/${encodeURIComponent(bg)}`);
-    }
+    if (!chat?.id) return;
+    const bg = chatMeta.background as string | null | undefined;
+    useUIStore.getState().setChatBackground(bg ? `/api/backgrounds/file/${encodeURIComponent(bg)}` : null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id]);
 
   // Persist background choice to chat metadata so it survives page refresh.
   // Catches all sources: manual picker, background agent, scene commands, slash commands.
-  // Only persist non-null backgrounds — never write null to metadata (avoids wiping
-  // the user's background when opening a new chat that hasn't had one set yet).
+  // When the user clears the background, we must persist null so the removal
+  // sticks across chat switches; otherwise the restore effect re-applies the
+  // stale saved background. We only write null when metadata already had a
+  // background — that way a global UI background carried over from a previous
+  // chat doesn't pollute a fresh chat's metadata on switch.
   const bgPersistTimer = useRef<ReturnType<typeof setTimeout>>(null);
   useEffect(() => {
-    if (!chat?.id || !chatBackground) return;
+    if (!chat?.id) return;
+    const savedFilename = (chatMeta.background as string | null | undefined) ?? null;
+
+    if (!chatBackground) {
+      if (savedFilename === null) return;
+      if (bgPersistTimer.current) clearTimeout(bgPersistTimer.current);
+      bgPersistTimer.current = setTimeout(() => {
+        updateMeta.mutate({ id: chat!.id, background: null });
+      }, 500);
+      return;
+    }
+
     const filename = decodeURIComponent(chatBackground.replace(/^\/api\/backgrounds\/file\//, ""));
-    // Skip if metadata already matches (avoids pointless writes on restore)
-    if (filename === (chatMeta.background ?? null)) return;
+    if (filename === savedFilename) return;
     if (bgPersistTimer.current) clearTimeout(bgPersistTimer.current);
     bgPersistTimer.current = setTimeout(() => {
       updateMeta.mutate({ id: chat!.id, background: filename });
@@ -602,11 +708,12 @@ export function ChatArea() {
   }, [messages]);
 
   const handleRegenerate = useCallback(
-    async (messageId: string) => {
+    async (messageId: string, options?: { skipTouchConfirm?: boolean }) => {
       if (!activeChatId || isStreaming) return;
       // On touch devices, confirm to prevent accidental taps
       if (
-        matchMedia("(pointer: coarse)").matches &&
+        !options?.skipTouchConfirm &&
+        window.matchMedia("(pointer: coarse)").matches &&
         !(await showConfirmDialog({
           title: "Regenerate Message",
           message: "Regenerate this message as a new swipe?",
@@ -617,12 +724,22 @@ export function ChatArea() {
       }
       try {
         // Regenerate as a new swipe on the existing message
-        await generate({ chatId: activeChatId, connectionId: null, regenerateMessageId: messageId });
+        const hasInput = currentInput ? currentInput.trim().length > 0 : false;
+        await generate(
+          guideGenerations && hasInput
+            ? {
+                chatId: activeChatId,
+                connectionId: null,
+                regenerateMessageId: messageId,
+                generationGuide: currentInput?.toString(),
+              }
+            : { chatId: activeChatId, connectionId: null, regenerateMessageId: messageId },
+        );
       } catch {
         // Error toast is shown by the generate hook
       }
     },
-    [activeChatId, isStreaming, generate],
+    [activeChatId, isStreaming, generate, currentInput, guideGenerations],
   );
 
   const _handleRetryAgents = useCallback(async () => {
@@ -637,6 +754,16 @@ export function ChatArea() {
     if (types.length === 0) return;
     await retryAgents(activeChatId, types);
   }, [activeChatId, isStreaming, agentProcessing, enabledAgentTypes, retryAgents]);
+
+  const handleRerunSingleTracker = useCallback(
+    async (agentType: string) => {
+      if (!activeChatId || isStreaming || agentProcessing) return;
+      const trackerIds = new Set(BUILT_IN_AGENTS.filter((a) => a.category === "tracker").map((a) => a.id));
+      if (!trackerIds.has(agentType) || !enabledAgentTypes.has(agentType)) return;
+      await retryAgents(activeChatId, [agentType]);
+    },
+    [activeChatId, isStreaming, agentProcessing, enabledAgentTypes, retryAgents],
+  );
 
   const handleSetActiveSwipe = useCallback(
     (messageId: string, index: number) => {
@@ -674,6 +801,13 @@ export function ChatArea() {
     [updateMessageExtra],
   );
 
+  const handleToggleHiddenFromAI = useCallback(
+    (messageId: string, current: boolean) => {
+      updateMessageExtra.mutate({ messageId, extra: { hiddenFromAI: !current } });
+    },
+    [updateMessageExtra],
+  );
+
   const handleBranch = useCallback(
     (messageId: string) => {
       if (!activeChatId) return;
@@ -687,6 +821,14 @@ export function ChatArea() {
       );
     },
     [activeChatId, branchChat],
+  );
+
+  const handleCloneSceneFromHere = useCallback(
+    (messageId: string) => {
+      if (!activeChatId || isForking || isStreaming) return;
+      forkScene(activeChatId, "clone", { upToMessageId: messageId });
+    },
+    [activeChatId, forkScene, isForking, isStreaming],
   );
 
   // Peek prompt state
@@ -707,6 +849,138 @@ export function ChatArea() {
     }
     return null;
   }, [messages]);
+
+  const latestAssistantMessageForSwipes = useMemo(() => {
+    if (!messages) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const candidate = messages[i]!;
+      if (candidate.role === "assistant") return candidate;
+    }
+    return null;
+  }, [messages]);
+
+  const intuitiveSwipeBlocked =
+    settingsOpen ||
+    filesOpen ||
+    galleryOpen ||
+    wizardOpen ||
+    spriteArrangeMode ||
+    multiSelectMode ||
+    Boolean(deleteDialogMessageId) ||
+    Boolean(peekPromptData) ||
+    encounterActive;
+
+  const navigateLatestSwipe = useCallback(
+    (direction: -1 | 1) => {
+      const supportsMode = chatMode === "conversation" || isRoleplay;
+      if (!supportsMode || !intuitiveSwipeNavigation || intuitiveSwipeBlocked) return false;
+      if (!activeChatId || isStreaming || agentProcessing || !latestAssistantMessageForSwipes) return false;
+
+      const swipeCount = latestAssistantMessageForSwipes.swipeCount ?? 1;
+      const activeIndex = latestAssistantMessageForSwipes.activeSwipeIndex ?? 0;
+
+      if (direction < 0) {
+        if (activeIndex <= 0) return false;
+        handleSetActiveSwipe(latestAssistantMessageForSwipes.id, activeIndex - 1);
+        return true;
+      }
+
+      if (activeIndex < swipeCount - 1) {
+        handleSetActiveSwipe(latestAssistantMessageForSwipes.id, activeIndex + 1);
+        return true;
+      }
+
+      if (!intuitiveSwipeRerollLatest) return false;
+      void handleRegenerate(latestAssistantMessageForSwipes.id, { skipTouchConfirm: true });
+      return true;
+    },
+    [
+      activeChatId,
+      agentProcessing,
+      chatMode,
+      handleRegenerate,
+      handleSetActiveSwipe,
+      intuitiveSwipeBlocked,
+      intuitiveSwipeNavigation,
+      intuitiveSwipeRerollLatest,
+      isRoleplay,
+      isStreaming,
+      latestAssistantMessageForSwipes,
+    ],
+  );
+
+  useEffect(() => {
+    if (!intuitiveSwipeNavigation || intuitiveSwipeBlocked) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      if (shouldIgnoreIntuitiveSwipeTarget(event.target)) return;
+
+      if (event.repeat && event.key === "ArrowRight" && latestAssistantMessageForSwipes) {
+        const swipeCount = latestAssistantMessageForSwipes.swipeCount ?? 1;
+        const activeIndex = latestAssistantMessageForSwipes.activeSwipeIndex ?? 0;
+        if (activeIndex >= swipeCount - 1) return;
+      }
+
+      const handled = navigateLatestSwipe(event.key === "ArrowLeft" ? -1 : 1);
+      if (handled) event.preventDefault();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [intuitiveSwipeBlocked, intuitiveSwipeNavigation, latestAssistantMessageForSwipes, navigateLatestSwipe]);
+
+  useEffect(() => {
+    if (!intuitiveSwipeNavigation || intuitiveSwipeBlocked) return;
+
+    const handleTouchStart = (event: TouchEvent) => {
+      const surface = scrollRef.current;
+      const target = event.target;
+      if (
+        event.touches.length !== 1 ||
+        !surface ||
+        !(target instanceof Node) ||
+        !surface.contains(target) ||
+        shouldIgnoreIntuitiveSwipeTarget(target)
+      ) {
+        intuitiveTouchStartRef.current = null;
+        return;
+      }
+      const touch = event.touches.item(0);
+      if (!touch) return;
+      intuitiveTouchStartRef.current = {
+        x: touch.clientX,
+        y: touch.clientY,
+        target: event.target,
+      };
+    };
+
+    const handleTouchEnd = (event: TouchEvent) => {
+      const start = intuitiveTouchStartRef.current;
+      intuitiveTouchStartRef.current = null;
+      const touch = event.changedTouches.item(0);
+      if (!start || !touch || shouldIgnoreIntuitiveSwipeTarget(start.target)) return;
+
+      const deltaX = touch.clientX - start.x;
+      const deltaY = touch.clientY - start.y;
+      const absX = Math.abs(deltaX);
+      const absY = Math.abs(deltaY);
+      if (absX < INTUITIVE_SWIPE_MIN_DISTANCE || absY > INTUITIVE_SWIPE_MAX_VERTICAL_DRIFT || absX < absY * 1.35) {
+        return;
+      }
+
+      const handled = navigateLatestSwipe(deltaX < 0 ? 1 : -1);
+      if (handled) event.preventDefault();
+    };
+
+    window.addEventListener("touchstart", handleTouchStart, { passive: true });
+    window.addEventListener("touchend", handleTouchEnd, { passive: false });
+    return () => {
+      window.removeEventListener("touchstart", handleTouchStart);
+      window.removeEventListener("touchend", handleTouchEnd);
+    };
+  }, [intuitiveSwipeBlocked, intuitiveSwipeNavigation, navigateLatestSwipe]);
 
   useEffect(() => {
     if (chat) useChatStore.getState().setActiveChat(chat);
@@ -787,6 +1061,48 @@ export function ChatArea() {
     if (!isStreaming) userScrolledAwayRef.current = false;
   }, [isStreaming]);
 
+  // TTS autoplay — speak the last assistant message when streaming ends
+  const { data: ttsConfig } = useTTSConfig();
+  const ttsConfigRef = useRef(ttsConfig);
+  ttsConfigRef.current = ttsConfig;
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const chatModeRef = useRef(chatMode);
+  chatModeRef.current = chatMode;
+  const prevIsStreamingRef = useRef(false);
+  useEffect(() => {
+    const wasStreaming = prevIsStreamingRef.current;
+    prevIsStreamingRef.current = isStreaming;
+    if (!wasStreaming || isStreaming) return; // only fire on true → false transition
+
+    const cfg = ttsConfigRef.current;
+    if (!cfg?.enabled) return;
+
+    const mode = chatModeRef.current;
+    const shouldAutoplay =
+      mode === "roleplay" || mode === "visual_novel" ? cfg.autoplayRP : mode === "game" ? false : cfg.autoplayConvo;
+    if (!shouldAutoplay) return;
+
+    const msgs = messagesRef.current ?? [];
+    let lastMsg: (typeof msgs)[number] | undefined;
+    for (let index = msgs.length - 1; index >= 0; index -= 1) {
+      const candidate = msgs[index];
+      if (candidate.role === "assistant" || candidate.role === "narrator") {
+        lastMsg = candidate;
+        break;
+      }
+    }
+    if (!lastMsg?.content) return;
+
+    const fallbackSpeaker = lastMsg.characterId ? characterMap.get(lastMsg.characterId)?.name : undefined;
+    const ttsText = buildTTSMessageText(lastMsg.content, cfg, fallbackSpeaker);
+    if (!ttsText) return;
+    const ttsVoice = resolveTTSVoiceForSpeaker(cfg, fallbackSpeaker, lastMsg.characterId);
+    if (cfg.source === "elevenlabs" && !ttsVoice) return;
+
+    void ttsService.speak(ttsText, lastMsg.id, { speaker: fallbackSpeaker, voice: ttsVoice });
+  }, [characterMap, isStreaming]);
+
   const newestMsgId = msgData?.pages[0]?.[msgData.pages[0].length - 1]?.id;
   const newestMsgSwipeIndex = msgData?.pages[0]?.[msgData.pages[0].length - 1]?.activeSwipeIndex;
   const isOptimistic = newestMsgId?.startsWith("__optimistic_");
@@ -830,6 +1146,63 @@ export function ChatArea() {
     fetchNextPage();
   }, [fetchNextPage, hasNextPage, isFetchingNextPage]);
 
+  // ── /goto command: paginate older pages until target message is loaded, then scroll to it
+  const gotoRequest = useChatStore((s) => s.gotoRequest);
+  useEffect(() => {
+    if (!gotoRequest || gotoRequest.chatId !== activeChatId) return;
+    if (!messages) return;
+
+    const targetNumber = gotoRequest.messageNumber;
+    if (totalMessageCount > 0 && targetNumber > totalMessageCount) {
+      toast.error(`Message #${targetNumber} doesn't exist — this chat has ${totalMessageCount} messages.`);
+      useChatStore.getState().clearGotoRequest();
+      return;
+    }
+
+    const targetIndex = targetNumber - 1; // 0-based global index
+    if (targetIndex >= messageOffset) {
+      const targetId = messageIdByOrderIndex.get(targetIndex);
+      if (!targetId) {
+        useChatStore.getState().clearGotoRequest();
+        return;
+      }
+      // Wait one frame so newly-loaded messages are painted before scrolling.
+      const raf = requestAnimationFrame(() => {
+        const el = document.querySelector(`[data-message-id="${CSS.escape(targetId)}"]`);
+        if (el instanceof HTMLElement) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          userScrolledAwayRef.current = true; // suppress auto-scroll-to-bottom hijacking the jump
+        }
+        useChatStore.getState().clearGotoRequest();
+      });
+      return () => cancelAnimationFrame(raf);
+    }
+
+    // Target is older than the loaded window — fetch the next (older) page.
+    if (hasNextPage && !isFetchingNextPage) {
+      // Only engage the roleplay-surface scroll-preservation handshake when that
+      // surface is actually mounted; otherwise the flag would be set forever.
+      if (scrollRef.current) {
+        prevScrollHeightRef.current = scrollRef.current.scrollHeight;
+        isLoadingMoreRef.current = true;
+      }
+      fetchNextPage();
+    } else if (!hasNextPage) {
+      // Nothing more to load but we still didn't reach the target — give up.
+      useChatStore.getState().clearGotoRequest();
+    }
+  }, [
+    gotoRequest,
+    activeChatId,
+    messages,
+    messageOffset,
+    messageIdByOrderIndex,
+    totalMessageCount,
+    hasNextPage,
+    isFetchingNextPage,
+    fetchNextPage,
+  ]);
+
   // ═══════════════════════════════════════════════
   // Empty state (no active chat)
   // ═══════════════════════════════════════════════
@@ -840,9 +1213,9 @@ export function ChatArea() {
       <>
         <div
           data-component="ChatArea.EmptyState"
-          className="flex flex-1 flex-col items-center overflow-y-auto p-4 sm:p-8"
+          className="flex flex-1 flex-col items-center overflow-y-auto p-3 sm:p-5 lg:p-6"
         >
-          <div className="flex w-full max-w-md flex-col items-center gap-4 sm:gap-6 my-auto py-4">
+          <div className="flex w-full max-w-2xl flex-col items-center gap-3 py-2 sm:gap-4 sm:py-3 lg:pt-4 lg:pb-5">
             {/* Central hero */}
             <div className="relative">
               <div
@@ -854,7 +1227,13 @@ export function ChatArea() {
                 <img
                   src={showEmptyStateEffects ? "/logo-splash.gif" : "/logo.png"}
                   alt="Marinara Engine"
-                  className="h-full w-full object-cover"
+                  width={80}
+                  height={80}
+                  decoding="async"
+                  className={cn(
+                    "h-full w-full",
+                    showEmptyStateEffects ? "object-cover" : "object-contain p-1.5 sm:p-2",
+                  )}
                 />
               </div>
             </div>
@@ -901,6 +1280,8 @@ export function ChatArea() {
             {/* Recent Chats */}
             <RecentChats />
 
+            <HomeFaq />
+
             <div
               className={cn(
                 "w-48",
@@ -909,40 +1290,42 @@ export function ChatArea() {
             />
 
             {/* Footer */}
-            <div className="mt-2 flex flex-col items-center gap-3">
-              <p className="text-xs text-[var(--muted-foreground)]/60">
-                Created by{" "}
-                <a
-                  href="https://spicymarinara.github.io/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="underline decoration-[var(--muted-foreground)]/30 hover:text-[var(--primary)] hover:decoration-[var(--primary)]/40 transition-colors"
-                >
-                  Marinara
-                </a>
-              </p>
-              <p className="text-[0.625rem] text-[var(--muted-foreground)]/50">
-                Partnered with{" "}
-                <a
-                  href="https://linkapi.ai/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="underline decoration-[var(--muted-foreground)]/30 hover:text-[var(--primary)] hover:decoration-[var(--primary)]/40 transition-colors"
-                >
-                  LinkAPI
-                </a>
-              </p>
-              <p className="text-[0.625rem] text-[var(--muted-foreground)]/50">
-                Art and logo by{" "}
-                <a
-                  href="https://huntercolliex.carrd.co/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="underline decoration-[var(--muted-foreground)]/30 hover:text-[var(--primary)] hover:decoration-[var(--primary)]/40 transition-colors"
-                >
-                  Huntercolliex
-                </a>
-              </p>
+            <div className="flex w-full max-w-2xl flex-col items-center gap-2">
+              <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-0.5 text-center text-[0.625rem] leading-tight text-[var(--muted-foreground)]/55 sm:text-xs">
+                <span>
+                  Created by{" "}
+                  <a
+                    href="https://spicymarinara.github.io/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline decoration-[var(--muted-foreground)]/30 transition-colors hover:text-[var(--primary)] hover:decoration-[var(--primary)]/40"
+                  >
+                    Marinara
+                  </a>
+                </span>
+                <span>
+                  Partnered with{" "}
+                  <a
+                    href="https://linkapi.ai/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline decoration-[var(--muted-foreground)]/30 transition-colors hover:text-[var(--primary)] hover:decoration-[var(--primary)]/40"
+                  >
+                    LinkAPI
+                  </a>
+                </span>
+                <span>
+                  Art and logo by{" "}
+                  <a
+                    href="https://huntercolliex.carrd.co/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline decoration-[var(--muted-foreground)]/30 transition-colors hover:text-[var(--primary)] hover:decoration-[var(--primary)]/40"
+                  >
+                    Huntercolliex
+                  </a>
+                </span>
+              </div>
               <div className="flex gap-2">
                 <a
                   href="https://discord.com/invite/KdAkTg94ME"
@@ -969,24 +1352,25 @@ export function ChatArea() {
               </div>
 
               {/* Special thanks */}
-              <p className="mt-1 max-w-xs text-center text-[0.625rem] leading-relaxed text-[var(--muted-foreground)]/40">
-                Special thanks to MuniMuni, Guybrush01, Joshellis625, LukaTheHero, Coxde, JorgeLTE, Seele The Seal King,
-                Loungemeister, Kale, Tabris, GREGOR OVECH, Coins, Tacoman, Jorge, Promansis, Kitsumiro, Sheep, Pod042,
-                Prolix, PlutoMayhem, Mezzeh, Kuc0, Exalted, Yang Best Girl, MidnightSleeper, Geechan, TheLonelyDevil,
-                Artus, and you!
+              <p className="max-w-[42rem] px-1 text-center text-[0.625rem] leading-snug text-[var(--muted-foreground)]/40 sm:max-w-[46rem]">
+                Special thanks to Xel, Jorge, Cha1latte, Javedz678, Teuku, Shadota, Romu, Mm14141, MagicGoddess, John,
+                Pwildani, Romu, Felor, MuniMuni, Guybrush01, Joshellis625, LukaTheHero, Coxde, JorgeLTE, Seele The Seal
+                King, Loungemeister, Kale, Tabris, GREGOR OVECH, Coins, Tacoman, Jorge, Promansis, Kitsumiro, Sheep,
+                Pod042, Prolix, PlutoMayhem, Mezzeh, Kuc0, Exalted, Yang Best Girl, MidnightSleeper, Geechan,
+                TheLonelyDevil, Artus, and you!
               </p>
 
               {/* Restart tutorial */}
               <button
                 onClick={() => useUIStore.getState().setHasCompletedOnboarding(false)}
-                className="mt-1 inline-flex items-center gap-1 rounded-md px-2 py-1 text-[0.625rem] text-[var(--muted-foreground)]/40 transition-colors hover:text-[var(--muted-foreground)] hover:bg-[var(--secondary)]/60"
+                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[0.625rem] text-[var(--muted-foreground)]/40 transition-colors hover:bg-[var(--secondary)]/60 hover:text-[var(--muted-foreground)]"
                 title="Replay tutorial"
               >
                 <HelpCircle size="0.75rem" />
                 Replay Tutorial
               </button>
 
-              <p className="mt-2 text-[0.625rem] tracking-wide text-[var(--muted-foreground)]/30">v{APP_VERSION}</p>
+              <p className="text-[0.625rem] tracking-wide text-[var(--muted-foreground)]/30">v{APP_VERSION}</p>
             </div>
           </div>
         </div>
@@ -1021,14 +1405,20 @@ export function ChatArea() {
   // Unified layout — mode-aware rendering
   // ═══════════════════════════════════════════════
   const msgPayload = (messages ?? []).map((m) => ({ role: m.role, characterId: m.characterId, content: m.content }));
-  const chatList = (allChats as Array<{ id: string; name: string }> | undefined) ?? [];
+  const chatList =
+    (allChats as Array<{ id: string; name: string; metadata?: string | Record<string, unknown> }> | undefined) ?? [];
   const connectedChatName = chat?.connectedChatId
     ? chatList.find((item) => item.id === chat.connectedChatId)?.name
     : undefined;
+  const activeSceneChat = chatMeta.activeSceneChatId
+    ? chatList.find((item) => item.id === chatMeta.activeSceneChatId)
+    : undefined;
+  const activeSceneMeta = parseMetadataRecord(activeSceneChat?.metadata);
+  const hasActiveLinkedScene = activeSceneChat && activeSceneMeta.sceneStatus === "active";
   const isSceneChat = chatMeta.sceneStatus === "active" || Boolean(chatMeta.sceneOriginChatId);
   const conversationSceneInfo =
-    chatMeta.activeSceneChatId && chatList.some((item) => item.id === chatMeta.activeSceneChatId)
-      ? { variant: "origin" as const, sceneChatId: chatMeta.activeSceneChatId }
+    chatMeta.activeSceneChatId && hasActiveLinkedScene
+      ? { variant: "origin" as const, sceneChatId: chatMeta.activeSceneChatId, sceneChatName: activeSceneChat.name }
       : chatMeta.sceneStatus === "active"
         ? {
             variant: "scene" as const,
@@ -1043,24 +1433,33 @@ export function ChatArea() {
   // Game mode — RPG surface with GM narration, map, party chat
   // ═══════════════════════════════════════════════
   if (chatMode === "game") {
+    if (!chat) return surfaceFallback;
+
     const gameCharacters = allCharacters
-      ? (allCharacters as Array<{ id: string; data: string; avatarPath: string | null }>).map((c) => {
-          try {
-            const parsed = typeof c.data === "string" ? JSON.parse(c.data) : c.data;
-            return {
-              id: c.id,
-              name: parsed.name ?? "Unknown",
-              avatarUrl: c.avatarPath ?? undefined,
-              description: parsed.description ?? "",
-              personality: parsed.personality ?? "",
-              backstory: parsed.extensions?.backstory ?? "",
-              appearance: parsed.extensions?.appearance ?? "",
-              tags: parsed.tags ?? [],
-            };
-          } catch {
-            return { id: c.id, name: "Unknown" };
-          }
-        })
+      ? (allCharacters as Array<{ id: string; data: string; comment?: string | null; avatarPath: string | null }>).map(
+          (c) => {
+            try {
+              const parsed = typeof c.data === "string" ? JSON.parse(c.data) : c.data;
+              const display = parseCharacterDisplayData(c);
+              return {
+                id: c.id,
+                name: display.name,
+                comment: display.comment,
+                avatarUrl: c.avatarPath ?? undefined,
+                avatarCrop: parsed.extensions?.avatarCrop || null,
+                nameColor: parsed.extensions?.nameColor || undefined,
+                dialogueColor: parsed.extensions?.dialogueColor || undefined,
+                description: parsed.description ?? "",
+                personality: parsed.personality ?? "",
+                backstory: parsed.extensions?.backstory ?? "",
+                appearance: parsed.extensions?.appearance ?? "",
+                tags: parsed.tags ?? [],
+              };
+            } catch {
+              return { id: c.id, name: "Unknown" };
+            }
+          },
+        )
       : [];
 
     return (
@@ -1232,6 +1631,8 @@ export function ChatArea() {
           spriteCharacterIds={spriteCharacterIds}
           spriteExpressions={spriteExpressions}
           spritePlacements={spritePlacements}
+          spriteScale={spriteScale}
+          spriteOpacity={spriteOpacity}
           hasCustomSpritePlacements={hasCustomSpritePlacements}
           spriteArrangeMode={spriteArrangeMode}
           enabledAgentTypes={enabledAgentTypes}
@@ -1270,14 +1671,20 @@ export function ChatArea() {
           onEdit={handleEdit}
           onSetActiveSwipe={handleSetActiveSwipe}
           onToggleConversationStart={handleToggleConversationStart}
+          onToggleHiddenFromAI={handleToggleHiddenFromAI}
           onPeekPrompt={handlePeekPrompt}
           onBranch={isSceneChat ? undefined : handleBranch}
+          onCloneSceneFromHere={isSceneChat ? handleCloneSceneFromHere : undefined}
+          isCloneSceneFromHereDisabled={isForking || isStreaming}
           onToggleSelectMessage={handleToggleSelectMessage}
           onSummaryContextSizeChange={handleSummaryContextSizeChange}
           onRerunTrackers={handleRerunTrackers}
+          onRerunSingleTracker={handleRerunSingleTracker}
           onStartEncounter={() => startEncounter()}
           onConcludeScene={() => concludeScene(activeChatId)}
           onAbandonScene={() => abandonScene(activeChatId)}
+          onForkScene={forkScene}
+          isForkingScene={isForking || isStreaming}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenFiles={() => setFilesOpen(true)}
           onOpenGallery={() => setGalleryOpen(true)}

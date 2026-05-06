@@ -102,12 +102,27 @@ export interface Character {
   id: string;
   /** Original V2 data preserved for export compatibility */
   data: CharacterData;
+  /** User-only note shown under the character name in selectors and editors */
+  comment: string;
   /** Path to avatar image file */
   avatarPath: string | null;
   /** Path to sprite folder */
   spriteFolderPath: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Saved snapshot of a previous character card state. */
+export interface CharacterCardVersion {
+  id: string;
+  characterId: string;
+  data: CharacterData;
+  comment: string;
+  avatarPath: string | null;
+  version: string;
+  source: "manual" | "agent" | "command" | "restore" | string;
+  reason: string;
+  createdAt: string;
 }
 
 /** A group of characters (e.g. "Fatui Harbingers") — acts as a preset that adds all members to a chat. */

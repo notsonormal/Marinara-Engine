@@ -3,8 +3,20 @@
 // ──────────────────────────────────────────────
 import type { BaseLLMProvider, ChatMessage, LLMToolDefinition, LLMToolCall } from "../llm/base-provider.js";
 import type { AgentResult, AgentContext, AgentResultType } from "@marinara-engine/shared";
-import { getDefaultAgentPrompt } from "@marinara-engine/shared";
+import {
+  DEFAULT_AGENT_CONTEXT_SIZE,
+  DEFAULT_AGENT_MAX_TOKENS,
+  MAX_AGENT_MAX_TOKENS,
+  MIN_AGENT_MAX_TOKENS,
+  getDefaultAgentPrompt,
+} from "@marinara-engine/shared";
 import { isDebugAgentsEnabled } from "../../config/runtime-config.js";
+import { logger } from "../../lib/logger.js";
+
+const MAX_AGENT_CONTEXT_MESSAGES = 200;
+const EXPRESSION_AGENT_RECENT_CONTEXT_MESSAGES = 2;
+const EXPRESSION_AGENT_CONTEXT_CHAR_LIMIT = 1200;
+const EXPRESSION_AGENT_RESPONSE_CHAR_LIMIT = 6000;
 
 /** Strip HTML/XML-style tags (e.g. <div style="..."> <br> <speaker>) from text to save tokens. */
 function stripHtmlTags(text: string): string {
@@ -31,6 +43,63 @@ export interface AgentToolContext {
   executeToolCall: (call: LLMToolCall) => Promise<string>;
 }
 
+export function normalizeAgentContextSize(value: unknown, fallback = DEFAULT_AGENT_CONTEXT_SIZE): number {
+  const parsed =
+    typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : fallback;
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.max(1, Math.min(MAX_AGENT_CONTEXT_MESSAGES, Math.trunc(parsed)));
+}
+
+function redactSensitiveValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitiveValue(item));
+  }
+
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const redacted: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (/(token|secret|password|api[_-]?key|authorization|cookie|credential)/i.test(key)) {
+      redacted[key] = "[REDACTED]";
+      continue;
+    }
+    redacted[key] = redactSensitiveValue(entry);
+  }
+  return redacted;
+}
+
+function formatToolPayloadForLog(payload: string, maxLength = 400): string {
+  const truncate = (value: string) => (value.length > maxLength ? `${value.slice(0, maxLength)}...` : value);
+  const scrubSensitiveText = (value: string) =>
+    value
+      .replace(/(Bearer\s+)[A-Za-z0-9\-._~+/]+=*/gi, "$1[REDACTED]")
+      .replace(/((?:access|refresh|id)?[_-]?token["'\s:=]+)([^,\s"']+)/gi, "$1[REDACTED]")
+      .replace(
+        /((?:api[_-]?key|password|secret|authorization|cookie|credential)["'\s:=]+)([^,\s"']+)/gi,
+        "$1[REDACTED]",
+      );
+
+  try {
+    const parsed = JSON.parse(payload);
+    const formatted = JSON.stringify(redactSensitiveValue(parsed));
+    return truncate(scrubSensitiveText(formatted));
+  } catch {
+    const scrubbed = scrubSensitiveText(payload);
+    return truncate(scrubbed);
+  }
+}
+
+function normalizeAgentMaxTokens(value: unknown, fallback = DEFAULT_AGENT_MAX_TOKENS): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(MIN_AGENT_MAX_TOKENS, Math.min(MAX_AGENT_MAX_TOKENS, Math.trunc(value)));
+}
+
+function applyProviderMaxTokensOverride(provider: BaseLLMProvider, maxTokens: number): number {
+  return provider.maxTokensOverrideValue !== null ? Math.min(maxTokens, provider.maxTokensOverrideValue) : maxTokens;
+}
+
 /**
  * Execute a single agent: build prompt → call LLM → parse response.
  * If toolContext is provided, the agent can make tool calls in a loop.
@@ -45,36 +114,19 @@ export async function executeAgent(
   const startTime = Date.now();
 
   try {
-    // Build the agent's system prompt with <role> + <lore> + <agents> + extras
     const template = config.promptTemplate || getDefaultAgentPrompt(config.type);
     if (!template) {
       return makeError(config, "No prompt template configured", startTime);
     }
 
-    const systemParts: string[] = [];
-    systemParts.push(`<role>`);
-    systemParts.push(`You are a specialized agent. Fulfill your task and return the requested output.`);
-    systemParts.push(`</role>`);
-    systemParts.push(``);
-    systemParts.push(buildLoreBlock(context));
-    systemParts.push(``);
-    systemParts.push(`<agents>`);
-    systemParts.push(`Fulfill the requested task here and return the output in the format specified:`);
-    systemParts.push(template);
-    systemParts.push(`</agents>`);
-    const extras = buildAgentExtras(context);
-    if (extras) {
-      systemParts.push(``);
-      systemParts.push(extras);
-    }
-
-    // Build multi-turn message array for this agent (sliced to its own contextSize)
-    const agentContextSize = (config.settings.contextSize as number) || 5;
-    const messages = buildAgentMessages(systemParts.join("\n"), context, config.type, agentContextSize);
+    const messages =
+      config.type === "expression"
+        ? buildExpressionAgentMessages(template, context)
+        : buildStandardAgentMessages(config, template, context);
 
     // Agents use lower temperature for reliability
     const temperature = (config.settings.temperature as number) ?? 0.3;
-    const maxTokens = Math.max((config.settings.maxTokens as number) ?? 4096, 16384);
+    const maxTokens = applyProviderMaxTokensOverride(provider, normalizeAgentMaxTokens(config.settings.maxTokens));
     const streamResponses = context.streaming !== false;
 
     // If tools are available, use the tool call loop
@@ -94,13 +146,11 @@ export async function executeAgent(
     }
 
     // Call LLM (streaming to avoid proxy timeouts, no tools)
-    console.log(`[agent] ${config.type} (${config.name}) — ${model}`);
-    if (isDebugAgentsEnabled()) {
-      for (const msg of messages) {
-        console.log(`[agent] [${msg.role}] ${msg.content}`);
-      }
-      console.log(`[agent] ═══ END PROMPT — temperature=${temperature} maxTokens=${maxTokens} ═══\n`);
+    logger.info(`[agent] ${config.type} (${config.name}) — ${model}`);
+    for (const msg of messages) {
+      logger.debug(`[agent] [${msg.role}] ${msg.content}`);
     }
+    logger.debug(`[agent] ═══ END PROMPT — temperature=${temperature} maxTokens=${maxTokens} ═══\n`);
 
     let responseText = "";
     const result = await provider.chatComplete(messages, {
@@ -120,13 +170,11 @@ export async function executeAgent(
     responseText = responseText.trim();
     const durationMs = Date.now() - startTime;
 
-    console.log(`[agent] ${config.type} done (${responseText.length} chars, ${durationMs}ms)`);
-    if (isDebugAgentsEnabled() || config.type === "illustrator") {
-      console.log(`[agent] ${config.type} raw response: ${responseText.slice(0, 500)}`);
-    }
+    logger.info(`[agent] ${config.type} done (${responseText.length} chars, ${durationMs}ms)`);
+    logger.debug(`[agent] ${config.type} raw response: ${responseText.slice(0, 500)}`);
 
     // Parse the result based on agent type
-    const parsed = parseAgentResponse(config.type, responseText);
+    const parsed = parseAgentResponse(config, responseText);
 
     return {
       agentId: config.id,
@@ -162,6 +210,7 @@ async function executeAgentWithTools(
   const MAX_TOOL_ROUNDS = 5;
   const loopMessages = [...initialMessages];
   let totalTokens = 0;
+  const debugAgentsEnabled = isDebugAgentsEnabled() && logger.isLevelEnabled("debug");
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const result = await provider.chatComplete(loopMessages, {
@@ -178,7 +227,7 @@ async function executeAgentWithTools(
     // No tool calls → final response
     if (!result.toolCalls || result.toolCalls.length === 0) {
       const responseText = result.content?.trim() ?? "";
-      const parsed = parseAgentResponse(config.type, responseText);
+      const parsed = parseAgentResponse(config, responseText);
       return {
         agentId: config.id,
         agentType: config.type,
@@ -196,11 +245,26 @@ async function executeAgentWithTools(
       role: "assistant",
       content: result.content ?? "",
       tool_calls: result.toolCalls,
+      ...(result.providerMetadata ? { providerMetadata: result.providerMetadata } : {}),
     });
 
     // Execute each tool call and append results
     for (const tc of result.toolCalls) {
-      const toolResult = await toolContext.executeToolCall(tc);
+      logger.info("[agent-tools] %s calling: %s", config.type, tc.function.name);
+      if (debugAgentsEnabled) {
+        logger.debug("[agent-tools] %s args: %s", config.type, formatToolPayloadForLog(tc.function.arguments));
+      }
+      let toolResult: string;
+      try {
+        toolResult = await toolContext.executeToolCall(tc);
+      } catch (err) {
+        logger.error(err, "[agent-tools] %s %s failed", config.type, tc.function.name);
+        throw err;
+      }
+      logger.info("[agent-tools] %s %s completed", config.type, tc.function.name);
+      if (debugAgentsEnabled) {
+        logger.debug("[agent-tools] %s result: %s", config.type, formatToolPayloadForLog(toolResult));
+      }
       loopMessages.push({
         role: "tool",
         content: toolResult,
@@ -219,7 +283,7 @@ async function executeAgentWithTools(
   });
   totalTokens += finalResult.usage?.totalTokens ?? 0;
   const responseText = finalResult.content?.trim() ?? "";
-  const parsed = parseAgentResponse(config.type, responseText);
+  const parsed = parseAgentResponse(config, responseText);
   return {
     agentId: config.id,
     agentType: config.type,
@@ -251,12 +315,35 @@ export async function executeAgentBatch(
   model: string,
 ): Promise<AgentResult[]> {
   if (configs.length === 0) return [];
+  const isolatedConfigs = configs.filter(shouldRunAgentIndividually);
+  if (isolatedConfigs.length > 0 && isolatedConfigs.length < configs.length) {
+    logger.info(
+      "[agent-batch] Running %d compact agent(s) outside batch: [%s]",
+      isolatedConfigs.length,
+      isolatedConfigs.map((c) => c.type).join(", "),
+    );
+    const batchedConfigs = configs.filter((config) => !shouldRunAgentIndividually(config));
+    const [batchedResults, isolatedSettled] = await Promise.all([
+      executeAgentBatch(batchedConfigs, context, provider, model),
+      Promise.allSettled(isolatedConfigs.map((config) => executeAgent(config, context, provider, model))),
+    ]);
+    const isolatedResults = isolatedSettled.map((entry, index) =>
+      entry.status === "fulfilled"
+        ? entry.value
+        : makeError(
+            isolatedConfigs[index]!,
+            entry.reason instanceof Error ? entry.reason.message : "Agent execution failed",
+            Date.now(),
+          ),
+    );
+    return [...batchedResults, ...isolatedResults];
+  }
   if (configs.length === 1) {
-    console.log(`[agent-batch] Only 1 agent (${configs[0]!.type}), running individually`);
+    logger.info(`[agent-batch] Only 1 agent (${configs[0]!.type}), running individually`);
     return [await executeAgent(configs[0]!, context, provider, model)];
   }
 
-  console.log(`[agent-batch] Batching ${configs.length} agents: [${configs.map((c) => c.type).join(", ")}]`);
+  logger.info(`[agent-batch] Batching ${configs.length} agents: [${configs.map((c) => c.type).join(", ")}]`);
 
   const startTime = Date.now();
 
@@ -264,26 +351,28 @@ export async function executeAgentBatch(
     // Build merged system prompt (includes lore + agent extras)
     const systemPrompt = buildBatchSystemPrompt(configs, context);
     // Batch uses the max contextSize among its members
-    const batchContextSize = Math.max(...configs.map((c) => (c.settings.contextSize as number) || 5));
+    const batchContextSize = Math.max(...configs.map((c) => normalizeAgentContextSize(c.settings.contextSize)));
     const messages = buildAgentMessages(systemPrompt, context, "__batch__", batchContextSize);
 
-    // Each agent needs enough room for its full JSON output.
-    // Use a generous floor (16384) so the model never runs out mid-response.
-    const maxTokensPerAgent = Math.max(...configs.map((c) => (c.settings.maxTokens as number) ?? 4096));
+    // Each agent reserves its own configured output budget. The context fitter
+    // may still reduce this further if the prompt needs more room.
+    const perAgentTokens = configs.map((c) => normalizeAgentMaxTokens(c.settings.maxTokens));
     const temperature = Math.min(...configs.map((c) => (c.settings.temperature as number) ?? 0.3));
-    const batchMaxTokens = Math.max(maxTokensPerAgent * configs.length, 16384);
+    const rawBatchMaxTokens = Math.min(
+      perAgentTokens.reduce((sum, tokens) => sum + tokens, 0),
+      MAX_AGENT_MAX_TOKENS,
+    );
+    const batchMaxTokens = applyProviderMaxTokensOverride(provider, rawBatchMaxTokens);
     const streamResponses = context.streaming !== false;
-    console.log(
-      `[agent-batch] maxTokens: ${batchMaxTokens} (${maxTokensPerAgent} × ${configs.length} agents, floor 16384)`,
+    logger.info(
+      `[agent-batch] maxTokens: ${batchMaxTokens} (sum=${rawBatchMaxTokens} from [${perAgentTokens.join(", ")}]${provider.maxTokensOverrideValue !== null ? `, capped at ${provider.maxTokensOverrideValue}` : ""})`,
     );
 
-    if (isDebugAgentsEnabled()) {
-      console.log(`\n[agent-batch] ═══ BATCH PROMPT — [${configs.map((c) => c.type).join(", ")}] — ${model} ═══`);
-      for (const msg of messages) {
-        console.log(`[agent-batch] [${msg.role}] ${msg.content}`);
-      }
-      console.log(`[agent-batch] ═══ END BATCH PROMPT — temperature=${temperature} maxTokens=${batchMaxTokens} ═══\n`);
+    logger.debug(`\n[agent-batch] ═══ BATCH PROMPT — [${configs.map((c) => c.type).join(", ")}] — ${model} ═══`);
+    for (const msg of messages) {
+      logger.debug(`[agent-batch] [${msg.role}] ${msg.content}`);
     }
+    logger.debug(`[agent-batch] ═══ END BATCH PROMPT — temperature=${temperature} maxTokens=${batchMaxTokens} ═══\n`);
 
     // Use streaming (onToken) to keep the connection alive — avoids proxy
     // timeouts (e.g. Cloudflare 524) on large batch responses.
@@ -308,22 +397,22 @@ export async function executeAgentBatch(
     const durationMs = Date.now() - startTime;
     const totalTokens = result.usage?.totalTokens ?? 0;
 
-    console.log(`[agent-batch] Got response (${responseText.length} chars, ${durationMs}ms, ${totalTokens} tokens)`);
-    if (isDebugAgentsEnabled()) {
-      console.log(`[agent-batch] ${responseText}`);
-    }
+    logger.info(`[agent-batch] Got response (${responseText.length} chars, ${durationMs}ms, ${totalTokens} tokens)`);
+    logger.debug(`[agent-batch] ${responseText}`);
 
     // Parse the batched response into individual results
     const { parsed, failed } = parseBatchResponse(configs, responseText, durationMs, totalTokens);
 
-    console.log(
-      `[agent-batch] Batch parse: ${parsed.length} parsed, ${failed.length} failed`,
+    logger.info(
+      "[agent-batch] Batch parse: %d parsed, %d failed %s",
+      parsed.length,
+      failed.length,
       failed.length > 0 ? `Failed: [${failed.map((f) => f.type).join(", ")}]` : "",
     );
 
     // Retry failed agents individually (batch fallback)
     if (failed.length > 0) {
-      console.log(`[agent-batch] Retrying ${failed.length} failed agents individually...`);
+      logger.info(`[agent-batch] Retrying ${failed.length} failed agents individually...`);
       const retrySettled = await Promise.allSettled(
         failed.map((config) => executeAgent(config, context, provider, model)),
       );
@@ -334,7 +423,7 @@ export async function executeAgentBatch(
           retries.push(entry.value);
         } else {
           // Individual retry also failed — produce error result
-          console.error(`[agent-batch] Individual retry FAILED for ${failed[i]!.type}:`, entry.reason);
+          logger.error(entry.reason, "[agent-batch] Individual retry FAILED for %s", failed[i]!.type);
           retries.push(
             makeError(failed[i]!, entry.reason instanceof Error ? entry.reason.message : "Retry failed", startTime),
           );
@@ -347,7 +436,7 @@ export async function executeAgentBatch(
   } catch (err) {
     // On failure, return errors for all agents in the batch
     const errMsg = err instanceof Error ? err.message : "Batch execution failed";
-    console.error(`[agent-batch] Batch call FAILED: ${errMsg}`);
+    logger.error(err, "[agent-batch] Batch call FAILED: %s", errMsg);
     return configs.map((c) => makeError(c, errMsg, startTime));
   }
 }
@@ -387,7 +476,10 @@ function buildBatchSystemPrompt(configs: AgentExecConfig[], context: AgentContex
   parts.push(`</agents>`);
 
   // ── Agent-specific extras (sprites, backgrounds, etc.) ──
-  const extras = buildAgentExtras(context);
+  const extras = buildAgentExtras(
+    context,
+    configs.map((c) => c.type),
+  );
   if (extras) {
     parts.push(``);
     parts.push(extras);
@@ -397,7 +489,7 @@ function buildBatchSystemPrompt(configs: AgentExecConfig[], context: AgentContex
   parts.push(``);
   parts.push(`─── REQUIRED OUTPUT FORMAT ───`);
   for (const config of configs) {
-    const isJson = JSON_AGENTS.has(config.type);
+    const isJson = agentResponseIsJson(config);
     parts.push(
       `<result agent="${config.type}">`,
       isJson ? `{ ... valid JSON ... }` : `... your text output ...`,
@@ -459,7 +551,7 @@ function parseBatchResponse(
     }
 
     if (matchedOutput !== null) {
-      const parsedResult = parseAgentResponse(config.type, matchedOutput);
+      const parsedResult = parseAgentResponse(config, matchedOutput);
       parsed.push({
         agentId: config.id,
         agentType: config.type,
@@ -489,13 +581,111 @@ function makeError(config: AgentExecConfig, error: string, startTime: number): A
   return {
     agentId: config.id,
     agentType: config.type,
-    type: AGENT_RESULT_TYPE_MAP[config.type] ?? "context_injection",
+    type: resolveAgentResultType(config),
     data: null,
     tokensUsed: 0,
     durationMs: Date.now() - startTime,
     success: false,
     error,
   };
+}
+
+function shouldRunAgentIndividually(config: Pick<AgentExecConfig, "type">): boolean {
+  return config.type === "expression";
+}
+
+function buildStandardAgentMessages(config: AgentExecConfig, template: string, context: AgentContext): ChatMessage[] {
+  // Build the agent's system prompt with <role> + <lore> + <agents> + extras
+  const systemParts: string[] = [];
+  systemParts.push(`<role>`);
+  systemParts.push(`You are a specialized agent. Fulfill your task and return the requested output.`);
+  systemParts.push(`</role>`);
+  systemParts.push(``);
+  systemParts.push(buildLoreBlock(context));
+  systemParts.push(``);
+  systemParts.push(`<agents>`);
+  systemParts.push(`Fulfill the requested task here and return the output in the format specified:`);
+  systemParts.push(template);
+  systemParts.push(`</agents>`);
+  const extras = buildAgentExtras(context, [config.type]);
+  if (extras) {
+    systemParts.push(``);
+    systemParts.push(extras);
+  }
+
+  // Build multi-turn message array for this agent (sliced to its own contextSize)
+  const agentContextSize = normalizeAgentContextSize(config.settings.contextSize);
+  return buildAgentMessages(systemParts.join("\n"), context, config.type, agentContextSize);
+}
+
+function truncateAgentText(text: string, maxChars: number): string {
+  const cleaned = stripHtmlTags(text);
+  const chars = Array.from(cleaned);
+  if (chars.length <= maxChars) return cleaned;
+
+  const marker = "\n\n[Trimmed to keep this agent request compact]\n\n";
+  const available = Math.max(0, maxChars - marker.length);
+  const head = Math.floor(available * 0.4);
+  const tail = available - head;
+  return chars.slice(0, head).join("") + marker + chars.slice(-tail).join("");
+}
+
+function findLatestAssistantMessage(context: AgentContext): { index: number; content: string } | null {
+  for (let index = context.recentMessages.length - 1; index >= 0; index--) {
+    const message = context.recentMessages[index]!;
+    if (message.role === "assistant" && message.content.trim()) {
+      return { index, content: message.content };
+    }
+  }
+  return null;
+}
+
+function buildExpressionAgentMessages(template: string, context: AgentContext): ChatMessage[] {
+  const systemParts: string[] = [];
+  systemParts.push(`<role>`);
+  systemParts.push(`You are a specialized expression-selection agent. Keep the request compact and return only JSON.`);
+  systemParts.push(`</role>`);
+  systemParts.push(``);
+  systemParts.push(`<agents>`);
+  systemParts.push(`Fulfill the requested task here and return the output in the format specified:`);
+  systemParts.push(template);
+  systemParts.push(`</agents>`);
+
+  const spritesBlock = buildAvailableSpritesBlock(context);
+  if (spritesBlock) {
+    systemParts.push(``);
+    systemParts.push(spritesBlock);
+  }
+
+  const latestAssistant = findLatestAssistantMessage(context);
+  const responseText = context.mainResponse?.trim() || latestAssistant?.content || "";
+  const contextEndIndex = context.mainResponse?.trim() ? context.recentMessages.length : (latestAssistant?.index ?? 0);
+  const recentContext = context.recentMessages
+    .slice(0, contextEndIndex)
+    .slice(-EXPRESSION_AGENT_RECENT_CONTEXT_MESSAGES)
+    .filter((message) => message.content.trim());
+
+  const userParts: string[] = [];
+  if (recentContext.length > 0) {
+    userParts.push(`<recent_context>`);
+    for (const message of recentContext) {
+      const role = message.role === "assistant" ? "assistant" : "user";
+      userParts.push(`[${role}] ${truncateAgentText(message.content, EXPRESSION_AGENT_CONTEXT_CHAR_LIMIT)}`);
+    }
+    userParts.push(`</recent_context>`);
+    userParts.push(``);
+  }
+
+  userParts.push(`<assistant_response>`);
+  userParts.push(truncateAgentText(responseText, EXPRESSION_AGENT_RESPONSE_CHAR_LIMIT));
+  userParts.push(`</assistant_response>`);
+  userParts.push(``);
+  userParts.push(`Now return the requested format.`);
+
+  return [
+    { role: "system", content: systemParts.join("\n"), contextKind: "prompt" },
+    { role: "user", content: userParts.join("\n"), contextKind: "history" },
+  ];
 }
 
 /** Extract a useful message from fetch/network errors (preserves err.cause). */
@@ -670,12 +860,58 @@ function buildLoreBlock(context: AgentContext): string {
   return parts.join("\n");
 }
 
+function buildAvailableSpritesBlock(context: AgentContext): string {
+  if (!context.memory._availableSprites) return "";
+
+  const sprites = context.memory._availableSprites as Array<{
+    characterId: string;
+    characterName: string;
+    expressions: string[];
+  }>;
+  const parts: string[] = [`<available_sprites>`];
+  for (const char of sprites) {
+    parts.push(`${char.characterName} (${char.characterId}): ${char.expressions.join(", ")}`);
+  }
+  parts.push(`</available_sprites>`);
+  return parts.join("\n");
+}
+
 /**
  * Build agent-specific context blocks (sprites, backgrounds, source material, etc.)
  * that go into the system message after lore.
  */
-function buildAgentExtras(context: AgentContext): string {
+function buildAgentExtras(context: AgentContext, agentTypes: string[] = []): string {
   const parts: string[] = [];
+
+  const escapeXml = (value: string) =>
+    value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
+  // Card Evolution Auditor needs the FULL character card (not just description)
+  // so it can emit exact-match oldText edits. Gated on agent type because
+  // forwarding every field would bloat context for agents that don't need it.
+  if (agentTypes.includes("card-evolution-auditor") && context.characters.length > 0) {
+    parts.push(`<character_cards>`);
+    for (const char of context.characters) {
+      parts.push(`<character id="${escapeXml(char.id)}" name="${escapeXml(char.name)}">`);
+      if (char.description) parts.push(`<description>${escapeXml(char.description)}</description>`);
+      if (char.personality) parts.push(`<personality>${escapeXml(char.personality)}</personality>`);
+      if (char.scenario) parts.push(`<scenario>${escapeXml(char.scenario)}</scenario>`);
+      if (char.backstory) parts.push(`<backstory>${escapeXml(char.backstory)}</backstory>`);
+      if (char.appearance) parts.push(`<appearance>${escapeXml(char.appearance)}</appearance>`);
+      if (char.firstMes) parts.push(`<first_mes>${escapeXml(char.firstMes)}</first_mes>`);
+      if (char.mesExample) parts.push(`<mes_example>${escapeXml(char.mesExample)}</mes_example>`);
+      if (char.creatorNotes) parts.push(`<creator_notes>${escapeXml(char.creatorNotes)}</creator_notes>`);
+      if (char.systemPrompt) parts.push(`<system_prompt>${escapeXml(char.systemPrompt)}</system_prompt>`);
+      if (char.postHistoryInstructions)
+        parts.push(`<post_history_instructions>${escapeXml(char.postHistoryInstructions)}</post_history_instructions>`);
+      parts.push(`</character>`);
+    }
+    parts.push(`</character_cards>`);
+  }
 
   if (context.gameState) {
     parts.push(`<current_game_state>`);
@@ -683,17 +919,9 @@ function buildAgentExtras(context: AgentContext): string {
     parts.push(`</current_game_state>`);
   }
 
-  if (context.memory._availableSprites) {
-    const sprites = context.memory._availableSprites as Array<{
-      characterId: string;
-      characterName: string;
-      expressions: string[];
-    }>;
-    parts.push(`<available_sprites>`);
-    for (const char of sprites) {
-      parts.push(`${char.characterName} (${char.characterId}): ${char.expressions.join(", ")}`);
-    }
-    parts.push(`</available_sprites>`);
+  if (agentTypes.includes("expression")) {
+    const availableSpritesBlock = buildAvailableSpritesBlock(context);
+    if (availableSpritesBlock) parts.push(availableSpritesBlock);
   }
 
   if (context.memory._availableBackgrounds) {
@@ -716,7 +944,7 @@ function buildAgentExtras(context: AgentContext): string {
 
   if (context.memory._existingLorebookEntries) {
     const rawEntries = context.memory._existingLorebookEntries as Array<
-      string | { name?: string; keys?: string[]; locked?: boolean }
+      string | { id?: string; name?: string; content?: string; keys?: string[]; locked?: boolean }
     >;
     const entries = rawEntries
       .map((entry) => {
@@ -724,10 +952,16 @@ function buildAgentExtras(context: AgentContext): string {
         if (!entry || typeof entry !== "object") return null;
 
         const name = typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : "Unnamed";
+        const id = typeof entry.id === "string" && entry.id.trim() ? entry.id.trim() : "";
+        const content = typeof entry.content === "string" ? entry.content.trim() : "";
         const keys = Array.isArray(entry.keys) ? entry.keys.filter((key) => typeof key === "string") : [];
-        const keyText = keys.length > 0 ? ` | keys: ${keys.join(", ")}` : "";
-        const lockedText = entry.locked === true ? " | locked" : "";
-        return `- ${name}${keyText}${lockedText}`;
+        const attrs = [
+          id ? `id="${escapeXml(id)}"` : "",
+          `name="${escapeXml(name)}"`,
+          keys.length > 0 ? `keys="${escapeXml(keys.join(", "))}"` : "",
+          entry.locked === true ? `locked="true"` : "",
+        ].filter(Boolean);
+        return [`<entry ${attrs.join(" ")}>`, `<content>${escapeXml(content)}</content>`, `</entry>`].join("\n");
       })
       .filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 
@@ -748,6 +982,12 @@ function buildAgentExtras(context: AgentContext): string {
     parts.push(`<source_material>`);
     parts.push(context.memory._sourceMaterial as string);
     parts.push(`</source_material>`);
+  }
+
+  if (context.memory._routerCatalog) {
+    parts.push(`<entry_catalog>`);
+    parts.push(context.memory._routerCatalog as string);
+    parts.push(`</entry_catalog>`);
   }
 
   if (context.memory._chunkInfo) {
@@ -817,6 +1057,7 @@ const AGENT_RESULT_TYPE_MAP: Record<string, AgentResultType> = {
   quest: "quest_update",
   illustrator: "image_prompt",
   "lorebook-keeper": "lorebook_update",
+  "card-evolution-auditor": "character_card_update",
   "prompt-reviewer": "prompt_review",
   combat: "game_state_update",
   background: "background_change",
@@ -832,6 +1073,49 @@ const AGENT_RESULT_TYPE_MAP: Record<string, AgentResultType> = {
   "secret-plot-driver": "secret_plot",
 };
 
+const AGENT_RESULT_TYPES = new Set<AgentResultType>([
+  "game_state_update",
+  "text_rewrite",
+  "sprite_change",
+  "echo_message",
+  "quest_update",
+  "image_prompt",
+  "context_injection",
+  "continuity_check",
+  "director_event",
+  "lorebook_update",
+  "character_card_update",
+  "prompt_review",
+  "background_change",
+  "character_tracker_update",
+  "persona_stats_update",
+  "custom_tracker_update",
+  "chat_summary",
+  "spotify_control",
+  "haptic_command",
+  "cyoa_choices",
+  "secret_plot",
+  "game_master_narration",
+  "party_action",
+  "game_map_update",
+  "game_state_transition",
+]);
+
+const TEXT_RESULT_TYPES = new Set<AgentResultType>(["context_injection", "director_event"]);
+
+export function resolveAgentResultType(config: Pick<AgentExecConfig, "type" | "settings">): AgentResultType {
+  const configured = config.settings?.resultType;
+  if (typeof configured === "string" && AGENT_RESULT_TYPES.has(configured as AgentResultType)) {
+    return configured as AgentResultType;
+  }
+  return AGENT_RESULT_TYPE_MAP[config.type] ?? "context_injection";
+}
+
+function agentResponseIsJson(config: Pick<AgentExecConfig, "type" | "settings">): boolean {
+  const resultType = resolveAgentResultType(config);
+  return JSON_AGENTS.has(config.type) || !TEXT_RESULT_TYPES.has(resultType);
+}
+
 /** Agents that return structured JSON. */
 const JSON_AGENTS = new Set([
   "world-state",
@@ -841,6 +1125,7 @@ const JSON_AGENTS = new Set([
   "quest",
   "illustrator",
   "lorebook-keeper",
+  "card-evolution-auditor",
   "prompt-reviewer",
   "combat",
   "background",
@@ -858,10 +1143,16 @@ const JSON_AGENTS = new Set([
 /**
  * Parse the raw LLM response into a typed result.
  */
-function parseAgentResponse(agentType: string, responseText: string): { type: AgentResultType; data: unknown } {
-  const resultType = AGENT_RESULT_TYPE_MAP[agentType] ?? "context_injection";
+function parseAgentResponse(
+  config: Pick<AgentExecConfig, "type" | "settings">,
+  responseText: string,
+): {
+  type: AgentResultType;
+  data: unknown;
+} {
+  const resultType = resolveAgentResultType(config);
 
-  if (JSON_AGENTS.has(agentType)) {
+  if (agentResponseIsJson(config)) {
     try {
       const jsonStr = extractJson(responseText);
       const data = JSON.parse(jsonStr);

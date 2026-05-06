@@ -15,9 +15,12 @@ import {
   Plug,
   Image,
   BookOpen,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import type { GameSetupConfig, GameGmMode } from "@marinara-engine/shared";
-import { cn } from "../../lib/utils";
+import { getCharacterTitle } from "../../lib/character-display";
+import { cn, getAvatarCropStyle } from "../../lib/utils";
 import { Modal } from "../ui/Modal";
 import {
   GenerationParametersFields,
@@ -29,22 +32,61 @@ import { useConnections } from "../../hooks/use-connections";
 import { usePersonas } from "../../hooks/use-characters";
 import { useSidecarStore } from "../../stores/sidecar.store";
 import { useLorebooks } from "../../hooks/use-lorebooks";
+import { useGameAssetStore } from "../../stores/game-asset.store";
+import { useUIStore } from "../../stores/ui.store";
 
 interface GameSetupWizardProps {
   onComplete: (
     config: GameSetupConfig,
     preferences: string,
-    connections: { gmConnectionId?: string; characterConnectionId?: string },
+    connections: { gmConnectionId?: string },
     gameName?: string,
   ) => void;
   onCancel: () => void;
   isLoading: boolean;
-  characters: Array<{ id: string; name: string; avatarUrl?: string | null }>;
+  characters: Array<{
+    id: string;
+    name: string;
+    comment?: string | null;
+    avatarUrl?: string | null;
+    avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null;
+  }>;
 }
 
 interface PersonaDisplayInfo {
   name: string;
   comment?: string | null;
+}
+
+function CharacterAvatar({
+  character,
+  className = "h-6 w-6 rounded-full",
+}: {
+  character: {
+    name: string;
+    avatarUrl?: string | null;
+    avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null;
+  };
+  className?: string;
+}) {
+  if (!character.avatarUrl) {
+    return (
+      <div className={cn("flex items-center justify-center bg-[var(--accent)] text-[0.5625rem] font-bold", className)}>
+        {character.name[0]}
+      </div>
+    );
+  }
+  return (
+    <span className={cn("block shrink-0 overflow-hidden", className)}>
+      <img
+        src={character.avatarUrl}
+        alt={character.name}
+        loading="lazy"
+        className="h-full w-full object-cover"
+        style={getAvatarCropStyle(character.avatarCrop)}
+      />
+    </span>
+  );
 }
 
 function getPersonaTitle(persona: PersonaDisplayInfo): string | null {
@@ -55,6 +97,7 @@ function getPersonaTitle(persona: PersonaDisplayInfo): string | null {
 const GENRES = ["Fantasy", "Sci-Fi", "Horror", "Modern", "Post-Apocalyptic", "Cyberpunk", "Steampunk", "Historical"];
 const TONES = ["Heroic", "Dark", "Comedic", "Gritty", "Whimsical", "Serious", "Campy"];
 const DIFFICULTIES = ["Casual", "Normal", "Hard", "Brutal"];
+const LEARNED_OPTION_PREVIEW_LIMIT = 8;
 
 const SETTING_SUGGESTIONS = [
   "Surprise me!",
@@ -69,6 +112,118 @@ const GOAL_SUGGESTIONS = [
   "Survive and uncover the truth",
   "Become the ruler of the land",
 ];
+
+type LearnedOptionGroup = "genres" | "tones" | "settings" | "goals";
+
+function optionKey(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function filterLearnedOptions(options: string[] | undefined, excluded: string[]) {
+  const excludedKeys = new Set(excluded.map(optionKey));
+  const seen = new Set<string>();
+  return (options ?? []).filter((option) => {
+    const trimmed = option.trim();
+    const key = optionKey(trimmed);
+    if (!trimmed || excludedKeys.has(key) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function filterCustomLearnedValues(values: string[], builtIns: string[]) {
+  const excluded = new Set([...builtIns, "Surprise me, go wild!"].map(optionKey));
+  return values.map((value) => value.trim()).filter((value) => value && !excluded.has(optionKey(value)));
+}
+
+function LearnedOptionChips({
+  options,
+  expanded,
+  onToggleExpanded,
+  onSelect,
+  selected,
+}: {
+  options: string[];
+  expanded: boolean;
+  onToggleExpanded: () => void;
+  onSelect: (value: string) => void;
+  selected?: (value: string) => boolean;
+}) {
+  if (options.length === 0) return null;
+
+  const visible = expanded ? options : options.slice(0, LEARNED_OPTION_PREVIEW_LIMIT);
+  const hiddenCount = Math.max(0, options.length - visible.length);
+
+  return (
+    <div className="mt-1.5 flex flex-wrap gap-1">
+      {visible.map((option) => {
+        const isSelected = selected?.(option) ?? false;
+        return (
+          <button
+            key={option}
+            type="button"
+            onClick={() => onSelect(option)}
+            className={cn(
+              "rounded-full px-2 py-0.5 text-[0.625rem] transition-colors",
+              isSelected
+                ? "bg-[var(--primary)]/20 text-[var(--primary)] ring-1 ring-[var(--primary)]/35"
+                : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--primary)]/10 hover:text-[var(--primary)]",
+            )}
+          >
+            {option}
+          </button>
+        );
+      })}
+      {(hiddenCount > 0 || expanded) && (
+        <button
+          type="button"
+          onClick={onToggleExpanded}
+          className="rounded-full border border-[var(--border)] bg-[var(--card)] px-2 py-0.5 text-[0.625rem] text-[var(--muted-foreground)] transition-colors hover:border-[var(--primary)]/40 hover:text-[var(--primary)]"
+        >
+          {expanded ? "Show less" : `+${hiddenCount} more`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+type GameLanguageOption = {
+  label: string;
+  value: string;
+  aliases?: string[];
+};
+
+const GAME_LANGUAGE_OPTIONS: readonly GameLanguageOption[] = [
+  { label: "English", value: "English" },
+  { label: "日本語", value: "Japanese" },
+  { label: "한국어", value: "Korean" },
+  { label: "中文", value: "Chinese" },
+  { label: "Español", value: "Spanish", aliases: ["Espanol"] },
+  { label: "Français", value: "French", aliases: ["Francais"] },
+  { label: "Deutsch", value: "German" },
+  { label: "Polski", value: "Polish" },
+  { label: "Português", value: "Portuguese", aliases: ["Portugues"] },
+  { label: "Русский", value: "Russian" },
+];
+
+const GAME_LANGUAGE_LOOKUP = new Map(
+  GAME_LANGUAGE_OPTIONS.flatMap((option) => {
+    const entries: Array<[string, string]> = [
+      [option.label.toLowerCase(), option.value],
+      [option.value.toLowerCase(), option.value],
+    ];
+    for (const alias of option.aliases ?? []) {
+      entries.push([alias.toLowerCase(), option.value]);
+    }
+    return entries;
+  }),
+);
+
+function normalizeGameLanguage(language: string): string {
+  const trimmed = language.trim();
+  if (!trimmed) return "";
+  return GAME_LANGUAGE_LOOKUP.get(trimmed.toLowerCase()) ?? trimmed;
+}
 
 export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }: GameSetupWizardProps) {
   const [step, setStep] = useState(0);
@@ -91,8 +246,6 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
   const [customizeParameters, setCustomizeParameters] = useState(false);
   const [generationParameters, setGenerationParameters] =
     useState<EditableGenerationParameters>(ROLEPLAY_PARAMETER_DEFAULTS);
-  const [charConnectionId, setCharConnectionId] = useState<string | null>(null);
-  const [sameConnection, setSameConnection] = useState(true);
   const [personaSearch, setPersonaSearch] = useState("");
   const [rating, setRating] = useState<"sfw" | "nsfw">("sfw");
   const [useLocalScene, setUseLocalScene] = useState(true);
@@ -103,9 +256,18 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
   const [lbSearch, setLbSearch] = useState("");
   const [enableCustomWidgets, setEnableCustomWidgets] = useState(true);
   const [language, setLanguage] = useState("English");
+  const [startMuted, setStartMuted] = useState(false);
+  const [expandedLearnedOptions, setExpandedLearnedOptions] = useState<Record<LearnedOptionGroup, boolean>>({
+    genres: false,
+    tones: false,
+    settings: false,
+    goals: false,
+  });
 
   const sidecarStatus = useSidecarStore((s) => s.status);
   const sidecarConfig = useSidecarStore((s) => s.config);
+  const learnedGameSetupOptions = useUIStore((s) => s.learnedGameSetupOptions);
+  const rememberGameSetupOptions = useUIStore((s) => s.rememberGameSetupOptions);
   const sidecarAvailable = !!sidecarConfig.modelPath && sidecarStatus !== "not_downloaded";
 
   // Fetch sidecar status on mount so the dropdown is populated without visiting Connections first
@@ -180,6 +342,26 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
   );
 
   const steps = ["Genre & Setting", "Party & GM", "You & Model", "Goals"];
+  const learnedGenres = useMemo(
+    () => filterLearnedOptions(learnedGameSetupOptions?.genres, [...GENRES, ...genres]),
+    [genres, learnedGameSetupOptions?.genres],
+  );
+  const learnedTones = useMemo(
+    () => filterLearnedOptions(learnedGameSetupOptions?.tones, [...TONES, ...tones]),
+    [learnedGameSetupOptions?.tones, tones],
+  );
+  const learnedSettings = useMemo(
+    () => filterLearnedOptions(learnedGameSetupOptions?.settings, [...SETTING_SUGGESTIONS, setting]),
+    [learnedGameSetupOptions?.settings, setting],
+  );
+  const learnedGoals = useMemo(
+    () => filterLearnedOptions(learnedGameSetupOptions?.goals, [...GOAL_SUGGESTIONS, playerGoals]),
+    [learnedGameSetupOptions?.goals, playerGoals],
+  );
+
+  const toggleLearnedOptions = (group: LearnedOptionGroup) => {
+    setExpandedLearnedOptions((prev) => ({ ...prev, [group]: !prev[group] }));
+  };
 
   const toggleGenre = (g: string) => {
     setGenres((prev) => (prev.includes(g) ? prev.filter((x) => x !== g) : [...prev, g]));
@@ -210,12 +392,23 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
   };
 
   const filteredGmCharacters = useMemo(
-    () => characters.filter((c) => c.name.toLowerCase().includes(gmSearch.toLowerCase())),
+    () =>
+      characters.filter((c) => {
+        const query = gmSearch.toLowerCase();
+        const title = getCharacterTitle(c)?.toLowerCase() ?? "";
+        return c.name.toLowerCase().includes(query) || title.includes(query);
+      }),
     [characters, gmSearch],
   );
 
   const filteredPartyCharacters = useMemo(
-    () => characters.filter((c) => c.id !== gmCharacterId && c.name.toLowerCase().includes(partySearch.toLowerCase())),
+    () =>
+      characters.filter((c) => {
+        if (c.id === gmCharacterId) return false;
+        const query = partySearch.toLowerCase();
+        const title = getCharacterTitle(c)?.toLowerCase() ?? "";
+        return c.name.toLowerCase().includes(query) || title.includes(query);
+      }),
     [characters, gmCharacterId, partySearch],
   );
 
@@ -232,13 +425,23 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
   }, [gmParameterDefaults]);
 
   const canStart = !!gmConnectionId;
+  const normalizedLanguage = normalizeGameLanguage(language);
 
   const handleComplete = () => {
     if (isLoading || !canStart) return;
+    if (startMuted) {
+      useGameAssetStore.getState().setAudioMuted(true);
+    }
     // Sync the wizard's local-scene toggle to the global sidecar config
     if (sidecarAvailable) {
       useSidecarStore.getState().updateConfig({ useForGameScene: sceneModelValue === "local" });
     }
+    rememberGameSetupOptions({
+      genres: filterCustomLearnedValues(genres, GENRES),
+      tones: filterCustomLearnedValues(tones, TONES),
+      settings: filterCustomLearnedValues(setting ? [setting] : [], SETTING_SUGGESTIONS),
+      goals: filterCustomLearnedValues(playerGoals ? [playerGoals] : [], GOAL_SUGGESTIONS),
+    });
     onComplete(
       {
         genre: genres.join(", ") || "Fantasy",
@@ -256,13 +459,12 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
         imageConnectionId: enableSpriteGeneration && imageConnectionId ? imageConnectionId : undefined,
         activeLorebookIds: activeLorebookIds.length > 0 ? activeLorebookIds : undefined,
         enableCustomWidgets,
-        language: language.trim() || undefined,
+        language: normalizedLanguage || undefined,
         generationParameters: customizeParameters ? generationParameters : undefined,
       },
       preferences,
       {
         gmConnectionId: gmConnectionId ?? undefined,
-        characterConnectionId: sameConnection ? (gmConnectionId ?? undefined) : (charConnectionId ?? undefined),
       },
       gameName.trim() || undefined,
     );
@@ -342,6 +544,13 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                     </button>
                   ))}
               </div>
+              <LearnedOptionChips
+                options={learnedGenres}
+                expanded={expandedLearnedOptions.genres}
+                onToggleExpanded={() => toggleLearnedOptions("genres")}
+                onSelect={toggleGenre}
+                selected={(value) => genres.includes(value)}
+              />
               <div className="mt-2 flex items-center gap-1.5">
                 <input
                   type="text"
@@ -383,6 +592,12 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                   </button>
                 ))}
               </div>
+              <LearnedOptionChips
+                options={learnedSettings}
+                expanded={expandedLearnedOptions.settings}
+                onToggleExpanded={() => toggleLearnedOptions("settings")}
+                onSelect={setSetting}
+              />
             </div>
 
             {/* Tone — multi-select */}
@@ -419,6 +634,13 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                     </button>
                   ))}
               </div>
+              <LearnedOptionChips
+                options={learnedTones}
+                expanded={expandedLearnedOptions.tones}
+                onToggleExpanded={() => toggleLearnedOptions("tones")}
+                onSelect={toggleTone}
+                selected={(value) => tones.includes(value)}
+              />
               <div className="mt-2 flex items-center gap-1.5">
                 <input
                   type="text"
@@ -504,22 +726,20 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                 className="w-full rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs text-[var(--foreground)] outline-none ring-1 ring-transparent transition-all placeholder:text-[var(--muted-foreground)] focus:ring-[var(--primary)]/40"
               />
               <div className="mt-1.5 flex flex-wrap gap-1">
-                {["English", "日本語", "한국어", "中文", "Español", "Français", "Deutsch", "Português", "Русский"].map(
-                  (lang) => (
-                    <button
-                      key={lang}
-                      onClick={() => setLanguage(lang)}
-                      className={cn(
-                        "rounded-full px-2 py-0.5 text-[0.625rem] transition-colors",
-                        language === lang
-                          ? "bg-[var(--primary)]/20 text-[var(--primary)] ring-1 ring-[var(--primary)]/40"
-                          : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:text-[var(--primary)] hover:bg-[var(--primary)]/10",
-                      )}
-                    >
-                      {lang}
-                    </button>
-                  ),
-                )}
+                {GAME_LANGUAGE_OPTIONS.map((option) => (
+                  <button
+                    key={option.value}
+                    onClick={() => setLanguage(option.label)}
+                    className={cn(
+                      "rounded-full px-2 py-0.5 text-[0.625rem] transition-colors",
+                      normalizedLanguage === option.value
+                        ? "bg-[var(--primary)]/20 text-[var(--primary)] ring-1 ring-[var(--primary)]/40"
+                        : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:text-[var(--primary)] hover:bg-[var(--primary)]/10",
+                    )}
+                  >
+                    {option.label}
+                  </button>
+                ))}
               </div>
               <p className="mt-1 text-[0.575rem] text-[var(--muted-foreground)]">
                 All narration and dialogue will be written in this language.
@@ -572,18 +792,7 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                     if (!c) return null;
                     return (
                       <div className="mb-2 flex items-center gap-2.5 rounded-lg bg-[var(--primary)]/10 px-3 py-2 ring-1 ring-[var(--primary)]/30">
-                        {c.avatarUrl ? (
-                          <img
-                            src={c.avatarUrl}
-                            alt={c.name}
-                            loading="lazy"
-                            className="h-6 w-6 rounded-full object-cover"
-                          />
-                        ) : (
-                          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5625rem] font-bold">
-                            {c.name[0]}
-                          </div>
-                        )}
+                        <CharacterAvatar character={c} />
                         <span className="flex-1 truncate text-xs">{c.name}</span>
                         <button
                           onClick={() => setGmCharacterId(null)}
@@ -616,19 +825,15 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                           c.id === gmCharacterId && "bg-[var(--primary)]/5",
                         )}
                       >
-                        {c.avatarUrl ? (
-                          <img
-                            src={c.avatarUrl}
-                            alt={c.name}
-                            loading="lazy"
-                            className="h-6 w-6 rounded-full object-cover"
-                          />
-                        ) : (
-                          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5625rem] font-bold">
-                            {c.name[0]}
-                          </div>
-                        )}
-                        <span className="flex-1 truncate text-xs">{c.name}</span>
+                        <CharacterAvatar character={c} />
+                        <div className="min-w-0 flex-1">
+                          <span className="block truncate text-xs">{c.name}</span>
+                          {getCharacterTitle(c) && (
+                            <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                              {getCharacterTitle(c)}
+                            </span>
+                          )}
+                        </div>
                         {c.id === gmCharacterId && (
                           <span className="text-[0.625rem] text-[var(--primary)]">Selected</span>
                         )}
@@ -660,19 +865,15 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                         key={cid}
                         className="flex items-center gap-2.5 rounded-lg bg-[var(--primary)]/10 px-3 py-2 ring-1 ring-[var(--primary)]/30"
                       >
-                        {c.avatarUrl ? (
-                          <img
-                            src={c.avatarUrl}
-                            alt={c.name}
-                            loading="lazy"
-                            className="h-6 w-6 rounded-full object-cover"
-                          />
-                        ) : (
-                          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5625rem] font-bold">
-                            {c.name[0]}
-                          </div>
-                        )}
-                        <span className="flex-1 truncate text-xs">{c.name}</span>
+                        <CharacterAvatar character={c} />
+                        <div className="min-w-0 flex-1">
+                          <span className="block truncate text-xs">{c.name}</span>
+                          {getCharacterTitle(c) && (
+                            <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                              {getCharacterTitle(c)}
+                            </span>
+                          )}
+                        </div>
                         <button
                           onClick={() => togglePartyMember(cid)}
                           className="flex h-5 w-5 items-center justify-center rounded-md text-[var(--muted-foreground)] transition-colors hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]"
@@ -708,19 +909,15 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                           isSelected && "bg-[var(--primary)]/5",
                         )}
                       >
-                        {c.avatarUrl ? (
-                          <img
-                            src={c.avatarUrl}
-                            alt={c.name}
-                            loading="lazy"
-                            className="h-6 w-6 rounded-full object-cover"
-                          />
-                        ) : (
-                          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5625rem] font-bold">
-                            {c.name[0]}
-                          </div>
-                        )}
-                        <span className="flex-1 truncate text-xs">{c.name}</span>
+                        <CharacterAvatar character={c} />
+                        <div className="min-w-0 flex-1">
+                          <span className="block truncate text-xs">{c.name}</span>
+                          {getCharacterTitle(c) && (
+                            <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                              {getCharacterTitle(c)}
+                            </span>
+                          )}
+                        </div>
                         {isSelected ? (
                           <span className="text-[0.625rem] text-[var(--primary)]">Added</span>
                         ) : (
@@ -843,7 +1040,7 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
             <div>
               <label className="mb-1.5 block text-xs font-medium text-[var(--foreground)]">
                 <Plug size={12} className="mr-1 inline" />
-                GM Model
+                GM / Party Model
               </label>
               <select
                 value={gmConnectionId ?? ""}
@@ -858,10 +1055,11 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                   </option>
                 ))}
               </select>
-              <p className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-[0.6875rem] leading-relaxed text-amber-100">
-                <span className="font-semibold text-amber-200">Warning!</span> It&apos;s recommended you use a strong
-                model (any SOTA one; the newest Opus, Gemini, GPT) for the initial generation for the best experience.
-                You can change the model later, after the initial generation (in Chat Settings -&gt; Connection).
+              <p className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[0.6875rem] leading-relaxed text-amber-800 dark:border-amber-500/25 dark:text-amber-100">
+                <span className="font-semibold text-amber-900 dark:text-amber-200">Warning!</span> It&apos;s recommended
+                you use a strong model (any SOTA one; the newest Opus, Gemini, GPT) for the initial generation for the
+                best experience. You can change the model later, after the initial generation (in Chat Settings -&gt;
+                Connection).
               </p>
               <div className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--card)] p-3">
                 <button
@@ -902,39 +1100,6 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
               )}
             </div>
 
-            {/* Character Model */}
-            <div>
-              <label className="mb-1.5 flex items-center gap-2 text-xs font-medium text-[var(--foreground)]">
-                Character Model
-                <button
-                  onClick={() => setSameConnection(!sameConnection)}
-                  className={cn(
-                    "rounded-full px-2 py-0.5 text-[0.625rem] transition-colors",
-                    sameConnection
-                      ? "bg-[var(--primary)]/15 text-[var(--primary)]"
-                      : "bg-[var(--secondary)] text-[var(--muted-foreground)]",
-                  )}
-                >
-                  {sameConnection ? "Same as GM" : "Different"}
-                </button>
-              </label>
-              {!sameConnection && (
-                <select
-                  value={charConnectionId ?? ""}
-                  onChange={(e) => setCharConnectionId(e.target.value || null)}
-                  className="w-full rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs text-[var(--foreground)] outline-none ring-1 ring-transparent transition-all focus:ring-[var(--primary)]/40"
-                >
-                  <option value="">Select a connection…</option>
-                  {connections.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                      {c.model ? ` — ${c.model}` : ""}
-                    </option>
-                  ))}
-                </select>
-              )}
-            </div>
-
             {/* Scene Effects Model — unified dropdown */}
             <div>
               <label className="mb-1.5 block text-xs font-medium text-[var(--foreground)]">
@@ -966,8 +1131,8 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
               </select>
               <p className="mt-1 text-[0.575rem] text-[var(--muted-foreground)]">
                 {sceneModelValue === "local"
-                  ? "Gemma handles backgrounds, music, widgets, expressions, and weather. Main model focuses on narration only."
-                  : "Handles backgrounds, music, widgets, and expressions after each GM turn. If skipped, the GM model handles scene tags inline."}
+                  ? "Gemma handles backgrounds, music, weather, and cinematic effects. The GM handles narration, widgets, and expressions."
+                  : "Handles backgrounds, music, weather, and cinematic effects after each GM turn. If skipped, the GM model handles scene tags inline."}
               </p>
             </div>
 
@@ -1027,7 +1192,7 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                     ))}
                   </select>
                   {imageConnections.length === 0 && (
-                    <p className="mt-1 text-[0.55rem] text-amber-400/80">
+                    <p className="mt-1 text-[0.55rem] text-amber-700 dark:text-amber-400/80">
                       No image generation connections found. Add one in Settings → Connections.
                     </p>
                   )}
@@ -1099,6 +1264,12 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                   </button>
                 ))}
               </div>
+              <LearnedOptionChips
+                options={learnedGoals}
+                expanded={expandedLearnedOptions.goals}
+                onToggleExpanded={() => toggleLearnedOptions("goals")}
+                onSelect={setPlayerGoals}
+              />
             </div>
 
             {/* Preferences */}
@@ -1196,6 +1367,39 @@ export function GameSetupWizard({ onComplete, onCancel, isLoading, characters }:
                   )}
                 </div>
               </div>
+            </div>
+
+            {/* Start Muted */}
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-3">
+              <button
+                onClick={() => setStartMuted(!startMuted)}
+                className="flex w-full items-center justify-between gap-2 text-left"
+              >
+                <div className="flex items-center gap-2">
+                  {startMuted ? (
+                    <VolumeX size={14} className="text-[var(--muted-foreground)]" />
+                  ) : (
+                    <Volume2 size={14} className="text-[var(--primary)]" />
+                  )}
+                  <div>
+                    <p className="text-xs font-medium text-[var(--foreground)]">Start Muted</p>
+                    <p className="text-[0.55rem] text-[var(--muted-foreground)]">Begin the game with all audio muted</p>
+                  </div>
+                </div>
+                <div
+                  className={cn(
+                    "flex h-5 w-8 items-center rounded-full px-0.5 transition-colors",
+                    startMuted ? "bg-[var(--primary)]" : "bg-[var(--secondary)]",
+                  )}
+                >
+                  <div
+                    className={cn(
+                      "h-4 w-4 rounded-full bg-white transition-transform",
+                      startMuted && "translate-x-3.5",
+                    )}
+                  />
+                </div>
+              </button>
             </div>
           </>
         )}

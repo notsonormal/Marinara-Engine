@@ -1,8 +1,9 @@
 // ──────────────────────────────────────────────
-// Seed: Default Prompt Preset
-// Creates Marinara's general-purpose roleplay preset on first boot.
+// Seed: Marinara's Universal Prompt Preset
+// Creates Marinara's universal roleplay preset on first boot.
 // Reads the exported preset JSON and imports it via the standard importer.
 // ──────────────────────────────────────────────
+import { logger } from "../lib/logger.js";
 import type { DB } from "./connection.js";
 import { createPromptsStorage } from "../services/storage/prompts.storage.js";
 import { importMarinara } from "../services/import/marinara.importer.js";
@@ -13,14 +14,30 @@ import { dirname, join } from "path";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+const LEGACY_MARINARA_PRESET_NAME = "Default";
+const MARINARA_PRESET_NAME = "Marinara's Universal Preset";
+const MARINARA_PRESET_DESCRIPTION = "Marinara's universal roleplay preset. Serves as a good base.";
+const MARINARA_PRESET_AUTHOR = "Marinara";
+
 // ─────────────────────────────────────────────
 //  Main seed function
 // ─────────────────────────────────────────────
 export async function seedDefaultPreset(db: DB) {
   const storage = createPromptsStorage(db);
 
-  // Skip if any preset already exists (user may have deleted or changed defaults)
+  // Rename the legacy bundled preset in existing databases without touching user presets.
   const existing = await storage.list();
+  const legacyMarinaraPreset = existing.find(
+    (preset) => preset.name === LEGACY_MARINARA_PRESET_NAME && preset.author === MARINARA_PRESET_AUTHOR,
+  );
+  if (legacyMarinaraPreset) {
+    await storage.update(legacyMarinaraPreset.id, {
+      name: MARINARA_PRESET_NAME,
+      description: MARINARA_PRESET_DESCRIPTION,
+    });
+  }
+
+  // Skip if any preset already exists (user may have deleted or changed defaults)
   if (existing.length > 0) return;
 
   // Load the exported preset JSON
@@ -31,7 +48,7 @@ export async function seedDefaultPreset(db: DB) {
   // Import using the standard importer
   const result = await importMarinara(envelope, db);
   if (!result.success || result.type !== "marinara_preset") {
-    console.error("[seed] Failed to import default preset:", result);
+    logger.error("[seed] Failed to import default preset: %j", result);
     return;
   }
 

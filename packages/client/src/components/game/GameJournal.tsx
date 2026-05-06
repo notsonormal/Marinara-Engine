@@ -5,8 +5,8 @@
 // NPC notes, locations, inventory, and events —
 // all assembled from committed snapshots, no LLM.
 // ──────────────────────────────────────────────
-import { useState, useEffect, useRef, useCallback } from "react";
-import { X, MapPin, Swords, ScrollText, Package, Users, PenLine, BookOpen } from "lucide-react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { X, MapPin, Swords, ScrollText, Package, Users, PenLine, BookOpen, Trash2 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { api } from "../../lib/api-client";
 import { AnimatedText } from "./AnimatedText";
@@ -18,6 +18,9 @@ interface JournalEntry {
   type: "location" | "npc" | "combat" | "quest" | "item" | "event" | "note";
   title: string;
   content: string;
+  readableType?: "note" | "book";
+  sourceMessageId?: string;
+  sourceSegmentIndex?: number;
 }
 
 interface QuestEntry {
@@ -40,6 +43,8 @@ interface GameJournalProps {
   chatId: string;
   npcs?: GameNpc[];
   onClose: () => void;
+  onNpcPortraitClick?: (npcName: string) => void;
+  onNpcRemove?: (npcName: string) => Promise<void> | void;
 }
 
 type TabId = "all" | "npcs" | "locations" | "inventory" | "library" | "notes";
@@ -63,11 +68,57 @@ const TYPE_ICONS: Record<string, typeof ScrollText> = {
   note: ScrollText,
 };
 
-export function GameJournal({ chatId, npcs, onClose }: GameJournalProps) {
+const TRAILING_REPUTATION_LABEL = /(devoted|allied|friendly|neutral|unfriendly|hostile|enemy)$/i;
+
+function normalizeNpcName(value: string): string {
+  return value.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function cleanNpcDisplayName(value: string): string {
+  return value.replace(TRAILING_REPUTATION_LABEL, "").trim() || value;
+}
+
+function normalizeNpcEntryTitle(value: string): string {
+  const title = value.replace(/^[^\p{L}\p{N}]+/u, "").trim();
+  return normalizeNpcName(cleanNpcDisplayName(title));
+}
+
+function dedupeNpcInteractions(interactions: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const interaction of interactions) {
+    const trimmed = interaction.trim();
+    const key = trimmed.toLowerCase();
+    if (!trimmed || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(trimmed);
+  }
+  return deduped;
+}
+
+function pruneJournalNpc(journal: Journal, npcName: string): Journal {
+  const target = normalizeNpcName(cleanNpcDisplayName(npcName));
+  return {
+    ...journal,
+    npcLog: journal.npcLog.filter((entry) => normalizeNpcName(cleanNpcDisplayName(entry.npcName)) !== target),
+    entries: journal.entries.filter((entry) => {
+      if (entry.type !== "npc") return true;
+      const title = entry.title.replace(/^[^\p{L}\p{N}]+/u, "").trim();
+      return normalizeNpcName(cleanNpcDisplayName(title)) !== target;
+    }),
+  };
+}
+
+function shouldShowNpcDescription(npc: GameNpc): boolean {
+  return (npc as GameNpc & { descriptionSource?: string }).descriptionSource === "model" && !!npc.description?.trim();
+}
+
+export function GameJournal({ chatId, npcs, onClose, onNpcPortraitClick, onNpcRemove }: GameJournalProps) {
   const [journal, setJournal] = useState<Journal | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>("all");
   const [playerNotes, setPlayerNotes] = useState("");
   const [notesSaved, setNotesSaved] = useState(true);
+  const [removingNpcName, setRemovingNpcName] = useState<string | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestNotesRef = useRef("");
 
@@ -112,6 +163,37 @@ export function GameJournal({ chatId, npcs, onClose }: GameJournalProps) {
       }
     };
   }, [saveNotes]);
+
+  const handleRemoveNpc = useCallback(
+    async (npcName: string) => {
+      if (!onNpcRemove) return;
+      setRemovingNpcName(npcName);
+      try {
+        await onNpcRemove(npcName);
+        setJournal((prev) => (prev ? pruneJournalNpc(prev, npcName) : prev));
+      } finally {
+        setRemovingNpcName(null);
+      }
+    },
+    [onNpcRemove],
+  );
+
+  const trackedNpcNames = useMemo(() => {
+    const names = new Set<string>();
+    for (const npc of npcs ?? []) {
+      const key = normalizeNpcName(cleanNpcDisplayName(npc.name));
+      if (key) names.add(key);
+    }
+    return names;
+  }, [npcs]);
+
+  const visibleEntries = useMemo(
+    () =>
+      (journal?.entries ?? []).filter(
+        (entry) => entry.type !== "npc" || trackedNpcNames.has(normalizeNpcEntryTitle(entry.title)),
+      ),
+    [journal?.entries, trackedNpcNames],
+  );
 
   if (!journal) {
     return (
@@ -160,11 +242,19 @@ export function GameJournal({ chatId, npcs, onClose }: GameJournalProps) {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4">
-        {activeTab === "all" && <TimelineView entries={journal.entries} />}
-        {activeTab === "npcs" && <NpcsView npcLog={journal.npcLog} npcs={npcs} />}
+        {activeTab === "all" && <TimelineView entries={visibleEntries} />}
+        {activeTab === "npcs" && (
+          <NpcsView
+            npcLog={journal.npcLog}
+            npcs={npcs}
+            onNpcPortraitClick={onNpcPortraitClick}
+            onNpcRemove={onNpcRemove ? handleRemoveNpc : undefined}
+            removingNpcName={removingNpcName}
+          />
+        )}
         {activeTab === "locations" && <LocationsView locations={journal.locations} />}
         {activeTab === "inventory" && <InventoryView items={journal.inventoryLog} />}
-        {activeTab === "library" && <LibraryView entries={journal.entries.filter((e) => e.type === "note")} />}
+        {activeTab === "library" && <LibraryView entries={visibleEntries.filter((e) => e.type === "note")} />}
         {activeTab === "notes" && <NotesView notes={playerNotes} onChange={handleNotesChange} saved={notesSaved} />}
       </div>
     </div>
@@ -204,57 +294,116 @@ function reputationLabel(rep: number): { text: string; color: string } {
   return { text: "Enemy", color: "text-red-400" };
 }
 
-function NpcsView({ npcLog, npcs }: { npcLog: Array<{ npcName: string; interactions: string[] }>; npcs?: GameNpc[] }) {
-  const metNpcs = npcs?.filter((n) => n.met) ?? [];
-  const hasContent = metNpcs.length > 0 || npcLog.length > 0;
+function NpcsView({
+  npcLog,
+  npcs,
+  onNpcPortraitClick,
+  onNpcRemove,
+  removingNpcName,
+}: {
+  npcLog: Array<{ npcName: string; interactions: string[] }>;
+  npcs?: GameNpc[];
+  onNpcPortraitClick?: (npcName: string) => void;
+  onNpcRemove?: (npcName: string) => void;
+  removingNpcName?: string | null;
+}) {
+  const trackedNpcs = npcs ?? [];
+  const hasContent = trackedNpcs.length > 0;
 
   if (!hasContent) {
     return <div className="text-center text-xs text-white/40">No NPCs encountered yet.</div>;
   }
 
-  // Build a combined view: NPC data (with reputation) + interaction log
-  const npcMap = new Map<string, { npc?: GameNpc; interactions: string[]; displayName: string }>();
-  for (const n of metNpcs) {
-    npcMap.set(n.name.toLowerCase(), { npc: n, interactions: [], displayName: n.name });
+  const npcMap = new Map<string, { npc: GameNpc; interactions: string[]; displayName: string; originalName: string }>();
+  for (const n of trackedNpcs) {
+    const displayName = cleanNpcDisplayName(n.name);
+    const key = normalizeNpcName(displayName);
+    if (!key) continue;
+    npcMap.set(key, { npc: n, interactions: [], displayName, originalName: n.name });
   }
   for (const entry of npcLog) {
-    const key = entry.npcName.toLowerCase();
+    const displayName = cleanNpcDisplayName(entry.npcName);
+    const key = normalizeNpcName(displayName);
+    if (!key) continue;
     const existing = npcMap.get(key);
+    const interactions = dedupeNpcInteractions(entry.interactions);
     if (existing) {
-      existing.interactions = entry.interactions;
-    } else {
-      npcMap.set(key, { interactions: entry.interactions, displayName: entry.npcName });
+      existing.interactions = dedupeNpcInteractions([...existing.interactions, ...interactions]);
     }
   }
+  const entries = [...npcMap.values()].sort((left, right) => {
+    const metDelta = Number(Boolean(right.npc.met)) - Number(Boolean(left.npc.met));
+    if (metDelta !== 0) return metDelta;
+    return left.displayName.localeCompare(right.displayName);
+  });
 
   return (
     <div className="flex flex-col gap-2">
-      {[...npcMap.values()].map((entry, i) => {
-        const name = entry.npc?.name ?? entry.displayName;
-        const rep = entry.npc ? reputationLabel(entry.npc.reputation) : null;
+      {entries.map((entry) => {
+        const name = cleanNpcDisplayName(entry.npc.name);
+        const rep = reputationLabel(entry.npc.reputation);
+        const canUploadPortrait = !!onNpcPortraitClick;
+        const isRemoving = removingNpcName
+          ? normalizeNpcName(cleanNpcDisplayName(removingNpcName)) === normalizeNpcName(name)
+          : false;
         return (
-          <div key={i} className="rounded-lg border border-white/5 bg-white/3 px-3 py-2">
+          <div key={normalizeNpcName(name)} className="rounded-lg border border-white/5 bg-white/3 px-3 py-2">
             <div className="flex items-center gap-2">
-              {entry.npc?.avatarUrl && (
+              {canUploadPortrait ? (
+                <button
+                  type="button"
+                  onClick={() => onNpcPortraitClick?.(entry.npc.name)}
+                  className="shrink-0 rounded-full transition-transform hover:scale-[1.05] focus:outline-none focus:ring-2 focus:ring-white/20"
+                  title="Upload or replace NPC portrait"
+                >
+                  {entry.npc.avatarUrl ? (
+                    <img
+                      src={entry.npc.avatarUrl}
+                      alt={name}
+                      className="h-6 w-6 rounded-full object-cover ring-1 ring-white/10 transition-colors hover:ring-white/25"
+                    />
+                  ) : (
+                    <div className="flex h-6 w-6 items-center justify-center rounded-full bg-white/10 text-[0.6rem] font-semibold text-white/60 ring-1 ring-white/10 transition-colors hover:ring-white/25">
+                      {name[0]?.toUpperCase() ?? "?"}
+                    </div>
+                  )}
+                </button>
+              ) : entry.npc.avatarUrl ? (
                 <img src={entry.npc.avatarUrl} alt={name} className="h-6 w-6 shrink-0 rounded-full object-cover" />
+              ) : (
+                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/10 text-[0.6rem] font-semibold text-white/60">
+                  {name[0]?.toUpperCase() ?? "?"}
+                </div>
               )}
               <span className="flex-1 text-xs font-medium text-white/80">
-                {entry.npc?.emoji ? `${entry.npc.emoji} ` : ""}
+                {entry.npc.emoji ? `${entry.npc.emoji} ` : ""}
                 {name}
               </span>
-              {rep && <span className={cn("text-[10px] font-medium", rep.color)}>{rep.text}</span>}
+              <span
+                className={cn(
+                  "rounded-full px-1.5 py-0.5 text-[10px] font-medium",
+                  entry.npc.met ? "bg-emerald-400/10 text-emerald-300" : "bg-white/5 text-white/35",
+                )}
+              >
+                {entry.npc.met ? "Met" : "Not Met"}
+              </span>
+              <span className={cn("text-[10px] font-medium", rep.color)}>{rep.text}</span>
+              {onNpcRemove && (
+                <button
+                  type="button"
+                  onClick={() => onNpcRemove(entry.originalName)}
+                  disabled={isRemoving}
+                  title="Remove this NPC from the journal"
+                  className="rounded p-1 text-white/35 transition-colors hover:bg-red-500/15 hover:text-red-300 disabled:opacity-40"
+                >
+                  <Trash2 size={11} />
+                </button>
+              )}
             </div>
-            {entry.npc?.description && <div className="mt-1 text-[0.6rem] text-white/40">{entry.npc.description}</div>}
-            {entry.npc?.location && <div className="mt-0.5 text-[0.6rem] text-white/30">📍 {entry.npc.location}</div>}
-            {entry.interactions.length > 0 && (
-              <div className="mt-1 flex flex-col gap-0.5">
-                {entry.interactions.slice(-5).map((int, j) => (
-                  <div key={j} className="text-[0.625rem] text-white/40">
-                    • <AnimatedText html={int} />
-                  </div>
-                ))}
-              </div>
+            {shouldShowNpcDescription(entry.npc) && (
+              <div className="mt-1 text-[0.6rem] text-white/40">{entry.npc.description}</div>
             )}
+            {entry.npc?.location && <div className="mt-0.5 text-[0.6rem] text-white/30">📍 {entry.npc.location}</div>}
           </div>
         );
       })}
@@ -320,7 +469,7 @@ function LibraryView({ entries }: { entries: JournalEntry[] }) {
   return (
     <div className="flex flex-col gap-2">
       {[...entries].reverse().map((entry, i) => {
-        const isBook = entry.title.toLowerCase() === "book";
+        const isBook = entry.readableType === "book" || entry.title.toLowerCase() === "book";
         const text = entry.content;
         return (
           <div key={i} className="rounded-lg border border-white/5 bg-white/3 px-3 py-2">

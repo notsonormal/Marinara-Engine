@@ -16,6 +16,9 @@ export interface KnownModel {
 // ── OpenAI (from #model_openai_select) ──
 
 export const OPENAI_MODELS: KnownModel[] = [
+  // GPT-5.5
+  { id: "gpt-5.5", name: "gpt-5.5", context: 1050000, maxOutput: 128000 },
+  { id: "gpt-5.5-2026-04-23", name: "gpt-5.5-2026-04-23", context: 1050000, maxOutput: 128000 },
   // GPT-5.4
   { id: "gpt-5.4", name: "gpt-5.4", context: 1050000, maxOutput: 128000 },
   { id: "gpt-5.4-2026-03-05", name: "gpt-5.4-2026-03-05", context: 1050000, maxOutput: 128000 },
@@ -124,6 +127,21 @@ export const ANTHROPIC_MODELS: KnownModel[] = [
   { id: "claude-3-5-haiku-20241022", name: "claude-3-5-haiku-20241022", context: 200000, maxOutput: 8192 },
   { id: "claude-3-opus-20240229", name: "claude-3-opus-20240229", context: 200000, maxOutput: 4096 },
   { id: "claude-3-haiku-20240307", name: "claude-3-haiku-20240307", context: 200000, maxOutput: 4096 },
+];
+
+// ── Claude (Subscription via Claude Agent SDK) ──
+// Models reachable through the local `claude` CLI auth (Pro / Max). Anthropic
+// gates which model IDs are available per plan tier; the SDK surfaces a clear
+// error if the signed-in plan can't run the requested model. We keep this list
+// to the current tool-eligible families to avoid offering retired aliases that
+// the subscription path no longer accepts.
+export const CLAUDE_SUBSCRIPTION_MODELS: KnownModel[] = [
+  { id: "claude-opus-4-7", name: "Claude Opus 4.7", context: 1000000, maxOutput: 128000 },
+  { id: "claude-opus-4-6", name: "Claude Opus 4.6", context: 1000000, maxOutput: 32000 },
+  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", context: 1000000, maxOutput: 32000 },
+  { id: "claude-opus-4-5", name: "Claude Opus 4.5", context: 1000000, maxOutput: 32000 },
+  { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", context: 1000000, maxOutput: 16000 },
+  { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", context: 200000, maxOutput: 8192 },
 ];
 
 // ── Google AI Studio (from #model_google_select) ──
@@ -259,6 +277,17 @@ export const COHERE_MODELS: KnownModel[] = [
 // ── OpenRouter (loaded dynamically from API in SillyTavern — no static list) ──
 
 export const OPENROUTER_MODELS: KnownModel[] = [];
+
+// ── xAI / Grok (OpenAI-compatible API) ──
+
+export const XAI_MODELS: KnownModel[] = [
+  // Official xAI docs recommend Grok 4.3 for standard chat API usage.
+  { id: "grok-4.3", name: "Grok 4.3", context: 1000000, maxOutput: 0 },
+  // Reasoning docs mention this model as auto-reasoning without configurable effort.
+  { id: "grok-4-1-fast", name: "Grok 4.1 Fast", context: 2000000, maxOutput: 0 },
+  // Multi-agent research model; uses Responses API and reasoning.effort for 4 vs 16 agents.
+  { id: "grok-4.20-multi-agent", name: "Grok 4.20 Multi-Agent", context: 2000000, maxOutput: 0 },
+];
 
 // ── Additional providers with static lists in SillyTavern ──
 
@@ -451,13 +480,21 @@ export const IMAGE_GENERATION_SOURCES: ImageGenSource[] = [
 // Known image generation models (grouped by service)
 const IMAGE_GEN_MODELS: KnownModel[] = [
   // OpenAI
+  { id: "gpt-image-2", name: "GPT Image 2", context: 0, maxOutput: 0 },
+  { id: "gpt-image-1.5", name: "GPT Image 1.5", context: 0, maxOutput: 0 },
   { id: "dall-e-3", name: "DALL-E 3", context: 0, maxOutput: 0 },
   { id: "dall-e-2", name: "DALL-E 2", context: 0, maxOutput: 0 },
   { id: "gpt-image-1", name: "GPT Image 1", context: 0, maxOutput: 0 },
   // Stability AI
-  { id: "sd3-large", name: "Stable Diffusion 3 Large", context: 0, maxOutput: 0 },
-  { id: "sd3-large-turbo", name: "SD3 Large Turbo", context: 0, maxOutput: 0 },
-  { id: "sd3-medium", name: "Stable Diffusion 3 Medium", context: 0, maxOutput: 0 },
+  { id: "stable-image-core", name: "Stable Image Core", context: 0, maxOutput: 0 },
+  { id: "stable-image-ultra", name: "Stable Image Ultra", context: 0, maxOutput: 0 },
+  { id: "sd3.5-large", name: "Stable Diffusion 3.5 Large", context: 0, maxOutput: 0 },
+  { id: "sd3.5-large-turbo", name: "SD3.5 Large Turbo", context: 0, maxOutput: 0 },
+  { id: "sd3.5-medium", name: "Stable Diffusion 3.5 Medium", context: 0, maxOutput: 0 },
+  { id: "sd3.5-flash", name: "Stable Diffusion 3.5 Flash", context: 0, maxOutput: 0 },
+  { id: "sd3-large", name: "Stable Diffusion 3 Large (legacy alias)", context: 0, maxOutput: 0 },
+  { id: "sd3-large-turbo", name: "SD3 Large Turbo (legacy alias)", context: 0, maxOutput: 0 },
+  { id: "sd3-medium", name: "Stable Diffusion 3 Medium (legacy alias)", context: 0, maxOutput: 0 },
   // Together AI
   { id: "black-forest-labs/FLUX.1-schnell-Free", name: "FLUX.1 Schnell (Free)", context: 0, maxOutput: 0 },
   { id: "black-forest-labs/FLUX.1-schnell", name: "FLUX.1 Schnell", context: 0, maxOutput: 0 },
@@ -493,6 +530,7 @@ export function inferImageSource(model: string, baseUrl: string): string {
     return m;
   }
   if (m === "drawthings") return "automatic1111";
+  if (u.includes("nano-gpt.com")) return "nanogpt";
   if (m.startsWith("dall-e") || m.startsWith("gpt-image") || u.includes("openai.com")) return "openai";
   if (m.startsWith("sd3") || u.includes("stability.ai")) return "stability";
   if (m.includes("nai-diffusion") || u.includes("novelai.net")) return "novelai";
@@ -506,7 +544,6 @@ export function inferImageSource(model: string, baseUrl: string): string {
   if (m.includes("gemini") && m.includes("image")) return "gemini_image";
   if (m.includes("imagen")) return "gemini_image";
   // OpenAI-compatible fallback (works for most proxies)
-  if (u.includes("nano-gpt.com")) return "nanogpt";
   return "openai";
 }
 
@@ -515,12 +552,15 @@ export function inferImageSource(model: string, baseUrl: string): string {
 export const MODEL_LISTS: Record<APIProvider, KnownModel[]> = {
   openai: OPENAI_MODELS,
   anthropic: ANTHROPIC_MODELS,
+  claude_subscription: CLAUDE_SUBSCRIPTION_MODELS,
   google: GOOGLE_MODELS,
   mistral: MISTRAL_MODELS,
   cohere: COHERE_MODELS,
   openrouter: OPENROUTER_MODELS,
   nanogpt: [], // NanoGPT aggregator — models fetched dynamically via API
-  custom: [], // User must type model ID manually for custom endpoints
+  xai: XAI_MODELS,
+  // Seed OAI-compatible endpoints with the OpenAI catalog; remote /models still merge on top.
+  custom: OPENAI_MODELS,
   image_generation: IMAGE_GEN_MODELS,
 };
 

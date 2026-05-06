@@ -51,7 +51,10 @@ export function useAutonomousMessaging(
   const recordUserActivity = useCallback(async () => {
     if (!chatId) return;
     try {
-      await api.post("/conversation/activity/user", { chatId });
+      await api.post("/conversation/activity/user", {
+        chatId,
+        preserveGenerationInProgress: useChatStore.getState().abortControllers.has(chatId),
+      });
     } catch {
       // non-critical
     }
@@ -75,7 +78,12 @@ export function useAutonomousMessaging(
     async (characterIds?: string[]) => {
       if (!chatId) return;
       try {
-        await api.post("/conversation/schedule/generate", { chatId, characterIds });
+        const scheduleGenerationPreferences = useUIStore.getState().scheduleGenerationPreferences;
+        await api.post("/conversation/schedule/generate", {
+          chatId,
+          characterIds,
+          scheduleGenerationPreferences,
+        });
       } catch {
         // non-critical — schedule generation may fail if no connection
       }
@@ -160,9 +168,12 @@ export function useAutonomousMessaging(
       } catch {
         // generation failed — non-critical
       } finally {
-        // Always record activity to reset server-side generationInProgress flag,
-        // even on failure/empty response — otherwise autonomous polling gets stuck.
-        await recordAssistantActivity(produced ? characterId : undefined);
+        // Successful generations are recorded by the server when it saves the
+        // assistant message. On failure/empty response, clear the in-progress
+        // autonomous flag so polling does not get stuck until timeout.
+        if (!produced) {
+          await recordAssistantActivity(undefined);
+        }
         generatingRef.current = false;
       }
 

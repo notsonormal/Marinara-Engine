@@ -1,11 +1,15 @@
 // ──────────────────────────────────────────────
 // Game: Input Bar (send message, roll dice, attach files, emoji)
 // ──────────────────────────────────────────────
-import { useState, useRef, useEffect, useCallback, type KeyboardEvent } from "react";
-import { Send, Dices, Paperclip, Smile, Users, MessageCircle, MessageSquare } from "lucide-react";
+import { useState, useRef, useEffect, useCallback, useMemo, type KeyboardEvent } from "react";
+import { Send, Dices, Paperclip, Smile, Users, MessageCircle, MessageSquare, Languages, Loader2 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { EmojiPicker } from "../ui/EmojiPicker";
+import { SpeechToTextButton } from "../ui/SpeechToTextButton";
 import { useUIStore } from "../../stores/ui.store";
+import { useChatStore } from "../../stores/chat.store";
+import { translateDraftText } from "../../lib/draft-translation";
+import type { DiceRollResult } from "@marinara-engine/shared";
 
 interface Attachment {
   type: string;
@@ -21,7 +25,7 @@ interface GameInputProps {
     attachments?: Array<{ type: string; data: string }>,
     options?: { commitPendingMove?: boolean },
   ) => void;
-  onRollDice: (notation: string) => void;
+  onRollDice: (notation: string) => Promise<DiceRollResult | null>;
   /** When true, allow "Talk to Party" in the address selector. */
   hasPartyMembers?: boolean;
   /** Pending staged destination from the map UI. */
@@ -34,9 +38,25 @@ interface GameInputProps {
   inline?: boolean;
   /** Key for persisting the input draft to sessionStorage (e.g. chatId) */
   draftKey?: string;
+  /** Increment to request focus on the textarea (used by the Interrupt button to jump the player into typing). */
+  focusToken?: number;
+  /**
+   * When set, the input renders in interrupt-commit mode. `risky` paints the bar red,
+   * highlights the dice button with a glow, and shows a "using dice recommended" hint.
+   * `force` keeps the normal styling — the GM won't be told this is an interrupt.
+   */
+  interruptMode?: "risky" | "force" | null;
 }
 
 const QUICK_DICE = ["d20", "d6", "2d6", "d10", "d100", "d4", "d8", "d12"];
+
+function formatDiceResultTag(result: DiceRollResult): string {
+  const rollDetail =
+    result.rolls.length > 1 || result.modifier !== 0
+      ? ` (${result.rolls.join(", ")}${result.modifier ? ` ${result.modifier > 0 ? "+" : ""}${result.modifier}` : ""})`
+      : "";
+  return `[dice: ${result.notation} = ${result.total}${rollDetail}]`;
+}
 
 export function GameInput({
   onSend,
@@ -48,8 +68,11 @@ export function GameInput({
   isStreaming,
   inline,
   draftKey,
+  focusToken,
+  interruptMode,
 }: GameInputProps) {
   const enterToSend = useUIStore((s) => s.enterToSendGame);
+  const speechToTextEnabled = useUIStore((s) => s.speechToTextEnabled);
   const storageKey = draftKey ? `game-input-draft:${draftKey}` : null;
   const [text, setText] = useState(() => {
     if (!storageKey) return "";
@@ -62,7 +85,9 @@ export function GameInput({
   const [showDice, setShowDice] = useState(false);
   const [customDice, setCustomDice] = useState("");
   const [queuedDice, setQueuedDice] = useState<string | null>(null);
+  const [rollingQueuedDice, setRollingQueuedDice] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [isTranslatingDraft, setIsTranslatingDraft] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [addressMode, setAddressMode] = useState<AddressMode>("scene");
   const [addressMenuOpen, setAddressMenuOpen] = useState(false);
@@ -72,11 +97,34 @@ export function GameInput({
   const inputBarRef = useRef<HTMLDivElement>(null);
   const addressButtonRef = useRef<HTMLButtonElement>(null);
   const addressMenuRef = useRef<HTMLDivElement>(null);
+  const activeChat = useChatStore((s) => s.activeChat);
+  const chatMetadata = useMemo(() => {
+    if (!activeChat?.metadata) return {};
+    if (typeof activeChat.metadata !== "string") return activeChat.metadata as Record<string, unknown>;
+    try {
+      return JSON.parse(activeChat.metadata) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }, [activeChat?.metadata]);
+  const showDraftTranslateButton = chatMetadata.showInputTranslateButton === true;
 
   useEffect(() => {
     if (addressMode !== "party" || hasPartyMembers) return;
     setAddressMode("scene");
   }, [addressMode, hasPartyMembers]);
+
+  // Honors focus requests even if the input was disabled at the time the
+  // token bumped (e.g. Interrupt clicked while `isStreaming` is still true) —
+  // we re-attempt the focus once `disabled` flips to false.
+  const lastFocusedTokenRef = useRef(0);
+  useEffect(() => {
+    if (!focusToken) return;
+    if (lastFocusedTokenRef.current === focusToken) return;
+    if (disabled) return;
+    inputRef.current?.focus();
+    lastFocusedTokenRef.current = focusToken;
+  }, [focusToken, disabled]);
 
   useEffect(() => {
     if (!addressMenuOpen) return;
@@ -122,11 +170,11 @@ export function GameInput({
     inputRef.current?.focus();
   }, []);
 
-  const handleSend = () => {
+  const handleSend = async () => {
     const trimmed = text.trim();
     const commitPendingMove = !!pendingMoveLabel && addressMode === "scene";
     const hasTurnContent = trimmed.length > 0 || attachments.length > 0 || commitPendingMove || !!queuedDice;
-    if (!hasTurnContent || disabled) return;
+    if (!hasTurnContent || disabled || rollingQueuedDice) return;
 
     let body = trimmed;
     if (commitPendingMove && pendingMoveLabel) {
@@ -137,8 +185,16 @@ export function GameInput({
       attachments.length > 0 ? attachments.map((a) => ({ type: a.type, data: a.data })) : undefined;
 
     if (queuedDice) {
-      onRollDice(queuedDice);
-      body = body ? `${body}\n[dice: ${queuedDice}]` : `[dice: ${queuedDice}]`;
+      setRollingQueuedDice(true);
+      let diceResult: DiceRollResult | null = null;
+      try {
+        diceResult = await onRollDice(queuedDice);
+      } finally {
+        setRollingQueuedDice(false);
+      }
+      if (!diceResult) return;
+      const diceTag = formatDiceResultTag(diceResult);
+      body = body ? `${body}\n${diceTag}` : diceTag;
       setQueuedDice(null);
     }
 
@@ -161,7 +217,7 @@ export function GameInput({
     const shouldSend = enterToSend ? e.key === "Enter" && !e.shiftKey : e.key === "Enter" && (e.metaKey || e.ctrlKey);
     if (shouldSend) {
       e.preventDefault();
-      handleSend();
+      void handleSend();
     }
   };
 
@@ -201,19 +257,83 @@ export function GameInput({
     [updateText],
   );
 
+  const handleTranslateDraft = useCallback(async () => {
+    if (disabled || isTranslatingDraft || !text.trim()) return;
+    setIsTranslatingDraft(true);
+    try {
+      const translated = await translateDraftText(text);
+      if (!translated) return;
+      updateText(translated);
+      requestAnimationFrame(() => {
+        if (!inputRef.current) return;
+        inputRef.current.style.height = "auto";
+        inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 120)}px`;
+        inputRef.current.focus();
+      });
+    } finally {
+      setIsTranslatingDraft(false);
+    }
+  }, [disabled, isTranslatingDraft, text, updateText]);
+
+  const handleSpeechTranscript = useCallback(
+    (transcript: string) => {
+      const el = inputRef.current;
+      if (!el) return;
+      const currentText = el.value;
+      const start = el.selectionStart ?? currentText.length;
+      const end = el.selectionEnd ?? start;
+      const before = currentText.slice(0, start);
+      const after = currentText.slice(end);
+      const prefix = before && !/\s$/.test(before) ? " " : "";
+      const suffix = after && !/^\s/.test(after) ? " " : "";
+      const nextValue = `${before}${prefix}${transcript}${suffix}${after}`;
+      const nextCursor = before.length + prefix.length + transcript.length;
+
+      updateText(nextValue);
+      requestAnimationFrame(() => {
+        if (!inputRef.current) return;
+        inputRef.current.selectionStart = inputRef.current.selectionEnd = nextCursor;
+        inputRef.current.style.height = "auto";
+        inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 120)}px`;
+        inputRef.current.focus();
+      });
+    },
+    [updateText],
+  );
+
+  const riskyInterrupt = interruptMode === "risky";
+  const forceInterrupt = interruptMode === "force";
+
   return (
     <div
-      className={inline ? "" : "border-t border-[var(--border)] bg-[var(--card)]"}
-      style={inline ? undefined : { minHeight: 61 }}
+      className={cn(
+        inline ? "" : "border-t border-[var(--border)] bg-[var(--card)]",
+        riskyInterrupt &&
+          "rounded-xl ring-1 ring-red-500/40 bg-red-500/5 shadow-[0_0_18px_-6px_rgba(248,113,113,0.55)]",
+        forceInterrupt && "rounded-xl ring-1",
+      )}
+      style={
+        forceInterrupt
+          ? {
+              ...(inline ? {} : { minHeight: 61 }),
+              boxShadow: "0 0 18px -6px rgba(32, 194, 14, 0.6)",
+              backgroundColor: "rgba(32, 194, 14, 0.04)",
+              ["--tw-ring-color" as never]: "rgba(32, 194, 14, 0.45)",
+            }
+          : inline
+            ? undefined
+            : { minHeight: 61 }
+      }
     >
       {/* Dice picker */}
       {showDice && (
         <div className="flex flex-wrap items-center gap-1.5 border-b border-[var(--border)] px-4 py-2">
           {QUICK_DICE.map((d) => (
             <button
+              type="button"
               key={d}
               onClick={() => handleDiceRoll(d)}
-              className="rounded bg-white/10 px-2 py-1 text-xs font-mono text-white/70 hover:bg-white/20 transition-colors"
+              className="rounded bg-[var(--muted)]/30 px-2 py-1 text-xs font-mono text-[var(--foreground)]/70 hover:bg-[var(--muted)]/50 transition-colors"
             >
               🎲 {d}
             </button>
@@ -224,7 +344,7 @@ export function GameInput({
               value={customDice}
               onChange={(e) => setCustomDice(e.target.value)}
               placeholder="3d8+2"
-              className="h-[26px] w-16 rounded bg-white/10 px-1.5 text-xs font-mono text-white/70 outline-none placeholder:text-white/30"
+              className="h-[26px] w-16 rounded bg-[var(--muted)]/30 px-1.5 text-xs font-mono text-[var(--foreground)]/70 outline-none placeholder:text-[var(--muted-foreground)]/50"
               onKeyDown={(e) => {
                 if (e.key === "Enter" && customDice.trim()) {
                   handleDiceRoll(customDice.trim());
@@ -233,13 +353,14 @@ export function GameInput({
               }}
             />
             <button
+              type="button"
               onClick={() => {
                 if (customDice.trim()) {
                   handleDiceRoll(customDice.trim());
                   setCustomDice("");
                 }
               }}
-              className="flex h-[26px] items-center rounded bg-white/10 px-1.5 text-white/70 hover:bg-white/20"
+              className="flex h-[26px] items-center rounded bg-[var(--muted)]/30 px-1.5 text-[var(--foreground)]/70 hover:bg-[var(--muted)]/50"
             >
               <Send size={14} />
             </button>
@@ -303,8 +424,8 @@ export function GameInput({
                   className={cn(
                     "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors",
                     addressMode === "party"
-                      ? "bg-sky-500/15 text-sky-200"
-                      : "text-[var(--foreground)]/75 hover:bg-white/5 hover:text-[var(--foreground)]",
+                      ? "bg-sky-500/15 text-sky-700 dark:text-sky-200"
+                      : "text-[var(--foreground)]/75 hover:bg-black/5 hover:text-[var(--foreground)] dark:hover:bg-white/5",
                   )}
                 >
                   <Users size={14} className="shrink-0" />
@@ -317,8 +438,8 @@ export function GameInput({
                 className={cn(
                   "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors",
                   addressMode === "gm"
-                    ? "bg-amber-500/15 text-amber-200"
-                    : "text-[var(--foreground)]/75 hover:bg-white/5 hover:text-[var(--foreground)]",
+                    ? "bg-amber-500/15 text-amber-700 dark:text-amber-200"
+                    : "text-[var(--foreground)]/75 hover:bg-black/5 hover:text-[var(--foreground)] dark:hover:bg-white/5",
                 )}
               >
                 <MessageCircle size={14} className="shrink-0" />
@@ -397,16 +518,17 @@ export function GameInput({
           }
           disabled={disabled}
           rows={1}
-          className="min-w-0 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm leading-normal text-[#c3c2c2] outline-none placeholder:text-foreground/30 disabled:opacity-50"
+          className="min-w-0 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm leading-normal text-[var(--foreground)] outline-none placeholder:text-foreground/30 disabled:opacity-50"
           style={{ minHeight: 36, maxHeight: 120 }}
         />
 
         {queuedDice && (
-          <div className="flex items-center self-stretch rounded-lg border border-white/15 bg-white/10 px-2 text-xs text-white/70">
+          <div className="flex items-center self-stretch rounded-lg border border-[var(--border)] bg-[var(--muted)]/30 px-2 text-xs text-[var(--foreground)]/70">
             🎲 {queuedDice}
             <button
+              type="button"
               onClick={() => setQueuedDice(null)}
-              className="ml-1 text-white/40 transition-colors hover:text-white"
+              className="ml-1 text-[var(--muted-foreground)]/60 transition-colors hover:text-[var(--foreground)]"
               title="Clear queued roll"
             >
               ✕
@@ -415,21 +537,39 @@ export function GameInput({
         )}
 
         {/* Right: Dice, Emoji (desktop), Send */}
+        {riskyInterrupt && !queuedDice && (
+          <span className="hidden text-[0.625rem] font-medium uppercase tracking-wide text-red-300/80 sm:inline">
+            using dice recommended
+          </span>
+        )}
+        {forceInterrupt && (
+          <span
+            className="hidden text-[0.625rem] font-medium uppercase tracking-wide sm:inline"
+            style={{ color: "#20C20E", opacity: 0.9 }}
+          >
+            force interrupting
+          </span>
+        )}
         <button
+          type="button"
           onClick={() => setShowDice(!showDice)}
           className={cn(
             "shrink-0 rounded-lg p-1.5 transition-all active:scale-90",
             showDice
-              ? "text-white/80 hover:bg-foreground/10"
-              : "text-white/50 hover:bg-foreground/10 hover:text-white/70",
+              ? "text-[var(--foreground)]/80 hover:bg-foreground/10"
+              : "text-[var(--foreground)]/50 hover:bg-foreground/10 hover:text-[var(--foreground)]/70",
+            riskyInterrupt &&
+              !queuedDice &&
+              "animate-pulse text-red-300 ring-1 ring-red-400/60 shadow-[0_0_12px_-2px_rgba(248,113,113,0.85)] hover:text-red-200",
           )}
-          title="Roll dice"
+          title={riskyInterrupt && !queuedDice ? "Roll dice — recommended for an interrupt attempt" : "Roll dice"}
         >
           <Dices size={18} />
         </button>
 
         <div className="relative hidden sm:block">
           <button
+            type="button"
             ref={emojiButtonRef}
             onClick={() => setEmojiOpen((v) => !v)}
             className={cn(
@@ -451,18 +591,42 @@ export function GameInput({
           />
         </div>
 
+        {showDraftTranslateButton && (
+          <button
+            type="button"
+            onClick={() => void handleTranslateDraft()}
+            disabled={disabled || !text.trim() || isTranslatingDraft}
+            className={cn(
+              "flex h-8 w-8 shrink-0 items-center justify-center rounded-xl transition-all duration-200 active:scale-90",
+              !disabled && text.trim() && !isTranslatingDraft
+                ? "text-[var(--foreground)]/50 hover:bg-foreground/10 hover:text-[var(--foreground)]/70"
+                : "text-[var(--muted-foreground)]/40",
+            )}
+            title="Translate draft"
+          >
+            {isTranslatingDraft ? <Loader2 size={18} className="animate-spin" /> : <Languages size={18} />}
+          </button>
+        )}
+
+        {speechToTextEnabled && (
+          <SpeechToTextButton disabled={disabled} onTranscript={handleSpeechTranscript} iconSize={18} />
+        )}
+
         <button
-          onClick={handleSend}
+          type="button"
+          onClick={() => void handleSend()}
           disabled={
             disabled ||
+            rollingQueuedDice ||
             (!text.trim() && attachments.length === 0 && !(pendingMoveLabel && addressMode === "scene") && !queuedDice)
           }
           className={cn(
             "flex h-8 w-8 shrink-0 items-center justify-center rounded-xl transition-all duration-200 active:scale-90",
             (text.trim() || attachments.length > 0 || (pendingMoveLabel && addressMode === "scene") || queuedDice) &&
-              !disabled
-              ? "text-white hover:text-white/80"
-              : "text-white/30",
+              !disabled &&
+              !rollingQueuedDice
+              ? "text-[var(--foreground)]/50 hover:text-[var(--foreground)]/70"
+              : "text-[var(--muted-foreground)]/40",
           )}
         >
           <Send size={18} />

@@ -23,6 +23,7 @@ export type AgentResultType =
   | "continuity_check"
   | "director_event"
   | "lorebook_update"
+  | "character_card_update"
   | "prompt_review"
   | "background_change"
   | "character_tracker_update"
@@ -96,8 +97,26 @@ export interface AgentContext {
   mainResponse: string | null;
   /** Current game state (if any) */
   gameState: import("./game-state.js").GameState | null;
-  /** Active characters in the chat */
-  characters: Array<{ id: string; name: string; description: string }>;
+  /**
+   * Active characters in the chat. The base shape (id/name/description) is
+   * always populated. Richer card fields are optional — they're present in
+   * practice, but agents should not rely on them unless needed. The Card
+   * Evolution Auditor agent uses them to emit exact-match oldText edits.
+   */
+  characters: Array<{
+    id: string;
+    name: string;
+    description: string;
+    personality?: string;
+    scenario?: string;
+    creatorNotes?: string;
+    systemPrompt?: string;
+    backstory?: string;
+    appearance?: string;
+    mesExample?: string;
+    firstMes?: string;
+    postHistoryInstructions?: string;
+  }>;
   /** User persona info */
   persona: {
     name: string;
@@ -139,6 +158,7 @@ export const BUILT_IN_AGENT_IDS = {
   QUEST: "quest",
   ILLUSTRATOR: "illustrator",
   LOREBOOK_KEEPER: "lorebook-keeper",
+  CARD_EVOLUTION_AUDITOR: "card-evolution-auditor",
   PROMPT_REVIEWER: "prompt-reviewer",
   COMBAT: "combat",
   BACKGROUND: "background",
@@ -149,6 +169,7 @@ export const BUILT_IN_AGENT_IDS = {
   SPOTIFY: "spotify",
   EDITOR: "editor",
   KNOWLEDGE_RETRIEVAL: "knowledge-retrieval",
+  KNOWLEDGE_ROUTER: "knowledge-router",
   SCHEDULE_PLANNER: "schedule-planner",
   RESPONSE_ORCHESTRATOR: "response-orchestrator",
   AUTONOMOUS_MESSENGER: "autonomous-messenger",
@@ -156,8 +177,6 @@ export const BUILT_IN_AGENT_IDS = {
   HAPTIC: "haptic",
   CYOA: "cyoa",
   SECRET_PLOT_DRIVER: "secret-plot-driver",
-  GAME_MASTER: "game-master",
-  PARTY_PLAYER: "party-player",
 } as const;
 
 export type AgentCategory = "writer" | "tracker" | "misc";
@@ -304,6 +323,15 @@ export const BUILT_IN_AGENTS: BuiltInAgentMeta[] = [
     category: "misc",
   },
   {
+    id: "card-evolution-auditor",
+    name: "Card Evolution Auditor",
+    description:
+      "Detects when character card fields (description, personality, scenario, etc.) have become outdated based on roleplay events and proposes edits for user approval.",
+    phase: "post_processing",
+    enabledByDefault: false,
+    category: "tracker",
+  },
+  {
     id: "combat",
     name: "Combat",
     description: "Manages combat encounters, initiative, HP tracking, and turn-based actions.",
@@ -352,6 +380,15 @@ export const BUILT_IN_AGENTS: BuiltInAgentMeta[] = [
     name: "Knowledge Retrieval",
     description:
       "Scans specified lorebooks for information relevant to the current conversation, summarizes the key data, and injects it into the prompt — a lightweight RAG pipeline without vector databases.",
+    phase: "pre_generation",
+    enabledByDefault: false,
+    category: "writer",
+  },
+  {
+    id: "knowledge-router",
+    name: "Knowledge Router",
+    description:
+      "Lower-cost alternative to Knowledge Retrieval. Reads a short catalog of lorebook entries (descriptions or content snippets), picks which ones are relevant to the current scene, and injects them verbatim — no per-entry summarization passes. Best for large lorebooks where you've written entry descriptions.",
     phase: "pre_generation",
     enabledByDefault: false,
     category: "writer",
@@ -413,27 +450,6 @@ export const BUILT_IN_AGENTS: BuiltInAgentMeta[] = [
     defaultInjectAsSection: true,
     category: "writer",
   },
-
-  // ── Game Agents ──
-  {
-    id: "game-master",
-    name: "Game Master",
-    description:
-      "Narrates the RPG, handles dice rolls, manages NPCs, combat triggers, state transitions, map updates, story pacing, and session flow. The primary responder in Game mode.",
-    phase: "pre_generation",
-    enabledByDefault: false,
-    defaultInjectAsSection: true,
-    category: "misc",
-  },
-  {
-    id: "party-player",
-    name: "Party Player",
-    description:
-      "Controls non-player party members autonomously — their dialogue, actions, and decisions. Only sees public narration and party chat (no GM secrets like story arcs or plot twists).",
-    phase: "parallel",
-    enabledByDefault: false,
-    category: "misc",
-  },
 ];
 
 export const BUILT_IN_AGENT_RUN_INTERVAL_DEFAULTS: Readonly<Record<string, number>> = {
@@ -442,9 +458,16 @@ export const BUILT_IN_AGENT_RUN_INTERVAL_DEFAULTS: Readonly<Record<string, numbe
   "chat-summary": 5,
 };
 
+export const DEFAULT_AGENT_CONTEXT_SIZE = 5;
+export const DEFAULT_AGENT_MAX_TOKENS = 4096;
+export const MIN_AGENT_MAX_TOKENS = 128;
+export const MAX_AGENT_MAX_TOKENS = 32768;
+
 export function getDefaultBuiltInAgentSettings(agentType: string): Record<string, unknown> {
   const builtIn = BUILT_IN_AGENTS.find((agent) => agent.id === agentType);
-  const settings: Record<string, unknown> = {};
+  const settings: Record<string, unknown> = {
+    maxTokens: DEFAULT_AGENT_MAX_TOKENS,
+  };
 
   if (builtIn?.defaultInjectAsSection) {
     settings.injectAsSection = true;
@@ -469,6 +492,7 @@ export const DEFAULT_AGENT_TOOLS: Record<string, string[]> = {
   quest: ["update_game_state"],
   illustrator: [],
   "lorebook-keeper": ["search_lorebook"],
+  "card-evolution-auditor": [],
   "prompt-reviewer": [],
   combat: ["roll_dice", "update_game_state"],
   background: [],
@@ -476,6 +500,7 @@ export const DEFAULT_AGENT_TOOLS: Record<string, string[]> = {
   "persona-stats": ["update_game_state"],
   html: [],
   "chat-summary": [],
+  // Also used server-side to identify Spotify tools that require token refresh.
   spotify: [
     "spotify_get_playlists",
     "spotify_get_playlist_tracks",
@@ -485,6 +510,7 @@ export const DEFAULT_AGENT_TOOLS: Record<string, string[]> = {
   ],
   editor: [],
   "knowledge-retrieval": ["search_lorebook"],
+  "knowledge-router": [],
   "schedule-planner": [],
   "response-orchestrator": [],
   "autonomous-messenger": [],
@@ -492,8 +518,6 @@ export const DEFAULT_AGENT_TOOLS: Record<string, string[]> = {
   haptic: [],
   cyoa: [],
   "secret-plot-driver": [],
-  "game-master": ["roll_dice", "update_game_state"],
-  "party-player": [],
 };
 
 /** Data shape for a lorebook_update agent result. */
@@ -511,6 +535,49 @@ export interface LorebookUpdateResult {
     keys: string[];
     tag?: string;
   };
+}
+
+/**
+ * Single proposed edit to a character card field.
+ *
+ * Unlike LorebookUpdateResult, these edits are NEVER applied automatically —
+ * the server emits them as an agent_result SSE event and the client shows
+ * a confirmation modal. Character cards are more sensitive than lorebook
+ * entries because they define the character's identity.
+ */
+export const EDITABLE_CHARACTER_CARD_FIELDS = [
+  "description",
+  "personality",
+  "scenario",
+  "first_mes",
+  "mes_example",
+  "creator_notes",
+  "system_prompt",
+  "post_history_instructions",
+  "backstory",
+  "appearance",
+] as const;
+
+export type EditableCharacterCardField = (typeof EDITABLE_CHARACTER_CARD_FIELDS)[number];
+
+export interface CharacterCardFieldUpdate {
+  /** Stable target character id from the <character id="..."> context block. */
+  characterId: string;
+  /** Currently only "update" is supported; reserved for future create/delete. */
+  action: "update";
+  /** Which stored character-card field this edit targets. */
+  field: EditableCharacterCardField;
+  /** The existing field value the agent observed. */
+  oldText: string;
+  /** The proposed replacement text. */
+  newText: string;
+  /** Why the agent thinks this edit is warranted (shown to the user). */
+  reason: string;
+}
+
+/** Data shape for a character_card_update agent result. */
+export interface CharacterCardUpdateResult {
+  updates: CharacterCardFieldUpdate[];
 }
 
 // ──────────────────────────────────────────────
@@ -674,6 +741,29 @@ export const BUILT_IN_TOOLS: ToolDefinition[] = [
         category: { type: "string", description: "Optional category filter" },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "read_chat_summary",
+    description: "Read the current persisted chat summary for this chat.",
+    parameters: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "append_chat_summary",
+    description: "Append durable memory text to the persisted chat summary for this chat.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description:
+            "Concise summary text to append. Include only durable facts, plans, preferences, or story developments.",
+        },
+      },
+      required: ["text"],
     },
   },
   {

@@ -2,10 +2,16 @@
 // Chat: Manage Chat Files — switch between branches
 // Like SillyTavern's "Manage chat files" feature
 // ──────────────────────────────────────────────
-import { X, Trash2, FileText, MessageSquare, Download } from "lucide-react";
+import { X, Trash2, FileText, MessageSquare, Download, Pencil } from "lucide-react";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { cn } from "../../lib/utils";
-import { useChatGroup, useDeleteChat, useDeleteChatGroup, useExportChat } from "../../hooks/use-chats";
+import {
+  useChatGroup,
+  useDeleteChat,
+  useDeleteChatGroup,
+  useExportChat,
+  useUpdateChatMetadata,
+} from "../../hooks/use-chats";
 import { useChatStore } from "../../stores/chat.store";
 import type { Chat } from "@marinara-engine/shared";
 
@@ -17,7 +23,7 @@ interface ChatFilesDrawerProps {
 
 export function ChatFilesDrawer({ chat, open, onClose }: ChatFilesDrawerProps) {
   const groupId = (chat as any).groupId as string | null;
-  const { data: groupChats } = useChatGroup(groupId);
+  const { data: groupChats, refetch: refetchGroupChats } = useChatGroup(groupId);
   const deleteChat = useDeleteChat();
   const deleteChatGroup = useDeleteChatGroup();
   const exportChat = useExportChat();
@@ -26,9 +32,41 @@ export function ChatFilesDrawer({ chat, open, onClose }: ChatFilesDrawerProps) {
 
   const chatFiles = (groupChats ?? []) as Chat[];
 
+  const getBranchName = (cf: Chat) => {
+    const rawMeta = (cf as any).metadata;
+    const meta =
+      typeof rawMeta === "string"
+        ? (() => {
+            try {
+              return JSON.parse(rawMeta);
+            } catch {
+              return {};
+            }
+          })()
+        : (rawMeta ?? {});
+    return meta?.branchName ?? cf.name;
+  };
+
   const handleSwitch = (chatId: string) => {
     setActiveChatId(chatId);
     onClose();
+  };
+
+  const updateMetadata = useUpdateChatMetadata();
+
+  const handleRename = async (cf: Chat) => {
+    const currentName = getBranchName(cf);
+    const nextName = window.prompt("Rename branch:", currentName);
+    if (!nextName) return;
+
+    const trimmed = nextName.trim();
+    if (!trimmed || trimmed === currentName) return;
+
+    await updateMetadata.mutateAsync({
+      id: cf.id,
+      branchName: trimmed,
+    });
+    await refetchGroupChats();
   };
 
   const handleDelete = async (chatId: string) => {
@@ -60,7 +98,9 @@ export function ChatFilesDrawer({ chat, open, onClose }: ChatFilesDrawerProps) {
           <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
             <h3 className="text-sm font-bold">Manage Chat Files</h3>
             <button
+              type="button"
               onClick={onClose}
+              aria-label="Close chat files drawer"
               className="rounded-lg p-1.5 text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)]"
             >
               <X size="1rem" />
@@ -112,7 +152,9 @@ export function ChatFilesDrawer({ chat, open, onClose }: ChatFilesDrawerProps) {
         <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
           <h3 className="text-sm font-bold">Manage Chat Files</h3>
           <button
+            type="button"
             onClick={onClose}
+            aria-label="Close chat files drawer"
             className="rounded-lg p-1.5 text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)]"
           >
             <X size="1rem" />
@@ -176,7 +218,7 @@ export function ChatFilesDrawer({ chat, open, onClose }: ChatFilesDrawerProps) {
                     <MessageSquare size="0.875rem" />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-xs font-medium">{cf.name}</div>
+                    <div className="truncate text-xs font-medium">{getBranchName(cf)}</div>
                     <div className="text-[0.625rem] text-[var(--muted-foreground)]">
                       {dateStr} at {timeStr}
                     </div>
@@ -187,15 +229,28 @@ export function ChatFilesDrawer({ chat, open, onClose }: ChatFilesDrawerProps) {
                     </span>
                   )}
                   {!isActive && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDelete(cf.id);
-                      }}
-                      className="shrink-0 rounded-lg p-1.5 opacity-0 transition-all hover:bg-[var(--destructive)]/15 group-hover:opacity-100 max-md:opacity-100"
-                    >
-                      <Trash2 size="0.75rem" className="text-[var(--destructive)]" />
-                    </button>
+                    <div className="flex shrink-0 items-center gap-1 opacity-0 transition-all group-hover:opacity-100 max-md:opacity-100">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleRename(cf);
+                        }}
+                        className="rounded-lg p-1.5 transition-all hover:bg-[var(--accent)]/80 active:scale-[0.95] ring-1 ring-transparent hover:ring-[var(--border)]"
+                        title="Rename branch"
+                      >
+                        <Pencil size="0.75rem" className="text-[var(--muted-foreground)]" />
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDelete(cf.id);
+                        }}
+                        className="rounded-lg p-1.5 transition-all hover:bg-[var(--destructive)]/15"
+                        title="Delete branch"
+                      >
+                        <Trash2 size="0.75rem" className="text-[var(--destructive)]" />
+                      </button>
+                    </div>
                   )}
                 </div>
               );

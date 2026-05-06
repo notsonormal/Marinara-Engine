@@ -5,13 +5,13 @@
 // when creating new chats. One "active" preset per chat mode determines
 // the starting state for any newly created chat in that mode.
 //
-// What presets DO carry: connection, prompt preset, and most metadata
+// What presets DO carry: connection, prompt preset for non-conversation chats, and most metadata
 // (agents, tools, lorebooks, translation, advanced parameters, context
 // limit, memory recall, discord mirror, etc.).
 //
 // What presets DO NOT carry: per-chat identity (name, characters,
 // persona, group, sprites, scene prompt, summary, tags, ephemeral
-// lorebook overrides, connected chat link, folder/sort placement).
+// lorebook overrides, scene lifecycle state, connected chat link, folder/sort placement).
 
 import type { ChatMode, ChatMetadata } from "./chat.js";
 
@@ -49,10 +49,21 @@ export const CHAT_PRESET_EXCLUDED_METADATA_KEYS: readonly string[] = [
   "entryStateOverrides",
   "groupScenarioOverride",
   "groupScenarioText",
+  "sceneOriginChatId",
+  "sceneInitiatorCharId",
+  "sceneDescription",
+  "sceneScenario",
   "sceneSystemPrompt",
+  "sceneRating",
+  "sceneStatus",
+  "sceneConversationContext",
+  "sceneRelationshipHistory",
+  "sceneBackground",
+  "activeSceneChatId",
+  "sceneBusyCharIds",
   // Lorebooks are owned by the chat, never by the preset.
   "activeLorebookIds",
 ] as const;
 
-/** Top-level chat keys that CAN be saved into a preset. */
+/** Top-level chat keys that CAN be saved into a preset. promptPresetId is ignored for conversation-mode presets. */
 export const CHAT_PRESET_INCLUDED_CHAT_KEYS: readonly string[] = ["connectionId", "promptPresetId"] as const;

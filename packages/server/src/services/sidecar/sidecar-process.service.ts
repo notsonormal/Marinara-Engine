@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "child_process";
+import { logger } from "../../lib/logger.js";
 import { createWriteStream, existsSync, readFileSync, writeFileSync, type WriteStream } from "fs";
 import { createServer } from "net";
 import { dirname, join } from "path";
@@ -9,6 +10,7 @@ import { buildLlamaArgs, buildLlamaStartupPlans } from "./sidecar-launch-plan.js
 import { buildLlamaProcessEnv } from "./sidecar-runtime-env.js";
 import { mlxRuntimeService, type MlxRuntimeInstall } from "./mlx-runtime.service.js";
 import { sidecarRuntimeService, type SidecarRuntimeInstall } from "./sidecar-runtime.service.js";
+import { assertSupportedLlamaCppModelPath } from "./sidecar-model-files.js";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -36,6 +38,10 @@ async function getFreePort(): Promise<number> {
 type ManagedRuntimeInstall = SidecarRuntimeInstall | MlxRuntimeInstall;
 type SyncOptions = {
   suppressKnownFailure?: boolean;
+  forceStart?: boolean;
+  allowRuntimeInstall?: boolean;
+};
+type EnsureReadyOptions = {
   forceStart?: boolean;
   allowRuntimeInstall?: boolean;
 };
@@ -84,14 +90,16 @@ class SidecarProcessService {
     return this.failedRuntimeVariant;
   }
 
-  async ensureReady(forceStart = false): Promise<string> {
+  async ensureReady(options: EnsureReadyOptions = {}): Promise<string> {
+    const forceStart = options.forceStart ?? false;
+    const allowRuntimeInstall = options.allowRuntimeInstall ?? false;
     await this.syncForCurrentConfig({
       suppressKnownFailure: !forceStart,
       forceStart,
-      allowRuntimeInstall: forceStart,
+      allowRuntimeInstall,
     });
     if (!this.ready || !this.baseUrl) {
-      throw new Error(this.startupError ?? "The local sidecar server is not ready");
+      throw this.buildNotReadyError({ forceStart });
     }
     return this.baseUrl;
   }
@@ -108,7 +116,10 @@ class SidecarProcessService {
       this.clearStartupFailure();
       this.currentSignature = null;
       await this.stopUnlocked();
-      await this.syncUnlocked({ allowRuntimeInstall: true });
+      await this.syncUnlocked({ forceStart: true, allowRuntimeInstall: false });
+      if (!this.ready || !this.baseUrl) {
+        throw this.buildNotReadyError({ forceStart: true });
+      }
     });
   }
 
@@ -143,7 +154,9 @@ class SidecarProcessService {
         mlxRuntimeService.resetRuntime();
       } else {
         if (sidecarRuntimeService.getStatus(sidecarModelService.getConfig().runtimePreference).source === "system") {
-          throw new Error("The local runtime is using a system llama-server from PATH. Reinstall that runtime outside Marinara.");
+          throw new Error(
+            "The local runtime is using a system llama-server from PATH. Reinstall that runtime outside Marinara.",
+          );
         }
         sidecarRuntimeService.resetRuntime();
       }
@@ -197,9 +210,28 @@ class SidecarProcessService {
 
   private normalizeSyncOptions(options?: boolean | SyncOptions): SyncOptions {
     if (typeof options === "boolean") {
-      return { forceStart: options, allowRuntimeInstall: options };
+      return { forceStart: options, allowRuntimeInstall: false };
     }
     return options ?? {};
+  }
+
+  private buildNotReadyError(options: { forceStart?: boolean } = {}): Error {
+    if (!sidecarModelService.getConfiguredModelRef()) {
+      return new Error("Download or select a local model before using the local sidecar.");
+    }
+
+    const backend = sidecarModelService.getResolvedBackend();
+    if (!this.isRuntimeInstalled(backend)) {
+      return new Error("Install the local runtime from Local AI Model before using the local sidecar.");
+    }
+
+    if (!options.forceStart && !sidecarModelService.isEnabled()) {
+      return new Error(
+        "Enable the local model for trackers or game scene analysis, or start it manually from Local AI Model.",
+      );
+    }
+
+    return new Error(this.startupError ?? "The local sidecar server is not ready");
   }
 
   private isRuntimeInstalled(backend: SidecarBackend): boolean {
@@ -429,6 +461,7 @@ class SidecarProcessService {
     if (!existsSync(modelPath)) {
       throw new Error("The selected sidecar model file is missing. Please download it again.");
     }
+    assertSupportedLlamaCppModelPath(modelPath);
 
     let activeRuntime: SidecarRuntimeInstall | null = runtime;
     const attemptedVariants = new Set<string>();
@@ -451,8 +484,11 @@ class SidecarProcessService {
           : null;
 
         if (nextRuntime && !this.isMlxRuntime(nextRuntime) && !attemptedVariants.has(nextRuntime.variant)) {
-          console.warn(
-            `[sidecar] Runtime ${activeRuntime.variant} failed to boot before ready. Retrying with ${nextRuntime.variant}.`,
+          logger.warn(
+            error,
+            "[sidecar] Runtime %s failed to boot before ready. Retrying with %s.",
+            activeRuntime.variant,
+            nextRuntime.variant,
           );
           activeRuntime = nextRuntime;
           continue;
@@ -508,9 +544,7 @@ class SidecarProcessService {
 
         const nextPlan = startupPlans[attempt + 1];
         if (nextPlan && this.shouldRetryStartup(error)) {
-          console.warn(
-            `[sidecar] Startup with ${plan.label} failed (${error.message}). Retrying with ${nextPlan.label}.`,
-          );
+          logger.warn(error, "[sidecar] Startup with %s failed. Retrying with %s.", plan.label, nextPlan.label);
           continue;
         }
 
@@ -672,8 +706,10 @@ class SidecarProcessService {
       return;
     }
 
-    console.error(
-      `[sidecar] Local sidecar server exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "null"})`,
+    logger.error(
+      "[sidecar] Local sidecar server exited unexpectedly (code=%s, signal=%s)",
+      code ?? "null",
+      signal ?? "null",
     );
 
     if (this.starting) {
@@ -692,7 +728,7 @@ class SidecarProcessService {
     try {
       await this.syncForCurrentConfig({ allowRuntimeInstall: false });
     } catch (error) {
-      console.error("[sidecar] Auto-restart failed:", error);
+      logger.error(error, "[sidecar] Auto-restart failed");
       sidecarModelService.setStatus("server_error");
     }
   }

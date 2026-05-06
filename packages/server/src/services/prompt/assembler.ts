@@ -20,6 +20,7 @@ import { wrapContent, wrapGroup } from "./format-engine.js";
 import { expandMarker, type MarkerContext } from "./marker-expander.js";
 import { mergeAdjacentMessages, squashLeadingSystemMessages } from "./merger.js";
 import { injectAtDepth } from "../lorebook/prompt-injector.js";
+import { buildPromptMacroContext, collectCharacterDepthPromptEntries } from "./macro-context.js";
 
 // ═══════════════════════════════════════════════
 //  Public Interface
@@ -83,6 +84,7 @@ export interface AssemblerInput {
   /** Chat context */
   chatId: string;
   characterIds: string[];
+  personaId?: string | null;
   personaName: string;
   personaDescription: string;
   personaFields?: {
@@ -107,6 +109,8 @@ export interface AssemblerInput {
   chatEmbedding?: number[] | null;
   /** Per-chat ephemeral state overrides for lorebook entries (from chat metadata). */
   entryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
+  /** Generation trigger labels used by per-entry lorebook include/exclude filters. */
+  generationTriggers?: string[];
   /** When set, replaces individual character scenario fields with this group scenario. */
   groupScenarioOverrideText?: string | null;
 }
@@ -179,14 +183,18 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     }
   }
 
-  // Build macro context (character names resolved from IDs)
-  const charNames = await resolveCharacterNames(input.db, input.characterIds);
-  const macroCtx: MacroContext = {
-    user: input.personaName || "User",
-    char: charNames[0] || "Character",
-    characters: charNames,
+  // Build macro context (character names and primary card fields resolved from IDs)
+  const macroCtx = await buildPromptMacroContext({
+    db: input.db,
+    characterIds: input.characterIds,
+    personaName: input.personaName,
+    personaDescription: input.personaDescription,
+    personaFields: input.personaFields,
     variables: variableValues,
-  };
+    groupScenarioOverrideText: input.groupScenarioOverrideText,
+    lastInput: [...input.chatMessages].reverse().find((message) => message.role === "user")?.content,
+    chatId: input.chatId,
+  });
 
   // Resolve macros inside variable values themselves (e.g. {{user}} in a choice value)
   for (const key of Object.keys(variableValues)) {
@@ -198,6 +206,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     db: input.db,
     chatId: input.chatId,
     characterIds: input.characterIds,
+    personaId: input.personaId ?? null,
     personaName: input.personaName,
     personaDescription: input.personaDescription,
     personaFields: input.personaFields,
@@ -210,6 +219,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     activeLorebookIds: input.activeLorebookIds ?? [],
     chatEmbedding: input.chatEmbedding ?? null,
     entryStateOverrides: input.entryStateOverrides,
+    generationTriggers: input.generationTriggers ?? ["chat"],
     groupScenarioOverrideText: input.groupScenarioOverrideText ?? null,
   };
 
@@ -348,7 +358,17 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
   }
 
   if (markerCtx.lorebookDepthEntries && markerCtx.lorebookDepthEntries.length > 0) {
-    allDepthEntries.push(markerCtx.lorebookDepthEntries);
+    allDepthEntries.push(
+      markerCtx.lorebookDepthEntries.map((entry) => ({
+        ...entry,
+        content: resolveMacros(entry.content, macroCtx),
+      })),
+    );
+  }
+
+  const characterDepthEntries = await collectCharacterDepthPromptEntries(input.db, input.characterIds, macroCtx);
+  if (characterDepthEntries.length > 0) {
+    allDepthEntries.push(characterDepthEntries);
   }
 
   const combinedDepthEntries = allDepthEntries.flat();
@@ -434,7 +454,10 @@ async function resolveSection(
         id: section.id,
         groupId: section.groupId,
         role,
-        messages: expanded.messages,
+        messages: expanded.messages.map((message) => ({
+          ...message,
+          content: resolveMacros(message.content, ctx.macroCtx),
+        })),
         depth: section.injectionDepth,
         isChatHistory: true,
       };
@@ -532,24 +555,6 @@ function buildGroupMessages(
 //  Helpers
 // ═══════════════════════════════════════════════
 
-async function resolveCharacterNames(db: DB, characterIds: string[]): Promise<string[]> {
-  if (characterIds.length === 0) return [];
-
-  const { createCharactersStorage } = await import("../storage/characters.storage.js");
-  const chars = createCharactersStorage(db);
-  const names: string[] = [];
-
-  for (const id of characterIds) {
-    const row = await chars.getById(id);
-    if (row) {
-      const data = JSON.parse(row.data) as { name: string };
-      names.push(data.name);
-    }
-  }
-
-  return names;
-}
-
 /**
  * Enforce strict role formatting:
  * 1. Leading system messages stay as system.
@@ -599,6 +604,9 @@ function enforceStrictRoles(messages: ChatMLMessage[], chatHistoryEndIdx: number
       if (prev && prev.role === effectiveRole) {
         // Merge into previous (same role back-to-back)
         prev.content += "\n\n" + msg.content;
+        if (prev.contextKind !== msg.contextKind) {
+          delete prev.contextKind;
+        }
         if (msg.images?.length) {
           prev.images = [...(prev.images ?? []), ...msg.images];
         }

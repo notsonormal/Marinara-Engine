@@ -9,11 +9,35 @@
 
 ---
 
-> **⚠️ Alpha Software** — This is an early release. Expect rough edges, missing features, and breaking changes between versions. Bug reports and feedback are very welcome!
+> **⚠️ Alpha Software** — Early release. Expect rough edges, missing features, and breaking changes. Bug reports and feedback are very welcome!
 
 ---
 
-## Screenshots
+## Table of Contents
+
+- [🍝 Marinara Engine](#-marinara-engine)
+  - [Table of Contents](#table-of-contents)
+  - [Latest Release](#latest-release)
+  - [Roadmap](#roadmap)
+  - [Installation](#installation)
+  - [Features](#features)
+    - [Chat \& Roleplay](#chat--roleplay)
+    - [Visual \& Immersive](#visual--immersive)
+    - [AI Agent System](#ai-agent-system)
+    - [Prompt Engineering](#prompt-engineering)
+    - [Connections \& Providers](#connections--providers)
+    - [Export \& Data](#export--data)
+  - [Documentation](#documentation)
+  - [Community \& Support](#community--support)
+  - [Contributors](#contributors)
+  - [License](#license)
+
+---
+
+<a id="screenshots"></a>
+
+<details>
+<summary><h2>Screenshots</h2></summary>
 
 <p align="center">
   <img src="docs/screenshots/Desktop_Roleplay_View.png" width="90%" alt="Roleplay Chat — Desktop" />
@@ -71,20 +95,28 @@
   <em>Fully responsive — Conversations, Roleplay, and Game Mode all work on phones and tablets via PWA</em>
 </p>
 
+</details>
+
 ---
 
 ## Latest Release
 
-Current stable release: **[v1.5.4](https://github.com/Pasta-Devs/Marinara-Engine/releases/tag/v1.5.4)**.
+Current stable release: **[v1.5.8](https://github.com/Pasta-Devs/Marinara-Engine/releases/tag/v1.5.8)**.
 
-Detailed release notes now live in [CHANGELOG.md](CHANGELOG.md). Tagged releases use the `vX.Y.Z` format, and GitHub Releases remain the publication mechanism for installers, release notes, and update metadata.
+See [CHANGELOG.md](CHANGELOG.md) for detailed release notes. Tagged releases use the `vX.Y.Z` format and are published on the [Releases](https://github.com/Pasta-Devs/Marinara-Engine/releases) page.
 
-## Plans
+---
 
-- Adding Marinara Engine as a free-to-download app on both Android and iPhone mobiles.
-- An engine feature allowing you to set up full games with your curated sprites, soundtracks, scenarios, etc., and share them with others.
-- Different supported game modes, including more tabletop-like gameplay, point-and-click games, and classic text adventures.
-- Overall improvements and addressing any bugs that pop up along the way.
+## Roadmap
+
+- Free-to-download mobile apps for Android and iPhone
+- An engine feature for building and sharing full games with custom sprites, soundtracks, and scenarios
+- New game modes: tabletop-style, point-and-click, and classic text adventures
+- Ongoing improvements and bug fixes
+
+More detailed public [roadmap](https://github.com/orgs/Pasta-Devs/projects/1).
+
+---
 
 ## Installation
 
@@ -95,65 +127,9 @@ Detailed release notes now live in [CHANGELOG.md](CHANGELOG.md). Tagged releases
 | 🍎🐧 macOS / Linux  | [macOS / Linux Installation Guide](docs/installation/macos-linux.md)          |
 | 🤖 Android (Termux) | [Android (Termux) Installation Guide](docs/installation/android-termux.md)    |
 
-Each guide covers installation and updating for that platform.
+Each guide covers installation, updating, and LAN access for that platform. See [Configuration Reference](docs/CONFIGURATION.md) for environment variables setup. Having trouble? See [FAQ](docs/FAQ.md) and [Troubleshooting](docs/TROUBLESHOOTING.md).
 
----
-
-## Project Docs
-
-- [docs/INSTALLATION.md](docs/INSTALLATION.md) — installation guide index (all platforms)
-- [android/README.md](android/README.md) — Android WebView wrapper guide
-- [CONTRIBUTING.md](CONTRIBUTING.md) — contributor workflow, validation, versioning, and release steps
-- [CLAUDE.md](CLAUDE.md) — thin maintainer notes for contributors using Claude
-- [CHANGELOG.md](CHANGELOG.md) — release notes source of truth
-
-### Windows Installer
-
-Download **[Marinara-Engine-Installer-1.5.4.exe](https://github.com/Pasta-Devs/Marinara-Engine/releases/download/v1.5.4/Marinara-Engine-Installer-1.5.4.exe)** from the [Releases](https://github.com/Pasta-Devs/Marinara-Engine/releases) page and run it. The installer lets you choose the install folder, checks for Node.js and Git, aligns pnpm to the repo-pinned version even if an older global pnpm is already installed, clones the repo, installs dependencies, builds the app, and creates desktop and Start Menu shortcuts with the Marinara icon.
-
----
-
-## Accessing from Mobile (or Another Device)
-
-If you're running Marinara Engine on your computer and want to use it from your phone or tablet on the same network:
-
-If you started the app with bare `pnpm start`, set `HOST=0.0.0.0` first or use one of the shell launchers, which already default to that host.
-
-1. **Find your computer's local IP address:**
-   - **Windows:** Run `ipconfig` and look for `IPv4 Address`
-   - **macOS:** Check System Settings → Wi-Fi → your network, or run `ipconfig getifaddr en0`
-   - **Linux:** Run `hostname -I` or `ip addr`
-2. **Open a browser on your phone** and go to:
-
-   ```
-   http://<your-computer-ip>:7860
-   ```
-
-   Example: `http://192.168.1.42:7860`
-
-3. **Install the PWA** from your browser for a more native app experience.
-
-> **Tip:** If you're not on the same network, tools like [Tailscale](https://tailscale.com/) give each device a stable IP address on a private network.
-
----
-
-## Development
-
-```bash
-# Start both server + client with hot reload
-pnpm dev
-
-# Canonical local validation (lint + build)
-pnpm check
-
-# Server only (port 7860)
-pnpm dev:server
-
-# Client only (port 5173, proxies API to server)
-pnpm dev:client
-```
-
-Contributor workflow, validation, and release/version policy live in [CONTRIBUTING.md](CONTRIBUTING.md).
+Security defaults are intentionally local-first: loopback access works out of the box, while LAN, Docker bridge, Tailscale, and public clients require Basic Auth unless you explicitly opt back in. `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK=true` only restores unauthenticated access for private networks such as LAN, Docker bridge, Tailscale, and loopback; public clients still require `ALLOW_UNAUTHENTICATED_REMOTE=true`. Powerful actions such as backups, bulk import, update apply, sidecar install/download/delete, haptics, and custom tool mutation also require `ADMIN_SECRET`; see [Access Control](docs/CONFIGURATION.md#access-control).
 
 ---
 
@@ -161,162 +137,44 @@ Contributor workflow, validation, and release/version policy live in [CONTRIBUTI
 
 ### Chat & Roleplay
 
-- **Three Chat Modes** — Conversation (Discord-style), Roleplay (immersive RPG), Game (think of a mix between an RPG and a visual novel)
-- **Plug-And-Play** — Minimal setup and local-first defaults
-- **A Connected System** — Chats can share memory and context across modes
-- **Character Management** — Create or import characters with avatars, personalities, backstories, and system prompts
-- **Bot Browser** — Search and import characters from Chub.ai directly inside the app
-- **Chat Folders** — Organize chats into named, color-coded folders
-- **Avatar Zoom & Repositioning** — Crop and reposition character avatars with a zoom slider and drag-to-pan
-- **Persona System** — User personas with custom names, avatars, and descriptions
-- **Group Chats** — Multiple characters in a single conversation
-- **Chat Branching** — Branch conversations at any message and explore different paths
-- **Message Swiping** — Generate alternate responses and swipe between them
-- **Slash Commands** — `/narrator`, `/random`, `/sys`, `/as`, `/continue`, `/impersonate`, and more for quick chat control
-- **SillyTavern Import** — Migrate characters, chats, presets, and settings from SillyTavern
+Three chat modes — **Conversation** (Discord-style DMs), **Roleplay** (immersive RPG with sprites and backgrounds), and **Game** (AI Game Master with party, quests, and combat). Characters can share memory across modes. Create or import characters, search the Chub.ai bot browser, organize chats into folders, branch conversations, swipe between alternate responses, and import from SillyTavern.
 
 ### Visual & Immersive
 
-- **Sprite System** — Character expression sprites with automatic emotion-based switching
-- **Custom Backgrounds** — Upload backgrounds with per-scene switching
-- **Weather Effects** — Dynamic weather overlays (rain, snow, fog, and more)
-- **Two Visual Themes** — Y2K Marinara theme and a faithful SillyTavern classic theme
-- **Light & Dark Mode** — Both are supported
+Character expression sprites with automatic emotion switching, custom scene backgrounds, dynamic weather overlays, two visual themes (Y2K Marinara and SillyTavern classic), and light/dark mode.
 
-### AI Agent System (25 Built-In)
+### AI Agent System
 
-Agents are autonomous AI assistants that run alongside your chat, each handling a specific task:
-
-| Agent                     | What It Does                                                                |
-| ------------------------- | --------------------------------------------------------------------------- |
-| **World State**           | Tracks date, time, weather, location, and present characters                |
-| **Quest Tracker**         | Manages quest objectives, completion, and rewards                           |
-| **Character Tracker**     | Monitors character moods, relationships, appearance, outfit, and stats      |
-| **Persona Stats**         | Tracks your protagonist's needs and condition bars                          |
-| **Custom Tracker**        | Tracks user-defined fields such as currencies, counters, and flags          |
-| **Narrative Director**    | Introduces events, NPCs, and plot beats to keep the story moving            |
-| **Prose Guardian**        | Analyzes writing patterns and generates directives to improve prose variety |
-| **Continuity Checker**    | Detects contradictions with established lore and facts                      |
-| **Combat**                | Handles turn-based RPG combat with initiative, HP tracking, and actions     |
-| **Expression Engine**     | Detects emotions and selects character sprites                              |
-| **Background**            | Picks the best background image for the current scene                       |
-| **Echo Chamber**          | Simulates a live-stream chat reacting to your roleplay                      |
-| **Prompt Reviewer**       | Reviews and scores the assembled prompt before generation                   |
-| **Illustrator**           | Generates image prompts for key scenes                                      |
-| **Lorebook Keeper**       | Automatically creates and updates lorebook entries                          |
-| **Immersive HTML**        | Injects styled HTML, CSS, and JS for in-world visuals                       |
-| **Consistency Editor**    | Edits responses to fix factual errors and tracker contradictions            |
-| **Spotify DJ**            | Controls Spotify playback to match the scene's mood                         |
-| **Chat Summary**          | Generates condensed rolling summaries of long conversations                 |
-| **Knowledge Retrieval**   | Scans lorebooks for relevant context using chunked RAG                      |
-| **Schedule Planner**      | Generates realistic weekly schedules for characters in Conversation mode    |
-| **Response Orchestrator** | Decides which character or characters should respond in group conversations |
-| **Love Toys Control**     | Controls Buttplug.io haptic devices with per-device capability awareness    |
-| **CYOA Choices**          | Generates 2 to 4 in-character choices after each response                   |
-| **Autonomous Messenger**  | Allows characters to send messages unprompted when the user is inactive     |
-
-All agents are disabled by default. Enable only the ones you want, or create custom agents with your own prompts and tool configurations.
+25+ built-in agents that run alongside your chat — world state tracking, quest management, combat, expression detection, background selection, narrative direction, prose analysis, Spotify DJ, CYOA choices, and more. All disabled by default; enable only what you want, or create custom agents.
 
 ### Prompt Engineering
 
-- **Preset System** — Save and load full prompt configurations
-- **Prompt Sections** — Drag-and-drop ordering, depth injection, and per-section toggles
-- **Lorebooks** — World-building entries with keyword triggers that inject context automatically
-- **AI Lorebook Maker** — Generate structured lorebook entries from a topic prompt
-- **World Info Inspector** — Live view of active lorebook entries in the current chat, with token usage and keyword details
-- **Lorebook Token Counts & Sorting** — Estimated token counts per entry, sortable by order, name, tokens, or keys
-- **Regex Scripts** — Custom text processing with regex find or replace on inputs and outputs
-- **Macro System** — Template variables like `{{char}}`, `{{user}}`, `{{time}}`, and agent markers
+Preset system with drag-and-drop prompt ordering, lorebooks with keyword triggers, an AI lorebook maker, world info inspector, regex scripts, and a macro/template system.
 
 ### Connections & Providers
 
-- **Multi-Provider** — OpenAI, Anthropic, Google, OpenRouter, Mistral, Cohere, Pollinations, Stability AI, Together AI, NovelAI, ComfyUI, AUTOMATIC1111 / SD Web UI, and custom OpenAI-compatible endpoints
-- **Encrypted API Keys** — API keys are encrypted at rest with AES-256
-- **Per-Chat Overrides** — Different presets and connections per chat
-- **Connection Duplication & Testing** — Clone connections and validate provider-specific connectivity
+OpenAI, Anthropic, Google, OpenRouter, NanoGPT, Mistral, Cohere, Pollinations, Stability AI, Together AI, NovelAI, ComfyUI, SD Web UI, and custom OpenAI-compatible endpoints. API keys are encrypted at rest with AES-256. Per-chat connection overrides.
 
 ### Export & Data
 
-- **Export Chats** — Save chats as JSONL or plain text
-- **Fully Local** — SQLite database, all data stays on your machine
-- **No Account Required** — Just install and go
+Export chats as JSONL or plain text. Fully local file-native storage — all data stays on your machine. No account required.
 
 ---
 
-## Configuration
+## Documentation
 
-Copy `.env.example` to `.env` to customize:
-
-| Variable                         | Default                                                  | Description                                                                                                                                                    |
-| -------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PORT`                           | `7860`                                                   | Server port. Keep Android builds, launchers, Docker, and Termux on the same value.                                                                             |
-| `HOST`                           | `127.0.0.1` (`pnpm start`) / `0.0.0.0` (shell launchers) | Bind address                                                                                                                                                   |
-| `AUTO_OPEN_BROWSER`              | `true`                                                   | Whether the shell launchers auto-open the local app URL. Set to `false`, `0`, `no`, or `off` to disable. Does not apply to the Android WebView wrapper.        |
-| `AUTO_CREATE_DEFAULT_CONNECTION` | `true`                                                   | Whether Marinara auto-creates the built-in OpenRouter Free starter connection when no saved connections exist. Set to `false`, `0`, `no`, or `off` to disable. |
-| `TZ`                             | _(system default; containers are often `UTC`)_           | Optional IANA timezone used for time-based features like character schedules.                                                                                  |
-| `DATABASE_URL`                   | `file:./data/marinara-engine.db`                         | SQLite database path. Relative file paths resolve from `packages/server` for compatibility with existing local installs.                                       |
-| `ENCRYPTION_KEY`                 | _(empty)_                                                | AES key for API key encryption (generate with `openssl rand -hex 32`)                                                                                          |
-| `ADMIN_SECRET`                   | _(empty)_                                                | Optional shared secret for destructive admin endpoints such as `/api/admin/clear-all`                                                                          |
-| `LOG_LEVEL`                      | `info`                                                   | Logging verbosity                                                                                                                                              |
-| `CORS_ORIGINS`                   | `http://localhost:5173,http://127.0.0.1:5173`            | Allowed CORS origins. Set `*` for allow-all without credentials; explicit origin lists keep credentialed CORS support.                                         |
-| `SSL_CERT`                       | _(empty)_                                                | Path to the TLS certificate. Set both `SSL_CERT` and `SSL_KEY` to enable HTTPS.                                                                                |
-| `SSL_KEY`                        | _(empty)_                                                | Path to the TLS private key                                                                                                                                    |
-| `IP_ALLOWLIST`                   | _(empty)_                                                | Comma-separated IPs or CIDRs to allow. Loopback is always allowed.                                                                                             |
-| `GIPHY_API_KEY`                  | _(empty)_                                                | Optional Giphy API key. GIF search is unavailable when unset.                                                                                                  |
-
----
-
-## Project Structure
-
-```text
-marinara-engine/
-├── packages/
-│   ├── client/       # React frontend (Vite + Tailwind v4)
-│   ├── server/       # Fastify API, SQLite database, AI agents, update routes
-│   └── shared/       # Shared types, schemas, constants, version data
-├── android/          # Android WebView wrapper for the Termux-served app
-├── installer/        # Windows installer sources and scripts
-├── docs/             # Screenshots and user documentation (installation + frontend)
-├── start.bat         # Windows launcher
-├── start.sh          # macOS/Linux launcher
-├── start-termux.sh   # Termux launcher
-└── .env.example      # Environment template
-```
-
-## Tech Stack
-
-| Layer    | Technology                                                     |
-| -------- | -------------------------------------------------------------- |
-| Frontend | React 19, Tailwind CSS v4, Framer Motion, Zustand, React Query |
-| Backend  | Fastify 5, Drizzle ORM, SQLite                                 |
-| PWA      | vite-plugin-pwa, Web App Manifest                              |
-| Shared   | TypeScript 5, Zod                                              |
-| Build    | Vite 6, pnpm workspaces                                        |
-
----
-
-## Troubleshooting
-
-### Windows: `EPERM: operation not permitted` when installing pnpm
-
-If you see an error like `EPERM: operation not permitted, open 'C:\Program Files\nodejs\yarnpkg'` or a corepack signature verification failure, corepack could not write to `C:\Program Files\nodejs\`.
-
-**Fix one of these:**
-
-1. **Run as Administrator** — Right-click your terminal (CMD or PowerShell), select "Run as administrator", then run `start.bat` again.
-2. **Install pnpm manually** — Run `npm install -g pnpm`, then run `start.bat` again.
-3. **Update corepack** — Run `npm install -g corepack`, `corepack enable`, and `corepack prepare pnpm@10.30.3 --activate` in an Administrator terminal.
-
-### Data Seems Missing After A Recent Update
-
-If your chats or presets appear to be missing after updating, do not delete any data folders yet. Recent path changes can make the app open a different SQLite file without erasing the old one.
-
-Check both local data locations:
-
-1. `packages/server/data/`
-2. `data/`
-
-Look for `marinara-engine.db` plus any `-wal` and `-shm` companion files. The server now logs the resolved `DATA_DIR` and database path on startup to help identify which one is active.
+| Document                                             | Description                                                     |
+| ---------------------------------------------------- | --------------------------------------------------------------- |
+| [docs/INSTALLATION.md](docs/INSTALLATION.md)         | Installation guide index (all platforms)                        |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md)       | Environment variables and `.env` reference                      |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)   | Common issues and fixes                                         |
+| [docs/FAQ.md](docs/FAQ.md)                           | Frequently asked questions (LAN access, etc.)                   |
+| [docs/FRONTEND.md](docs/FRONTEND.md)                 | Frontend architecture, components, hooks, and API reference     |
+| [docs/ARCHITECTURE_MAP.md](docs/ARCHITECTURE_MAP.md) | Code ownership map and module-boundary refactor groundwork      |
+| [android/README.md](android/README.md)               | Android WebView wrapper (APK) guide                             |
+| [CONTRIBUTING.md](CONTRIBUTING.md)                   | Contributor workflow, validation, versioning, and release steps |
+| [CHANGELOG.md](CHANGELOG.md)                         | Release notes                                                   |
+| [CLAUDE.md](CLAUDE.md)                               | Maintainer notes for contributors using Claude                  |
 
 ---
 
@@ -341,6 +199,26 @@ Look for `marinara-engine.db` plus any `-wal` and `-shm` companion files. The se
 - [Pwildani](https://github.com/pwildani)
 - [Romu](https://github.com/Romuromylus)
 - [Felor](https://github.com/felorhik)
+- [MagicGoddess](https://github.com/MagicGoddess)
+- [Mm14141](https://github.com/mm14141)
+- [Romu](https://github.com/Romuromylus)
+- [Shadota](https://github.com/Shadota)
+- [Teuku Rezhaldy](https://github.com/0-trspace)
+- [Mohammad Javed](https://github.com/Javedz678)
+- [Loungemeister](https://github.com/loungemeister)
+- [Cha1latte](https://github.com/cha1latte)
+- [Trade-Mottoes](https://github.com/Trade-Mottoes)
+- [OnlyJimmy](https://github.com/Trade-Mottoes)
+- [Xelvanis](https://github.com/Xelvanis)
+- [Anarchistcowboy](https://github.com/Anarchistcowboy)
+- [Adunato](https://github.com/adunato)
+- [DarthTheMonster](https://github.com/DarthTheMonster)
+- [Morgul](https://github.com/Morgul)
+- [Kevin Ho](https://github.com/kevin-ho)
+- [Tom DARONDOVAS](https://github.com/LightD31)
+- [Jacob M](https://github.com/jake9000)
+- [Lochalan](https://github.com/Lochalan)
+- [Kolacheee](https://github.com/kolacheee)
 
 ---
 

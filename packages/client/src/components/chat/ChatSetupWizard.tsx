@@ -18,8 +18,9 @@ import {
   Bot,
   Wand2,
   ArrowLeft,
+  UserRound,
 } from "lucide-react";
-import { cn } from "../../lib/utils";
+import { cn, getAvatarCropStyle, type AvatarCrop } from "../../lib/utils";
 import { useConnections } from "../../hooks/use-connections";
 import { usePresets, usePresetFull, useDefaultPreset } from "../../hooks/use-presets";
 import { useCharacters, usePersonas } from "../../hooks/use-characters";
@@ -29,9 +30,18 @@ import { useChatPresets, useApplyChatPreset } from "../../hooks/use-chat-presets
 import { useUIStore } from "../../stores/ui.store";
 import { useChatStore } from "../../stores/chat.store";
 import { api } from "../../lib/api-client";
+import { getCharacterTitle, parseCharacterDisplayData } from "../../lib/character-display";
 import { ChoiceSelectionModal } from "../presets/ChoiceSelectionModal";
 import type { Chat, ChatMode, ChatPreset } from "@marinara-engine/shared";
 import { useQueryClient } from "@tanstack/react-query";
+import {
+  CHAT_PARAMETER_DEFAULTS,
+  GenerationParametersFields,
+  getEditableGenerationParameters,
+  parseEditableGenerationParameters,
+  ROLEPLAY_PARAMETER_DEFAULTS,
+  type EditableGenerationParameters,
+} from "../ui/GenerationParametersEditor";
 
 // ─── Step definitions ─────────────────────────
 
@@ -86,9 +96,22 @@ interface ChatSetupWizardProps {
 }
 
 interface PersonaDisplayInfo {
+  id?: string;
   name: string;
+  avatarPath?: string | null;
   comment?: string | null;
 }
+
+type PersonaSetupOption = PersonaDisplayInfo & {
+  id: string;
+  avatarPath: string | null;
+};
+
+type ConnectionSetupOption = {
+  id: string;
+  name: string;
+  defaultParameters?: unknown;
+};
 
 function getPersonaTitle(persona: PersonaDisplayInfo): string | null {
   const title = persona.comment?.trim();
@@ -98,6 +121,162 @@ function getPersonaTitle(persona: PersonaDisplayInfo): string | null {
 function formatPersonaLabel(persona: PersonaDisplayInfo): string {
   const title = getPersonaTitle(persona);
   return title ? `${persona.name} - ${title}` : persona.name;
+}
+
+function getCharacterAvatarCrop(character: { data: unknown }): AvatarCrop | null {
+  try {
+    const parsed = typeof character.data === "string" ? JSON.parse(character.data) : character.data;
+    return (parsed as { extensions?: { avatarCrop?: AvatarCrop | null } } | null)?.extensions?.avatarCrop ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function CharacterAvatarImage({
+  character,
+  src,
+  alt,
+  className,
+}: {
+  character: { data: unknown };
+  src: string;
+  alt: string;
+  className: string;
+}) {
+  return (
+    <span className={cn("block shrink-0 overflow-hidden", className)}>
+      <img
+        src={src}
+        alt={alt}
+        loading="lazy"
+        className="h-full w-full object-cover"
+        style={getAvatarCropStyle(getCharacterAvatarCrop(character))}
+      />
+    </span>
+  );
+}
+
+function PersonaAvatar({ persona }: { persona: PersonaDisplayInfo | null }) {
+  if (persona?.avatarPath) {
+    return (
+      <img src={persona.avatarPath} alt={persona.name} loading="lazy" className="h-7 w-7 rounded-full object-cover" />
+    );
+  }
+
+  return (
+    <div className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--accent)] text-[0.625rem] font-bold text-[var(--muted-foreground)]">
+      {persona?.name ? persona.name[0] : <UserRound size="0.875rem" />}
+    </div>
+  );
+}
+
+function PersonaPicker({
+  personas,
+  value,
+  onChange,
+}: {
+  personas: PersonaSetupOption[];
+  value: string | null;
+  onChange: (personaId: string | null) => void;
+}) {
+  const selectedId = value ?? "";
+
+  return (
+    <div className="overflow-hidden rounded-lg bg-[var(--secondary)]/50 ring-1 ring-[var(--border)]">
+      <button
+        type="button"
+        onClick={() => onChange(null)}
+        aria-pressed={!selectedId}
+        className={cn(
+          "flex w-full items-center gap-2.5 px-3 py-2 text-left transition-all hover:bg-[var(--accent)]",
+          !selectedId && "bg-[var(--primary)]/10 ring-1 ring-inset ring-[var(--primary)]/25",
+        )}
+      >
+        <PersonaAvatar persona={null} />
+        <div className="min-w-0 flex-1">
+          <span className="block truncate text-xs font-medium">None</span>
+          <span className="block truncate text-[0.625rem] text-[var(--muted-foreground)]">Stay anonymous</span>
+        </div>
+        {!selectedId && <Check size="0.75rem" className="shrink-0 text-[var(--primary)]" />}
+      </button>
+
+      {personas.length > 0 && <div className="border-t border-[var(--border)]" />}
+
+      <div className="max-h-40 overflow-y-auto">
+        {personas.map((persona) => {
+          const isSelected = selectedId === persona.id;
+          const title = getPersonaTitle(persona);
+          return (
+            <button
+              key={persona.id}
+              type="button"
+              onClick={() => onChange(persona.id)}
+              aria-pressed={isSelected}
+              className={cn(
+                "flex w-full items-center gap-2.5 px-3 py-2 text-left transition-all hover:bg-[var(--accent)]",
+                isSelected && "bg-[var(--primary)]/10 ring-1 ring-inset ring-[var(--primary)]/25",
+              )}
+              title={formatPersonaLabel(persona)}
+            >
+              <PersonaAvatar persona={persona} />
+              <div className="min-w-0 flex-1">
+                <span className="block truncate text-xs font-medium">{persona.name}</span>
+                {title && (
+                  <span className="block truncate text-[0.625rem] text-[var(--muted-foreground)]">{title}</span>
+                )}
+              </div>
+              {isSelected && <Check size="0.75rem" className="shrink-0 text-[var(--primary)]" />}
+            </button>
+          );
+        })}
+        {personas.length === 0 && (
+          <p className="px-3 py-2 text-[0.6875rem] text-[var(--muted-foreground)]">No personas created yet.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SetupGenerationParametersPanel({
+  enabled,
+  value,
+  onEnabledChange,
+  onChange,
+}: {
+  enabled: boolean;
+  value: EditableGenerationParameters;
+  onEnabledChange: (enabled: boolean) => void;
+  onChange: (next: EditableGenerationParameters) => void;
+}) {
+  return (
+    <div className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-3">
+      <button
+        type="button"
+        onClick={() => onEnabledChange(!enabled)}
+        className="flex w-full items-center justify-between gap-3 text-left"
+      >
+        <div>
+          <span className="block text-xs font-medium text-[var(--foreground)]">Customize Parameters</span>
+          <span className="block text-[0.575rem] text-[var(--muted-foreground)]">
+            Leave this off to use the selected connection&apos;s saved defaults for this chat.
+          </span>
+        </div>
+        <div
+          className={cn(
+            "h-5 w-9 rounded-full p-0.5 transition-colors",
+            enabled ? "bg-[var(--primary)]" : "bg-[var(--muted-foreground)]/50",
+          )}
+        >
+          <div className={cn("h-4 w-4 rounded-full bg-white transition-transform", enabled && "translate-x-3.5")} />
+        </div>
+      </button>
+      {enabled && (
+        <div className="mt-3 border-t border-[var(--border)] pt-3">
+          <GenerationParametersFields value={value} onChange={onChange} />
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function ChatSetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
@@ -128,7 +307,7 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
   const openRightPanel = useUIStore((s) => s.openRightPanel);
   const [scheduleState, setScheduleState] = useState<"idle" | "generating" | "done">("idle");
   const [autonomousEnabled, setAutonomousEnabled] = useState(true);
-  const [generateSchedule, setGenerateSchedule] = useState(true);
+  const [generateSchedule, setGenerateSchedule] = useState(false);
 
   // Track whether the user has manually edited the chat name.
   // If not, auto-rename to match the selected character name(s).
@@ -143,7 +322,8 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
   }, [chat.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const characters = useMemo(
-    () => (allCharacters ?? []) as Array<{ id: string; data: string; avatarPath: string | null }>,
+    () =>
+      (allCharacters ?? []) as Array<{ id: string; data: string; comment?: string | null; avatarPath: string | null }>,
     [allCharacters],
   );
   const personas = (allPersonas ?? []) as Array<{
@@ -152,6 +332,33 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
     avatarPath: string | null;
     comment?: string | null;
   }>;
+  const metadata = useMemo(() => {
+    const raw = (chat as unknown as { metadata?: string | Record<string, unknown> }).metadata;
+    return typeof raw === "string" ? JSON.parse(raw) : (raw ?? {});
+  }, [chat]);
+  const connectionOptions = useMemo(() => ((connections ?? []) as ConnectionSetupOption[]) ?? [], [connections]);
+  const selectedConnection = useMemo(
+    () => connectionOptions.find((connection) => connection.id === chat.connectionId) ?? null,
+    [connectionOptions, chat.connectionId],
+  );
+  const parameterDefaults = useMemo(
+    () => getEditableGenerationParameters(CHAT_PARAMETER_DEFAULTS, selectedConnection?.defaultParameters),
+    [selectedConnection?.defaultParameters],
+  );
+  const [customizeParameters, setCustomizeParameters] = useState(
+    () => !!parseEditableGenerationParameters(metadata.chatParameters),
+  );
+  const [generationParameters, setGenerationParameters] = useState<EditableGenerationParameters>(() =>
+    getEditableGenerationParameters(parameterDefaults, metadata.chatParameters),
+  );
+
+  useEffect(() => {
+    setGenerationParameters(getEditableGenerationParameters(parameterDefaults, metadata.chatParameters));
+  }, [parameterDefaults, metadata.chatParameters]);
+
+  useEffect(() => {
+    setCustomizeParameters(!!parseEditableGenerationParameters(metadata.chatParameters));
+  }, [metadata.chatParameters]);
 
   const chatCharIds: string[] = useMemo(() => {
     return typeof chat.characterIds === "string" ? JSON.parse(chat.characterIds) : (chat.characterIds ?? []);
@@ -159,14 +366,26 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
 
   const [search, setSearch] = useState("");
 
-  const charName = useCallback((c: { id?: string; data: string }) => {
-    try {
-      const p = typeof c.data === "string" ? JSON.parse(c.data) : c.data;
-      return (p as { name?: string }).name ?? "Unknown";
-    } catch {
-      return "Unknown";
+  const charInfoMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof parseCharacterDisplayData>>();
+    for (const character of characters) {
+      map.set(character.id, parseCharacterDisplayData(character));
     }
-  }, []);
+    return map;
+  }, [characters]);
+
+  const getCharacterInfo = useCallback(
+    (c: { id?: string; data: string; comment?: string | null }) => {
+      if (c.id && charInfoMap.has(c.id)) return charInfoMap.get(c.id)!;
+      return parseCharacterDisplayData(c);
+    },
+    [charInfoMap],
+  );
+
+  const charName = useCallback(
+    (c: { id?: string; data: string; comment?: string | null }) => getCharacterInfo(c).name,
+    [getCharacterInfo],
+  );
 
   // Build an auto-generated chat name from character IDs
   const buildAutoName = useCallback(
@@ -215,9 +434,13 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
     [chat.id, updateChat],
   );
 
-  const available = characters.filter(
-    (c) => !chatCharIds.includes(c.id) && charName(c).toLowerCase().includes(search.toLowerCase()),
-  );
+  const available = characters.filter((c) => {
+    if (chatCharIds.includes(c.id)) return false;
+    const info = getCharacterInfo(c);
+    const query = search.toLowerCase();
+    const title = getCharacterTitle(info)?.toLowerCase() ?? "";
+    return info.name.toLowerCase().includes(query) || title.includes(query);
+  });
 
   const hasConnection = !!chat.connectionId;
   const hasCharacters = chatCharIds.length > 0;
@@ -229,12 +452,19 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
     await updateMeta.mutateAsync({
       id: chat.id,
       autonomousMessages: autonomousEnabled,
+      conversationSchedulesEnabled: autonomousEnabled && generateSchedule,
+      chatParameters: customizeParameters ? generationParameters : null,
       ...(savedPrompt ? { customSystemPrompt: savedPrompt } : {}),
     });
     if (autonomousEnabled && generateSchedule) {
       setScheduleState("generating");
       try {
-        await api.post("/conversation/schedule/generate", { chatId: chat.id, characterIds: chatCharIds });
+        const scheduleGenerationPreferences = useUIStore.getState().scheduleGenerationPreferences;
+        await api.post("/conversation/schedule/generate", {
+          chatId: chat.id,
+          characterIds: chatCharIds,
+          scheduleGenerationPreferences,
+        });
       } catch {
         // Schedule generation is non-critical — continue anyway
       }
@@ -243,21 +473,32 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
     } else {
       onFinish();
     }
-  }, [hasConnection, hasCharacters, chat.id, chatCharIds, onFinish, autonomousEnabled, generateSchedule, updateMeta]);
+  }, [
+    hasConnection,
+    hasCharacters,
+    chat.id,
+    chatCharIds,
+    onFinish,
+    autonomousEnabled,
+    generateSchedule,
+    updateMeta,
+    customizeParameters,
+    generationParameters,
+  ]);
 
   return (
     <>
       <div className="absolute inset-0 z-40 bg-black/40 backdrop-blur-[3px]" onClick={onFinish} />
 
-      <div className="absolute inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
+      <div className="absolute inset-0 z-50 flex items-center justify-center p-3 pointer-events-none max-md:pt-[max(0.75rem,env(safe-area-inset-top))] max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:p-4">
         <motion.div
           initial={{ opacity: 0, y: 16, scale: 0.97 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
           transition={{ duration: 0.2, ease: "easeOut" }}
-          className="pointer-events-auto w-full max-w-sm max-h-[90vh] flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-2xl overflow-hidden"
+          className="pointer-events-auto flex max-h-[calc(100dvh-1.5rem)] w-full max-w-sm flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-2xl sm:max-h-[min(90dvh,42rem)]"
         >
           {/* Header */}
-          <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
+          <div className="flex shrink-0 items-center justify-between border-b border-[var(--border)] px-4 py-3">
             <div className="flex items-center gap-2">
               <MessageCircle size="0.875rem" className="text-[var(--primary)]" />
               <h3 className="text-sm font-semibold text-[var(--foreground)]">New Conversation</h3>
@@ -270,7 +511,7 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
             </button>
           </div>
 
-          <div className="p-4 space-y-4 overflow-y-auto min-h-0 flex-1">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4">
             {/* Conversation name */}
             <div className="space-y-1.5">
               <label className="text-[0.6875rem] font-medium text-[var(--muted-foreground)] uppercase tracking-wider">
@@ -304,13 +545,13 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
               >
                 <option value="">None</option>
                 <option value="random">🎲 Random</option>
-                {((connections ?? []) as Array<{ id: string; name: string }>).map((c) => (
+                {connectionOptions.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.name}
                   </option>
                 ))}
               </select>
-              {((connections ?? []) as Array<unknown>).length === 0 && (
+              {connectionOptions.length === 0 && (
                 <button
                   onClick={() => {
                     openRightPanel("connections");
@@ -322,6 +563,12 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
                   Set Up a Connection
                 </button>
               )}
+              <SetupGenerationParametersPanel
+                enabled={customizeParameters}
+                value={generationParameters}
+                onEnabledChange={setCustomizeParameters}
+                onChange={setGenerationParameters}
+              />
             </div>
 
             {/* Persona picker (compact) */}
@@ -329,18 +576,7 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
               <label className="text-[0.6875rem] font-medium text-[var(--muted-foreground)] uppercase tracking-wider">
                 Your Persona
               </label>
-              <select
-                value={chat.personaId ?? ""}
-                onChange={(e) => setPersona(e.target.value || null)}
-                className="w-full rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-[var(--border)] transition-shadow focus:ring-[var(--primary)]/40"
-              >
-                <option value="">None</option>
-                {personas.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {formatPersonaLabel(p)}
-                  </option>
-                ))}
-              </select>
+              <PersonaPicker personas={personas} value={chat.personaId ?? null} onChange={setPersona} />
             </div>
 
             {/* Character picker — main area */}
@@ -363,18 +599,20 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
                     const c = characters.find((ch) => ch.id === cid);
                     if (!c) return null;
                     const name = charName(c);
+                    const title = getCharacterTitle(getCharacterInfo(c));
                     return (
                       <button
                         key={cid}
                         onClick={() => toggleCharacter(cid)}
                         className="flex items-center gap-1.5 rounded-full bg-[var(--primary)]/15 pl-1 pr-2.5 py-1 text-xs ring-1 ring-[var(--primary)]/30 transition-all hover:bg-[var(--destructive)]/15 hover:ring-[var(--destructive)]/30 group"
+                        title={title ? `${name} - ${title}` : name}
                       >
                         {c.avatarPath ? (
-                          <img
+                          <CharacterAvatarImage
+                            character={c}
                             src={c.avatarPath}
                             alt={name}
-                            loading="lazy"
-                            className="h-5 w-5 rounded-full object-cover"
+                            className="h-5 w-5 rounded-full"
                           />
                         ) : (
                           <div className="flex h-5 w-5 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5rem] font-bold">
@@ -406,7 +644,8 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
                 </div>
                 <div className="max-h-40 overflow-y-auto border-t border-[var(--border)]">
                   {available.map((c) => {
-                    const name = charName(c);
+                    const info = getCharacterInfo(c);
+                    const title = getCharacterTitle(info);
                     return (
                       <button
                         key={c.id}
@@ -414,18 +653,25 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
                         className="flex w-full items-center gap-2.5 px-3 py-2 text-left transition-all hover:bg-[var(--accent)]"
                       >
                         {c.avatarPath ? (
-                          <img
+                          <CharacterAvatarImage
+                            character={c}
                             src={c.avatarPath}
-                            alt={name}
-                            loading="lazy"
-                            className="h-7 w-7 rounded-full object-cover"
+                            alt={info.name}
+                            className="h-7 w-7 rounded-full"
                           />
                         ) : (
                           <div className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5625rem] font-bold">
-                            {name[0]}
+                            {info.name[0]}
                           </div>
                         )}
-                        <span className="flex-1 truncate text-xs">{name}</span>
+                        <div className="min-w-0 flex-1">
+                          <span className="block truncate text-xs">{info.name}</span>
+                          {title && (
+                            <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                              {title}
+                            </span>
+                          )}
+                        </div>
                         <Plus size="0.75rem" className="text-[var(--muted-foreground)]" />
                       </button>
                     );
@@ -460,7 +706,7 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
                   <div>
                     <span className="text-xs font-medium">Autonomous Messages</span>
                     <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-                      Characters can message you first based on their schedule
+                      Characters can message you first when you&apos;re inactive
                     </p>
                   </div>
                 </div>
@@ -498,7 +744,7 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
                     <div>
                       <span className="text-xs font-medium">Generate Schedule</span>
                       <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-                        Creates a schedule for each character that dictates their availability
+                        Optional routines for availability and delayed replies
                       </p>
                     </div>
                   </div>
@@ -614,14 +860,38 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
     comment?: string | null;
   }>;
   const characters = useMemo(
-    () => (allCharacters ?? []) as Array<{ id: string; data: string; avatarPath: string | null }>,
+    () =>
+      (allCharacters ?? []) as Array<{ id: string; data: string; comment?: string | null; avatarPath: string | null }>,
     [allCharacters],
+  );
+  const connectionOptions = useMemo(() => ((connections ?? []) as ConnectionSetupOption[]) ?? [], [connections]);
+  const selectedConnection = useMemo(
+    () => connectionOptions.find((connection) => connection.id === chat.connectionId) ?? null,
+    [connectionOptions, chat.connectionId],
+  );
+  const parameterDefaults = useMemo(
+    () => getEditableGenerationParameters(ROLEPLAY_PARAMETER_DEFAULTS, selectedConnection?.defaultParameters),
+    [selectedConnection?.defaultParameters],
   );
 
   const metadata = useMemo(() => {
     const raw = (chat as unknown as { metadata?: string | Record<string, unknown> }).metadata;
     return typeof raw === "string" ? JSON.parse(raw) : (raw ?? {});
   }, [chat]);
+  const [customizeParameters, setCustomizeParameters] = useState(
+    () => !!parseEditableGenerationParameters(metadata.chatParameters),
+  );
+  const [generationParameters, setGenerationParameters] = useState<EditableGenerationParameters>(() =>
+    getEditableGenerationParameters(parameterDefaults, metadata.chatParameters),
+  );
+
+  useEffect(() => {
+    setGenerationParameters(getEditableGenerationParameters(parameterDefaults, metadata.chatParameters));
+  }, [parameterDefaults, metadata.chatParameters]);
+
+  useEffect(() => {
+    setCustomizeParameters(!!parseEditableGenerationParameters(metadata.chatParameters));
+  }, [metadata.chatParameters]);
 
   const chatCharIds: string[] = useMemo(() => {
     return typeof chat.characterIds === "string" ? JSON.parse(chat.characterIds) : (chat.characterIds ?? []);
@@ -630,30 +900,28 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
   const activeLorebookIds: string[] = useMemo(() => metadata.activeLorebookIds ?? [], [metadata.activeLorebookIds]);
 
   // Character name helper
-  const charNameMap = useMemo(() => {
-    const map = new Map<string, string>();
+  const charInfoMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof parseCharacterDisplayData>>();
     for (const c of characters) {
-      try {
-        const p = typeof c.data === "string" ? JSON.parse(c.data) : c.data;
-        map.set(c.id, (p as { name?: string }).name ?? "Unknown");
-      } catch {
-        map.set(c.id, "Unknown");
-      }
+      map.set(c.id, parseCharacterDisplayData(c));
     }
     return map;
   }, [characters]);
 
   const charName = useCallback(
-    (c: { id?: string; data: string }) => {
-      if (c.id && charNameMap.has(c.id)) return charNameMap.get(c.id)!;
-      try {
-        const p = typeof c.data === "string" ? JSON.parse(c.data) : c.data;
-        return (p as { name?: string }).name ?? "Unknown";
-      } catch {
-        return "Unknown";
-      }
+    (c: { id?: string; data: string; comment?: string | null }) => {
+      if (c.id && charInfoMap.has(c.id)) return charInfoMap.get(c.id)!.name;
+      return parseCharacterDisplayData(c).name;
     },
-    [charNameMap],
+    [charInfoMap],
+  );
+
+  const charTitle = useCallback(
+    (c: { id?: string; data: string; comment?: string | null }) => {
+      if (c.id && charInfoMap.has(c.id)) return getCharacterTitle(charInfoMap.get(c.id)!);
+      return getCharacterTitle(parseCharacterDisplayData(c));
+    },
+    [charInfoMap],
   );
 
   // Track whether the user has manually edited the chat name.
@@ -665,10 +933,10 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
   const buildAutoName = useCallback(
     (charIds: string[]) => {
       if (charIds.length === 0) return "New Roleplay";
-      const names = charIds.map((id) => charNameMap.get(id)).filter((n): n is string => !!n);
+      const names = charIds.map((id) => charInfoMap.get(id)?.name).filter((n): n is string => !!n);
       return names.length > 0 ? names.join(", ") : "New Roleplay";
     },
-    [charNameMap],
+    [charInfoMap],
   );
 
   // ── Mutations ──
@@ -767,14 +1035,30 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
     [chat.id, activeLorebookIds, updateMeta],
   );
 
-  // Default the shortcut dropdown to the Default preset once presets load
+  // Default the shortcut dropdown once presets load. Prefer (in order):
+  //  1) the preset already applied to this chat,
+  //  2) the user's starred / active preset for the mode,
+  //  3) the built-in Default preset.
   useEffect(() => {
     if (shortcutPresetId) return;
-    const def = chatPresetList.find((p) => p.isDefault);
-    if (def) setShortcutPresetId(def.id);
-  }, [chatPresetList, shortcutPresetId]);
+    if (chatPresetList.length === 0) return;
+    const appliedId = (metadata.appliedChatPresetId as string | undefined) ?? null;
+    const applied = appliedId ? chatPresetList.find((p) => p.id === appliedId) : null;
+    const starred = chatPresetList.find((p) => p.isActive);
+    const fallback = chatPresetList.find((p) => p.isDefault);
+    const pick = applied ?? starred ?? fallback;
+    if (pick) setShortcutPresetId(pick.id);
+  }, [chatPresetList, shortcutPresetId, metadata.appliedChatPresetId]);
 
   const [shortcutApplying, setShortcutApplying] = useState(false);
+
+  const finishWizard = useCallback(async () => {
+    await updateMeta.mutateAsync({
+      id: chat.id,
+      chatParameters: customizeParameters ? generationParameters : null,
+    });
+    onFinish();
+  }, [chat.id, customizeParameters, generationParameters, onFinish, updateMeta]);
 
   const handleShortcutApply = useCallback(async () => {
     if (!shortcutPresetId) {
@@ -802,7 +1086,7 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
 
   const next = useCallback(() => {
     if (isLast) {
-      onFinish();
+      void finishWizard();
     } else {
       // When leaving the preset step (index 1), show the choice modal if the preset has variables
       if (currentStep.key === "preset" && chat.promptPresetId && presetFull?.choiceBlocks?.length) {
@@ -813,7 +1097,7 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
       setCharSearch("");
       setLbSearch("");
     }
-  }, [isLast, onFinish, currentStep.key, chat.promptPresetId, presetFull?.choiceBlocks?.length]);
+  }, [isLast, finishWizard, currentStep.key, chat.promptPresetId, presetFull?.choiceBlocks?.length]);
 
   // ─── Step content renderers ───────────────────
 
@@ -827,13 +1111,13 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
         >
           <option value="">None</option>
           <option value="random">🎲 Random</option>
-          {((connections ?? []) as Array<{ id: string; name: string }>).map((c) => (
+          {connectionOptions.map((c) => (
             <option key={c.id} value={c.id}>
               {c.name}
             </option>
           ))}
         </select>
-        {((connections ?? []) as Array<unknown>).length === 0 && (
+        {connectionOptions.length === 0 && (
           <button
             onClick={() => {
               openRightPanel("connections");
@@ -845,6 +1129,12 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
             Set Up a Connection
           </button>
         )}
+        <SetupGenerationParametersPanel
+          enabled={customizeParameters}
+          value={generationParameters}
+          onEnabledChange={setCustomizeParameters}
+          onChange={setGenerationParameters}
+        />
       </div>
     );
   }
@@ -859,7 +1149,7 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
         <option value="">None</option>
         {((presets ?? []) as Array<{ id: string; name: string; isDefault?: boolean | string }>).map((p) => (
           <option key={p.id} value={p.id}>
-            {p.isDefault === true || p.isDefault === "true" ? "Default" : p.name}
+            {p.name}
           </option>
         ))}
       </select>
@@ -867,26 +1157,16 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
   }
 
   function renderPersona() {
-    return (
-      <select
-        value={chat.personaId ?? ""}
-        onChange={(e) => setPersona(e.target.value || null)}
-        className="w-full rounded-lg bg-[var(--secondary)] px-3 py-2.5 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
-      >
-        <option value="">None</option>
-        {personas.map((p) => (
-          <option key={p.id} value={p.id}>
-            {formatPersonaLabel(p)}
-          </option>
-        ))}
-      </select>
-    );
+    return <PersonaPicker personas={personas} value={chat.personaId ?? null} onChange={setPersona} />;
   }
 
   function renderCharacters() {
-    const available = characters.filter(
-      (c) => !chatCharIds.includes(c.id) && charName(c).toLowerCase().includes(charSearch.toLowerCase()),
-    );
+    const available = characters.filter((c) => {
+      if (chatCharIds.includes(c.id)) return false;
+      const query = charSearch.toLowerCase();
+      const title = charTitle(c)?.toLowerCase() ?? "";
+      return charName(c).toLowerCase().includes(query) || title.includes(query);
+    });
 
     return (
       <div className="space-y-2">
@@ -897,19 +1177,32 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
               const c = characters.find((ch) => ch.id === cid);
               if (!c) return null;
               const name = charName(c);
+              const title = charTitle(c);
               return (
                 <div
                   key={cid}
                   className="flex items-center gap-2.5 rounded-lg bg-[var(--primary)]/10 px-3 py-2 ring-1 ring-[var(--primary)]/30"
                 >
                   {c.avatarPath ? (
-                    <img src={c.avatarPath} alt={name} loading="lazy" className="h-6 w-6 rounded-full object-cover" />
+                    <CharacterAvatarImage
+                      character={c}
+                      src={c.avatarPath}
+                      alt={name}
+                      className="h-6 w-6 rounded-full"
+                    />
                   ) : (
                     <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5625rem] font-bold">
                       {name[0]}
                     </div>
                   )}
-                  <span className="flex-1 truncate text-xs">{name}</span>
+                  <div className="min-w-0 flex-1">
+                    <span className="block truncate text-xs">{name}</span>
+                    {title && (
+                      <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                        {title}
+                      </span>
+                    )}
+                  </div>
                   <button
                     onClick={() => toggleCharacter(cid)}
                     className="flex h-5 w-5 items-center justify-center rounded-md text-[var(--muted-foreground)] transition-colors hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]"
@@ -937,6 +1230,7 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
           <div className="max-h-32 overflow-y-auto">
             {available.map((c) => {
               const name = charName(c);
+              const title = charTitle(c);
               return (
                 <button
                   key={c.id}
@@ -944,13 +1238,25 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
                   className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-all hover:bg-[var(--accent)]"
                 >
                   {c.avatarPath ? (
-                    <img src={c.avatarPath} alt={name} loading="lazy" className="h-6 w-6 rounded-full object-cover" />
+                    <CharacterAvatarImage
+                      character={c}
+                      src={c.avatarPath}
+                      alt={name}
+                      className="h-6 w-6 rounded-full"
+                    />
                   ) : (
                     <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5625rem] font-bold">
                       {name[0]}
                     </div>
                   )}
-                  <span className="flex-1 truncate text-xs">{name}</span>
+                  <div className="min-w-0 flex-1">
+                    <span className="block truncate text-xs">{name}</span>
+                    {title && (
+                      <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                        {title}
+                      </span>
+                    )}
+                  </div>
                   <Plus size="0.75rem" className="text-[var(--muted-foreground)]" />
                 </button>
               );
@@ -1067,7 +1373,7 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
       {/* Wizard card — centered (hidden while choice modal is open) */}
       <div
         className={cn(
-          "absolute inset-0 z-50 flex items-center justify-center p-4 pointer-events-none",
+          "absolute inset-0 z-50 flex items-center justify-center p-3 pointer-events-none max-md:pt-[max(0.75rem,env(safe-area-inset-top))] max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:p-4",
           showChoiceModal && "hidden",
         )}
       >
@@ -1079,10 +1385,10 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -12, scale: 0.97 }}
               transition={{ duration: 0.2, ease: "easeOut" }}
-              className="pointer-events-auto w-full max-w-sm max-h-[90vh] flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-2xl overflow-hidden"
+              className="pointer-events-auto flex max-h-[calc(100dvh-1.5rem)] w-full max-w-sm flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-2xl sm:max-h-[min(90dvh,42rem)]"
             >
               {/* Header */}
-              <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
+              <div className="flex shrink-0 items-center justify-between border-b border-[var(--border)] px-4 py-3">
                 <button
                   onClick={() => setShortcutMode(false)}
                   className="flex items-center gap-1.5 rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
@@ -1103,7 +1409,7 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
                 </button>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
+              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4">
                 <p className="text-center text-xs leading-relaxed text-[var(--muted-foreground)]">
                   Pick a preset, your persona, and any characters to instantly configure this roleplay.
                 </p>
@@ -1132,18 +1438,7 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
                   <label className="text-[0.6875rem] font-medium text-[var(--muted-foreground)] uppercase tracking-wider">
                     Persona
                   </label>
-                  <select
-                    value={chat.personaId ?? ""}
-                    onChange={(e) => setPersona(e.target.value || null)}
-                    className="w-full rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-[var(--border)] transition-shadow focus:ring-[var(--primary)]/40"
-                  >
-                    <option value="">None</option>
-                    {personas.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {formatPersonaLabel(p)}
-                      </option>
-                    ))}
-                  </select>
+                  <PersonaPicker personas={personas} value={chat.personaId ?? null} onChange={setPersona} />
                 </div>
 
                 {/* Characters */}
@@ -1165,18 +1460,20 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
                         const c = characters.find((ch) => ch.id === cid);
                         if (!c) return null;
                         const name = charName(c);
+                        const title = charTitle(c);
                         return (
                           <button
                             key={cid}
                             onClick={() => toggleCharacter(cid)}
                             className="flex items-center gap-1.5 rounded-full bg-[var(--primary)]/15 pl-1 pr-2.5 py-1 text-xs ring-1 ring-[var(--primary)]/30 transition-all hover:bg-[var(--destructive)]/15 hover:ring-[var(--destructive)]/30 group"
+                            title={title ? `${name} - ${title}` : name}
                           >
                             {c.avatarPath ? (
-                              <img
+                              <CharacterAvatarImage
+                                character={c}
                                 src={c.avatarPath}
                                 alt={name}
-                                loading="lazy"
-                                className="h-5 w-5 rounded-full object-cover"
+                                className="h-5 w-5 rounded-full"
                               />
                             ) : (
                               <div className="flex h-5 w-5 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5rem] font-bold">
@@ -1206,12 +1503,15 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
                     </div>
                     <div className="max-h-40 overflow-y-auto">
                       {characters
-                        .filter(
-                          (c) =>
-                            !chatCharIds.includes(c.id) && charName(c).toLowerCase().includes(charSearch.toLowerCase()),
-                        )
+                        .filter((c) => {
+                          if (chatCharIds.includes(c.id)) return false;
+                          const query = charSearch.toLowerCase();
+                          const title = charTitle(c)?.toLowerCase() ?? "";
+                          return charName(c).toLowerCase().includes(query) || title.includes(query);
+                        })
                         .map((c) => {
                           const name = charName(c);
+                          const title = charTitle(c);
                           return (
                             <button
                               key={c.id}
@@ -1219,26 +1519,35 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
                               className="flex w-full items-center gap-2.5 px-3 py-2 text-left transition-all hover:bg-[var(--accent)]"
                             >
                               {c.avatarPath ? (
-                                <img
+                                <CharacterAvatarImage
+                                  character={c}
                                   src={c.avatarPath}
                                   alt={name}
-                                  loading="lazy"
-                                  className="h-6 w-6 rounded-full object-cover"
+                                  className="h-6 w-6 rounded-full"
                                 />
                               ) : (
                                 <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)] text-[0.5625rem] font-bold">
                                   {name[0]}
                                 </div>
                               )}
-                              <span className="flex-1 truncate text-xs">{name}</span>
+                              <div className="min-w-0 flex-1">
+                                <span className="block truncate text-xs">{name}</span>
+                                {title && (
+                                  <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                                    {title}
+                                  </span>
+                                )}
+                              </div>
                               <Plus size="0.75rem" className="text-[var(--muted-foreground)]" />
                             </button>
                           );
                         })}
-                      {characters.filter(
-                        (c) =>
-                          !chatCharIds.includes(c.id) && charName(c).toLowerCase().includes(charSearch.toLowerCase()),
-                      ).length === 0 && (
+                      {characters.filter((c) => {
+                        if (chatCharIds.includes(c.id)) return false;
+                        const query = charSearch.toLowerCase();
+                        const title = charTitle(c)?.toLowerCase() ?? "";
+                        return charName(c).toLowerCase().includes(query) || title.includes(query);
+                      }).length === 0 && (
                         <p className="px-3 py-3 text-center text-[0.6875rem] text-[var(--muted-foreground)]">
                           {characters.filter((c) => !chatCharIds.includes(c.id)).length === 0
                             ? "All characters added."
@@ -1251,7 +1560,7 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
               </div>
 
               {/* Footer */}
-              <div className="border-t border-[var(--border)] px-4 py-3 flex items-center justify-between">
+              <div className="flex shrink-0 items-center justify-between border-t border-[var(--border)] px-4 py-3">
                 <button
                   onClick={() => setShortcutMode(false)}
                   className="rounded-lg px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
@@ -1284,72 +1593,76 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -12, scale: 0.97 }}
               transition={{ duration: 0.2, ease: "easeOut" }}
-              className="pointer-events-auto w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-2xl"
+              className="pointer-events-auto flex max-h-[calc(100dvh-1.5rem)] w-full max-w-sm flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-2xl sm:max-h-[min(90dvh,42rem)]"
             >
-              {/* Sprite */}
-              <div className="mb-3 flex justify-center">
-                <img
-                  src={currentStep.sprite}
-                  alt="Professor Mari"
-                  className="h-28 w-auto object-contain drop-shadow-lg"
-                  style={currentStep.spriteFlip ? { transform: "scaleX(-1)" } : undefined}
-                  draggable={false}
-                />
-              </div>
-
-              {/* Title */}
-              <h3 className="mb-1 text-center text-sm font-semibold text-[var(--foreground)]">{currentStep.title}</h3>
-
-              {/* Body */}
-              <p className="mb-4 text-center text-xs leading-relaxed text-[var(--muted-foreground)]">
-                {currentStep.body}
-              </p>
-
-              {/* Step content */}
-              <div className="mb-4">{stepRenderers[currentStep.key]?.()}</div>
-
-              {/* Progress dots */}
-              <div className="mb-3 flex items-center justify-center gap-1.5">
-                {STEPS.map((_, i) => (
-                  <div
-                    key={i}
-                    className={cn(
-                      "h-1.5 rounded-full transition-all duration-300",
-                      i === step
-                        ? "w-4 bg-[var(--primary)]"
-                        : i < step
-                          ? "w-1.5 bg-[var(--primary)]/40"
-                          : "w-1.5 bg-[var(--muted-foreground)]/20",
-                    )}
+              <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-3 pt-5">
+                {/* Sprite */}
+                <div className="mb-3 flex justify-center">
+                  <img
+                    src={currentStep.sprite}
+                    alt="Professor Mari"
+                    className="h-24 w-auto object-contain drop-shadow-lg sm:h-28"
+                    style={currentStep.spriteFlip ? { transform: "scaleX(-1)" } : undefined}
+                    draggable={false}
                   />
-                ))}
+                </div>
+
+                {/* Title */}
+                <h3 className="mb-1 text-center text-sm font-semibold text-[var(--foreground)]">{currentStep.title}</h3>
+
+                {/* Body */}
+                <p className="mb-4 text-center text-xs leading-relaxed text-[var(--muted-foreground)]">
+                  {currentStep.body}
+                </p>
+
+                {/* Step content */}
+                <div>{stepRenderers[currentStep.key]?.()}</div>
               </div>
 
-              {/* Buttons */}
-              <div className="flex items-center justify-between gap-2">
-                <button
-                  onClick={onFinish}
-                  className="rounded-lg px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
-                >
-                  Skip
-                </button>
-                <button
-                  onClick={() => setShortcutMode(true)}
-                  title="Apply a saved chat-settings preset and pick a persona + characters in one step"
-                  className="flex items-center gap-1.5 rounded-lg border border-[var(--primary)]/30 bg-[var(--primary)]/10 px-3 py-1.5 text-xs font-medium text-[var(--primary)] transition-all hover:bg-[var(--primary)]/20"
-                >
-                  <Wand2 size="0.75rem" />
-                  <span className="hidden xs:inline sm:inline">Use Settings Presets</span>
-                  <span className="inline xs:hidden sm:hidden">Presets</span>
-                </button>
-                <button
-                  onClick={next}
-                  disabled={nextDisabled}
-                  className="flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-4 py-1.5 text-xs font-medium text-[var(--primary-foreground)] shadow-sm transition-all hover:opacity-90 active:scale-95 disabled:opacity-50"
-                >
-                  {isLast ? "Done" : "Next"}
-                  {isLast ? <Check size="0.75rem" /> : <ChevronRight size="0.75rem" />}
-                </button>
+              <div className="shrink-0 border-t border-[var(--border)]/70 px-5 py-3">
+                {/* Progress dots */}
+                <div className="mb-3 flex items-center justify-center gap-1.5">
+                  {STEPS.map((_, i) => (
+                    <div
+                      key={i}
+                      className={cn(
+                        "h-1.5 rounded-full transition-all duration-300",
+                        i === step
+                          ? "w-4 bg-[var(--primary)]"
+                          : i < step
+                            ? "w-1.5 bg-[var(--primary)]/40"
+                            : "w-1.5 bg-[var(--muted-foreground)]/20",
+                      )}
+                    />
+                  ))}
+                </div>
+
+                {/* Buttons */}
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    onClick={onFinish}
+                    className="rounded-lg px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
+                  >
+                    Skip
+                  </button>
+                  <button
+                    onClick={() => setShortcutMode(true)}
+                    title="Apply a saved chat-settings preset and pick a persona + characters in one step"
+                    className="flex items-center gap-1.5 rounded-lg border border-[var(--primary)]/30 bg-[var(--primary)]/10 px-3 py-1.5 text-xs font-medium text-[var(--primary)] transition-all hover:bg-[var(--primary)]/20"
+                  >
+                    <Wand2 size="0.75rem" />
+                    <span className="hidden xs:inline sm:inline">Use Settings Presets</span>
+                    <span className="inline xs:hidden sm:hidden">Presets</span>
+                  </button>
+                  <button
+                    onClick={next}
+                    disabled={nextDisabled}
+                    className="flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-4 py-1.5 text-xs font-medium text-[var(--primary-foreground)] shadow-sm transition-all hover:opacity-90 active:scale-95 disabled:opacity-50"
+                  >
+                    {isLast ? "Done" : "Next"}
+                    {isLast ? <Check size="0.75rem" /> : <ChevronRight size="0.75rem" />}
+                  </button>
+                </div>
               </div>
             </motion.div>
           )}

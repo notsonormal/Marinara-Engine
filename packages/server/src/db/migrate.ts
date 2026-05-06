@@ -43,10 +43,22 @@ const CREATE_TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS characters (
     id TEXT PRIMARY KEY NOT NULL,
     data TEXT NOT NULL,
+    comment TEXT NOT NULL DEFAULT '',
     avatar_path TEXT,
     sprite_folder_path TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS character_card_versions (
+    id TEXT PRIMARY KEY NOT NULL,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    data TEXT NOT NULL,
+    comment TEXT NOT NULL DEFAULT '',
+    avatar_path TEXT,
+    version TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'manual',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS personas (
     id TEXT PRIMARY KEY NOT NULL,
@@ -94,6 +106,7 @@ const CREATE_TABLES: string[] = [
     token_budget INTEGER NOT NULL DEFAULT 2048,
     recursive_scanning TEXT NOT NULL DEFAULT 'false',
     character_id TEXT,
+    persona_id TEXT,
     chat_id TEXT,
     enabled TEXT NOT NULL DEFAULT 'true',
     generated_by TEXT,
@@ -102,11 +115,23 @@ const CREATE_TABLES: string[] = [
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
-  `CREATE TABLE IF NOT EXISTS lorebook_entries (
+  `CREATE TABLE IF NOT EXISTS lorebook_folders (
     id TEXT PRIMARY KEY NOT NULL,
     lorebook_id TEXT NOT NULL REFERENCES lorebooks(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
+    enabled TEXT NOT NULL DEFAULT 'true',
+    parent_folder_id TEXT,
+    "order" INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS lorebook_entries (
+    id TEXT PRIMARY KEY NOT NULL,
+    lorebook_id TEXT NOT NULL REFERENCES lorebooks(id) ON DELETE CASCADE,
+    folder_id TEXT,
+    name TEXT NOT NULL,
     content TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
     keys TEXT NOT NULL DEFAULT '[]',
     secondary_keys TEXT NOT NULL DEFAULT '[]',
     enabled TEXT NOT NULL DEFAULT 'true',
@@ -118,6 +143,13 @@ const CREATE_TABLES: string[] = [
     match_whole_words TEXT NOT NULL DEFAULT 'false',
     case_sensitive TEXT NOT NULL DEFAULT 'false',
     use_regex TEXT NOT NULL DEFAULT 'false',
+    character_filter_mode TEXT NOT NULL DEFAULT 'any',
+    character_filter_ids TEXT NOT NULL DEFAULT '[]',
+    character_tag_filter_mode TEXT NOT NULL DEFAULT 'any',
+    character_tag_filters TEXT NOT NULL DEFAULT '[]',
+    generation_trigger_filter_mode TEXT NOT NULL DEFAULT 'any',
+    generation_trigger_filters TEXT NOT NULL DEFAULT '[]',
+    additional_matching_sources TEXT NOT NULL DEFAULT '[]',
     position INTEGER NOT NULL DEFAULT 0,
     depth INTEGER NOT NULL DEFAULT 4,
     "order" INTEGER NOT NULL DEFAULT 100,
@@ -318,6 +350,17 @@ const CREATE_TABLES: string[] = [
     height INTEGER,
     created_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS character_images (
+    id TEXT PRIMARY KEY NOT NULL,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    prompt TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    width INTEGER,
+    height INTEGER,
+    created_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS ooc_influences (
     id TEXT PRIMARY KEY NOT NULL,
     source_chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
@@ -325,6 +368,14 @@ const CREATE_TABLES: string[] = [
     content TEXT NOT NULL,
     anchor_message_id TEXT,
     consumed TEXT NOT NULL DEFAULT 'false',
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS conversation_notes (
+    id TEXT PRIMARY KEY NOT NULL,
+    source_chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    target_chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    anchor_message_id TEXT,
     created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS memory_chunks (
@@ -361,6 +412,17 @@ const CREATE_TABLES: string[] = [
     value TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS installed_extensions (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    css TEXT,
+    js TEXT,
+    enabled TEXT NOT NULL DEFAULT 'true',
+    installed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS chat_presets (
     id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL,
@@ -369,6 +431,12 @@ const CREATE_TABLES: string[] = [
     is_active TEXT NOT NULL DEFAULT 'false',
     settings TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS prompt_overrides (
+    key TEXT PRIMARY KEY NOT NULL,
+    template TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     updated_at TEXT NOT NULL
   )`,
 ];
@@ -410,6 +478,11 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     table: "lorebooks",
     column: "max_recursion_depth",
     definition: "INTEGER NOT NULL DEFAULT 3",
+  },
+  {
+    table: "lorebooks",
+    column: "persona_id",
+    definition: "TEXT",
   },
   {
     table: "lorebook_entries",
@@ -497,6 +570,11 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     definition: "TEXT",
   },
   {
+    table: "characters",
+    column: "comment",
+    definition: "TEXT NOT NULL DEFAULT ''",
+  },
+  {
     table: "personas",
     column: "tags",
     definition: "TEXT NOT NULL DEFAULT '[]'",
@@ -511,8 +589,62 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     column: "default_parameters",
     definition: "TEXT",
   },
+  {
+    table: "api_connections",
+    column: "max_tokens_override",
+    definition: "INTEGER",
+  },
+  {
+    table: "lorebook_entries",
+    column: "description",
+    definition: "TEXT NOT NULL DEFAULT ''",
+  },
+  {
+    table: "lorebook_entries",
+    column: "folder_id",
+    definition: "TEXT",
+  },
+  {
+    table: "lorebook_entries",
+    column: "character_filter_mode",
+    definition: "TEXT NOT NULL DEFAULT 'any'",
+  },
+  {
+    table: "lorebook_entries",
+    column: "character_filter_ids",
+    definition: "TEXT NOT NULL DEFAULT '[]'",
+  },
+  {
+    table: "lorebook_entries",
+    column: "character_tag_filter_mode",
+    definition: "TEXT NOT NULL DEFAULT 'any'",
+  },
+  {
+    table: "lorebook_entries",
+    column: "character_tag_filters",
+    definition: "TEXT NOT NULL DEFAULT '[]'",
+  },
+  {
+    table: "lorebook_entries",
+    column: "generation_trigger_filter_mode",
+    definition: "TEXT NOT NULL DEFAULT 'any'",
+  },
+  {
+    table: "lorebook_entries",
+    column: "generation_trigger_filters",
+    definition: "TEXT NOT NULL DEFAULT '[]'",
+  },
+  {
+    table: "lorebook_entries",
+    column: "additional_matching_sources",
+    definition: "TEXT NOT NULL DEFAULT '[]'",
+  },
 ];
 
+/**
+ * Applies idempotent SQLite schema repairs on startup so upgraded installs can
+ * use the current Drizzle schema before any routes or seeders touch the DB.
+ */
 export async function runMigrations(db: DB) {
   // 1. Create all tables if they don't exist
   for (const stmt of CREATE_TABLES) {
@@ -542,7 +674,17 @@ export async function runMigrations(db: DB) {
     sql.raw(`CREATE INDEX IF NOT EXISTS idx_ooc_influences_target ON ooc_influences(target_chat_id, consumed)`),
   );
   await db.run(
+    sql.raw(
+      `CREATE INDEX IF NOT EXISTS idx_conversation_notes_target ON conversation_notes(target_chat_id, created_at)`,
+    ),
+  );
+  await db.run(
     sql.raw(`CREATE INDEX IF NOT EXISTS idx_memory_chunks_chat ON memory_chunks(chat_id, last_message_at DESC)`),
+  );
+  await db.run(
+    sql.raw(
+      `CREATE INDEX IF NOT EXISTS idx_character_card_versions ON character_card_versions(character_id, created_at DESC)`,
+    ),
   );
   await db.run(sql.raw(`CREATE INDEX IF NOT EXISTS idx_custom_themes_active ON custom_themes(is_active)`));
   await db.run(sql.raw(`CREATE INDEX IF NOT EXISTS idx_chat_presets_mode_active ON chat_presets(mode, is_active)`));

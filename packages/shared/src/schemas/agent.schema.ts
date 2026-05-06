@@ -16,13 +16,21 @@ export const agentResultTypeSchema = z.enum([
   "continuity_check",
   "director_event",
   "lorebook_update",
+  "character_card_update",
   "prompt_review",
   "background_change",
   "character_tracker_update",
   "persona_stats_update",
+  "custom_tracker_update",
   "chat_summary",
   "spotify_control",
+  "haptic_command",
+  "cyoa_choices",
   "secret_plot",
+  "game_master_narration",
+  "party_action",
+  "game_map_update",
+  "game_state_transition",
 ]);
 
 export const createAgentConfigSchema = z.object({
@@ -32,6 +40,7 @@ export const createAgentConfigSchema = z.object({
   phase: agentPhaseSchema,
   enabled: z.boolean().default(true),
   connectionId: z.string().nullable().default(null),
+  resultType: agentResultTypeSchema.optional(),
   promptTemplate: z.string().default(""),
   settings: z.record(z.unknown()).default({}),
 });

@@ -2,26 +2,43 @@
 // Zustand Store: Agent Slice
 // ──────────────────────────────────────────────
 import { create } from "zustand";
-import type { AgentResult } from "@marinara-engine/shared";
+import type { AgentResult, CharacterCardFieldUpdate } from "@marinara-engine/shared";
 
-interface AgentDebugEntry {
+/**
+ * A character_card_update result awaiting user confirmation.
+ *
+ * Character cards are sensitive (they define the character's identity) so
+ * the Card Evolution Auditor never writes them automatically — each batch
+ * of proposed edits sits here until the user approves or rejects it.
+ */
+export interface PendingCardUpdate {
+  /** Client-generated ID, used as key for dismissal. */
+  id: string;
+  characterId: string;
+  characterName: string;
+  updates: CharacterCardFieldUpdate[];
+  agentName: string;
+  /** ms since epoch — used for stable ordering. */
   timestamp: number;
+}
+
+export interface AgentDebugEntry {
   phase: string;
-  agents?: Array<{ type: string; name: string; model: string; maxTokens: number }>;
-  batchMaxTokens?: number;
-  results?: Array<{
-    agentType: string;
-    success: boolean;
-    error: string | null;
-    durationMs: number;
-    tokensUsed: number;
-    resultType: string;
+  agents?: Array<{
+    type: string;
+    name: string;
+    model: string;
+    maxTokens: number;
   }>;
+  results?: AgentResult[];
+  batchMaxTokens?: number;
+  timestamp: number;
 }
 
 interface AgentState {
   activeAgents: string[];
   lastResults: Map<string, AgentResult>;
+  debugLog: AgentDebugEntry[];
   isProcessing: boolean;
   /** Agent types that failed even after auto-retry — manual retry available */
   failedAgentTypes: string[];
@@ -46,12 +63,14 @@ interface AgentState {
     label: string;
     text: string;
   }>;
-  debugLog: AgentDebugEntry[];
+  pendingCardUpdates: PendingCardUpdate[];
 
   // Actions
   setActiveAgents: (agents: string[]) => void;
   setProcessing: (processing: boolean) => void;
   addResult: (agentId: string, result: AgentResult) => void;
+  addDebugEntry: (entry: Omit<AgentDebugEntry, "timestamp"> & { timestamp?: number }) => void;
+  clearDebugLog: () => void;
   setFailedAgentTypes: (types: string[]) => void;
   clearFailedAgentTypes: () => void;
   addThoughtBubble: (agentId: string, agentName: string, content: string) => void;
@@ -65,14 +84,16 @@ interface AgentState {
   setEchoLoadedChatId: (chatId: string | null) => void;
   setCyoaChoices: (choices: Array<{ label: string; text: string }>) => void;
   clearCyoaChoices: () => void;
-  addDebugEntry: (entry: AgentDebugEntry) => void;
-  clearDebugLog: () => void;
+  enqueuePendingCardUpdate: (entry: PendingCardUpdate) => void;
+  dismissPendingCardUpdate: (id: string) => void;
+  clearPendingCardUpdates: () => void;
   reset: () => void;
 }
 
 export const useAgentStore = create<AgentState>((set) => ({
   activeAgents: [],
   lastResults: new Map(),
+  debugLog: [],
   isProcessing: false,
   failedAgentTypes: [],
   thoughtBubbles: [],
@@ -81,7 +102,7 @@ export const useAgentStore = create<AgentState>((set) => ({
   echoBaseline: 0,
   echoLoadedChatId: null,
   cyoaChoices: [],
-  debugLog: [],
+  pendingCardUpdates: [],
 
   setActiveAgents: (agents) => set({ activeAgents: agents }),
   setProcessing: (processing) => set({ isProcessing: processing }),
@@ -97,6 +118,13 @@ export const useAgentStore = create<AgentState>((set) => ({
       }
       return { lastResults: results };
     }),
+
+  addDebugEntry: (entry) =>
+    set((s) => ({
+      debugLog: [...s.debugLog, { ...entry, timestamp: entry.timestamp ?? Date.now() }].slice(-100),
+    })),
+
+  clearDebugLog: () => set({ debugLog: [] }),
 
   setFailedAgentTypes: (types) => set({ failedAgentTypes: types }),
   clearFailedAgentTypes: () => set({ failedAgentTypes: [] }),
@@ -129,13 +157,17 @@ export const useAgentStore = create<AgentState>((set) => ({
   setCyoaChoices: (choices) => set({ cyoaChoices: choices }),
   clearCyoaChoices: () => set({ cyoaChoices: [] }),
 
-  addDebugEntry: (entry) => set((s) => ({ debugLog: [...s.debugLog, entry].slice(-100) })),
-  clearDebugLog: () => set({ debugLog: [] }),
+  enqueuePendingCardUpdate: (entry) =>
+    set((s) => ({ pendingCardUpdates: [...s.pendingCardUpdates, entry].slice(-20) })),
+  dismissPendingCardUpdate: (id) =>
+    set((s) => ({ pendingCardUpdates: s.pendingCardUpdates.filter((e) => e.id !== id) })),
+  clearPendingCardUpdates: () => set({ pendingCardUpdates: [] }),
 
   reset: () =>
     set({
       activeAgents: [],
       lastResults: new Map(),
+      debugLog: [],
       isProcessing: false,
       failedAgentTypes: [],
       thoughtBubbles: [],
@@ -144,6 +176,6 @@ export const useAgentStore = create<AgentState>((set) => ({
       echoBaseline: 0,
       echoLoadedChatId: null,
       cyoaChoices: [],
-      debugLog: [],
+      pendingCardUpdates: [],
     }),
 }));

@@ -36,7 +36,10 @@ export function buildPartySystemPrompt(ctx: PartyPromptContext): string {
     sections.push(
       `<party_personal_arcs>`,
       `Each party member has a personal arc — a side-quest or character story centered on them. Use these to inform their motivations, dialogue, and behavior. They may bring up their arc naturally, hint at it, or react strongly when events touch on it.`,
-      ...ctx.partyArcs.map((a) => `\n<arc name="${a.name}">\nArc: ${a.arc}\nGoal: ${a.goal}\n</arc>`),
+      ...ctx.partyArcs.map(
+        (a) =>
+          `\n<arc name="${a.name}">\nArc: ${a.arc}\nGoal: ${a.goal}\nStatus: ${a.completed ? "completed" : "active"}${a.resolution ? `\nResolution: ${a.resolution}` : ""}\n</arc>`,
+      ),
       `</party_personal_arcs>`,
     );
   }
@@ -45,45 +48,44 @@ export function buildPartySystemPrompt(ctx: PartyPromptContext): string {
     `<party_dialogue_format>`,
     `You MUST format every line using this structured syntax. One line per action/dialogue.`,
     ``,
-    `Dialogue types (the [expression] tag is MANDATORY for main, side, extra, and whisper):`,
+    `Dialogue types (the [expression] tag is MANDATORY for main, side, and whisper):`,
     `  [Name] [main] [expression]: "Spoken dialogue." — Primary dialogue. Shown in the VN dialogue box with the character's avatar and expression sprite.`,
-    `  [Name] [side] [expression]: "Side remark." — Quick quips, overhearing, comedic interjections. Appears as a floating box above the main dialogue.`,
-    `  [Name] [extra] [expression]: "Butt-in dialogue." — Another character butting in or interjecting during someone else's main line. Appears as a small box with avatar above the active dialogue.`,
+    `  [Name] [side] [expression]: "Side remark." — Quick quips, overhearing, comedic interjections, or butt-in dialogue during someone else's main line. Appears as a floating box above the main dialogue.`,
     `  [Name] [action] [expression]: Description of physical action or reaction. — Narrates what the character physically does. Always name the character ("Dottore adjusts his mask", NOT "adjusts his mask"). NO asterisks. Also use for brief non-verbal beats.`,
     `  [Name] [thought] [expression]: Internal monologue... — Private thoughts the character has.`,
     `  [Name] [whisper:TargetName] [expression]: "Whispered text." — A quiet aside directed at a specific character.`,
     ``,
     `Expression tags: Use [expression] to describe the character's facial expression/mood for the sprite display.`,
-    `Default: happy, sad, smirk, angry, neutral, surprised, worried, amused, disgusted, flirty, bored, scared, determined, mischievous, cold, tender, battle_stance, thinking, eye_roll, deadpan`,
+    `Default: happy, sad, smirk, angry, neutral, surprised, worried, amused, disgusted, flirty, bored, scared, determined, mischievous, cold, tender, thinking, eye_roll, deadpan`,
+    `The engine auto-selects built-in full-body poses like idle, thinking, cheer, battle stance, attack, defend, casting, hurt, and victory. Only use a pose-like tag when it is explicitly listed below for that character as a custom sprite alias.`,
     ...(ctx.characterSprites?.length
       ? [
           ``,
           `Available sprites per character (prefer these expression names for accurate avatar display):`,
           ...ctx.characterSprites.map(
             (c) =>
-              `  ${c.name}: ${c.expressions.join(", ")}${c.fullBody.length > 0 ? ` | full-body: ${c.fullBody.join(", ")}` : ""}`,
+              `  ${c.name}: ${c.expressions.join(", ")}${c.fullBody.length > 0 ? ` | custom full-body aliases: ${c.fullBody.join(", ")}` : ""}`,
           ),
         ]
       : []),
     ``,
     `Example turn:`,
     `[Dottore] [main] [smirk]: "I'm not stingy. Unlike some bankers in this party."`,
-    `[Pantalone] [extra] [annoyed]: "I can hear you, you know?"`,
+    `[Pantalone] [side] [annoyed]: "I can hear you, you know?"`,
     `[Scaramouche] [action] [eye_roll]: Scaramouche rolls his eyes.`,
     `[Columbina] [whisper:${ctx.playerName}] [amused]: "They do this every time."`,
     `[Dottore] [action] [neutral]: Dottore adjusts his mask and steps toward the artifact with clinical interest.`,
     ``,
     `Rules:`,
     `- Use [main] for key dialogue that advances the scene`,
-    `- Use [side] for flavor, comedy, banter, and overheard remarks`,
-    `- Use [extra] for characters butting in or interjecting during another character's dialogue`,
+    `- Use [side] for flavor, comedy, banter, overheard remarks, and characters butting in or interjecting during another character's dialogue`,
     `- Use [action] for physical actions, combat moves, exploration actions, and quick non-verbal reactions. Never use asterisks (*) — write plain text.`,
     `- Use [thought] sparingly for revealing inner conflict or foreshadowing`,
     `- Use [whisper:Name] for private asides (comedic or dramatic)`,
-    `- ALWAYS include the [expression] tag for every line — it drives the character sprite`,
+    `- ALWAYS include the [expression] tag for every line — it drives the portrait expression, while standard full-body poses are selected automatically by the engine`,
     `- Not every character needs to speak every turn — only those who would naturally react`,
     `- In [action] lines, ALWAYS address the player as "you" when describing something done to/around the player (e.g. "He gestures vaguely at your entire being")`,
-    `- Dialogue text in [main], [side], [extra], and [whisper] should be in quotes`,
+    `- Dialogue text in [main], [side], and [whisper] should be in quotes`,
     `- NEVER generate dialogue lines for the player (${ctx.playerName}). You control only party members, not the player.`,
     `</party_dialogue_format>`,
   );

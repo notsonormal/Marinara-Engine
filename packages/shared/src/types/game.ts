@@ -2,6 +2,7 @@
 // Game Mode Types
 // ──────────────────────────────────────────────
 import type { GenerationParameters } from "./prompt.js";
+import type { CombatItemEffect } from "./combat-encounter.js";
 
 /** The four main states a game can be in during a session. */
 export type GameActiveState = "exploration" | "dialogue" | "combat" | "travel_rest";
@@ -48,6 +49,8 @@ export interface MapEdge {
 
 /** A map of the current area — either a grid (overworld/city) or a node graph (dungeon/interior). */
 export interface GameMap {
+  /** Stable ID used when a game stores more than one map. Older saves may omit it. */
+  id?: string;
   type: "grid" | "node";
   name: string;
   description: string;
@@ -72,6 +75,10 @@ export interface PartyArc {
   arc: string;
   /** Their personal goal that drives this arc */
   goal: string;
+  /** Whether the arc has been completed */
+  completed?: boolean;
+  /** Optional short note describing how it resolved or what changed */
+  resolution?: string;
 }
 
 // ── Character Cards (tabletop-style) ──
@@ -100,6 +107,12 @@ export interface GameNpc {
   name: string;
   emoji: string;
   description: string;
+  /** Origin of the description. Only "model" descriptions should be treated as canonical profile text. */
+  descriptionSource?: "model" | "library" | "narration" | "user";
+  /** Optional presentation hint used for systems like NPC voice matching. */
+  gender?: string | null;
+  /** Optional pronoun hint used for systems like NPC voice matching. */
+  pronouns?: string | null;
   location: string;
   /** Party reputation with this NPC: -100 (hostile) to 100 (devoted) */
   reputation: number;
@@ -118,20 +131,24 @@ export interface SessionSummary {
   sessionNumber: number;
   /** Narrative recap of what happened */
   summary: string;
+  /** Exact in-world situation where the next session should resume */
+  resumePoint: string;
   /** How party member relationships evolved */
   partyDynamics: string;
   /** Current state of the party after the session */
   partyState: string;
-  /** Important plot points, quests, and lore discovered */
+  /** Important plot points, twists, quests, and lore discovered */
   keyDiscoveries: string[];
-  /** Major story revelations or plot-critical moments */
-  revelations: string[];
   /** Important character moments (dates, bonding, betrayals, confessions, etc.) */
   characterMoments: string[];
+  /** Small personal details, preferences, habits, and past fragments to recall later */
+  littleDetails: string[];
   /** Serialized stats/inventory/quest snapshot */
   statsSnapshot: Record<string, unknown>;
   /** NPC reputation changes */
   npcUpdates: string[];
+  /** Optional player steering note for the next session. */
+  nextSessionRequest?: string | null;
   timestamp: string;
 }
 
@@ -149,7 +166,7 @@ export interface GameSetupConfig {
   rating: "sfw" | "nsfw";
   /** Character ID to use as GM (only when gmMode is "character") */
   gmCharacterId?: string;
-  /** Character IDs for party members */
+  /** Party member IDs; library character IDs or `npc:<slug>` tracked-NPC IDs. */
   partyCharacterIds: string[];
   /** User's persona ID */
   personaId?: string;
@@ -243,6 +260,9 @@ export interface CombatSkill {
   /** Multiplier against base stat */
   power: number;
   description?: string;
+  cooldown?: number;
+  element?: string;
+  statusEffect?: string;
 }
 
 /** Element presets for the elemental reaction system */
@@ -269,6 +289,8 @@ export interface CombatAttackResult {
   isMiss: boolean;
   remainingHp: number;
   isKo: boolean;
+  /** True when the action restored HP instead of dealing damage. */
+  isHeal?: boolean;
   /** Skill used, if any */
   skillName?: string;
   /** Element used in the attack */
@@ -297,7 +319,12 @@ export interface CombatRoundResult {
 export type CombatPlayerAction =
   | { type: "attack"; targetId: string }
   | { type: "skill"; skillId: string; targetId: string }
-  | { type: "item"; itemId: string; targetId?: string }
+  | {
+      type: "item";
+      itemId: string;
+      targetId?: string;
+      itemEffect?: CombatItemEffect;
+    }
   | { type: "defend" }
   | { type: "flee" };
 
@@ -333,7 +360,16 @@ export type DirectionEffect =
   | "vignette"
   | "letterbox"
   | "color_grade"
-  | "focus";
+  | "focus"
+  | "pulse"
+  | "slow_zoom"
+  | "impact_zoom"
+  | "tilt"
+  | "desaturate"
+  | "chromatic_aberration"
+  | "film_grain"
+  | "rain_streaks"
+  | "spotlight";
 
 /** A single cinematic direction command parsed from GM output. */
 export interface DirectionCommand {

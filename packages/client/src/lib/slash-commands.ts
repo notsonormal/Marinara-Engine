@@ -27,6 +27,10 @@ export interface SlashCommandContext {
     userMessage?: string;
     impersonate?: boolean;
     attachments?: { type: string; data: string }[];
+    impersonatePresetId?: string;
+    impersonateConnectionId?: string;
+    impersonateBlockAgents?: boolean;
+    impersonatePromptTemplate?: string;
   }) => Promise<boolean | void>;
   /** Insert a message directly into the chat (no LLM) */
   createMessage: (data: { role: string; content: string; characterId?: string | null }) => void;
@@ -95,19 +99,44 @@ function buildMacroHelpText(): string {
 
   for (const macro of SUPPORTED_MACROS) {
     const lines = sections.get(macro.category) ?? [];
-    lines.push(`  ${macro.syntax} — ${macro.description}`);
+    lines.push(`${macro.syntax} - ${macro.description}`);
     sections.set(macro.category, lines);
   }
 
   return [
     "Supported Macros:",
+    "Tip: In group chats, a bracketed block containing character macros like {{char}} and {{description}} repeats once per character.",
     ...Array.from(sections.entries()).flatMap(([category, lines], index) =>
-      index === 0 ? [`${category}:`, ...lines] : ["", `${category}:`, ...lines],
+      index === 0 ? ["", `${category}:`, ...lines] : ["", `${category}:`, ...lines],
     ),
+    "",
+    "Input Actions:",
+    "{{prompt}} - Open the prompt preview for the current chat without sending a message",
   ].join("\n");
 }
 
 const MACRO_HELP_TEXT = buildMacroHelpText();
+
+function buildSlashHelpText(): string {
+  return ["Available Commands:", "", ...COMMANDS.map((command) => `${command.usage} - ${command.description}`)].join(
+    "\n",
+  );
+}
+
+function parseImpersonatePromptArg(args: string): string {
+  let prompt = args.trim();
+  if (!prompt) return "";
+
+  const quote = prompt[0];
+  if (quote === '"' || quote === "'") {
+    prompt = prompt.slice(1);
+    if (prompt.endsWith(quote)) {
+      prompt = prompt.slice(0, -1);
+    }
+  }
+
+  return prompt.trim();
+}
 
 // ── Command definitions ────────────────
 
@@ -199,13 +228,52 @@ const COMMANDS: SlashCommand[] = [
     usage: "/impersonate [direction]",
     async execute(args, ctx) {
       const direction = args.trim();
+      const { impersonatePresetId, impersonateConnectionId, impersonateBlockAgents, impersonatePromptTemplate } =
+        useUIStore.getState();
+      const trimmedPromptTemplate = impersonatePromptTemplate.trim();
       await ctx.generate({
         chatId: ctx.chatId,
         connectionId: null,
         impersonate: true,
         ...(direction ? { userMessage: direction } : {}),
+        ...(impersonatePresetId ? { impersonatePresetId } : {}),
+        ...(impersonateConnectionId ? { impersonateConnectionId } : {}),
+        ...(impersonateBlockAgents !== undefined ? { impersonateBlockAgents } : {}),
+        ...(trimmedPromptTemplate ? { impersonatePromptTemplate: trimmedPromptTemplate } : {}),
       });
       return { handled: true };
+    },
+  },
+  {
+    name: "impersonate_prompt",
+    aliases: ["imp_prompt"],
+    description: "Set the prompt prefix used by /impersonate in this chat",
+    usage: '/impersonate_prompt <prompt|reset>  (e.g. /impersonate_prompt "You will now play as my OC:")',
+    local: true,
+    async execute(args, ctx) {
+      const raw = args.trim();
+      if (!raw) {
+        return {
+          handled: true,
+          feedback:
+            'Usage: /impersonate_prompt "You will now play as my OC:"\nUse /impersonate_prompt reset to return to the default impersonation prompt.',
+        };
+      }
+
+      if (/^(reset|clear|default)$/i.test(raw)) {
+        await api.patch(`/chats/${ctx.chatId}/metadata`, { impersonatePrompt: null });
+        ctx.invalidate();
+        return { handled: true, feedback: "Impersonate prompt reset to the default." };
+      }
+
+      const prompt = parseImpersonatePromptArg(raw);
+      if (!prompt) {
+        return { handled: true, feedback: "Please provide a prompt, or use /impersonate_prompt reset." };
+      }
+
+      await api.patch(`/chats/${ctx.chatId}/metadata`, { impersonatePrompt: prompt });
+      ctx.invalidate();
+      return { handled: true, feedback: `Impersonate prompt updated:\n${prompt}` };
     },
   },
   {
@@ -334,13 +402,28 @@ const COMMANDS: SlashCommand[] = [
     },
   },
   {
+    name: "goto",
+    aliases: ["jump", "scroll"],
+    description: "Scroll to a specific message number (e.g. /goto 27)",
+    usage: "/goto <number>",
+    local: true,
+    async execute(args, ctx) {
+      const raw = args.trim();
+      const n = Number.parseInt(raw, 10);
+      if (!raw || !Number.isFinite(n) || n < 1 || String(n) !== raw) {
+        return { handled: true, feedback: "Usage: /goto <positive message number> (e.g. /goto 27)" };
+      }
+      useChatStore.getState().requestGotoMessage(ctx.chatId, n);
+      return { handled: true };
+    },
+  },
+  {
     name: "help",
     description: "Show available slash commands",
     usage: "/help",
     local: true,
     async execute(_args, _ctx) {
-      const lines = COMMANDS.map((c) => `${c.usage} — ${c.description}`);
-      return { handled: true, feedback: `Available Commands:\n${lines.join("\n")}` };
+      return { handled: true, feedback: buildSlashHelpText() };
     },
   },
   {

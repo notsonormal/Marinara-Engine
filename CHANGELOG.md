@@ -2,6 +2,268 @@
 
 This file is the release-notes source of truth for Marinara Engine. Reuse these entries when publishing GitHub Releases for tags in the `vX.Y.Z` format.
 
+## [1.5.8]
+
+### Added
+
+- Special edition of Game mode Lorebook Keeper.
+- Guides for all modes.
+- QoL improvements to Lorebooks handling.
+- Optional intuitive swipe navigation lets Conversation and Roleplay users move through rerolls with arrow keys or touch swipes, with an opt-in reroll-at-the-end shortcut.
+- Roleplay chats can now optionally let characters create direct-message Conversation chats with hidden `[dm: ...]` commands.
+- Lorebook entries can now be selected in bulk and copied or moved to another lorebook.
+
+### Fixed
+
+- Various issues caused by the security tightening were fixed.
+- Sidecar issues fixed.
+- Improves the selfie regex, catching malformed commands.
+- Fixed context trimming.
+- MLX sidecar runtime installs the upstream `mlx-lm` source build so curated Gemma 4 MLX models can load on Apple Silicon.
+- Dry-run prompt preview now trims against manually configured preset Max Context Window values instead of only connection/model limits.
+- Script custom tools now show their disabled state in the editor and fail safely when `CUSTOM_TOOL_SCRIPT_ENABLED` is off instead of silently disappearing from agent tool pickers.
+- Browser extensions now load under CSP through Blob module execution instead of eval, keeping extension support without adding `unsafe-eval`.
+- Local sidecar runtime installation now works when the matching Admin Access secret is entered, even if `SIDECAR_RUNTIME_INSTALL_ENABLED` remains off.
+- Agent traffic now warns when the default agent connection may bill a provider. Agents explicitly set to Local Model are skipped with a visible warning when the sidecar is unavailable instead of silently falling back to a paid API connection.
+- Chat attachments now wait for file reads, preserve files in manual group mode, and expose supported text files like JSON/Markdown/CSV to the model instead of silently dropping them.
+- Fixed rolling in Game mode.
+- Lorebook Keeper updates now receive existing entry content, and append structured new facts instead of replacing user-written lorebook text.
+- Docker images now repair `/app/data` volume ownership before dropping to the non-root runtime user, preventing `EACCES` startup failures during file-storage migration.
+- OpenAI-compatible local streams now accept stricter and looser SSE `data:` formatting, Conversation mode visibly streams text again, and live reasoning chunks appear while a reply is still generating.
+- Expression agent sprite updates now repair stale character IDs from the current character name before dropping the expression, so existing characters keep their expressions mid-session.
+- Stability AI image connections now test against Stability's account endpoint, fetch legacy v1 engines when needed, and generate through the correct v2beta Stable Image task endpoints instead of probing `/models`.
+- Game mode party changes made from Chat Settings now sync to game metadata and carry into future sessions.
+- NanoGPT GPT Image 2 requests now normalize image size to a supported pixel budget instead of forwarding too-small canvases.
+- Conversation manual generations now share the autonomous in-progress guard, preventing async catch-up replies from duplicating the same user turn.
+
+## [1.5.7]
+
+### Added
+
+- Guide for Game mode.
+- Professor Mari can now create Lorebooks for you.
+- Days tracker in Game mode that you can edit.
+- Lorebook entry trigger mode can now be changed directly from the entry status dot.
+- Game mode interrupt button that allows you to interrupt the GM (with or without consequences to your game).
+- Various improvements to the Game mode's combat and inventory systems, more cinematic battles, better UI handling, and more overall mechanics.
+- Game mode map scaling.
+- New permanent tag that persists in Roleplay mode if a character passed you important information in Conversation mode.
+- Improvements to the Knowledge Router agent.
+- Storing the Conversation Theme background gradient separately for dark and light color schemes, so switching OS/browser theme automatically loads the correct gradient.
+- Custom agents now have a chat memory.
+- Prompt overrides the registry for image generation.
+- Active filter tab in Lorebooks.
+- Compressed Lorebooks.
+- Customizable generation settings for local image generation.
+- When generating schedules, they now receive context from the conversation chats you had with a character.
+- Hide/unhide messages in Roleplay mode.
+- Alternative display of logs for Game mode.
+- Custom agents can now choose a result type, including Text Rewrite for post-processing agents that edit the generated reply.
+- Setting to enable showing and editing image prompts before they're sent.
+- Setting to change the image dimensions for generation.
+- Various small QOL changes.
+- Custom agents' outputs can now be edited in the Agents button in the Roleplay mode.
+- Custom parameters field.
+- Sliders to control the sprite's size and opacity in Roleplay mode.
+- Custom activity statuses for the user.
+- Vectorized Lorebook entries are now visibly marked.
+- Character card version history with compare and restore controls.
+- Prefills.
+- File-backed storage is now the default: legacy SQLite data is imported into JSON files under `DATA_DIR/storage`, backups include those files, and `STORAGE_BACKEND=sqlite` remains as an advanced compatibility escape hatch.
+- Allowed token size outputs in agents.
+- Lorebook folders.
+- Game mode setup remembers custom genre, tone, setting, and goal options from previous games.
+- Optional trimming for incomplete model endings before generated messages are saved.
+- Draft translation button option in chat Translation settings for Conversation, Roleplay, and Game modes.
+- Native vs compatible export choices for profile, character, persona, and lorebook exports.
+- PocketTTS is now available as a local TTS provider.
+- Optional speech-to-text microphone buttons can be enabled for Conversation, Roleplay, and Game input fields.
+- Character imports now ask before extracting embedded character-card lorebooks into standalone Marinara lorebooks.
+- Home Assistant HACS integration that syncs Marinara custom tools and a Home Assistant agent for smart-home control.
+- Updated the supported toolchain to Node.js 24 LTS and pnpm 10.33.2 across launchers, installers, Docker images, docs, and CI, plus refreshed dependencies within their compatible ranges.
+- Lorebook entries can now be scoped by active characters, character tags, and generation triggers, and can scan selected character/persona fields as extra keyword-matching sources.
+- Game mode now has an optional Lorebook Keeper that updates a game-scoped lorebook after session conclusion and automatically attaches it to that game.
+
+### Security
+
+- Hardened default network access so loopback remains convenient while non-loopback private-network traffic fails closed unless Basic Auth, an allowlist, or an explicit unsafe opt-in is configured.
+- Added global unsafe-method CSRF/origin protections, security headers, route throttling, and shared privileged-route gates for admin, update, backup/import, sidecar, haptics, and custom-tool operations.
+- Added SSRF, path containment, upload validation, bulk-import capability tokens, and response-size guards around high-risk URL, file, and archive flows.
+- Disabled or gated risky execution paths by default, including API-driven update apply, custom script tools, sidecar runtime installs, and remote haptic control.
+- Removed the seeded default provider key, encrypted Spotify token storage, and redacted obvious secrets from profile export.
+- Hardened chat HTML sanitization and SVG/image handling, then upgraded vulnerable production and build dependencies.
+- Hardened Docker, Android WebView/backup, GitHub Actions action references, and Windows installer dependency verification.
+- Breaking/default changes: privileged routes now require `ADMIN_SECRET`, Docker binds to localhost by default, and update apply, custom script tools, and sidecar runtime installs are disabled until operators opt in with the documented environment switches.
+- Operators who intentionally need the old exposure model must set `ADMIN_SECRET`, choose a remote bind address for Docker/launchers, and explicitly enable only the required flows such as `UPDATES_APPLY_ENABLED`, `CUSTOM_TOOL_SCRIPT_ENABLED`, or `SIDECAR_RUNTIME_INSTALL_ENABLED`.
+
+### Fixed
+
+- Custom OpenAI-compatible endpoints like Venice no longer receive provider-specific request fields just because a fetched model ID matches an OpenAI, xAI, OpenRouter, or Z.AI naming pattern.
+- Addressed various security concerns.
+- Game mode dark screen error addressed.
+- Removed the persistent SQLite database as the default live storage path, reducing release-to-release migration failures.
+- File-backed migration now merges every known legacy database location and performs a one-time repair for snapshots that missed chats during early v1.5.7 testing.
+- On mobile Roleplay, the branch quick-switcher now lives inside the three-dot toolbar menu, so it no longer overlaps the Agents' controls.
+- Settings Debug Mode now prints prompt, scene-analysis, party-turn, and game asset debug logs even when `LOG_LEVEL` is not set to `debug`.
+- Switching chats doesn't stop the generation of the previously triggered one.
+- Cross-conversations confusions addressed.
+- {{user}} and {{char}} macros now work in all modes.
+- Injections at a specific depth now work correctly.
+- Added Spotify OAuth redirect URI handling and manual paste-back.
+- [Start the game] is being sent twice upon starting the game.
+- Expression Engine now retrieves all the available sprites correctly upon retry.
+- Fixed unstable message pagination cursor.
+- Various errors were addressed.
+- Advanced parameters are now respected by local endpoints.
+- Improved the quality of some prompts.
+- Ensured the daily/weekly summaries trigger consistently.
+- We now handle assets in Game mode better.
+- Conversation mode characters no longer reply to themselves; instead, they reply to you.
+- Drag-and-drop on mobiles now works.
+- Custom agents can now rewrite your messages.
+- Full-body sprites in game mode now get updated properly.
+- Deleted characters from group chat no longer appear as Unknown.
+- Roleplay setup and connection setup dialogs now fit short screens with internal scrolling, and Custom Parameters starts empty with an example placeholder.
+- File-backed storage now supports Lorebook folders during generation and migration.
+- Deleting one saved character card version now leaves the rest of the version history intact.
+- Removed the legacy database setup step from the installer flow.
+- Fresh installs no longer install the old `better-sqlite3` or `sql.js` SQLite fallback packages.
+- Browser-tab character imports now preserve embedded Chub lorebooks as linked Marinara lorebooks.
+- OpenRouter Claude reasoning is requested with OpenRouter's unified `reasoning` payload again, restoring thinking capture for Sonnet/Opus reasoning models.
+- Sprite sheet prompts now more explicitly require complete slicable grids for expression and full-body pose generation.
+- Loopback LLM provider URLs are allowed by default again, so local model servers on `127.0.0.1`, `::1`, or `localhost` do not require the broad private-network URL opt-in.
+- Restored the animated Marinara logo on the home screen while keeping the static logo as the inactive-page fallback.
+- Tightened the home screen spacing so the logo, FAQ, credits, and special thanks fit more comfortably on desktop and mobile.
+- Windows installer updates now force-refresh the release tag and verify the resolved tag commit instead of aborting on legitimate v1.5.7 hotfix retags.
+- The v1.5.7 Android wrapper APK now uses a bumped `versionCode` for hotfix updates and the release workflow uploads an installable sideload APK.
+- Game Lorebook Keeper now continues in the background after a session is concluded instead of holding the End Session response open.
+- Launchers, installers, and in-app updates now fall back to installed or temporary pnpm when Corepack cannot resolve the exact pinned pnpm patch version.
+- Explicit ComfyUI and AUTOMATIC1111 image-generation connections can use LAN/private-network hosts without the broad image URL opt-in.
+- Restored scoped HTML/CSS rendering inside Roleplay messages and narrator bubbles.
+- Backup and profile export failures now surface the specific server/admin-secret error instead of a generic failure toast.
+- Haptic agent position commands now normalize PositionWithDuration-style outputs and continue executing later commands if one device command fails.
+- Lorebook entry drawers now autosave edits, so the manual Save Entry button is no longer needed.
+- Docker/LAN browser origins now pass CSRF checks when Marinara is reached through a mapped host port, and `CSRF_TRUSTED_ORIGINS=*` is honored as an explicit unsafe wildcard.
+- Loopback backup/profile export requests no longer require `ADMIN_SECRET` by default; remote privileged requests still do.
+- Turning off Conversation schedules now clears saved schedule metadata and resets affected character availability state.
+- Removed the Workbox `index.html` navigation fallback that caused non-precached-url console noise.
+- Various minor UI bugs.
+
+## [1.5.6]
+
+### Added
+
+- New connection provider Claude (Subscription) that routes chat through the locally installed Claude Agent SDK so requests bill against your Anthropic Pro / Max subscription instead of an `sk-ant-*` API key. Requires `npm i -g @anthropic-ai/claude-code` and a one-time `claude login` on the host running Marinara. This is the same auth mechanism Anthropic-endorsed integrations like Zed use; no proxy or third-party shim is involved. Built-in agent tools are disabled and use Marinara's own agent/tool layer. Embeddings are not supported on this provider; configure a separate connection for them.
+- The "Mari is thinking…" indicator appears above the composer while Professor Mari executes her embedded commands (create/update character, fetch, create chat, navigate). Makes it clear that her background work is running, not frozen. Bonus: Dottore is doing jumping jacks.
+- Dry-run generation endpoint (`POST /api/generate/dryRun`) that runs the full generation pipeline without side effects; no messages persisted, no agents or tools invoked, no Discord webhooks. Extensions can send a `userMessage` to preview "what if I said this", use `impersonate: true` to preview the user's next in-character line, enable optional injections (lorebook, trackers, chat summary), override the preset or connection, and optionally receive the assembled prompt instead of a completion (`returnPrompt: true`). Supports both non-streaming JSON responses and SSE streaming with abort capability. Intended as a stopgap extension API for flexible prompt inspection and silent generation.
+- In Game mode, NPCs can be added/removed from your party, plus now you can manage the party manually.
+- If you have Image Generation enabled in Game mode, during important scenes, the model now generates immersive VN-like scenes from the player's POV.
+- Overall improvements to generating expressions/full-body sprites for your characters.
+- Guided generations with a visible indicator.
+- Schedule generation preferences added for conversations.
+- Pygmalion, Jenny, and DataCat added to the Browser.
+- Pinnable taskbar shortcut via custom launcher.
+- Universal Tool Support for agents.
+- New Knowledge Router agent.
+- You can now link Personas to Lorebooks.
+- Drag-and-drop Lorebook entries.
+- Added ElevenLabs for TTS support.
+- TTS now supports character and NPC voices.
+- You can now see spoilers for Game mode and edit the plot accordingly to your needs in the History section.
+- Upon ending the Game session, you can now optionally include what you want to happen in the next session.
+- Separate volume levels for different sounds in Game mode.
+- Added the `/impersonate_prompt` command that allows you to change the impersonate prompt.
+- Added manual mode in Conversations that only makes the character respond when you ping them with `@name`.
+- Resizing sprites in game mode.
+- Conversation auto-summarization now has a Day Rollover Hour (so a late-night session doesn't get cut in half when calendar midnight passes) and a Recent Message Tail (keeps the last N messages verbatim across the day boundary so characters wake up remembering the actual flow of last night, not just the gist). Defaults: 4 AM rollover, 10-message tail.
+- Conversation characters can now emit durable `<note>...</note>` tags for connected roleplay and game chats. Notes persist in the target chat's prompt until cleared from Chat Settings.
+- Lorebook entries now use compact rows with inline controls and an expandable inline editor.
+- Lorebook entries can now be grouped into collapsible folders to reduce vertical clutter for stable or AI-managed entries. Folders have their own enable/disable toggle that gates every entry inside (regardless of each entry's own toggle) without modifying the entries' individual settings, so re-enabling a folder restores everything to how it was. Each folder is its own container — sort by Order works inside the folder, and a folder full of high-Order entries can sit above root-level entries with low Order without conflict. Move entries between folders via a per-row folder picker or drag-and-drop. Collapse state is per-browser (localStorage). Folders are flat in this release; nesting may follow.
+
+### Fixed
+
+- UI and other minor glitches in Game Mode.
+- Image Generation in game mode is not firing up for named NPCs in a scene.
+- More ComfyUI fixes.
+- Various general fixes and improvements.
+- Anchor link error.
+- We now enable the send button immediately after branching.
+- Remove background actually sticks across switches.
+- Sidecar CUDA runtime setup fix.
+- Light Mode readability issues.
+- Removed the ability to apply presets to Conversations, which broke the format.
+- Improved usability on mobile devices with small screens, where tapping tiny buttons could be difficult.
+- Navigational icons under messages now scale with the display size.
+- When selecting Personas during chat setups, you can now see their avatars.
+- Switching between chats doesn't cancel generations in progress.
+- Parameters added to Conversations and Roleplay setups.
+- Bugged NPC entries in Game mode journal.
+- Creating a new agent doesn't delete the old one.
+- Preset names are no longer set to Default upon being selected.
+- Black screen on search bar typing in chats was fixed.
+- Various UI fixes applied.
+- DeepSeek V4 is now supported.
+- Addressed the bug that deleted your Persona fields when uploading an avatar in an unsaved state.
+- Minor adjustments to some agent widgets.
+- Game mode now supports multiple maps.
+- Debug mode restored.
+- Expression Engine retries now load available sprites, validate returned expressions, and persist the corrected sprite state.
+
+## [1.5.5]
+
+### Added
+
+- New agent: Card Evolution Auditor that actively updates your characters as they grow.
+- Polska gurom!!! In Game mode.
+- GM can now add party members during the game and create character cards for them.
+- Turn, Scene Analysis, and Assets Image Generation retry button in Game mode.
+- Improved Game mode's structure and prompts.
+- Custom widgets, notes/books, session summaries, and inventory in Game mode are now all editable.
+- You can now upload custom NPC portraits in Game mode when clicking on the portraits.
+- The Characters tab now opens a full-page library with large card browsing, creator-note previews, and a selected-card overview before editing.
+- Chat galleries and character galleries now support selecting and uploading multiple images in one action.
+- Chat branches can now be switched from a selector at the top of the chat bar instead of only through Manage Chat Files.
+- Conversation schedules now let you customize per-character idle and DND response delays, plus inactivity follow-up timing.
+- Character titles to mirror the ones Personas have.
+- Various macros, see all under `/macros`.
+- Game mode combat improvements (statuses, abilities).
+- Bulk delete.
+- Search filters for chats in the Chats tab.
+- TTS support.
+- FAQ on the home page.
+
+### Fixed
+
+- Fresh installs and client builds no longer fail with `ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL` because the shared package now builds from root entrypoints instead of the client package's nested `predev` and `prebuild` hooks.
+- The lite container release workflow now inspects the correct `-lite` image tag instead of the nonexistent `*-lite-lite` tag, so tagged lite image publishing completes successfully again.
+- Fixed sidecar startup state and enabled logs for Ollama to see what's going on.
+- You can now use tab when writing lorebook entries.
+- Some image generation endpoints.
+- Clicking roleplay image attachments now opens them in Marinara's in-app lightbox instead of a new browser tab.
+- Auto-play in game mode now pauses when you're reading a note, a book, or doing a QTE event.
+- Opening a conversation no longer resets the autonomous-message inactivity timers just because the message history finished loading.
+- OpenAI-compatible connections no longer send reasoning payloads to models that do not support them.
+- Selfies and sprite generation no longer force a character avatar as a hidden reference image by default.
+- Explicitly adding or editing an agent no longer persists it as globally disabled.
+- Memory recall now stays inside a dedicated prompt budget before injection, preventing recalled history from crowding out agent and thinking context.
+- Exporting a modified character to PNG no longer reuses stale embedded card metadata from the avatar image.
+- Sprites get displayed automatically when you add Expression Engine to your chat, and their setup was moved to the Agents section of Chat Settings.
+- More ComfyUI fixes.
+- Group chats' inconsistent injections: now, upon regenerations, the model knows who should respond.
+- Game mode scene-wrap now only sends the current party's character names instead of the entire imported character library, preventing large libraries from tripping the 100-name limit.
+- Professor Mari now has access to all the fields in character cards/personas/lorebooks/etc. and can correctly split info into them.
+- The Windows installer now downloads Git from a valid prerequisite URL again instead of failing the autodownload step with a missing PowerShell `-Uri` argument.
+- Mobile UI fixes for Game mode.
+- Increased the output size to 16384 tokens on the new Game setup generation to prevent malformed JSON errors.
+- Decreased padding for text in boxes in the Glued Side Panel avatars option.
+- Edit Sheet in Game mode black screen bug.
+- CYOA choices can now be edited.
+- UI fixes.
+- Lorebook entries now don't stay active after they've been activated once, and the lorebooks respect the token limits of how many active entries there may be at once.
+- Custom widgets now may change between sessions.
+- No more looping music/ambiance in Game mode.
+- If a provider accepts a smaller context size than the overall model allows, we now automatically reduce the output size to match the allowed size.
+
 ## [1.5.4]
 
 ### Added

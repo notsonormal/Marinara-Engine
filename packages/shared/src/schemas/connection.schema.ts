@@ -6,11 +6,13 @@ import { z } from "zod";
 export const apiProviderSchema = z.enum([
   "openai",
   "anthropic",
+  "claude_subscription",
   "google",
   "mistral",
   "cohere",
   "openrouter",
   "nanogpt",
+  "xai",
   "custom",
   "image_generation",
 ]);
@@ -33,6 +35,7 @@ export const createConnectionSchema = z.object({
   imageGenerationSource: z.string().nullable().default(null),
   comfyuiWorkflow: z.string().nullable().default(null),
   imageService: z.string().nullable().default(null),
+  maxTokensOverride: z.number().int().min(1).nullable().default(null),
 });
 
 export type CreateConnectionInput = z.infer<typeof createConnectionSchema>;

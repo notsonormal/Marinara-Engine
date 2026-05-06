@@ -13,15 +13,30 @@ echo.
 where node >nul 2>&1
 if errorlevel 1 (
     echo  [ERROR] Node.js is not installed or not in PATH.
-    echo  Please install Node.js 20+ from https://nodejs.org
+    echo  Please install Node.js 24 LTS or newer from https://nodejs.org
+    echo.
+    pause
+    exit /b 1
+)
+
+for /f "tokens=1 delims=." %%a in ('node -v') do set "NODE_RAW=%%a"
+set "NODE_MAJOR=!NODE_RAW:v=!"
+if not defined NODE_MAJOR (
+    echo  [ERROR] Could not determine Node.js version.
+    pause
+    exit /b 1
+)
+if !NODE_MAJOR! LSS 24 (
+    echo  [ERROR] Node.js 24 LTS or newer is required. You have v!NODE_MAJOR!.
+    echo  Please update Node.js from https://nodejs.org
     echo.
     pause
     exit /b 1
 )
 
 :: Resolve the repo-pinned pnpm version from package.json
-set "PNPM_VERSION=10.30.3"
-for /f "usebackq delims=" %%i in (`node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).packageManager?.split('@')[1] || '10.30.3'"`) do set "PNPM_VERSION=%%i"
+set "PNPM_VERSION=10.33.2"
+for /f "usebackq delims=" %%i in (`node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).packageManager?.split('@')[1] || '10.33.2'"`) do set "PNPM_VERSION=%%i"
 set "PNPM_RUNNER=pnpm"
 set "CURRENT_PNPM_VERSION="
 
@@ -41,8 +56,8 @@ if not defined CURRENT_PNPM_VERSION (
     where pnpm >nul 2>&1
     if not errorlevel 1 (
         for /f "usebackq delims=" %%i in (`pnpm --version 2^>nul`) do set "CURRENT_PNPM_VERSION=%%i"
-        if /I not "!CURRENT_PNPM_VERSION!"=="%PNPM_VERSION%" (
-            set "CURRENT_PNPM_VERSION="
+        if defined CURRENT_PNPM_VERSION (
+            echo  [..] Using installed pnpm !CURRENT_PNPM_VERSION!
         )
     )
 )
@@ -63,6 +78,25 @@ if not defined CURRENT_PNPM_VERSION (
     exit /b 1
 )
 
+goto :after_restore_helper
+
+:restore_stashed_changes
+if not "!STASHED!"=="1" goto :eof
+if "!STASH_REF!"=="" goto :eof
+git stash apply -q "!STASH_REF!" >nul 2>&1
+if errorlevel 1 (
+    echo  [WARN] Auto-update could not reapply your local changes cleanly.
+    echo         Your changes are preserved in !STASH_REF!.
+    echo         Review them with: git stash show -p !STASH_REF!
+    echo         Reapply them manually with: git stash pop !STASH_REF!
+    git reset --hard HEAD >nul 2>&1
+    goto :eof
+)
+git stash drop -q "!STASH_REF!" >nul 2>&1
+goto :eof
+
+:after_restore_helper
+
 :: Auto-update from Git
 if not exist ".git" goto :skip_update
 echo  [..] Checking for updates...
@@ -77,8 +111,19 @@ if /I "!OLD_HEAD!"=="!TARGET_HEAD!" (
     echo  [OK] Already up to date
     goto :skip_update
 )
+:: Drop known-safe untracked files that older installer versions placed in
+:: $INSTDIR but are now also tracked in the repo. Without this, git merge
+:: --ff-only refuses to overwrite them and the auto-update silently fails.
+:: The repo copies are byte-identical to what the installer wrote, so this
+:: is non-destructive — git restores them as tracked files after the merge.
+if exist "app-icon.ico" (
+    git ls-files --error-unmatch "app-icon.ico" >nul 2>&1
+    if errorlevel 1 del /q "app-icon.ico" >nul 2>&1
+)
+
 :: Stash any tracked local changes so the fast-forward update doesn't fail
 set "STASHED=0"
+set "STASH_REF="
 set "DIRTY=0"
 git diff --quiet >nul 2>&1
 if errorlevel 1 set "DIRTY=1"
@@ -86,20 +131,21 @@ git diff --cached --quiet >nul 2>&1
 if errorlevel 1 set "DIRTY=1"
 if "!DIRTY!"=="1" (
     git stash push -q -m "auto-stash before update" >nul 2>&1 && set "STASHED=1"
+    if "!STASHED!"=="1" for /f "tokens=*" %%i in ('git stash list -1 --format^=%%gd 2^>nul') do set "STASH_REF=%%i"
 )
 git merge --ff-only origin/main >nul 2>&1
 if errorlevel 1 (
-    if "!STASHED!"=="1" git stash pop -q >nul 2>&1
+    if "!STASHED!"=="1" call :restore_stashed_changes
     echo  [WARN] Could not fast-forward to origin/main. Continuing with current version.
     goto :skip_update
 )
 for /f "tokens=*" %%i in ('git rev-parse HEAD 2^>nul') do set "NEW_HEAD=%%i"
 if /I not "!NEW_HEAD!"=="!TARGET_HEAD!" (
-    if "!STASHED!"=="1" git stash pop -q >nul 2>&1
+    if "!STASHED!"=="1" call :restore_stashed_changes
     echo  [WARN] Update did not land on origin/main. Continuing with current version.
     goto :skip_update
 )
-if "!STASHED!"=="1" git stash pop -q >nul 2>&1
+if "!STASHED!"=="1" call :restore_stashed_changes
 echo  [OK] Updated to latest version
 echo  [..] Reinstalling dependencies...
 call :run_pnpm install

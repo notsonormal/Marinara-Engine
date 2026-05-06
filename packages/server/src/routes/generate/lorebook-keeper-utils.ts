@@ -7,7 +7,9 @@ export interface LorebookKeeperSettings {
 }
 
 export interface ExistingLorebookEntrySummary {
+  id: string;
   name: string;
+  content: string;
   keys: string[];
   locked: boolean;
 }
@@ -61,6 +63,7 @@ export async function resolveLorebookKeeperTarget(args: {
   lorebooksStore: LorebooksStore;
   chatId: string;
   characterIds: string[];
+  personaId?: string | null;
   activeLorebookIds: string[];
   preferredTargetLorebookId: string | null;
 }): Promise<{
@@ -68,12 +71,13 @@ export async function resolveLorebookKeeperTarget(args: {
   targetLorebookId: string | null;
   targetLorebookName: string | null;
 }> {
-  const { lorebooksStore, chatId, characterIds, activeLorebookIds, preferredTargetLorebookId } = args;
+  const { lorebooksStore, chatId, characterIds, personaId, activeLorebookIds, preferredTargetLorebookId } = args;
   const allBooks = (await lorebooksStore.list()) as unknown as Array<{
     id: string;
     name?: string | null;
     enabled?: unknown;
     characterId?: string | null;
+    personaId?: string | null;
     chatId?: string | null;
   }>;
 
@@ -82,6 +86,7 @@ export async function resolveLorebookKeeperTarget(args: {
     if (!isEnabledLorebook(book.enabled)) return false;
     if (activeLorebookIds.includes(book.id)) return true;
     if (book.characterId && characterIds.includes(book.characterId)) return true;
+    if (book.personaId && book.personaId === personaId) return true;
     if (book.chatId && book.chatId === chatId) return true;
     return false;
   });
@@ -114,7 +119,9 @@ export async function loadLorebookKeeperExistingEntries(
   if (!targetLorebookId) return [];
 
   const entries = (await lorebooksStore.listEntries(targetLorebookId)) as Array<{
+    id?: string | null;
     name?: string | null;
+    content?: string | null;
     keys?: string[] | null;
     locked?: unknown;
   }>;
@@ -122,7 +129,9 @@ export async function loadLorebookKeeperExistingEntries(
   return entries
     .filter((entry) => typeof entry.name === "string" && entry.name.trim().length > 0)
     .map((entry) => ({
+      id: typeof entry.id === "string" ? entry.id : "",
       name: entry.name!.trim(),
+      content: typeof entry.content === "string" ? entry.content : "",
       keys: Array.isArray(entry.keys) ? entry.keys.filter((key) => typeof key === "string") : [],
       locked: entry.locked === true || entry.locked === "true",
     }));
@@ -185,6 +194,92 @@ export function buildHistoricalLorebookKeeperContext<T extends LorebookKeeperMes
   };
 }
 
+function normalizeKeeperFact(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value
+    .trim()
+    .replace(/^(?:[-*]|\u2022)\s+/, "")
+    .replace(/\s+/g, " ");
+  return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeKeeperFactForComparison(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeKeeperFacts(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const facts: string[] = [];
+  for (const entry of value) {
+    const fact = normalizeKeeperFact(entry);
+    if (!fact) continue;
+    const comparable = normalizeKeeperFactForComparison(fact);
+    if (seen.has(comparable)) continue;
+    seen.add(comparable);
+    facts.push(fact);
+  }
+  return facts;
+}
+
+function mergeLorebookKeys(existingKeys: unknown, newKeys: string[]): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  const add = (key: unknown) => {
+    if (typeof key !== "string") return;
+    const trimmed = key.trim();
+    if (!trimmed) return;
+    const comparable = trimmed.toLowerCase();
+    if (seen.has(comparable)) return;
+    seen.add(comparable);
+    merged.push(trimmed);
+  };
+
+  if (Array.isArray(existingKeys)) {
+    for (const key of existingKeys) add(key);
+  }
+  for (const key of newKeys) add(key);
+  return merged;
+}
+
+export function mergeLorebookKeeperUpdateContent(args: {
+  existingContent: unknown;
+  replacementContent: unknown;
+  newFacts: unknown;
+}): string {
+  const existing = typeof args.existingContent === "string" ? args.existingContent.trim() : "";
+  const replacement = typeof args.replacementContent === "string" ? args.replacementContent.trim() : "";
+  const facts = normalizeKeeperFacts(args.newFacts);
+
+  if (facts.length === 0) {
+    if (!existing) return replacement;
+    if (!replacement) return existing;
+
+    const existingComparable = normalizeKeeperFactForComparison(existing);
+    const replacementComparable = normalizeKeeperFactForComparison(replacement);
+    if (replacementComparable.includes(existingComparable)) return replacement;
+    if (existingComparable.includes(replacementComparable)) return existing;
+
+    return `${existing}\n\n${replacement}`;
+  }
+
+  const baseContent = existing || replacement;
+  const existingComparable = normalizeKeeperFactForComparison(baseContent);
+  const novelFacts = facts.filter((fact) => {
+    const comparable = normalizeKeeperFactForComparison(fact);
+    return comparable.length > 0 && !existingComparable.includes(comparable);
+  });
+
+  if (novelFacts.length === 0) return baseContent;
+
+  const addition = novelFacts.map((fact) => `- ${fact}`).join("\n");
+  return baseContent ? `${baseContent}\n\n${addition}` : addition;
+}
+
 export async function persistLorebookKeeperUpdates(args: {
   lorebooksStore: LorebooksStore;
   chatId: string;
@@ -214,9 +309,16 @@ export async function persistLorebookKeeperUpdates(args: {
   const existingEntries = (await lorebooksStore.listEntries(targetLorebookId)) as unknown as Array<{
     id: string;
     name?: string | null;
+    content?: string | null;
+    keys?: string[] | null;
+    tag?: string | null;
     locked?: unknown;
   }>;
-  const entryByName = new Map(existingEntries.map((entry) => [entry.name?.toLowerCase(), entry]));
+  const entryByName = new Map<string, (typeof existingEntries)[number]>();
+  for (const entry of existingEntries) {
+    const name = typeof entry.name === "string" ? entry.name.trim().toLowerCase() : "";
+    if (name) entryByName.set(name, entry);
+  }
 
   for (const update of updates) {
     const rawName = typeof update.entryName === "string" ? update.entryName.trim() : "";
@@ -232,21 +334,49 @@ export async function persistLorebookKeeperUpdates(args: {
     }
 
     if (existing) {
-      await lorebooksStore.updateEntry(existing.id, { content, keys, tag });
-      entryByName.set(rawName.toLowerCase(), existing);
+      const mergedContent = mergeLorebookKeeperUpdateContent({
+        existingContent: existing.content,
+        replacementContent: content,
+        newFacts: update.newFacts,
+      });
+      const mergedKeys = mergeLorebookKeys(existing.keys, keys);
+      const mergedTag = tag || existing.tag || "";
+      await lorebooksStore.updateEntry(existing.id, {
+        content: mergedContent,
+        keys: mergedKeys,
+        tag: mergedTag,
+      });
+      entryByName.set(rawName.toLowerCase(), {
+        ...existing,
+        content: mergedContent,
+        keys: mergedKeys,
+        tag: mergedTag,
+      });
       continue;
     }
 
+    const createContent = mergeLorebookKeeperUpdateContent({
+      existingContent: "",
+      replacementContent: content,
+      newFacts: update.newFacts,
+    });
     const created = await lorebooksStore.createEntry({
       lorebookId: targetLorebookId,
       name: rawName,
-      content,
+      content: createContent,
       keys,
       tag,
       enabled: true,
     });
     if (created && typeof created === "object" && "id" in created) {
-      entryByName.set(rawName.toLowerCase(), created as { id: string; name?: string | null; locked?: unknown });
+      const createdEntry = created as { id: string; name?: string | null; locked?: unknown };
+      entryByName.set(rawName.toLowerCase(), {
+        ...createdEntry,
+        name: createdEntry.name ?? rawName,
+        content: createContent,
+        keys,
+        tag,
+      });
     }
   }
 

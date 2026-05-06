@@ -7,9 +7,11 @@ import { Loader2, ChevronUp, Settings2, FolderOpen, Image as ImageIcon, ArrowRig
 import { ConversationMessage } from "./ConversationMessage";
 import { ConversationInput } from "./ConversationInput";
 import { SceneBanner, EndSceneBar } from "./SceneBanner";
+import { ChatBranchSelector } from "./ChatBranchSelector";
 import { useChatStore } from "../../stores/chat.store";
 import { useUIStore } from "../../stores/ui.store";
 import { playNotificationPing } from "../../lib/notification-sound";
+import { getAvatarCropStyle } from "../../lib/utils";
 import { characterKeys } from "../../hooks/use-characters";
 import { api } from "../../lib/api-client";
 import type { CharacterMap, MessageSelectionToggle, PersonaInfo } from "./chat-area.types";
@@ -33,6 +35,8 @@ interface ConversationViewProps {
   characterNames: string[];
   personaInfo?: PersonaInfo;
   chatMeta: Record<string, any>;
+  chatName?: string;
+  chatGroupId?: string | null;
   chatCharIds: string[];
   onDelete: (messageId: string) => void;
   onRegenerate: (messageId: string) => void;
@@ -51,6 +55,7 @@ interface ConversationViewProps {
   sceneInfo?: {
     variant: "origin" | "scene";
     sceneChatId?: string;
+    sceneChatName?: string;
     originChatId?: string;
     description?: string;
   };
@@ -77,27 +82,42 @@ function getDayKey(dateStr: string): string {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
-/** Check if a message's content uses "Name: text" format with known character names */
-function hasNamePrefixFormat(msg: Message, characterMap: CharacterMap): boolean {
+/** Check if a message's content uses "Name: text" format with known chat-member character names */
+function hasNamePrefixFormat(msg: Message, characterMap: CharacterMap, chatCharacterIds: string[]): boolean {
   if (!msg.content) return false;
+  const chatNames = new Set(
+    chatCharacterIds
+      .map((id) => characterMap.get(id)?.name?.toLowerCase())
+      .filter((name): name is string => typeof name === "string" && name.length > 0),
+  );
+  if (!chatNames.size) return false;
   const lines = msg.content.split("\n");
   for (const line of lines) {
     const colonIdx = line.indexOf(": ");
     if (colonIdx > 0) {
       const name = line.slice(0, colonIdx).trim();
-      // Check if this name matches any character in the character map
-      for (const [, charInfo] of characterMap) {
-        if (charInfo && charInfo.name.toLowerCase() === name.toLowerCase()) return true;
-      }
+      if (chatNames.has(name.toLowerCase())) return true;
     }
   }
   return false;
+}
+
+function isHiddenFromUser(message: Message) {
+  try {
+    const extra = typeof message.extra === "string" ? JSON.parse(message.extra) : (message.extra ?? {});
+    return extra.hiddenFromUser === true;
+  } catch {
+    return false;
+  }
 }
 
 // Module-level set that remembers which message keys have been "seen" across
 // component remounts. This prevents stagger animations and notification sounds
 // from replaying when the user navigates away from a chat and comes back.
 const globalSeenKeys = new Set<string>();
+
+const HEADER_BTN =
+  "flex items-center justify-center rounded-lg bg-[var(--card)]/80 p-1.5 text-foreground/80 backdrop-blur-sm transition-colors hover:bg-[var(--card)] hover:text-foreground dark:bg-black/30 dark:hover:bg-black/50";
 
 export function ConversationView({
   chatId,
@@ -112,6 +132,8 @@ export function ConversationView({
   characterNames,
   personaInfo,
   chatMeta,
+  chatName,
+  chatGroupId,
   chatCharIds,
   onDelete,
   onRegenerate,
@@ -135,6 +157,7 @@ export function ConversationView({
   const streamingChatId = useChatStore((s) => s.streamingChatId);
   const isStreaming = useChatStore((s) => s.isStreaming) && streamingChatId === chatId;
   const streamBuffer = useChatStore((s) => s.streamBuffer);
+  const thinkingBuffer = useChatStore((s) => s.thinkingBuffer);
   const regenerateMessageId = useChatStore((s) => s.regenerateMessageId);
   const streamingCharacterId = useChatStore((s) => s.streamingCharacterId);
   const typingCharacterName = useChatStore((s) => s.typingCharacterName);
@@ -158,13 +181,20 @@ export function ConversationView({
     return () => clearInterval(timer);
   }, [chatId, qc]);
 
-  // Global conversation gradient from settings
-  const convoGradientFrom = useUIStore((s) => s.convoGradientFrom);
-  const convoGradientTo = useUIStore((s) => s.convoGradientTo);
-  const gradientStyle = useMemo(
-    () => ({ background: `linear-gradient(135deg, ${convoGradientFrom}, ${convoGradientTo})` }),
-    [convoGradientFrom, convoGradientTo],
-  );
+  // Per-scheme conversation gradient from settings.
+  // When a scheme's values are still the defaults (user hasn't customized), use
+  // a CSS variable so custom themes can override the conversation background.
+  const convoGradient = useUIStore((s) => s.convoGradient);
+  const theme = useUIStore((s) => s.theme);
+  const gradientStyle = useMemo(() => {
+    const g = convoGradient[theme];
+    const isDefaultDark = convoGradient.dark.from === "#0a0a0e" && convoGradient.dark.to === "#1c2133";
+    const isDefaultLight = convoGradient.light.from === "#f2eff7" && convoGradient.light.to === "#eae6f0";
+    if ((theme === "dark" && isDefaultDark) || (theme === "light" && isDefaultLight)) {
+      return { background: "var(--secondary)" };
+    }
+    return { background: `linear-gradient(135deg, ${g.from}, ${g.to})` };
+  }, [convoGradient, theme]);
   const hasAutonomousMessaging = !!chatMeta.autonomousMessages || !!chatMeta.characterExchanges;
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -225,7 +255,7 @@ export function ConversationView({
     if (isOptimistic || (isNearBottomRef.current && !userScrolledAwayRef.current)) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [newestMsgId, streamBuffer, isStreaming, delayedCharacterInfo, typingCharacterName, isOptimistic]);
+  }, [newestMsgId, streamBuffer, thinkingBuffer, isStreaming, delayedCharacterInfo, typingCharacterName, isOptimistic]);
 
   // Preserve scroll on load-more
   useLayoutEffect(() => {
@@ -266,6 +296,7 @@ export function ConversationView({
     let lastDay = "";
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i]!;
+      if (isHiddenFromUser(msg)) continue;
       const day = getDayKey(msg.createdAt);
       if (day !== lastDay) {
         items.push({ type: "separator", key: `sep-${day}`, label: formatDaySeparator(msg.createdAt) });
@@ -299,7 +330,7 @@ export function ConversationView({
       // Split multi-line assistant messages into separate visual rows
       // Skip splitting for messages with <speaker> tags or Name: text format
       // (group chat merged mode) — those are handled by ConversationMessage's group renderer.
-      const hasGroupFormat = msg.content.includes("<speaker=") || hasNamePrefixFormat(msg, characterMap);
+      const hasGroupFormat = msg.content.includes("<speaker=") || hasNamePrefixFormat(msg, characterMap, chatCharIds);
       if (msg.role === "assistant" && msg.content && !hasGroupFormat) {
         const cleaned = stripTimestamps(msg.content);
         // Strip lines that are just the character's name (LLM prefixing in group individual mode)
@@ -364,7 +395,7 @@ export function ConversationView({
       items.push({ type: "message", key: msg.id, msg: displayMsg, isGrouped: grouped, index: messageOffset + i });
     }
     return items;
-  }, [messages, characterMap, totalMessageCount]);
+  }, [messages, characterMap, chatCharIds, totalMessageCount]);
 
   // ── Staggered reveal for split assistant lines ──
   // When a new multi-line assistant message arrives, show lines one by one
@@ -540,6 +571,7 @@ export function ConversationView({
             const chars = chatCharIds.map((id) => characterMap.get(id)).filter(Boolean) as Array<{
               name: string;
               avatarUrl: string | null;
+              avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null;
               conversationStatus?: "online" | "idle" | "dnd" | "offline";
               conversationActivity?: string;
             }>;
@@ -559,17 +591,24 @@ export function ConversationView({
             if (chars.length === 1) {
               const c = chars[0]!;
               return (
-                <div className="flex items-center gap-2 rounded-lg bg-black/30 px-2.5 py-1.5 backdrop-blur-sm">
+                <div className="flex items-center gap-2 rounded-lg bg-[var(--card)]/80 px-2.5 py-1.5 backdrop-blur-sm dark:bg-black/30">
                   <div className="relative flex-shrink-0">
                     {c.avatarUrl ? (
-                      <img src={c.avatarUrl} alt={c.name} className="h-5 w-5 rounded-full object-cover" />
+                      <span className="block h-5 w-5 overflow-hidden rounded-full">
+                        <img
+                          src={c.avatarUrl}
+                          alt={c.name}
+                          className="h-full w-full object-cover"
+                          style={getAvatarCropStyle(c.avatarCrop)}
+                        />
+                      </span>
                     ) : (
                       <div className="flex h-5 w-5 items-center justify-center rounded-full bg-foreground/20 text-[0.5rem] font-bold text-foreground">
                         {c.name[0]}
                       </div>
                     )}
                     <span
-                      className={`absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-full ring-[1.5px] ring-black/30 ${statusColor(c.conversationStatus)}`}
+                      className={`absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-full ring-[1.5px] ring-[var(--border)] ${statusColor(c.conversationStatus)}`}
                     />
                   </div>
                   <div className="flex flex-col leading-tight">
@@ -584,7 +623,7 @@ export function ConversationView({
 
             // Multiple characters — show stacked avatars + names
             return (
-              <div className="flex items-center gap-2 rounded-lg bg-black/30 px-2.5 py-1.5 backdrop-blur-sm">
+              <div className="flex items-center gap-2 rounded-lg bg-[var(--card)]/80 px-2.5 py-1.5 backdrop-blur-sm dark:bg-black/30">
                 <div
                   className="relative flex-shrink-0"
                   style={{ width: `${Math.min(chars.length, 3) * 12 + 8}px`, height: 20 }}
@@ -593,24 +632,27 @@ export function ConversationView({
                     <div key={i} className="absolute top-0" style={{ left: i * 12 }}>
                       <div className="relative">
                         {c.avatarUrl ? (
-                          <img
-                            src={c.avatarUrl}
-                            alt={c.name}
-                            className="h-5 w-5 rounded-full object-cover ring-1 ring-black/30"
-                          />
+                          <span className="block h-5 w-5 overflow-hidden rounded-full ring-1 ring-[var(--border)]">
+                            <img
+                              src={c.avatarUrl}
+                              alt={c.name}
+                              className="h-full w-full object-cover"
+                              style={getAvatarCropStyle(c.avatarCrop)}
+                            />
+                          </span>
                         ) : (
-                          <div className="flex h-5 w-5 items-center justify-center rounded-full bg-foreground/20 text-[0.5rem] font-bold text-foreground ring-1 ring-black/30">
+                          <div className="flex h-5 w-5 items-center justify-center rounded-full bg-foreground/20 text-[0.5rem] font-bold text-foreground ring-1 ring-[var(--border)]">
                             {c.name[0]}
                           </div>
                         )}
                         <span
-                          className={`absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full ring-[1px] ring-black/30 ${statusColor(c.conversationStatus)}`}
+                          className={`absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full ring-[1px] ring-[var(--border)] ${statusColor(c.conversationStatus)}`}
                         />
                       </div>
                     </div>
                   ))}
                 </div>
-                <span className="text-[0.75rem] font-medium text-white/90">
+                <span className="text-[0.75rem] font-medium text-[var(--foreground)]/90">
                   {chars.length <= 2 ? chars.map((c) => c.name).join(" & ") : `${chars[0]!.name} + ${chars.length - 1}`}
                 </span>
               </div>
@@ -618,34 +660,23 @@ export function ConversationView({
           })()}
 
           <div className="flex items-center gap-1.5">
-            <button
-              onClick={onOpenFiles}
-              className="flex items-center justify-center rounded-lg bg-black/30 p-1.5 text-foreground/80 backdrop-blur-sm transition-colors hover:bg-black/50 hover:text-foreground"
-              title="Chat Files"
-            >
+            <ChatBranchSelector activeChatId={chatId} activeChatName={chatName} groupId={chatGroupId} />
+            <button onClick={onOpenFiles} className={HEADER_BTN} title="Manage Chat Files">
               <FolderOpen size="0.875rem" />
             </button>
-            <button
-              onClick={onOpenGallery}
-              className="flex items-center justify-center rounded-lg bg-black/30 p-1.5 text-foreground/80 backdrop-blur-sm transition-colors hover:bg-black/50 hover:text-foreground"
-              title="Gallery"
-            >
+            <button onClick={onOpenGallery} className={HEADER_BTN} title="Gallery">
               <ImageIcon size="0.875rem" />
             </button>
             {onSwitchChat && (
               <button
                 onClick={onSwitchChat}
-                className="flex items-center justify-center rounded-lg bg-black/30 p-1.5 text-foreground/80 backdrop-blur-sm transition-colors hover:bg-black/50 hover:text-foreground"
+                className={HEADER_BTN}
                 title={connectedChatName ? `Switch to ${connectedChatName}` : "Switch to connected chat"}
               >
                 <ArrowRightLeft size="0.875rem" />
               </button>
             )}
-            <button
-              onClick={onOpenSettings}
-              className="flex items-center justify-center rounded-lg bg-black/30 p-1.5 text-foreground/80 backdrop-blur-sm transition-colors hover:bg-black/50 hover:text-foreground"
-              title="Chat Settings"
-            >
+            <button onClick={onOpenSettings} className={HEADER_BTN} title="Chat Settings">
               <Settings2 size="0.875rem" />
             </button>
           </div>
@@ -733,9 +764,11 @@ export function ConversationView({
                   isStreaming={isStreaming}
                   regenerateMessageId={regenerateMessageId}
                   streamBuffer={streamBuffer}
+                  thinkingBuffer={thinkingBuffer}
                   lastAssistantMessageId={lastAssistantMessageId}
                   characterMap={characterMap}
                   personaInfo={personaInfo}
+                  chatCharacterIds={chatCharIds}
                   onDelete={onDelete}
                   onRegenerate={onRegenerate}
                   onEdit={onEdit}
@@ -753,13 +786,17 @@ export function ConversationView({
             // During regeneration, don't pass isStreaming until content arrives — the
             // "X is typing..." indicator at the bottom provides visual feedback instead
             // of showing bouncing dots inside the message bubble.
-            const hasStreamContent = isRegenerating && !!streamBuffer;
+            const hasStreamContent = isRegenerating && (!!streamBuffer || !!thinkingBuffer);
             // Strip old-swipe attachments during regeneration so a previous
             // illustration doesn't linger while new text is streaming in.
             const displayMsg = isRegenerating
               ? (() => {
                   const parsed = typeof msg.extra === "string" ? JSON.parse(msg.extra) : (msg.extra ?? {});
-                  return { ...msg, content: streamBuffer || msg.content, extra: { ...parsed, attachments: null } };
+                  return {
+                    ...msg,
+                    content: streamBuffer || (thinkingBuffer ? "Thinking..." : msg.content),
+                    extra: { ...parsed, attachments: null, thinking: thinkingBuffer || parsed.thinking },
+                  };
                 })()
               : msg;
             elements.push(
@@ -776,6 +813,7 @@ export function ConversationView({
                 isLastAssistantMessage={msg.id === lastAssistantMessageId}
                 characterMap={characterMap}
                 personaInfo={personaInfo as any}
+                chatCharacterIds={chatCharIds}
                 messageIndex={item.index + 1}
                 messageOrderIndex={item.index}
                 multiSelectMode={multiSelectMode}
@@ -789,7 +827,7 @@ export function ConversationView({
         })()}
 
         {/* Delayed indicator (DND/idle — waiting for character to become available) */}
-        {delayedCharacterInfo && isStreaming && !streamBuffer && (
+        {delayedCharacterInfo && isStreaming && !streamBuffer && !thinkingBuffer && (
           <div className="flex items-center gap-2 px-4 py-1.5 text-[0.8125rem] text-[var(--text-secondary)]">
             <span className="italic">
               {delayedCharacterInfo.status === "dnd"
@@ -800,7 +838,7 @@ export function ConversationView({
         )}
 
         {/* Typing indicator — shown when generation is actively running */}
-        {isStreaming && !streamBuffer && typingCharacterName && (
+        {isStreaming && !streamBuffer && !thinkingBuffer && typingCharacterName && (
           <div className="flex items-center gap-2 px-4 py-1.5 text-[0.8125rem] text-[var(--text-secondary)]">
             <span className="flex gap-0.5">
               <span
@@ -821,31 +859,35 @@ export function ConversationView({
         )}
 
         {/* Streaming message — only shown once actual content starts arriving */}
-        {isStreaming && !regenerateMessageId && streamBuffer && (
+        {isStreaming && !regenerateMessageId && (streamBuffer || thinkingBuffer) && (
           <ConversationMessage
             message={{
               id: "__streaming__",
               chatId,
               role: "assistant",
               characterId: streamingCharacterId ?? chatCharIds[0] ?? null,
-              content: streamBuffer,
+              content: streamBuffer || "Thinking...",
               activeSwipeIndex: 0,
               extra: {
                 displayText: null,
                 isGenerated: true,
                 tokenCount: 0,
                 generationInfo: null,
+                thinking: thinkingBuffer || null,
               },
               createdAt: new Date().toISOString(),
             }}
             isStreaming
             characterMap={characterMap}
             personaInfo={personaInfo as any}
+            chatCharacterIds={chatCharIds}
           />
         )}
 
         {/* Scene banner — inline at bottom of messages (origin variant only) */}
-        {sceneInfo?.variant === "origin" && <SceneBanner variant="origin" sceneChatId={sceneInfo.sceneChatId} />}
+        {sceneInfo?.variant === "origin" && (
+          <SceneBanner variant="origin" sceneChatId={sceneInfo.sceneChatId} sceneChatName={sceneInfo.sceneChatName} />
+        )}
 
         <div ref={messagesEndRef} className="h-1" />
       </div>
@@ -856,7 +898,6 @@ export function ConversationView({
           <ConversationAutonomousEffects
             key={chatId}
             chatId={chatId}
-            chatCharIds={chatCharIds}
             messages={messages}
             characterMap={characterMap}
             chatMeta={chatMeta}
@@ -875,7 +916,35 @@ export function ConversationView({
       )}
 
       {/* ── Input area ── */}
-      <ConversationInput characterNames={characterNames} />
+      <ConversationInput
+        key={chatId}
+        characterNames={characterNames}
+        groupResponseOrder={
+          chatMeta.groupResponseOrder === "manual"
+            ? "manual"
+            : chatCharIds.length > 1
+              ? (chatMeta.groupResponseOrder ?? "sequential")
+              : undefined
+        }
+        chatCharacters={
+          chatCharIds.length > 1
+            ? chatCharIds
+                .filter((id) => characterMap.has(id))
+                .map((id) => {
+                  const info = characterMap.get(id)!;
+                  return {
+                    id,
+                    name: info.name,
+                    avatarUrl: info.avatarUrl ?? null,
+                    avatarCrop: info.avatarCrop ?? null,
+                    conversationStatus: info.conversationStatus,
+                    conversationActivity: info.conversationActivity,
+                  };
+                })
+            : undefined
+        }
+        onPeekPrompt={onPeekPrompt}
+      />
     </div>
   );
 }
@@ -886,8 +955,10 @@ function SplitMessageGroup({
   isStreaming,
   regenerateMessageId,
   streamBuffer,
+  thinkingBuffer,
   lastAssistantMessageId,
   characterMap,
+  chatCharacterIds,
   personaInfo,
   onDelete,
   onRegenerate,
@@ -899,8 +970,10 @@ function SplitMessageGroup({
   isStreaming: boolean;
   regenerateMessageId: string | null;
   streamBuffer: string;
+  thinkingBuffer: string;
   lastAssistantMessageId: string | undefined | null;
   characterMap: CharacterMap;
+  chatCharacterIds: string[];
   personaInfo: PersonaInfo | undefined;
   onDelete: (id: string) => void;
   onRegenerate: (id: string) => void;
@@ -949,6 +1022,7 @@ function SplitMessageGroup({
           onPeekPrompt={onPeekPrompt}
           isLastAssistantMessage={false}
           characterMap={characterMap}
+          chatCharacterIds={chatCharacterIds}
           personaInfo={personaInfo as any}
         />
         <div className="space-y-2 pl-14 pr-4 -mt-1">
@@ -956,7 +1030,7 @@ function SplitMessageGroup({
             ref={editRef}
             value={editValue}
             onChange={(e) => setEditValue(e.target.value)}
-            className="w-full resize-none rounded-lg border border-white/25 bg-[var(--secondary)] p-2.5 text-[0.9375rem] leading-relaxed outline-none"
+            className="w-full resize-none rounded-lg border border-[var(--border)] bg-[var(--secondary)] p-2.5 text-[0.9375rem] leading-relaxed outline-none"
             rows={Math.min(editValue.split("\n").length + 1, 16)}
             onKeyDown={(e) => {
               if (e.key === "Backspace" && editValue === "") {
@@ -1007,7 +1081,7 @@ function SplitMessageGroup({
         if (isRegen) {
           // While waiting for content, don't render — the "X is typing..." indicator
           // at the bottom of the message list provides the visual feedback.
-          if (!streamBuffer) {
+          if (!streamBuffer && !thinkingBuffer) {
             return (
               <ConversationMessage
                 key={firstItem.key}
@@ -1023,11 +1097,16 @@ function SplitMessageGroup({
                 onPeekPrompt={onPeekPrompt}
                 isLastAssistantMessage={false}
                 characterMap={characterMap}
+                chatCharacterIds={chatCharacterIds}
                 personaInfo={personaInfo as any}
               />
             );
           }
-          const dMsg = { ...firstItem.msg, content: streamBuffer, extra: regenExtra };
+          const dMsg = {
+            ...firstItem.msg,
+            content: streamBuffer || "Thinking...",
+            extra: { ...regenExtra, thinking: thinkingBuffer || regenExtra?.thinking },
+          };
           return (
             <ConversationMessage
               key={firstItem.key}
@@ -1045,6 +1124,7 @@ function SplitMessageGroup({
               onEditClick={handleStartEdit}
               isLastAssistantMessage={firstItem.msg.id === lastAssistantMessageId}
               characterMap={characterMap}
+              chatCharacterIds={chatCharacterIds}
               personaInfo={personaInfo as any}
               messageIndex={firstItem.index + 1}
             />
@@ -1071,6 +1151,7 @@ function SplitMessageGroup({
               onEditClick={handleStartEdit}
               isLastAssistantMessage={msg.id === lastAssistantMessageId}
               characterMap={characterMap}
+              chatCharacterIds={chatCharacterIds}
               personaInfo={personaInfo as any}
               messageIndex={gi.index + 1}
             />

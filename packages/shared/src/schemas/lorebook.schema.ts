@@ -7,6 +7,18 @@ export const lorebookCategorySchema = z.enum(["world", "character", "npc", "spel
 
 export const selectiveLogicSchema = z.enum(["and", "or", "not"]);
 
+export const lorebookFilterModeSchema = z.enum(["any", "include", "exclude"]);
+
+export const lorebookMatchingSourceSchema = z.enum([
+  "character_name",
+  "character_description",
+  "character_personality",
+  "character_scenario",
+  "character_tags",
+  "persona_description",
+  "persona_tags",
+]);
+
 export const activationConditionSchema = z.object({
   field: z.string(),
   operator: z.enum(["equals", "not_equals", "contains", "not_contains", "gt", "lt"]),
@@ -19,6 +31,26 @@ export const lorebookScheduleSchema = z.object({
   activeLocations: z.array(z.string()).default([]),
 });
 
+// ──────────────────────────────────────────────
+// Folders — collapsible containers for entries
+// `parentFolderId` is reserved for a future nested-folder PR; v1 enforces
+// `null` at the route layer so the schema accepts the field but the server
+// rejects non-null values.
+// ──────────────────────────────────────────────
+export const createLorebookFolderSchema = z.object({
+  name: z.string().min(1).max(200),
+  enabled: z.boolean().default(true),
+  parentFolderId: z.string().nullable().default(null),
+  order: z.number().int().default(0),
+});
+
+export const updateLorebookFolderSchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  enabled: z.boolean().optional(),
+  parentFolderId: z.string().nullable().optional(),
+  order: z.number().int().optional(),
+});
+
 export const createLorebookSchema = z.object({
   name: z.string().min(1).max(200),
   description: z.string().default(""),
@@ -28,6 +60,7 @@ export const createLorebookSchema = z.object({
   recursiveScanning: z.boolean().default(false),
   maxRecursionDepth: z.number().int().min(1).max(10).default(3),
   characterId: z.string().nullable().default(null),
+  personaId: z.string().nullable().default(null),
   chatId: z.string().nullable().default(null),
   enabled: z.boolean().default(true),
   tags: z.array(z.string()).default([]),
@@ -44,6 +77,7 @@ export const updateLorebookSchema = z.object({
   recursiveScanning: z.boolean().optional(),
   maxRecursionDepth: z.number().int().min(1).max(10).optional(),
   characterId: z.string().nullable().optional(),
+  personaId: z.string().nullable().optional(),
   chatId: z.string().nullable().optional(),
   enabled: z.boolean().optional(),
   tags: z.array(z.string()).optional(),
@@ -55,6 +89,7 @@ export const createLorebookEntrySchema = z.object({
   lorebookId: z.string(),
   name: z.string().min(1).max(200),
   content: z.string().default(""),
+  description: z.string().default(""),
   keys: z.array(z.string()).default([]),
   secondaryKeys: z.array(z.string()).default([]),
   enabled: z.boolean().default(true),
@@ -66,7 +101,14 @@ export const createLorebookEntrySchema = z.object({
   matchWholeWords: z.boolean().default(false),
   caseSensitive: z.boolean().default(false),
   useRegex: z.boolean().default(false),
-  position: z.number().int().min(0).max(1).default(0),
+  characterFilterMode: lorebookFilterModeSchema.default("any"),
+  characterFilterIds: z.array(z.string()).default([]),
+  characterTagFilterMode: lorebookFilterModeSchema.default("any"),
+  characterTagFilters: z.array(z.string()).default([]),
+  generationTriggerFilterMode: lorebookFilterModeSchema.default("any"),
+  generationTriggerFilters: z.array(z.string()).default([]),
+  additionalMatchingSources: z.array(lorebookMatchingSourceSchema).default([]),
+  position: z.number().int().min(0).max(2).default(0),
   depth: z.number().int().min(0).default(4),
   order: z.number().int().default(100),
   role: z.enum(["system", "user", "assistant"]).default("system"),
@@ -76,6 +118,8 @@ export const createLorebookEntrySchema = z.object({
   ephemeral: z.number().int().min(0).nullable().default(null),
   group: z.string().default(""),
   groupWeight: z.number().nullable().default(null),
+  /** Optional folder this entry belongs to. Null/omitted = root level. */
+  folderId: z.string().nullable().default(null),
   preventRecursion: z.boolean().default(false),
   locked: z.boolean().default(false),
   tag: z.string().default(""),
@@ -88,6 +132,7 @@ export const createLorebookEntrySchema = z.object({
 export const updateLorebookEntrySchema = z.object({
   name: z.string().min(1).max(200).optional(),
   content: z.string().optional(),
+  description: z.string().optional(),
   keys: z.array(z.string()).optional(),
   secondaryKeys: z.array(z.string()).optional(),
   enabled: z.boolean().optional(),
@@ -99,7 +144,14 @@ export const updateLorebookEntrySchema = z.object({
   matchWholeWords: z.boolean().optional(),
   caseSensitive: z.boolean().optional(),
   useRegex: z.boolean().optional(),
-  position: z.number().int().min(0).max(1).optional(),
+  characterFilterMode: lorebookFilterModeSchema.optional(),
+  characterFilterIds: z.array(z.string()).optional(),
+  characterTagFilterMode: lorebookFilterModeSchema.optional(),
+  characterTagFilters: z.array(z.string()).optional(),
+  generationTriggerFilterMode: lorebookFilterModeSchema.optional(),
+  generationTriggerFilters: z.array(z.string()).optional(),
+  additionalMatchingSources: z.array(lorebookMatchingSourceSchema).optional(),
+  position: z.number().int().min(0).max(2).optional(),
   depth: z.number().int().min(0).optional(),
   order: z.number().int().optional(),
   role: z.enum(["system", "user", "assistant"]).optional(),
@@ -109,6 +161,7 @@ export const updateLorebookEntrySchema = z.object({
   ephemeral: z.number().int().min(0).nullable().optional(),
   group: z.string().optional(),
   groupWeight: z.number().nullable().optional(),
+  folderId: z.string().nullable().optional(),
   preventRecursion: z.boolean().optional(),
   locked: z.boolean().optional(),
   tag: z.string().optional(),
@@ -122,3 +175,5 @@ export type CreateLorebookInput = z.input<typeof createLorebookSchema>;
 export type UpdateLorebookInput = z.infer<typeof updateLorebookSchema>;
 export type CreateLorebookEntryInput = z.input<typeof createLorebookEntrySchema>;
 export type UpdateLorebookEntryInput = z.infer<typeof updateLorebookEntrySchema>;
+export type CreateLorebookFolderInput = z.input<typeof createLorebookFolderSchema>;
+export type UpdateLorebookFolderInput = z.infer<typeof updateLorebookFolderSchema>;

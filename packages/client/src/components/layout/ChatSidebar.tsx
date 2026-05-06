@@ -16,12 +16,18 @@ import {
   MinusCircle,
   FolderOpen,
   FolderPlus,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   GripVertical,
   CheckSquare,
   Square as SquareIcon,
+  ArrowUpDown,
+  Tag,
+  Pencil,
 } from "lucide-react";
 import { useChats, useCreateChat, useDeleteChat, useDeleteChatGroup } from "../../hooks/use-chats";
+import { useChatPresets, useApplyChatPreset } from "../../hooks/use-chat-presets";
 import { useConnections } from "../../hooks/use-connections";
 import {
   useChatFolders,
@@ -35,11 +41,38 @@ import { useCharacters } from "../../hooks/use-characters";
 import { useChatStore } from "../../stores/chat.store";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { useUIStore, type UserStatus } from "../../stores/ui.store";
-import { cn } from "../../lib/utils";
+import { cn, getAvatarCropStyle } from "../../lib/utils";
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
-import type { ChatFolder, ChatMode } from "@marinara-engine/shared";
+import type { Chat, ChatFolder, ChatMode } from "@marinara-engine/shared";
 import { Modal } from "../ui/Modal";
 import { Reorder, useDragControls } from "framer-motion";
+
+type ChatSortOption = "newest" | "oldest" | "name-asc" | "name-desc";
+
+function getChatTags(chat: Pick<Chat, "metadata">): string[] {
+  return Array.isArray(chat.metadata?.tags)
+    ? chat.metadata.tags.filter((tag): tag is string => typeof tag === "string" && tag.trim().length > 0)
+    : [];
+}
+
+function toSearchText(value: unknown): string {
+  return typeof value === "string" ? value : value == null ? "" : String(value);
+}
+
+function normalizeChatCharacterIds(value: unknown): string[] {
+  const parsed = (() => {
+    if (typeof value !== "string") return value;
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value.trim() ? [value] : [];
+    }
+  })();
+
+  return Array.isArray(parsed)
+    ? parsed.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim())
+    : [];
+}
 
 const MODE_CONFIG: Record<
   string,
@@ -77,9 +110,11 @@ const MODE_CONFIG: Record<
 };
 
 export function ChatSidebar() {
-  const { data: chats, isLoading } = useChats();
+  const { data: chats, isError: chatsError, isLoading, isFetching, refetch: refetchChats } = useChats();
   const { data: connections } = useConnections();
   const createChat = useCreateChat();
+  const { data: chatPresetsData } = useChatPresets();
+  const applyChatPreset = useApplyChatPreset();
   const deleteChat = useDeleteChat();
   const deleteChatGroup = useDeleteChatGroup();
   const activeChatId = useChatStore((s) => s.activeChatId);
@@ -100,17 +135,34 @@ export function ChatSidebar() {
   const reorderFoldersMut = useReorderFolders();
   const moveChatMut = useMoveChat();
 
-  // Build character lookup: id → { name, avatarUrl, conversationStatus }
+  // Build character lookup: id → { name, avatarUrl, avatarCrop, conversationStatus }
   const charLookup = useMemo(() => {
-    const map = new Map<string, { name: string; avatarUrl: string | null; conversationStatus?: string }>();
+    const map = new Map<
+      string,
+      {
+        name: string;
+        avatarUrl: string | null;
+        avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null;
+        conversationStatus?: string;
+      }
+    >();
     if (!allCharacters) return map;
-    for (const char of allCharacters as Array<{ id: string; data: string; avatarPath: string | null }>) {
+    for (const char of allCharacters as Array<{ id: string; data: unknown; avatarPath: string | null }>) {
       try {
         const parsed = typeof char.data === "string" ? JSON.parse(char.data) : char.data;
+        const record = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+        const extensions =
+          record.extensions && typeof record.extensions === "object"
+            ? (record.extensions as Record<string, unknown>)
+            : {};
+        const name = typeof record.name === "string" && record.name.trim() ? record.name.trim() : "Unknown";
+        const conversationStatus =
+          typeof extensions.conversationStatus === "string" ? extensions.conversationStatus : undefined;
         map.set(char.id, {
-          name: parsed.name ?? "Unknown",
+          name,
           avatarUrl: char.avatarPath ?? null,
-          conversationStatus: parsed.extensions?.conversationStatus || undefined,
+          avatarCrop: (extensions.avatarCrop as { zoom: number; offsetX: number; offsetY: number } | undefined) ?? null,
+          conversationStatus,
         });
       } catch {
         map.set(char.id, { name: "Unknown", avatarUrl: null });
@@ -119,6 +171,9 @@ export function ChatSidebar() {
     return map;
   }, [allCharacters]);
   const [searchQuery, setSearchQuery] = useState("");
+  const [sort, setSort] = useState<ChatSortOption>("newest");
+  const [activeTag, setActiveTag] = useState<string | null>(null);
+  const [tagsExpanded, setTagsExpanded] = useState(false);
   const [activeTab, setActiveTab] = useState<"conversation" | "roleplay" | "game">("conversation");
   const [deleteTarget, setDeleteTarget] = useState<{
     chatId: string;
@@ -152,14 +207,51 @@ export function ChatSidebar() {
   // Exit multi-select when switching tabs
   useEffect(() => {
     exitMultiSelect();
-  }, [activeTab]); // eslint-disable-line react-hooks/exhaustive-deps
+    setActiveTag(null);
+    setTagsExpanded(false);
+  }, [activeTab, exitMultiSelect]);
 
-  const filtered = chats?.filter(
-    (c) =>
-      c.name.toLowerCase().includes(searchQuery.toLowerCase()) &&
-      c.mode === activeTab &&
-      !(c.mode === "conversation" && c.metadata?.gameId),
+  const modeChats = useMemo(
+    () =>
+      (chats ?? []).filter(
+        (chat) => chat.mode === activeTab && !(chat.mode === "conversation" && chat.metadata?.gameId),
+      ),
+    [chats, activeTab],
   );
+
+  const allTags = useMemo(() => {
+    const tags = new Set<string>();
+    for (const chat of modeChats) {
+      for (const tag of getChatTags(chat)) tags.add(tag);
+    }
+    return [...tags].sort((a, b) => a.localeCompare(b));
+  }, [modeChats]);
+
+  useEffect(() => {
+    if (activeTag && !allTags.includes(activeTag)) {
+      setActiveTag(null);
+    }
+  }, [activeTag, allTags]);
+
+  const filtered = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+
+    return modeChats.filter((chat) => {
+      const tags = getChatTags(chat);
+      if (activeTag && !tags.includes(activeTag)) return false;
+      if (!query) return true;
+
+      const characterNames = normalizeChatCharacterIds((chat as { characterIds?: unknown }).characterIds)
+        .map((characterId) => charLookup.get(characterId)?.name ?? "")
+        .filter(Boolean);
+
+      return (
+        toSearchText(chat.name).toLowerCase().includes(query) ||
+        tags.some((tag) => tag.toLowerCase().includes(query)) ||
+        characterNames.some((name) => name.toLowerCase().includes(query))
+      );
+    });
+  }, [modeChats, searchQuery, activeTag, charLookup]);
 
   // ── Collapse chats that share a groupId into one entry ──
   const displayChats = useMemo(() => {
@@ -175,11 +267,22 @@ export function ChatSidebar() {
       }
     }
 
-    // Sort by most recently updated first
-    const sorted = [...filtered].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    const sorted = [...filtered].sort((a, b) => {
+      switch (sort) {
+        case "oldest":
+          return new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime();
+        case "name-asc":
+          return toSearchText(a.name).localeCompare(toSearchText(b.name));
+        case "name-desc":
+          return toSearchText(b.name).localeCompare(toSearchText(a.name));
+        case "newest":
+        default:
+          return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+      }
+    });
 
     const seenGroups = new Set<string>();
-    const result: { chat: (typeof filtered)[0]; branchCount: number }[] = [];
+    const result: { chat: (typeof sorted)[number]; branchCount: number }[] = [];
 
     for (const chat of sorted) {
       if (chat.groupId) {
@@ -192,7 +295,7 @@ export function ChatSidebar() {
     }
 
     return result;
-  }, [chats, filtered]);
+  }, [chats, filtered, sort]);
 
   // ── Folder grouping ──
   const modeFolders = useMemo(() => {
@@ -269,6 +372,8 @@ export function ChatSidebar() {
       // user is actively browsing search results and shouldn't lose them).
       if (!internalNavRef.current) {
         setSearchQuery("");
+        setActiveTag(null);
+        setTagsExpanded(false);
       }
       internalNavRef.current = false;
       s.tabSynced = true;
@@ -318,18 +423,40 @@ export function ChatSidebar() {
       if (hasAnyDetailOpen()) {
         closeAllDetails();
       }
+      // Resolve the user's starred default preset for this mode (only modes with presets).
+      const presets = chatPresetsData ?? [];
+      const presetMode: ChatMode | null = mode === "conversation" || mode === "roleplay" ? mode : null;
+      const starred = presetMode
+        ? (presets.find((p) => p.mode === presetMode && p.isActive && !p.isDefault) ?? null)
+        : null;
       createChat.mutate(
         { name: `New ${MODE_CONFIG[mode]?.label ?? mode}`, mode, characterIds: [] },
         {
-          onSuccess: (chat) => {
+          onSuccess: async (chat) => {
             setActiveChatId(chat.id);
+            if (starred) {
+              try {
+                await applyChatPreset.mutateAsync({ presetId: starred.id, chatId: chat.id });
+              } catch {
+                /* non-fatal — chat still opens with system defaults */
+              }
+            }
             useChatStore.getState().setShouldOpenSettings(true);
             useChatStore.getState().setShouldOpenWizard(true);
           },
         },
       );
     },
-    [connections, createChat, setActiveChatId, setPendingNewChatMode, hasAnyDetailOpen, closeAllDetails],
+    [
+      connections,
+      createChat,
+      setActiveChatId,
+      setPendingNewChatMode,
+      hasAnyDetailOpen,
+      closeAllDetails,
+      chatPresetsData,
+      applyChatPreset,
+    ],
   );
 
   const handleNewChatFromTab = useCallback(() => {
@@ -490,12 +617,16 @@ export function ChatSidebar() {
         {/* Chat avatar(s) or mode icon fallback — with unread badge overlay */}
         <div className="relative flex-shrink-0">
           {(() => {
-            const charIds: string[] =
-              typeof chat.characterIds === "string" ? JSON.parse(chat.characterIds) : (chat.characterIds ?? []);
+            const charIds = normalizeChatCharacterIds((chat as { characterIds?: unknown }).characterIds);
             const avatars = charIds
               .slice(0, 3)
               .map((id) => charLookup.get(id))
-              .filter(Boolean) as { name: string; avatarUrl: string | null; conversationStatus?: string }[];
+              .filter(Boolean) as {
+              name: string;
+              avatarUrl: string | null;
+              avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null;
+              conversationStatus?: string;
+            }[];
 
             const isConvoMode = chat.mode === "conversation";
             const statusDot = (status?: string) => {
@@ -534,7 +665,14 @@ export function ChatSidebar() {
               const a = avatars[0]!;
               return a.avatarUrl ? (
                 <div className="relative h-7 w-7 flex-shrink-0 transition-transform group-active:scale-90">
-                  <img src={a.avatarUrl} alt={a.name} className="h-7 w-7 rounded-full object-cover" />
+                  <span className="block h-7 w-7 overflow-hidden rounded-full">
+                    <img
+                      src={a.avatarUrl}
+                      alt={a.name}
+                      className="h-full w-full object-cover"
+                      style={getAvatarCropStyle(a.avatarCrop)}
+                    />
+                  </span>
                   {statusDot(a.conversationStatus)}
                 </div>
               ) : (
@@ -552,15 +690,20 @@ export function ChatSidebar() {
               <div className="relative h-7 w-7 flex-shrink-0 transition-transform group-active:scale-90">
                 {avatars.slice(0, 2).map((a, i) =>
                   a.avatarUrl ? (
-                    <img
+                    <span
                       key={i}
-                      src={a.avatarUrl}
-                      alt={a.name}
                       className={cn(
-                        "absolute h-5 w-5 rounded-full object-cover ring-2 ring-[var(--sidebar-background)]",
+                        "absolute h-5 w-5 overflow-hidden rounded-full ring-2 ring-[var(--sidebar-background)]",
                         i === 0 ? "top-0 left-0 z-10" : "bottom-0 right-0",
                       )}
-                    />
+                    >
+                      <img
+                        src={a.avatarUrl}
+                        alt={a.name}
+                        className="h-full w-full object-cover"
+                        style={getAvatarCropStyle(a.avatarCrop)}
+                      />
+                    </span>
                   ) : (
                     <div
                       key={i}
@@ -716,17 +859,93 @@ export function ChatSidebar() {
         })}
       </div>
 
-      {/* Search */}
-      <div className="px-3 py-2">
-        <div className="flex items-center gap-2 rounded-lg bg-[var(--secondary)] px-3 py-2 ring-1 ring-transparent transition-all focus-within:ring-[var(--primary)]/40">
-          <Search size="0.8125rem" className="text-[var(--muted-foreground)]" />
+      {/* Search + filters */}
+      <div className="space-y-1.5 px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2 rounded-lg bg-[var(--secondary)] px-3 py-2 ring-1 ring-transparent transition-all focus-within:ring-[var(--primary)]/40">
+          <Search size="0.8125rem" className="shrink-0 text-[var(--muted-foreground)]" />
           <input
             type="text"
             placeholder={`Search ${activeTab === "conversation" ? "conversations" : activeTab === "game" ? "games" : "roleplays"}...`}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="flex-1 bg-transparent text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)] outline-none"
+            className="min-w-0 flex-1 bg-transparent text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)] outline-none"
           />
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="relative">
+            <select
+              value={sort}
+              onChange={(e) => setSort(e.target.value as ChatSortOption)}
+              className="w-full appearance-none rounded-lg bg-[var(--secondary)] py-2 pl-2.5 pr-7 text-[0.6875rem] text-[var(--foreground)] outline-none ring-1 ring-transparent transition-all focus:ring-[var(--primary)]/40"
+              title="Sort chats"
+            >
+              <option value="newest">Sort: Newest</option>
+              <option value="oldest">Sort: Oldest</option>
+              <option value="name-asc">Sort: A-Z</option>
+              <option value="name-desc">Sort: Z-A</option>
+            </select>
+            <ArrowUpDown
+              size="0.625rem"
+              className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)]"
+            />
+          </div>
+
+          {allTags.length > 0 && (
+            <div className="flex max-w-full flex-wrap items-center gap-1">
+              <button
+                onClick={() => setTagsExpanded((prev) => !prev)}
+                className={cn(
+                  "flex max-w-full items-center gap-1 rounded-lg px-1.5 py-1 text-[0.625rem] transition-colors",
+                  activeTag
+                    ? "bg-[var(--primary)]/15 text-[var(--primary)]"
+                    : "text-[var(--muted-foreground)] hover:bg-[var(--sidebar-accent)]/40 hover:text-[var(--foreground)]",
+                )}
+                title={tagsExpanded ? "Collapse tags" : "Expand tags"}
+              >
+                <Tag size="0.6875rem" className="shrink-0" />
+                <span className="max-w-full truncate">
+                  {activeTag ? `Tag: ${activeTag}` : `Tags (${allTags.length})`}
+                </span>
+                {tagsExpanded ? (
+                  <ChevronUp size="0.625rem" className="shrink-0" />
+                ) : (
+                  <ChevronDown size="0.625rem" className="shrink-0" />
+                )}
+              </button>
+              {activeTag && (
+                <button
+                  onClick={() => setActiveTag(null)}
+                  className="rounded-lg px-2 py-1 text-[0.625rem] text-[var(--destructive)] transition-colors hover:bg-[var(--destructive)]/10"
+                >
+                  Clear
+                </button>
+              )}
+              {(tagsExpanded ? allTags : allTags.slice(0, 4)).map((tag) => (
+                <button
+                  key={tag}
+                  onClick={() => setActiveTag((prev) => (prev === tag ? null : tag))}
+                  className={cn(
+                    "max-w-full truncate rounded-lg px-2 py-1 text-[0.625rem] font-medium transition-all",
+                    activeTag === tag
+                      ? "bg-[var(--primary)]/15 text-[var(--primary)] ring-1 ring-[var(--primary)]/30"
+                      : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--sidebar-accent)]/40 hover:text-[var(--foreground)]",
+                  )}
+                  title={tag}
+                >
+                  {tag}
+                </button>
+              ))}
+              {!tagsExpanded && allTags.length > 4 && (
+                <button
+                  onClick={() => setTagsExpanded(true)}
+                  className="rounded-lg px-2 py-1 text-[0.625rem] text-[var(--muted-foreground)] transition-colors hover:bg-[var(--sidebar-accent)]/40 hover:text-[var(--foreground)]"
+                >
+                  +{allTags.length - 4} more
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -740,7 +959,25 @@ export function ChatSidebar() {
           </div>
         )}
 
-        {displayChats.length === 0 && !isLoading && (
+        {chatsError && !isLoading && (
+          <div className="flex flex-col items-center gap-2 px-3 py-12 text-center">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[var(--destructive)]/10">
+              <AlertTriangle size="1.25rem" className="text-[var(--destructive)]" />
+            </div>
+            <p className="text-xs text-[var(--muted-foreground)]">
+              Marinara is still waking up. Chats should appear in a moment.
+            </p>
+            <button
+              onClick={() => void refetchChats()}
+              disabled={isFetching}
+              className="mt-1 rounded-lg bg-[var(--primary)]/15 px-3 py-1.5 text-[0.6875rem] font-medium text-[var(--primary)] transition-all hover:bg-[var(--primary)]/25 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isFetching ? "Checking..." : "Try Again"}
+            </button>
+          </div>
+        )}
+
+        {displayChats.length === 0 && !isLoading && !chatsError && (
           <div className="flex flex-col items-center gap-2 px-3 py-12 text-center">
             <div className="animate-float flex h-12 w-12 items-center justify-center rounded-2xl bg-[var(--secondary)]">
               {activeTab === "conversation" ? (
@@ -752,7 +989,9 @@ export function ChatSidebar() {
               )}
             </div>
             <p className="text-xs text-[var(--muted-foreground)]">
-              No {activeTab === "conversation" ? "conversations" : activeTab === "game" ? "games" : "roleplays"} yet
+              {searchQuery.trim() || activeTag
+                ? `No ${activeTab === "conversation" ? "conversations" : activeTab === "game" ? "games" : "roleplays"} match the current filters`
+                : `No ${activeTab === "conversation" ? "conversations" : activeTab === "game" ? "games" : "roleplays"} yet`}
             </p>
             <button
               onClick={handleNewChatFromTab}
@@ -1010,17 +1249,25 @@ function FolderRow({
   return (
     <Reorder.Item value={folder.id} dragListener={false} dragControls={dragControls} as="div" className="flex flex-col">
       {/* Folder header */}
-      <div className="group relative flex items-center gap-1.5 rounded-lg px-2 py-1.5 hover:bg-[var(--sidebar-accent)]/40">
+      <div
+        onClick={() => onToggleCollapse(folder)}
+        className="group relative flex items-center gap-1.5 rounded-lg px-2 py-1.5 hover:bg-[var(--sidebar-accent)]/40"
+      >
         <div
           onPointerDown={(e) => dragControls.start(e)}
           className="cursor-grab touch-none opacity-0 transition-opacity active:cursor-grabbing group-hover:opacity-100 max-md:opacity-100"
         >
           <GripVertical size="0.625rem" className="text-[var(--muted-foreground)]" />
         </div>
-        <button onClick={() => onToggleCollapse(folder)} className="p-0.5 text-[var(--muted-foreground)]">
-          <ChevronRight size="0.75rem" className={cn("transition-transform", !folder.collapsed && "rotate-90")} />
-        </button>
-        <div className="h-2 w-2 rounded-full flex-shrink-0" style={{ backgroundColor: folder.color || "#6b7280" }} />
+        <ChevronRight
+          size="0.75rem"
+          className={cn("text-[var(--muted-foreground)] transition-transform", !folder.collapsed && "rotate-90")}
+        />
+        <div
+          className="h-2 w-2 rounded-full flex-shrink-0 cursor-pointer"
+          style={{ backgroundColor: folder.color || "#6b7280" }}
+          title={folder.name}
+        />
         {renaming ? (
           <input
             autoFocus
@@ -1043,19 +1290,24 @@ function FolderRow({
             className="flex-1 bg-transparent text-xs font-medium text-[var(--foreground)] outline-none"
           />
         ) : (
-          <span
-            onClick={() => {
-              setRenameValue(folder.name);
-              setRenaming(true);
-            }}
-            className="flex-1 cursor-text truncate text-xs font-medium text-[var(--muted-foreground)]"
-          >
+          <span className="flex-1 cursor-pointer truncate text-xs font-medium text-[var(--muted-foreground)]">
             {folder.name}
           </span>
         )}
         {entries.length > 0 && (
           <span className="text-[0.5625rem] text-[var(--muted-foreground)]">{entries.length}</span>
         )}
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            setRenameValue(folder.name);
+            setRenaming(true);
+          }}
+          className="shrink-0 rounded-md p-1 opacity-0 transition-all hover:bg-[var(--accent)] group-hover:opacity-100 max-md:opacity-100"
+          title="Rename folder"
+        >
+          <Pencil size="0.75rem" className="text-[var(--muted-foreground)]" />
+        </button>
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -1109,7 +1361,9 @@ const STATUS_OPTIONS: Array<{
 
 function UserStatusFooter() {
   const userStatus = useUIStore((s) => s.userStatus);
+  const userActivity = useUIStore((s) => s.userActivity);
   const setUserStatusManual = useUIStore((s) => s.setUserStatusManual);
+  const setUserActivity = useUIStore((s) => s.setUserActivity);
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -1152,17 +1406,25 @@ function UserStatusFooter() {
         </div>
       )}
 
-      {/* Status button */}
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 transition-all hover:bg-[var(--sidebar-accent)]/60"
-      >
-        <span className={`h-2 w-2 rounded-full ${current.color}`} />
-        <span className="text-xs text-[var(--sidebar-foreground)]">{current.label}</span>
-        <span className="ml-auto text-[0.625rem] text-[var(--muted-foreground)]">
-          {userStatus === "idle" ? "Away" : ""}
-        </span>
-      </button>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="flex min-w-0 shrink-0 items-center gap-2 rounded-lg px-2 py-1.5 transition-all hover:bg-[var(--sidebar-accent)]/60"
+          title="Change activity status"
+          aria-label="Change activity status"
+        >
+          <span className={`h-2 w-2 shrink-0 rounded-full ${current.color}`} />
+          <span className="max-w-20 truncate text-xs text-[var(--sidebar-foreground)]">{current.label}</span>
+        </button>
+        <input
+          value={userActivity}
+          onChange={(event) => setUserActivity(event.target.value)}
+          maxLength={120}
+          placeholder="What are you doing?"
+          aria-label="Custom activity"
+          className="min-w-0 flex-1 rounded-lg border border-[var(--border)]/40 bg-[var(--sidebar-accent)]/35 px-2 py-1.5 text-xs text-[var(--sidebar-foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)]/70 focus:border-[var(--primary)]/40 focus:bg-[var(--sidebar-accent)]/60"
+        />
+      </div>
     </div>
   );
 }
