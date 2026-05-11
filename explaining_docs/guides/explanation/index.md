@@ -9,5 +9,7 @@ Explanations are **understanding-oriented**. They clarify a particular topic, pr
 - [Deep Dive: Roleplay Mode Execution Trace](roleplay_mode/execution_trace.md)
 - [The Expression System (Sprite Swapping & Animation)](expression_system.md)
 - [How AI Image Generation works in the Engine](image_generation.md)
+- [AI Steering & Guided Generation](ai_steering.md)
+- [Asymmetric Mode Linking](mode-linking.md)
 - *How Context token limits are calculated (Pending)*
 - *The Philosophy behind the Agent Runner (Pending)*
