@@ -13,7 +13,6 @@ import {
 import { type SceneForkMode, type SpritePlacement, type SpriteSide } from "@marinara-engine/shared";
 import {
   FolderOpen,
-  Globe,
   Image,
   Loader2,
   MoreHorizontal,
@@ -27,16 +26,17 @@ import {
   FlipHorizontal2,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { getConnectedChatDisplayName } from "../../lib/chat-display";
 import { useUIStore } from "../../stores/ui.store";
 import { useChatStore } from "../../stores/chat.store";
 import { useGameStateStore } from "../../stores/game-state.store";
-import { useActiveLorebookEntries } from "../../hooks/use-lorebooks";
 import { ChatMessage } from "./ChatMessage";
 import { ChatInput } from "./ChatInput";
 import { CyoaChoices } from "./CyoaChoices";
 import { ChatBranchSelector } from "./ChatBranchSelector";
 import { EndSceneBar } from "./SceneBanner";
 import { ChatCommonOverlays } from "./ChatCommonOverlays";
+import { ActiveWorldInfoButton } from "./ActiveWorldInfoButton";
 import type {
   CharacterMap,
   MessageSelectionToggle,
@@ -77,11 +77,6 @@ const SummaryPopover = lazy(async () => {
   return { default: module.SummaryPopover };
 });
 
-const WorldInfoPanel = lazy(async () => {
-  const module = await import("./ChatRoleplayPanels");
-  return { default: module.WorldInfoPanel };
-});
-
 const AuthorNotesPanel = lazy(async () => {
   const module = await import("./ChatRoleplayPanels");
   return { default: module.AuthorNotesPanel };
@@ -89,6 +84,8 @@ const AuthorNotesPanel = lazy(async () => {
 
 const PANEL_BACKDROP =
   "fixed inset-0 z-[9999] flex items-center justify-center p-4 max-md:pt-[max(1rem,env(safe-area-inset-top))]";
+const TRACKER_FOREGROUND_AVOIDANCE_CLASS =
+  "md:pl-[var(--tracker-chat-avoid-left)] md:pr-[var(--tracker-chat-avoid-right)] md:transition-[padding] md:duration-200 md:ease-[cubic-bezier(0.16,1,0.3,1)]";
 const PANEL_CONTAINER =
   "relative max-h-[calc(100dvh-4rem)] w-full max-w-sm overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--card)] p-3 shadow-2xl shadow-black/40 animate-message-in";
 
@@ -111,7 +108,7 @@ function CrossfadeBackground({ url, className }: { url: string | null; className
     const currentUrl = activeSlot.current === "a" ? bgA : bgB;
     if (url === currentUrl) return;
 
-    if (url && url.startsWith("/api/backgrounds/")) {
+    if (url && (url.startsWith("/api/backgrounds/") || url.startsWith("/api/game-assets/"))) {
       fetch(url, { method: "HEAD" })
         .then((res) => {
           if (res.ok) {
@@ -372,95 +369,6 @@ function SummaryButton({
   );
 }
 
-function WorldInfoButton({ chatId }: { chatId: string | null }) {
-  const [open, setOpen] = useState(false);
-  const { data, isLoading } = useActiveLorebookEntries(chatId, true);
-  const ref = useRef<HTMLDivElement>(null);
-  const isMobile = typeof window !== "undefined" && window.innerWidth < 768;
-  const compact = useUIStore((s) => s.centerCompact);
-
-  useEffect(() => {
-    if (!open) return;
-    const handle = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", handle);
-    return () => document.removeEventListener("mousedown", handle);
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
-  }, [open]);
-
-  if (!chatId) return null;
-
-  const entries = data?.entries ?? [];
-  const hasEntries = entries.length > 0;
-
-  return (
-    <div className="relative" ref={ref} onClick={(e) => e.stopPropagation()}>
-      <button
-        onClick={() => setOpen(!open)}
-        className={cn(
-          "flex items-center justify-center rounded-full border backdrop-blur-md transition-all",
-          compact ? "p-1" : "p-1.5",
-          open
-            ? "bg-foreground/15 border-foreground/20 text-foreground/90"
-            : hasEntries && !isLoading
-              ? "bg-foreground/10 border-foreground/25 text-foreground/80 hover:bg-foreground/15 hover:text-foreground"
-              : "bg-foreground/5 border-foreground/10 text-foreground/60 hover:bg-foreground/10 hover:text-foreground",
-        )}
-        title="Active World Info"
-      >
-        <Globe size="0.875rem" />
-      </button>
-      {open &&
-        (isMobile ? (
-          createPortal(
-            <div
-              className={PANEL_BACKDROP}
-              onMouseDown={(e) => e.stopPropagation()}
-              onTouchStart={(e) => e.stopPropagation()}
-            >
-              <div className="absolute inset-0 bg-black/30" onClick={() => setOpen(false)} />
-              <div className={PANEL_CONTAINER} onClick={(e) => e.stopPropagation()}>
-                <Suspense
-                  fallback={
-                    <div className="flex items-center gap-2 py-4 text-xs text-[var(--muted-foreground)]">
-                      <Loader2 size="0.75rem" className="animate-spin" />
-                      Loading world info...
-                    </div>
-                  }
-                >
-                  <WorldInfoPanel chatId={chatId} isMobile={isMobile} onClose={() => setOpen(false)} />
-                </Suspense>
-              </div>
-            </div>,
-            document.body,
-          )
-        ) : (
-          <div className="absolute right-0 top-full z-50 mt-2 max-h-[60vh] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--card)] p-3 shadow-2xl shadow-black/40 animate-message-in">
-            <Suspense
-              fallback={
-                <div className="flex items-center gap-2 py-4 text-xs text-[var(--muted-foreground)]">
-                  <Loader2 size="0.75rem" className="animate-spin" />
-                  Loading world info...
-                </div>
-              }
-            >
-              <WorldInfoPanel chatId={chatId} isMobile={isMobile} onClose={() => setOpen(false)} />
-            </Suspense>
-          </div>
-        ))}
-    </div>
-  );
-}
-
 function AuthorNotesButton({ chatId, chatMeta }: { chatId: string | null; chatMeta: Record<string, any> }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -562,7 +470,7 @@ function AuthorNotesButton({ chatId, chatMeta }: { chatId: string | null; chatMe
 type RoleplaySurfaceProps = {
   activeChatId: string;
   chat: ChatData | null | undefined;
-  allChats: Array<{ id: string; name: string }> | undefined;
+  allChats: Array<{ id: string; name: string; metadata?: string | Record<string, unknown> | null }> | undefined;
   chatMeta: Record<string, any>;
   chatMode: string;
   isRoleplay: boolean;
@@ -644,7 +552,7 @@ type RoleplaySurfaceProps = {
   onSpriteSideChange: (side: SpriteSide) => void;
   onToggleSpriteArrange: () => void;
   onToggleSpritePosition: () => void;
-  onExpressionChange: (characterId: string, expression: string) => void;
+  onExpressionChange: (characterId: string, expression: string, options?: { immediate?: boolean }) => void;
   onSpritePlacementChange: (characterId: string, placement: SpritePlacement) => void;
   onDeleteConfirm: () => void;
   onDeleteSwipe: () => void;
@@ -756,7 +664,9 @@ export function ChatRoleplaySurface({
   onSelectAllBelowSelection,
   isGrouped,
 }: RoleplaySurfaceProps) {
-  const linkedChatName = chat?.connectedChatId ? allChats?.find((c) => c.id === chat.connectedChatId)?.name : undefined;
+  const linkedChatName = chat?.connectedChatId
+    ? getConnectedChatDisplayName(allChats?.find((c) => c.id === chat.connectedChatId))
+    : undefined;
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
   const rightPanelOpen = useUIStore((s) => s.rightPanelOpen);
   const hideEchoChamberOnMobile =
@@ -790,10 +700,15 @@ export function ChatRoleplaySurface({
           <div className="flex flex-1 flex-col overflow-hidden">
             <>
               <div
+                data-tracker-panel-anchor="roleplay-hud"
                 className={cn(
-                  "pointer-events-none relative z-40 items-center px-4 py-2 max-md:hidden",
+                  "pointer-events-none relative z-40 items-center py-2 max-md:hidden",
                   centerCompact ? "hidden" : "flex",
                 )}
+                style={{
+                  paddingLeft: "calc(1rem + var(--tracker-panel-hud-clear-left, 0px))",
+                  paddingRight: "calc(1rem + var(--tracker-panel-hud-clear-right, 0px))",
+                }}
               >
                 {chat && chatMeta.enableAgents && (
                   <div className="pointer-events-auto flex-1 overflow-x-auto">
@@ -827,7 +742,7 @@ export function ChatRoleplaySurface({
                       summaryContextSize={summaryContextSize}
                       onContextSizeChange={onSummaryContextSizeChange}
                     />
-                    <WorldInfoButton chatId={chat?.id ?? null} />
+                    <ActiveWorldInfoButton chatId={chat?.id ?? null} />
                     <AuthorNotesButton chatId={chat?.id ?? null} chatMeta={chatMeta} />
                     <RpToolbarButton
                       icon={<FolderOpen size="0.875rem" />}
@@ -869,13 +784,20 @@ export function ChatRoleplaySurface({
                 </div>
               </div>
               <div
+                data-tracker-panel-anchor={centerCompact ? "roleplay-hud" : undefined}
                 className={cn(
                   "pointer-events-auto relative z-40 w-full flex-col",
                   centerCompact ? "flex" : "flex md:hidden",
                 )}
               >
                 {chat && chatMeta.enableAgents && (
-                  <div className="flex w-full items-center justify-between px-2 pb-1 pt-2">
+                  <div
+                    className="flex w-full items-center justify-between pb-1 pt-2"
+                    style={{
+                      paddingLeft: "calc(0.5rem + var(--tracker-panel-hud-clear-left, 0px))",
+                      paddingRight: "calc(0.5rem + var(--tracker-panel-hud-clear-right, 0px))",
+                    }}
+                  >
                     <Suspense fallback={null}>
                       <RoleplayHUD
                         chatId={chat.id}
@@ -906,7 +828,7 @@ export function ChatRoleplaySurface({
                           summaryContextSize={summaryContextSize}
                           onContextSizeChange={onSummaryContextSizeChange}
                         />
-                        <WorldInfoButton chatId={chat?.id ?? null} />
+                        <ActiveWorldInfoButton chatId={chat?.id ?? null} />
                         <AuthorNotesButton chatId={chat?.id ?? null} chatMeta={chatMeta} />
                         <RpToolbarButton
                           icon={<FolderOpen size="0.875rem" />}
@@ -964,7 +886,7 @@ export function ChatRoleplaySurface({
                         summaryContextSize={summaryContextSize}
                         onContextSizeChange={onSummaryContextSizeChange}
                       />
-                      <WorldInfoButton chatId={chat?.id ?? null} />
+                      <ActiveWorldInfoButton chatId={chat?.id ?? null} />
                       <AuthorNotesButton chatId={chat?.id ?? null} chatMeta={chatMeta} />
                       <RpToolbarButton
                         icon={<FolderOpen size="0.875rem" />}
@@ -996,7 +918,7 @@ export function ChatRoleplaySurface({
               </Suspense>
             )}
 
-            <div className="relative z-10 flex-1 overflow-hidden">
+            <div className={cn("relative z-10 flex-1 overflow-hidden", TRACKER_FOREGROUND_AVOIDANCE_CLASS)}>
               <div
                 ref={scrollRef}
                 data-chat-scroll
@@ -1118,7 +1040,7 @@ export function ChatRoleplaySurface({
               </div>
             </div>
 
-            <div className="relative z-20">
+            <div className={cn("relative z-20", TRACKER_FOREGROUND_AVOIDANCE_CLASS)}>
               <div className={cn("relative", centerCompact ? "px-3" : "px-3 md:px-[12%]")}>
                 {chatMeta.sceneStatus === "active" && (
                   <EndSceneBar
@@ -1151,21 +1073,18 @@ export function ChatRoleplaySurface({
                       ? (chatMeta.groupResponseOrder ?? "sequential")
                       : undefined
                   }
-                  chatCharacters={
-                    chatCharIds.length > 1
-                      ? chatCharIds
-                          .filter((id) => characterMap.has(id))
-                          .map((id) => {
-                            const info = characterMap.get(id)!;
-                            return {
-                              id,
-                              name: info.name,
-                              avatarUrl: info.avatarUrl ?? null,
-                              avatarCrop: info.avatarCrop ?? null,
-                            };
-                          })
-                      : undefined
-                  }
+                  chatCharacters={chatCharIds
+                    .filter((id) => characterMap.has(id))
+                    .map((id) => {
+                      const info = characterMap.get(id)!;
+                      return {
+                        id,
+                        name: info.name,
+                        avatarUrl: info.avatarUrl ?? null,
+                        avatarCrop: info.avatarCrop ?? null,
+                      };
+                    })}
+                  onExpressionChange={onExpressionChange}
                   onPeekPrompt={onPeekPrompt}
                 />
               </div>

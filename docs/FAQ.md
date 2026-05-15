@@ -16,7 +16,7 @@ The shell launchers (`start.sh`, `start.bat`, `start-termux.sh`) already bind to
 
 ## 2. Configure access control
 
-Loopback (`127.0.0.1`) works without a password, but other devices on your LAN now require authentication by default. Set `BASIC_AUTH_USER` and `BASIC_AUTH_PASS` in `.env`, then restart Marinara. For privileged actions from that browser, also set `ADMIN_SECRET` and save it in **Settings -> Advanced -> Admin Access**.
+Loopback (`127.0.0.1`) works without a password, ordinary LAN clients require authentication by default, and Tailscale plus Docker bridge clients are trusted by default for private installs. Set `BASIC_AUTH_USER` and `BASIC_AUTH_PASS` in `.env`, then restart Marinara if you want LAN users to sign in. Set `BYPASS_AUTH_TAILSCALE=false` or `BYPASS_AUTH_DOCKER=false` if you want those clients to sign in too. For privileged actions from that browser, also set `ADMIN_SECRET` and save it in **Settings -> Advanced -> Admin Access**.
 
 You can restore the old unauthenticated LAN behavior with `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK=true`, but only do this on a network you fully trust. For a step-by-step walkthrough covering Basic Auth, IP Allowlist, and the private-network bypass, see [Remote Access — Setting Up Basic Auth or an IP Allowlist](REMOTE_ACCESS.md).
 
@@ -41,7 +41,7 @@ For example: `http://192.168.1.42:7860`
 
 ## 5. (Optional) Install the PWA
 
-Most mobile browsers will offer an **"Add to Home Screen"** or **"Install App"** prompt, giving you a more native app experience without browser chrome.
+Most mobile browsers will offer an **"Add to Home Screen"** or **"Install App"** prompt, giving you a more native app experience without browser chrome. On iPhone and iPad, see the [iOS / iPadOS PWA Guide](installation/ios-pwa.md).
 
 ### Not on the same network?
 
@@ -50,13 +50,50 @@ Tools like [Tailscale](https://tailscale.com/) give each device a stable IP addr
 ### Still not connecting?
 
 - Verify both devices are on the same Wi-Fi network.
-- Confirm `HOST=0.0.0.0` and Basic Auth credentials are set on the server.
+- Confirm `HOST=0.0.0.0` and, for ordinary LAN access, Basic Auth credentials are set on the server.
 - Check that no firewall is blocking the configured port (default `7860`).
 - See the [Troubleshooting](TROUBLESHOOTING.md#app-not-loading-on-mobile--another-device) page for more help.
 
 ### Using the Spotify DJ agent on a LAN install?
 
 Spotify's OAuth rules only allow `https://` or `http://127.0.0.1` redirect URIs, so the agent editor will show a `127.0.0.1` URI even when you're accessing Marinara from another device. Either put the server behind HTTPS or use the paste-back fallback in the agent editor — both flows are covered in [Spotify DJ login fails on a remote or LAN install](TROUBLESHOOTING.md#spotify-dj-login-fails-on-a-remote-or-lan-install).
+
+</details>
+
+---
+
+<details>
+<summary><strong>Is the Android APK a standalone app?</strong></summary>
+<br>
+
+No. The Android APK is a WebView shell, not a standalone Marinara Engine server build.
+
+The APK only opens `http://127.0.0.1:<PORT>` on the same Android device. That means Marinara Engine must already be installed and running in Termux before the APK can load anything.
+
+Use this flow:
+
+1. Install Termux from F-Droid.
+2. Follow the [Android (Termux) Installation Guide](installation/android-termux.md).
+3. Start Marinara Engine with `./start-termux.sh`.
+4. Open the APK if you want a dedicated home-screen shell.
+
+If you downloaded only the APK from a GitHub Release and skipped Termux, the app will not start by itself.
+
+</details>
+
+---
+
+<details>
+<summary><strong>What can Professor Mari do?</strong></summary>
+<br>
+
+Professor Mari is Marinara Engine's built-in assistant character. She can explain the app, help with setup, create characters and personas, create lorebooks, start new Conversation or Roleplay chats, navigate panels, and fetch existing items so she can review or update them. She is a guide and helper, not a replacement for the docs or release notes when something is version-specific or recently changed.
+
+Editing existing content needs more care than creating new content. Ask Mari to fetch the character, persona, lorebook, chat, or preset before editing it, and give her the specific field or behavior you want changed. Character edits keep a recoverable version snapshot, but persona edits overwrite without a snapshot, so back up personas before asking her to change one.
+
+She cannot currently submit GitHub issues from inside the app, complete the whole Game Setup Wizard through hidden commands, or automatically ingest the latest GitHub docs into her own prompt.
+
+See [Professor Mari](PROFESSOR_MARI.md) for the full capabilities and safety notes.
 
 </details>
 
@@ -135,6 +172,22 @@ It depends which retry button you use.
 Individual tracker controls are narrower. If you open a specific HUD widget and rerun it from there, Marinara sends only that tracker through the retry pipeline.
 
 Other retry controls are also scoped to what they say on the button: **Retry Failed Agents** retries the failed agents from the last generation, while Injections-tab re-runs only refresh the selected cached prompt injection for the current assistant message.
+
+</details>
+
+---
+
+<details>
+<summary><strong>Does Marinara Engine have Guided Generation / Swipes / Regen?</strong></summary>
+<br>
+
+Yes. Use `/narrator <direction>` when you want to steer the AI's next reply without speaking as your persona. It sends your text as hidden story direction, like `/narrator make Alex interrupt` or `/narrator move the scene toward the market`.
+
+For swipes and regens, enable **Settings -> Advanced -> Guide swipes/regens with chat input**. Then the current chat-box draft is used as guidance when you click **Regenerate**, create a new swipe/reroll, or manually trigger a character response in a group chat.
+
+Guided `/narrator` requests and guided manual character replies use Chat reply lorebook triggers. If an older lorebook entry was attached to Continue or Autonomous only so it could steer guided replies, move that entry to Chat reply.
+
+If you want to post your persona message first without triggering a reply, enable **Settings -> Advanced -> Quick replies menu** and include **Post only**. The same settings submenu can include **Guide reply** for a quick `/narrator` send and **Impersonate** for generating as your persona.
 
 </details>
 

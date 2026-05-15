@@ -13,6 +13,8 @@ import type {
   SceneAnalysis,
   SceneIllustrationRequest,
   SceneSegmentEffect,
+  SceneSpotifyTrackCandidate,
+  SceneSpotifyTrackSelection,
 } from "@marinara-engine/shared";
 import { normalizeLocationKind, normalizeMusicGenre, normalizeMusicIntensity } from "@marinara-engine/shared";
 import { logger } from "../../lib/logger.js";
@@ -127,6 +129,35 @@ function sanitizeIllustration(raw: unknown): SceneIllustrationRequest | null {
   };
 }
 
+function sanitizeSpotifyTrack(
+  raw: unknown,
+  candidates: SceneSpotifyTrackCandidate[] | undefined,
+): SceneSpotifyTrackSelection | null {
+  if (!candidates?.length) return null;
+  if (!raw || raw === "null") return null;
+
+  const uri =
+    typeof raw === "string"
+      ? sanitizeString(raw)
+      : raw && typeof raw === "object"
+        ? sanitizeString((raw as Record<string, unknown>).uri)
+        : null;
+  if (!uri) return null;
+
+  const candidate = candidates.find((track) => track.uri === uri);
+  if (!candidate) {
+    logger.debug(`[postprocess] spotifyTrack: "${uri}" → null (not in candidate list)`);
+    return null;
+  }
+
+  return {
+    uri: candidate.uri,
+    name: candidate.name,
+    artist: candidate.artist,
+    album: candidate.album ?? null,
+  };
+}
+
 function normalizeDirection(direction: DirectionCommand): DirectionCommand | null {
   if (!VALID_DIRECTION_EFFECTS.has(direction.effect)) return null;
 
@@ -202,6 +233,8 @@ function bestMatch(prose: string, tags: string[]): string | null {
 export interface PostProcessContext {
   availableBackgrounds: string[];
   availableSfx: string[];
+  useSpotifyMusic?: boolean;
+  availableSpotifyTracks?: SceneSpotifyTrackCandidate[];
   validWidgetIds: Set<string>;
   characterNames: string[];
   canGenerateBackgrounds?: boolean;
@@ -331,9 +364,17 @@ export function postProcessSceneResult(raw: SceneAnalysis, ctx: PostProcessConte
   if (result.timeOfDay === "null") result.timeOfDay = null;
   result.music = null;
   result.ambient = null;
-  result.musicGenre = normalizeMusicGenre(rawRecord.musicGenre);
-  result.musicIntensity = normalizeMusicIntensity(rawRecord.musicIntensity);
+  if (ctx.useSpotifyMusic) {
+    result.musicGenre = null;
+    result.musicIntensity = null;
+  } else {
+    result.musicGenre = normalizeMusicGenre(rawRecord.musicGenre);
+    result.musicIntensity = normalizeMusicIntensity(rawRecord.musicIntensity);
+  }
   result.locationKind = normalizeLocationKind(rawRecord.locationKind);
+  result.spotifyTrack = ctx.useSpotifyMusic
+    ? sanitizeSpotifyTrack(rawRecord.spotifyTrack, ctx.availableSpotifyTracks)
+    : null;
 
   // ── Background ──
   if (result.background && !ctx.availableBackgrounds.includes(result.background)) {

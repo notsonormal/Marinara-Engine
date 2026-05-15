@@ -3,7 +3,7 @@
 // ──────────────────────────────────────────────
 import { useCallback, useMemo } from "react";
 import { useRegexScripts, type RegexScriptRow } from "./use-regex-scripts";
-import type { RegexPlacement } from "@marinara-engine/shared";
+import { applyRegexReplacement, type RegexPlacement } from "@marinara-engine/shared";
 
 /**
  * Parses a RegexScriptRow from DB into a usable form.
@@ -41,7 +41,7 @@ function applyScripts(
   text: string,
   scripts: ReturnType<typeof parseScript>[],
   placement: RegexPlacement,
-  options?: { promptOnly?: boolean; depth?: number },
+  options?: { promptOnly?: boolean; depth?: number; resolveMacros?: (value: string) => string },
 ): string {
   let result = text;
   for (const script of scripts) {
@@ -57,11 +57,16 @@ function applyScripts(
     }
 
     try {
-      const re = new RegExp(script.findRegex, script.flags);
-      result = result.replace(re, script.replaceString);
+      const findRegex = options?.resolveMacros ? options.resolveMacros(script.findRegex) : script.findRegex;
+      if (!findRegex) continue;
+      const re = new RegExp(findRegex, script.flags);
+      result = applyRegexReplacement(result, re, script.replaceString, (value) =>
+        options?.resolveMacros ? options.resolveMacros(value) : value,
+      );
       // Apply trim strings
       for (const trim of script.trimStrings) {
-        if (trim) result = result.split(trim).join("");
+        const resolvedTrim = options?.resolveMacros ? options.resolveMacros(trim) : trim;
+        if (resolvedTrim) result = result.split(resolvedTrim).join("");
       }
     } catch {
       // Invalid regex — skip silently
@@ -87,19 +92,24 @@ export function useApplyRegex() {
   }, [regexScripts]);
 
   const applyToAIOutput = useCallback(
-    (text: string, depth?: number) => applyScripts(text, parsedScripts, "ai_output", { depth }),
+    (text: string, options?: { depth?: number; resolveMacros?: (value: string) => string }) =>
+      applyScripts(text, parsedScripts, "ai_output", options),
     [parsedScripts],
   );
 
   const applyToUserInput = useCallback(
-    (text: string, depth?: number) => applyScripts(text, parsedScripts, "user_input", { depth }),
+    (text: string, options?: { depth?: number; resolveMacros?: (value: string) => string }) =>
+      applyScripts(text, parsedScripts, "user_input", options),
     [parsedScripts],
   );
 
-  // Applies only prompt-only scripts (for content sent to the AI but not displayed)
+  // Applies scripts in prompt context, including scripts marked prompt-only.
   const applyPromptOnly = useCallback(
-    (text: string, placement: RegexPlacement, depth?: number) =>
-      applyScripts(text, parsedScripts, placement, { promptOnly: true, depth }),
+    (
+      text: string,
+      placement: RegexPlacement,
+      options?: { depth?: number; resolveMacros?: (value: string) => string },
+    ) => applyScripts(text, parsedScripts, placement, { promptOnly: true, ...options }),
     [parsedScripts],
   );
 

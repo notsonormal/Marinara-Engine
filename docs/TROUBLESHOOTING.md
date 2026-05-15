@@ -34,15 +34,31 @@ Look for `storage/manifest.json` first. If it does not exist, look for `marinara
 If you're accessing Marinara Engine from a phone or tablet on the same network and it won't connect:
 
 - Make sure the server is bound to `0.0.0.0`, not `127.0.0.1`. The shell launchers (`start.sh`, `start-termux.sh`) default to `0.0.0.0`. If you started manually with `pnpm start`, set `HOST=0.0.0.0` in `.env` first.
-- Configure `BASIC_AUTH_USER` and `BASIC_AUTH_PASS` for non-loopback access. Loopback remains passwordless, but LAN/Docker/Tailscale/private-network clients now fail closed by default when Basic Auth is unset.
+- Configure `BASIC_AUTH_USER` and `BASIC_AUTH_PASS` for ordinary LAN or public clients. Loopback remains passwordless, and Tailscale plus Docker bridge clients are trusted by default unless you set `BYPASS_AUTH_TAILSCALE=false` or `BYPASS_AUTH_DOCKER=false`.
 - If you need privileged features from that device, set `ADMIN_SECRET` on the server and save it in **Settings -> Advanced -> Admin Access**.
-- On mixed-trust networks, prefer `IP_ALLOWLIST` for specific trusted LAN/Docker/Tailscale/private-network client IPs or CIDRs instead of enabling the global `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK` compatibility switch. Configure it on the server and keep `ADMIN_SECRET` set for privileged actions.
-- The compatibility switch `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK=true` restores old unauthenticated LAN behavior, but only use it on a trusted private network.
-- If sending a message shows `Request origin is not trusted`, set `CSRF_TRUSTED_ORIGINS` to the exact URL you open in the browser, including Docker's mapped host port, for example `CSRF_TRUSTED_ORIGINS=http://192.168.1.10:3004`. Use `*` only on a fully trusted private setup.
+- On mixed-trust networks, prefer `IP_ALLOWLIST` for specific trusted LAN/private-network client IPs or CIDRs instead of enabling the global `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK` compatibility switch. Configure it on the server and keep `ADMIN_SECRET` set for privileged actions.
+- The compatibility switch `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK=true` restores old unauthenticated LAN behavior outside the default trusted Tailscale and Docker bridge ranges, but only use it on a trusted private network.
+- If a save appears to succeed in the UI but does not persist (preset, persona, or settings reverts on reload), check the browser for a Marinara "Save blocked: origin not trusted" toast and the server log for `[csrf] Rejected request:`. Loopback, LAN, Tailscale (100.64.0.0/10), and Docker bridge (172.16.0.0/12) origins are auto-trusted when the browser's URL is an IP literal, so this usually only happens when you reach Marinara through a public IP or DNS name. Add it to `CSRF_TRUSTED_ORIGINS` in `.env` — comma-separated for multiple origins, for example `CSRF_TRUSTED_ORIGINS=http://203.0.113.10:7831,https://chat.example.com`. Use `*` only on a fully trusted private setup. No restart needed.
 - Verify both devices are on the same Wi-Fi network.
 - Check that no firewall is blocking port `7860` (or your configured `PORT`).
 
 See the [LAN / mobile access FAQ](FAQ.md#how-do-i-access-marinara-engine-from-my-phone-or-another-device) for full setup details.
+
+---
+
+## Android APK Stuck on Connecting or Waiting for Server
+
+The APK is not a standalone Marinara Engine app. It is a WebView shell that opens the local Termux server on the same Android device.
+
+If the APK stays on the connection screen:
+
+1. Open Termux.
+2. Go to the Marinara Engine folder.
+3. Run `./start-termux.sh`.
+4. Wait for the launcher to finish and start the server.
+5. Open the APK again.
+
+Also confirm the APK and Termux use the same port. The default is `7860`; if you built the APK with `MARINARA_PORT=9000`, set `PORT=9000` in Termux's `.env` too.
 
 ---
 
@@ -89,6 +105,43 @@ If a Docker or Podman container fails with permission errors on the data volume:
 - **Bind mounts:** Make the host directory writable by UID/GID `1000`, or use a named volume. If your filesystem blocks container `chown`, fix ownership on the host instead.
 - **SELinux (Fedora, RHEL):** Add the `:Z` suffix to the volume mount — e.g., `-v marinara-data:/app/data:Z`.
 - **Rootless Podman:** Make sure the host directory is owned by your user, or use a named volume instead of a bind mount.
+
+---
+
+## Lite Container Crashes on Raspberry Pi 4 / Cortex-A72
+
+If the lite container silently restarts when it sends an outgoing LLM API request on a Raspberry Pi 4 or another Cortex-A72-class ARM device, check the container exit code. Exit `132` or `SIGILL` points to a known upstream Wolfi `nodejs-24` aarch64 regression on CPUs without the optional `pmull` feature. Known affected lite images include `1.5.7-lite`, `1.5.8-lite`, and the `:lite` tag published for v1.5.8 on 2026-05-05.
+
+The regular Debian-based `:latest` image is not affected. Until Wolfi publishes a fixed Node package, use one of these workarounds:
+
+- Use `ghcr.io/pasta-devs/marinara-engine:latest` on the affected device.
+- Pin the last known-good lite image by digest:
+
+  ```yaml
+  image: ghcr.io/pasta-devs/marinara-engine@sha256:726b3c82468a1e1b0ed84579c754202d700e8cf27861465d1c41fd2dc99adab8
+  ```
+
+The upstream tracker is [wolfi-dev/os#78694](https://github.com/wolfi-dev/os/issues/78694). Marinara's project tracker is [Pasta-Devs/Marinara-Engine#449](https://github.com/Pasta-Devs/Marinara-Engine/issues/449).
+
+---
+
+## Sprite Background Cleanup Still Leaves White Panels
+
+The built-in sprite cleanup is a matte remover. It works for simple white backgrounds, but generated sprite sheets can contain disconnected white panels, shadows, gutters, or white clothing/hair that are hard to separate with thresholds.
+
+For stronger cleanup, install the optional open-source AI background remover:
+
+```bash
+pnpm backgroundremover:install
+```
+
+Then restart Marinara and click **Reapply Cleanup** in the sprite generation review screen. If install fails:
+
+- Make sure Python 3.9-3.11 is installed (`python3 --version` or `py -3.11 --version` on Windows). Python 3.12+ may force native `numba`/`llvmlite` builds on some machines.
+- Rebuild the runtime with `pnpm backgroundremover:reinstall`.
+- Set `SPRITE_BACKGROUND_REMOVAL_ENGINE=builtin` to force the old built-in cleanup while troubleshooting.
+- First use may take longer because `backgroundremover` downloads U2Net model files into `DATA_DIR/background-remover/models`.
+- If logs mention a corrupted U2Net model, delete the reported `.pth` cache file and retry. Marinara pins its own cache under `DATA_DIR/background-remover/models` and retries once automatically if that managed cache is incomplete.
 
 ---
 

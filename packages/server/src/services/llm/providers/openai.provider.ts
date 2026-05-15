@@ -16,10 +16,10 @@ import { logger } from "../../../lib/logger.js";
 
 /**
  * Models that ONLY support the Responses API (`/responses`) and not Chat Completions.
- * All GPT-5.4 variants (base, pro, mini, dated snapshots) and Codex models use Responses.
+ * GPT-5.5, GPT-5.4 variants (base, pro, mini, dated snapshots), and Codex models use Responses.
  * Matching is case-insensitive.
  */
-const RESPONSES_ONLY_PREFIXES = ["gpt-5.4", "codex-"];
+const RESPONSES_ONLY_PREFIXES = ["gpt-5.5", "gpt-5.4", "codex-"];
 const RESPONSES_ONLY_SUFFIXES = ["-codex", "-codex-max", "-codex-mini"];
 
 type ChatCompletionsUsagePayload = {
@@ -62,6 +62,7 @@ type OpenAIProviderKind =
   | "mistral"
   | "cohere"
   | "custom"
+  | "openai-chatgpt"
   | "local-sidecar";
 
 /**
@@ -75,6 +76,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     defaultOpenrouterProvider?: string | null,
     maxTokensOverride?: number | null,
     private readonly providerKind: OpenAIProviderKind = "openai",
+    private readonly extraHeaders?: Record<string, string>,
   ) {
     super(baseUrl, apiKey, defaultMaxContext, defaultOpenrouterProvider, maxTokensOverride);
   }
@@ -126,6 +128,16 @@ export class OpenAIProvider extends BaseLLMProvider {
     if (topP == null || !Number.isFinite(topP)) return undefined;
     if (topP <= 0) return 1;
     return Math.min(topP, 1);
+  }
+
+  private normalizeChatCompletionsResponseFormat(responseFormat?: { type: string }): unknown | undefined {
+    if (!responseFormat) return undefined;
+
+    if (this.isGenericCustomProvider() && responseFormat.type === "json_object") {
+      return { type: "json_schema", json_schema: { name: "response", schema: { type: "object" }, strict: true } };
+    }
+
+    return responseFormat;
   }
 
   /**
@@ -317,6 +329,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${this.apiKey}`,
+      ...(this.extraHeaders ?? {}),
     };
     if (!this.isGenericCustomProvider() && this.baseUrl.includes("openrouter.ai")) {
       h["HTTP-Referer"] = "https://github.com/Pasta-Devs/Marinara-Engine";
@@ -329,9 +342,17 @@ export class OpenAIProvider extends BaseLLMProvider {
     return this.providerKind === "custom";
   }
 
+  private isOpenAIChatGPTProvider(): boolean {
+    return this.providerKind === "openai-chatgpt";
+  }
+
+  private isGpt55Model(model: string): boolean {
+    return model.toLowerCase().startsWith("gpt-5.5");
+  }
+
   /** Check if a model ID represents an OpenAI reasoning model */
   private isReasoningModel(model: string): boolean {
-    if (this.isGenericCustomProvider()) return false;
+    if (this.isGenericCustomProvider() && !this.isGpt55Model(model)) return false;
     const m = model.toLowerCase();
     return /^(o1|o3|o4)/.test(m) || m.startsWith("gpt-5");
   }
@@ -377,12 +398,14 @@ export class OpenAIProvider extends BaseLLMProvider {
   /**
    * Check if a model/config does NOT support temperature/topP.
    * o-series models never do.
-   * GPT-5.x models only support temperature when reasoning effort is "none" (the default).
+   * GPT-5.5 rejects sampling params entirely; older GPT-5.x models only reject
+   * them when reasoning effort is active.
    */
   private isNoTemperatureModel(model: string, reasoningEffort?: string): boolean {
-    if (this.isGenericCustomProvider()) return false;
+    if (this.isGenericCustomProvider() && !this.isGpt55Model(model)) return false;
     const m = model.toLowerCase();
     if (/^(o1|o3|o4)/.test(m)) return true;
+    if (this.isGpt55Model(model)) return true;
     if (m.startsWith("gpt-5") && reasoningEffort && reasoningEffort !== "none") return true;
     // Claude Opus 4.7+: all sampling params forbidden (covers reverse proxies)
     if (/claude-opus-4-(?:[7-9]|\d{2,})/.test(m)) return true;
@@ -409,7 +432,8 @@ export class OpenAIProvider extends BaseLLMProvider {
   }
 
   private shouldSendGLMEnableThinking(model: string): boolean {
-    return !this.isGenericCustomProvider() && this.isGLMModel(model) && this.isNativeGLMEndpoint();
+    if (this.isGenericCustomProvider() || !this.isGLMModel(model)) return false;
+    return this.isNativeGLMEndpoint() || this.providerKind === "nanogpt";
   }
 
   private hasActiveReasoningEffort(reasoningEffort?: string | null): boolean {
@@ -488,7 +512,13 @@ export class OpenAIProvider extends BaseLLMProvider {
 
   /** Check if a model requires or benefits from the Responses API instead of Chat Completions */
   private useResponsesAPI(model: string, options?: Pick<ChatOptions, "captureReasoning">): boolean {
+    if (this.isOpenAIChatGPTProvider()) return true;
+    // Custom providers generally only implement /chat/completions — never force
+    // /responses for them, even for GPT-5.5. Reasoning-model parameter tweaks
+    // (max_completion_tokens, temperature suppression) still apply via
+    // isReasoningModel / isNoTemperatureModel which have their own GPT-5.5 gates.
     if (this.isGenericCustomProvider()) return false;
+    if (this.isGpt55Model(model)) return true;
     const m = model.toLowerCase();
     return (
       this.isXAIMultiAgentModel(model) ||
@@ -496,11 +526,6 @@ export class OpenAIProvider extends BaseLLMProvider {
       RESPONSES_ONLY_PREFIXES.some((p) => m.startsWith(p)) ||
       RESPONSES_ONLY_SUFFIXES.some((s) => m.endsWith(s))
     );
-  }
-
-  private requiresStreamingChatCompletions(model: string): boolean {
-    if (this.isGenericCustomProvider()) return false;
-    return model.toLowerCase().startsWith("gpt-5.5");
   }
 
   private shouldUseOpenRouterPromptCaching(options: ChatOptions): boolean {
@@ -519,7 +544,27 @@ export class OpenAIProvider extends BaseLLMProvider {
   }
 
   private supportsGpt5Verbosity(model: string): boolean {
-    return !this.isGenericCustomProvider() && model.toLowerCase().startsWith("gpt-5");
+    if (this.isOpenAIChatGPTProvider()) return false;
+    return (!this.isGenericCustomProvider() || this.isGpt55Model(model)) && model.toLowerCase().startsWith("gpt-5");
+  }
+
+  private applyResponsesTextOptions(body: Record<string, unknown>, options: ChatOptions): void {
+    const textOptions =
+      body.text && typeof body.text === "object" && !Array.isArray(body.text)
+        ? (body.text as Record<string, unknown>)
+        : {};
+
+    if (options.verbosity && this.supportsGpt5Verbosity(options.model)) {
+      textOptions.verbosity = options.verbosity;
+    }
+
+    if (options.responseFormat) {
+      textOptions.format = options.responseFormat;
+    }
+
+    if (Object.keys(textOptions).length > 0) {
+      body.text = textOptions;
+    }
   }
 
   private shouldApplyOpenRouterProviderOverride(openrouterProvider?: string | null): boolean {
@@ -617,7 +662,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       formatted.push({ role: "user", content: "Continue." });
     }
 
-    const effectiveStream = this.requiresStreamingChatCompletions(options.model) ? true : (options.stream ?? true);
+    const effectiveStream = options.stream ?? true;
 
     const body: Record<string, unknown> = {
       model: options.model,
@@ -669,8 +714,9 @@ export class OpenAIProvider extends BaseLLMProvider {
     this.applyOpenRouterPromptCaching(body, options);
 
     // Force response format (e.g. JSON mode)
-    if (options.responseFormat) {
-      body.response_format = options.responseFormat;
+    const normalizedResponseFormat = this.normalizeChatCompletionsResponseFormat(options.responseFormat);
+    if (normalizedResponseFormat) {
+      body.response_format = normalizedResponseFormat;
     }
 
     this.applyCustomParameters(body, options);
@@ -693,6 +739,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       method: "POST",
       headers: this.buildHeaders(),
       body: JSON.stringify(body),
+      bufferResponse: !effectiveStream,
       ...(options.signal ? { signal: options.signal } : {}),
     });
 
@@ -703,10 +750,11 @@ export class OpenAIProvider extends BaseLLMProvider {
 
     if (!effectiveStream) {
       const json = await OpenAIProvider.parseJsonBody<{
-        choices: Array<{ message: Record<string, unknown> & { content: string | unknown[] } }>;
+        choices: Array<{ message: Record<string, unknown> & { content: string | unknown[] | null; refusal?: string } }>;
         usage?: ChatCompletionsUsagePayload;
       }>(response, "OpenAI chat() non-stream response");
       const msg = json.choices[0]?.message;
+      const refusal = typeof msg?.refusal === "string" && msg.refusal ? msg.refusal : "";
       const reasoningMetadata = OpenAIProvider.extractReasoningMetadata(msg);
       OpenAIProvider.emitChatCompletionsReasoning(options, reasoningMetadata);
       const reasoning = OpenAIProvider.extractReasoning(msg);
@@ -717,9 +765,9 @@ export class OpenAIProvider extends BaseLLMProvider {
       const blocks = OpenAIProvider.extractContentBlocks(msg?.content);
       if (blocks) {
         if (!reasoning && blocks.thinking && options.onThinking) options.onThinking(blocks.thinking);
-        yield blocks.text;
+        yield blocks.text || refusal;
       } else {
-        yield (msg?.content as string) ?? "";
+        yield (typeof msg?.content === "string" ? msg.content : "") || refusal;
       }
       return OpenAIProvider.extractChatCompletionsUsage(json.usage);
     }
@@ -785,6 +833,8 @@ export class OpenAIProvider extends BaseLLMProvider {
               if (blocks.text) yield blocks.text;
             } else if (delta?.content) {
               yield delta.content as string;
+            } else if (typeof delta?.refusal === "string" && delta.refusal) {
+              yield delta.refusal;
             }
           } catch {
             // Skip malformed JSON lines
@@ -819,9 +869,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     const url = `${this.baseUrl}/chat/completions`;
     const reasoning = this.isReasoningModel(options.model);
 
-    const useStream = this.requiresStreamingChatCompletions(options.model)
-      ? true
-      : (options.stream ?? !!options.onToken);
+    const useStream = options.stream ?? !!options.onToken;
 
     const formatted = this.formatMessages(messages, options.model);
     if (!formatted.some((m) => m.role !== "system" && m.role !== "developer")) {
@@ -877,8 +925,9 @@ export class OpenAIProvider extends BaseLLMProvider {
     this.applyOpenRouterPromptCaching(body, options);
 
     // Force response format (e.g. JSON mode)
-    if (options.responseFormat) {
-      body.response_format = options.responseFormat;
+    const normalizedResponseFormat = this.normalizeChatCompletionsResponseFormat(options.responseFormat);
+    if (normalizedResponseFormat) {
+      body.response_format = normalizedResponseFormat;
     }
 
     this.applyCustomParameters(body, options);
@@ -889,6 +938,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       method: "POST",
       headers: this.buildHeaders(),
       body: JSON.stringify(body),
+      bufferResponse: !useStream,
       ...(options.signal ? { signal: options.signal } : {}),
     });
 
@@ -925,6 +975,10 @@ export class OpenAIProvider extends BaseLLMProvider {
         resolvedContent = blocks.text || null;
       } else {
         resolvedContent = (choice?.message?.content as string) ?? null;
+      }
+      // Fall back to refusal text so the user sees why the model declined
+      if (!resolvedContent && typeof choice?.message?.refusal === "string" && choice.message.refusal) {
+        resolvedContent = choice.message.refusal;
       }
       const usage = OpenAIProvider.extractChatCompletionsUsage(json.usage);
       return {
@@ -1015,6 +1069,9 @@ export class OpenAIProvider extends BaseLLMProvider {
           } else if (delta?.content) {
             content += delta.content as string;
             options.onToken?.(delta.content as string);
+          } else if (typeof delta?.refusal === "string" && delta.refusal) {
+            content += delta.refusal;
+            options.onToken?.(delta.refusal);
           }
 
           // Accumulate tool call deltas
@@ -1186,10 +1243,11 @@ export class OpenAIProvider extends BaseLLMProvider {
   /** Build the Responses API request body */
   private buildResponsesBody(messages: ChatMessage[], options: ChatOptions): Record<string, unknown> {
     const { instructions, input } = this.formatResponsesInput(messages);
+    const isOpenAIChatGPT = this.isOpenAIChatGPTProvider();
 
     // Replay encrypted reasoning items from the previous turn so the model
     // retains its reasoning context and avoids re-deriving (and re-narrating) the same conclusions.
-    if (options.encryptedReasoningItems?.length) {
+    if (!isOpenAIChatGPT && options.encryptedReasoningItems?.length) {
       let lastAssistantIdx = -1;
       for (let i = input.length - 1; i >= 0; i--) {
         if ((input[i] as Record<string, unknown>).role === "assistant") {
@@ -1205,22 +1263,25 @@ export class OpenAIProvider extends BaseLLMProvider {
     const body: Record<string, unknown> = {
       model: options.model,
       input,
-      stream: options.stream ?? true,
+      stream: isOpenAIChatGPT ? true : (options.stream ?? true),
       store: false, // don't persist responses on OpenAI side
-      // Request encrypted reasoning items so we can replay them on the next turn
-      include: ["reasoning.encrypted_content"],
     };
 
-    if (instructions) {
-      body.instructions = instructions;
+    if (!isOpenAIChatGPT) {
+      // Request encrypted reasoning items so we can replay them on the next turn.
+      body.include = ["reasoning.encrypted_content"];
     }
 
-    if (options.maxTokens && !this.isXAIMultiAgentModel(options.model)) {
+    if (instructions || isOpenAIChatGPT) {
+      body.instructions = instructions || "You are a helpful assistant.";
+    }
+
+    if (!isOpenAIChatGPT && options.maxTokens && !this.isXAIMultiAgentModel(options.model)) {
       body.max_output_tokens = options.maxTokens;
     }
 
     // o-series models never support temperature/topP; GPT-5.x only with effort=none
-    if (!this.isNoTemperatureModel(options.model, options.reasoningEffort)) {
+    if (!isOpenAIChatGPT && !this.isNoTemperatureModel(options.model, options.reasoningEffort)) {
       if (options.temperature != null) body.temperature = options.temperature;
       const topP = OpenAIProvider.normalizeTopP(options.topP);
       if (topP != null) body.top_p = topP;
@@ -1230,23 +1291,27 @@ export class OpenAIProvider extends BaseLLMProvider {
       }
     }
 
-    this.applyResponsesReasoning(body, options);
+    if (!isOpenAIChatGPT) {
+      this.applyResponsesReasoning(body, options);
+    }
 
-    // GPT-5+ text verbosity control
-    if (options.verbosity && this.supportsGpt5Verbosity(options.model)) {
-      body.text = { verbosity: options.verbosity };
+    // GPT-5+ verbosity and Responses structured output / JSON mode.
+    if (!isOpenAIChatGPT) {
+      this.applyResponsesTextOptions(body, options);
     }
 
     const openrouterProvider = this.resolveOpenrouterProvider(options.openrouterProvider);
-    if (this.shouldApplyOpenRouterProviderOverride(openrouterProvider)) {
+    if (!isOpenAIChatGPT && this.shouldApplyOpenRouterProviderOverride(openrouterProvider)) {
       body.provider = { order: [openrouterProvider] };
     }
 
-    if (options.tools?.length && !this.isXAIMultiAgentModel(options.model)) {
+    if (!isOpenAIChatGPT && options.tools?.length && !this.isXAIMultiAgentModel(options.model)) {
       body.tools = this.formatResponsesTools(options.tools);
     }
 
-    this.applyCustomParameters(body, options);
+    if (!isOpenAIChatGPT) {
+      this.applyCustomParameters(body, options);
+    }
 
     return body;
   }
@@ -1261,6 +1326,7 @@ export class OpenAIProvider extends BaseLLMProvider {
   ): AsyncGenerator<string, LLMUsage | void, unknown> {
     const url = `${this.baseUrl}/responses`;
     const body = this.buildResponsesBody(messages, options);
+    const parseAsStream = this.isOpenAIChatGPTProvider() || (options.stream ?? true);
     logger.debug(
       "[OpenAI chatResponses] model=%s stream=%s reasoning=%j enableThinking=%s verbosity=%s max_output_tokens=%s tools=%s",
       body.model,
@@ -1278,6 +1344,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       method: "POST",
       headers: this.buildHeaders(),
       body: JSON.stringify(body),
+      bufferResponse: !parseAsStream,
       ...(options.signal ? { signal: options.signal } : {}),
     });
 
@@ -1296,6 +1363,7 @@ export class OpenAIProvider extends BaseLLMProvider {
           method: "POST",
           headers: this.buildHeaders(),
           body: JSON.stringify(body),
+          bufferResponse: !parseAsStream,
           ...(options.signal ? { signal: options.signal } : {}),
         });
         if (!response.ok) {
@@ -1307,7 +1375,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       }
     }
 
-    if (!options.stream) {
+    if (!parseAsStream) {
       // Non-streaming: parse the full response
       const json = await OpenAIProvider.parseJsonBody<Record<string, unknown>>(
         response,
@@ -1345,6 +1413,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     const decoder = new TextDecoder();
     let buffer = "";
     let streamUsage: LLMUsage | undefined;
+    let yieldedAny = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1380,7 +1449,10 @@ export class OpenAIProvider extends BaseLLMProvider {
           switch (eventType) {
             case "response.output_text.delta": {
               const delta = parsed.delta as string | undefined;
-              if (delta) yield delta;
+              if (delta) {
+                yieldedAny = true;
+                yield delta;
+              }
               break;
             }
             case "response.reasoning_summary_text.delta": {
@@ -1391,7 +1463,10 @@ export class OpenAIProvider extends BaseLLMProvider {
             case "response.refusal.delta": {
               // Treat refusals as regular text so the user sees the message
               const delta = parsed.delta as string | undefined;
-              if (delta) yield delta;
+              if (delta) {
+                yieldedAny = true;
+                yield delta;
+              }
               break;
             }
             case "response.completed": {
@@ -1400,7 +1475,29 @@ export class OpenAIProvider extends BaseLLMProvider {
               if (resp) {
                 streamUsage = this.extractResponsesUsage(resp);
                 this.emitEncryptedReasoning(resp, options);
+                // If no text was streamed (e.g. refusal or content only in the
+                // completed payload), extract it as a last-resort fallback.
+                if (!yieldedAny) {
+                  const fallback = this.extractResponsesText(resp);
+                  if (fallback) {
+                    yieldedAny = true;
+                    yield fallback;
+                  }
+                }
               }
+              break;
+            }
+            case "response.failed": {
+              const resp = parsed.response as Record<string, unknown> | undefined;
+              const error = resp?.error as Record<string, unknown> | undefined;
+              const msg = (error?.message as string) ?? "unknown error";
+              logger.error(new Error(msg), "[OpenAI Responses] Stream ended with response.failed");
+              break;
+            }
+            case "response.incomplete": {
+              const resp = parsed.response as Record<string, unknown> | undefined;
+              const reason = (resp?.incomplete_details as Record<string, unknown>)?.reason ?? "unknown";
+              logger.warn("[OpenAI Responses] Stream ended with response.incomplete (reason=%s)", reason);
               break;
             }
             // Ignore other event types (response.created, response.in_progress, etc.)
@@ -1420,7 +1517,8 @@ export class OpenAIProvider extends BaseLLMProvider {
    */
   private async chatCompleteResponses(messages: ChatMessage[], options: ChatOptions): Promise<ChatCompletionResult> {
     const url = `${this.baseUrl}/responses`;
-    const useStream = options.stream ?? !!options.onToken;
+    const callerWantsStream = options.stream ?? !!options.onToken;
+    const useStream = this.isOpenAIChatGPTProvider() || callerWantsStream;
     const body = this.buildResponsesBody(messages, { ...options, stream: useStream });
     logger.debug(
       "[OpenAI chatCompleteResponses] reasoning=%s onThinking=%s",
@@ -1432,6 +1530,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       method: "POST",
       headers: this.buildHeaders(),
       body: JSON.stringify(body),
+      bufferResponse: !useStream,
       ...(options.signal ? { signal: options.signal } : {}),
     });
 
@@ -1450,6 +1549,7 @@ export class OpenAIProvider extends BaseLLMProvider {
           method: "POST",
           headers: this.buildHeaders(),
           body: JSON.stringify(body),
+          bufferResponse: !useStream,
           ...(options.signal ? { signal: options.signal } : {}),
         });
         if (!response.ok) {
@@ -1552,6 +1652,15 @@ export class OpenAIProvider extends BaseLLMProvider {
               break;
             }
 
+            case "response.refusal.delta": {
+              const delta = parsed.delta as string | undefined;
+              if (delta) {
+                content += delta;
+                options.onToken?.(delta);
+              }
+              break;
+            }
+
             case "response.reasoning_summary_text.delta": {
               const delta = parsed.delta as string | undefined;
               if (delta && options.onThinking) options.onThinking(delta);
@@ -1620,7 +1729,30 @@ export class OpenAIProvider extends BaseLLMProvider {
                 this.emitEncryptedReasoning(resp, options);
                 const status = resp.status as string | undefined;
                 if (status === "incomplete") finishReason = "length";
+                // Fallback: extract text/refusal from the completed response
+                // if nothing was streamed (e.g. model returned only in payload)
+                if (!content) {
+                  const fallback = this.extractResponsesText(resp);
+                  if (fallback) {
+                    content = fallback;
+                    options.onToken?.(fallback);
+                  }
+                }
               }
+              break;
+            }
+            case "response.failed": {
+              const resp = parsed.response as Record<string, unknown> | undefined;
+              const error = resp?.error as Record<string, unknown> | undefined;
+              const msg = (error?.message as string) ?? "unknown error";
+              logger.error(new Error(msg), "[OpenAI Responses] chatCompleteResponses stream failed");
+              break;
+            }
+            case "response.incomplete": {
+              const resp = parsed.response as Record<string, unknown> | undefined;
+              const reason = (resp?.incomplete_details as Record<string, unknown>)?.reason ?? "unknown";
+              logger.warn("[OpenAI Responses] chatCompleteResponses stream incomplete (reason=%s)", reason);
+              finishReason = "length";
               break;
             }
           }
@@ -1651,7 +1783,11 @@ export class OpenAIProvider extends BaseLLMProvider {
 
     // Otherwise walk the output items
     const output = json.output as Array<Record<string, unknown>> | undefined;
-    if (!output) return "";
+    if (!output) {
+      // Fall back to top-level refusal field
+      if (typeof json.refusal === "string" && json.refusal) return json.refusal;
+      return "";
+    }
 
     let text = "";
     for (const item of output) {
@@ -1661,10 +1797,16 @@ export class OpenAIProvider extends BaseLLMProvider {
           for (const part of content) {
             if (part.type === "output_text" && typeof part.text === "string") {
               text += part.text;
+            } else if (part.type === "refusal" && typeof part.refusal === "string") {
+              text += part.refusal;
             }
           }
         }
       }
+    }
+    // Fall back to top-level refusal if no text was found in output items
+    if (!text && typeof json.refusal === "string" && json.refusal) {
+      text = json.refusal;
     }
     return text;
   }

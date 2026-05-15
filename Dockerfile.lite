@@ -30,9 +30,14 @@ COPY packages/shared/package.json packages/shared/
 COPY packages/server/package.json packages/server/
 COPY packages/client/package.json packages/client/
 
-# Install all dependencies (including dev for building)
+# Install all build dependencies. --ignore-scripts is what prevents
+# onnxruntime-node's GPU postinstall (the Lite-mode requirement); optional
+# deps are kept so Rollup and esbuild's platform-native binaries land in
+# node_modules. We then rebuild native packages used in Lite mode to register
+# their bindings, which --ignore-scripts skipped at install time.
 RUN --mount=type=cache,target=/app/.pnpm-store \
-    pnpm install --frozen-lockfile
+    pnpm install --frozen-lockfile --ignore-scripts && \
+    pnpm rebuild esbuild rollup sharp
 
 # Copy source code
 COPY tsconfig.base.json ./
@@ -62,21 +67,19 @@ COPY packages/shared/package.json packages/shared/
 COPY packages/server/package.json packages/server/
 COPY packages/client/package.json packages/client/
 
-# Install production deps only, then strip non-core native modules.
+# Install production deps. We can't pass --no-optional here because sharp's
+# native binary ships through transitive optional packages (@img/sharp-*),
+# which --no-optional would drop alongside the truly-optional onnxruntime
+# packages. Instead, install everything, rebuild sharp so its native binding
+# is registered (--ignore-scripts skipped it at install time), and then
+# explicitly prune onnxruntime to keep the lite image small.
 RUN --mount=type=cache,target=/app/.pnpm-store \
-    pnpm install --frozen-lockfile --prod && \
-    # ── Remove onnxruntime (native + WASM) ──
-    rm -rf /app/node_modules/.pnpm/onnxruntime-node@* \
-           /app/node_modules/.pnpm/onnxruntime-web@* \
-           /app/node_modules/.pnpm/onnxruntime-common@* \
-           /app/node_modules/onnxruntime-node \
-           /app/node_modules/onnxruntime-web \
-           /app/node_modules/onnxruntime-common && \
-    # ── Remove @huggingface/transformers (embedding model runtime) ──
-    rm -rf /app/node_modules/.pnpm/@huggingface+transformers@* \
-           /app/node_modules/@huggingface && \
-    # ── Sweep leftover native addons ──
-    find /app/node_modules/.pnpm -name '*.node' -path '*onnxruntime*' -delete 2>/dev/null; true
+    pnpm install --frozen-lockfile --prod --ignore-scripts && \
+    pnpm rebuild sharp && \
+    rm -rf node_modules/.pnpm/onnxruntime-node@* \
+           node_modules/.pnpm/onnxruntime-web@* \
+           packages/server/node_modules/onnxruntime-node \
+           packages/server/node_modules/onnxruntime-web
 
 # Archive node_modules preserving pnpm symlinks — Docker COPY
 # dereferences them which would break module resolution.
@@ -110,17 +113,20 @@ COPY --from=builder /app/packages/shared/dist packages/shared/dist
 COPY --from=builder /app/packages/server/dist packages/server/dist
 COPY --from=builder /app/packages/client/dist packages/client/dist
 COPY scripts/docker-entrypoint.mjs /usr/local/bin/marinara-docker-entrypoint.mjs
+COPY scripts/install-backgroundremover.mjs scripts/install-backgroundremover.mjs
 
 # Ensure data directory exists
 RUN mkdir -p /app/data && \
-    chown -R nonroot:nonroot /app
+    chown nonroot:nonroot /app/data
 
 # Runtime feature flag
 ENV MARINARA_LITE=true
 ENV DATA_DIR=/app/data
+ENV FILE_STORAGE_DIR=/app/data/storage
 ENV PORT=7860
 ENV HOST=0.0.0.0
 ENV NODE_ENV=production
+ENV MARINARA_DOCKER=true
 ENV MARINARA_DOCKER_USER=nonroot
 ENV MARINARA_DOCKER_GROUP=nonroot
 

@@ -72,7 +72,7 @@ test("startup migrations add lorebook folders schema to existing installs", asyn
         character_id, persona_id, chat_id, enabled, generated_by, source_agent_id, tags, created_at, updated_at
       ) VALUES (
         'legacy-book', 'Legacy Lorebook', '', 'uncategorized', 2, 2048, 'false',
-        NULL, NULL, NULL, 'true', NULL, NULL, '[]', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        'legacy-char', 'legacy-persona', NULL, 'true', NULL, NULL, '[]', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
       )`),
     );
     await db.run(
@@ -102,7 +102,223 @@ test("startup migrations add lorebook folders schema to existing installs", asyn
 
     assert.equal(folderTables.length, 1);
     assert.ok(entryColumns.some((column) => column.name === "folder_id"));
+    assert.ok(entryColumns.some((column) => column.name === "exclude_from_vectorization"));
+    const lorebookColumns = await db.all<{ name: string }>(sql.raw("PRAGMA table_info(lorebooks)"));
+    const migratedBooks = await db.all<{ id: string; is_global: string }>(
+      sql.raw(`SELECT id, is_global FROM lorebooks WHERE id = 'legacy-book'`),
+    );
+    const characterLinkTables = await db.all<{ name: string }>(
+      sql.raw(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lorebook_character_links'`),
+    );
+    const personaLinkTables = await db.all<{ name: string }>(
+      sql.raw(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lorebook_persona_links'`),
+    );
+    const characterLinks = await db.all<{ lorebook_id: string; character_id: string }>(
+      sql.raw(`SELECT lorebook_id, character_id FROM lorebook_character_links WHERE lorebook_id = 'legacy-book'`),
+    );
+    const personaLinks = await db.all<{ lorebook_id: string; persona_id: string }>(
+      sql.raw(`SELECT lorebook_id, persona_id FROM lorebook_persona_links WHERE lorebook_id = 'legacy-book'`),
+    );
+    assert.ok(lorebookColumns.some((column) => column.name === "is_global"));
+    assert.deepEqual(migratedBooks, [{ id: "legacy-book", is_global: "false" }]);
+    assert.equal(characterLinkTables.length, 1);
+    assert.equal(personaLinkTables.length, 1);
+    assert.deepEqual(characterLinks, [{ lorebook_id: "legacy-book", character_id: "legacy-char" }]);
+    assert.deepEqual(personaLinks, [{ lorebook_id: "legacy-book", persona_id: "legacy-persona" }]);
     assert.deepEqual(preservedEntries, [{ id: "legacy-entry", folder_id: null }]);
+  } finally {
+    client.close();
+  }
+});
+
+test("startup migrations add saved persona status options to existing installs", async () => {
+  const client = createClient({ url: "file::memory:" });
+  const db = drizzle(client) as unknown as DB;
+
+  try {
+    await db.run(
+      sql.raw(`CREATE TABLE personas (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        comment TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        personality TEXT NOT NULL DEFAULT '',
+        scenario TEXT NOT NULL DEFAULT '',
+        backstory TEXT NOT NULL DEFAULT '',
+        appearance TEXT NOT NULL DEFAULT '',
+        avatar_path TEXT,
+        is_active TEXT NOT NULL DEFAULT 'false',
+        name_color TEXT NOT NULL DEFAULT '',
+        dialogue_color TEXT NOT NULL DEFAULT '',
+        box_color TEXT NOT NULL DEFAULT '',
+        persona_stats TEXT NOT NULL DEFAULT '',
+        alt_descriptions TEXT NOT NULL DEFAULT '[]',
+        tags TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`),
+    );
+    await db.run(
+      sql.raw(`INSERT INTO personas (
+        id, name, comment, description, personality, scenario, backstory, appearance,
+        avatar_path, is_active, name_color, dialogue_color, box_color, persona_stats,
+        alt_descriptions, tags, created_at, updated_at
+      ) VALUES (
+        'legacy-persona', 'Legacy Persona', '', '', '', '', '', '',
+        NULL, 'true', '', '', '', '', '[]', '[]',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      )`),
+    );
+
+    await runMigrations(db);
+    await runMigrations(db);
+
+    const personaColumns = await db.all<{ name: string }>(sql.raw("PRAGMA table_info(personas)"));
+    const preservedPersonas = await db.all<{ id: string; saved_status_options: string }>(
+      sql.raw(`SELECT id, saved_status_options FROM personas WHERE id = 'legacy-persona'`),
+    );
+
+    assert.ok(personaColumns.some((column) => column.name === "saved_status_options"));
+    assert.deepEqual(preservedPersonas, [{ id: "legacy-persona", saved_status_options: "[]" }]);
+  } finally {
+    client.close();
+  }
+});
+
+test("startup migrations add Anthropic caching depth to existing connections", async () => {
+  const client = createClient({ url: "file::memory:" });
+  const db = drizzle(client) as unknown as DB;
+
+  try {
+    await db.run(
+      sql.raw(`CREATE TABLE api_connections (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        base_url TEXT NOT NULL DEFAULT '',
+        api_key_encrypted TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '',
+        max_context INTEGER NOT NULL DEFAULT 128000,
+        is_default TEXT NOT NULL DEFAULT 'false',
+        use_for_random TEXT NOT NULL DEFAULT 'false',
+        enable_caching TEXT NOT NULL DEFAULT 'false',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`),
+    );
+    await db.run(
+      sql.raw(`INSERT INTO api_connections (
+        id, name, provider, base_url, api_key_encrypted, model, max_context,
+        is_default, use_for_random, enable_caching, created_at, updated_at
+      ) VALUES (
+        'anthropic-legacy', 'Anthropic Legacy', 'anthropic', 'https://api.anthropic.com/v1', '',
+        'claude-sonnet-4-6', 200000, 'false', 'false', 'true',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      )`),
+    );
+
+    await runMigrations(db);
+    await runMigrations(db);
+
+    const columns = await db.all<{ name: string }>(sql.raw("PRAGMA table_info(api_connections)"));
+    const rows = await db.all<{ id: string; caching_at_depth: number }>(
+      sql.raw(`SELECT id, caching_at_depth FROM api_connections WHERE id = 'anthropic-legacy'`),
+    );
+
+    assert.ok(columns.some((column) => column.name === "caching_at_depth"));
+    assert.deepEqual(rows, [{ id: "anthropic-legacy", caching_at_depth: 5 }]);
+  } finally {
+    client.close();
+  }
+});
+
+test("startup migrations add max parallel jobs to existing connections", async () => {
+  const client = createClient({ url: "file::memory:" });
+  const db = drizzle(client) as unknown as DB;
+
+  try {
+    await db.run(
+      sql.raw(`CREATE TABLE api_connections (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        base_url TEXT NOT NULL DEFAULT '',
+        api_key_encrypted TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '',
+        max_context INTEGER NOT NULL DEFAULT 128000,
+        is_default TEXT NOT NULL DEFAULT 'false',
+        use_for_random TEXT NOT NULL DEFAULT 'false',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`),
+    );
+    await db.run(
+      sql.raw(`INSERT INTO api_connections (
+        id, name, provider, base_url, api_key_encrypted, model, max_context,
+        is_default, use_for_random, created_at, updated_at
+      ) VALUES (
+        'legacy-parallel', 'Legacy Parallel', 'openai', 'https://api.openai.com/v1', '',
+        'gpt-5.1', 128000, 'false', 'false',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      )`),
+    );
+
+    await runMigrations(db);
+    await runMigrations(db);
+
+    const columns = await db.all<{ name: string }>(sql.raw("PRAGMA table_info(api_connections)"));
+    const rows = await db.all<{ id: string; max_parallel_jobs: number }>(
+      sql.raw(`SELECT id, max_parallel_jobs FROM api_connections WHERE id = 'legacy-parallel'`),
+    );
+
+    assert.ok(columns.some((column) => column.name === "max_parallel_jobs"));
+    assert.deepEqual(rows, [{ id: "legacy-parallel", max_parallel_jobs: 1 }]);
+  } finally {
+    client.close();
+  }
+});
+
+test("startup migrations add prompt preset override to existing connections", async () => {
+  const client = createClient({ url: "file::memory:" });
+  const db = drizzle(client) as unknown as DB;
+
+  try {
+    await db.run(
+      sql.raw(`CREATE TABLE api_connections (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        base_url TEXT NOT NULL DEFAULT '',
+        api_key_encrypted TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '',
+        max_context INTEGER NOT NULL DEFAULT 128000,
+        is_default TEXT NOT NULL DEFAULT 'false',
+        use_for_random TEXT NOT NULL DEFAULT 'false',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`),
+    );
+    await db.run(
+      sql.raw(`INSERT INTO api_connections (
+        id, name, provider, base_url, api_key_encrypted, model, max_context,
+        is_default, use_for_random, created_at, updated_at
+      ) VALUES (
+        'legacy-preset-override', 'Legacy Preset Override', 'openai', 'https://api.openai.com/v1', '',
+        'gpt-5.1', 128000, 'false', 'false',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      )`),
+    );
+
+    await runMigrations(db);
+    await runMigrations(db);
+
+    const columns = await db.all<{ name: string }>(sql.raw("PRAGMA table_info(api_connections)"));
+    const rows = await db.all<{ id: string; prompt_preset_id: string | null }>(
+      sql.raw(`SELECT id, prompt_preset_id FROM api_connections WHERE id = 'legacy-preset-override'`),
+    );
+
+    assert.ok(columns.some((column) => column.name === "prompt_preset_id"));
+    assert.deepEqual(rows, [{ id: "legacy-preset-override", prompt_preset_id: null }]);
   } finally {
     client.close();
   }

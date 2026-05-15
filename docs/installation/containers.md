@@ -18,7 +18,7 @@ Data (file-backed storage, uploads, fonts, default backgrounds) is stored in the
 docker volume inspect marinara-data
 ```
 
-On startup, the official image repairs ownership of `/app/data` for named volumes, then drops back to the non-root runtime user. This lets older Docker installs migrate to file-backed storage without manual `chown` steps.
+On startup, the official image repairs ownership of `/app/data` for named volumes, then drops back to the non-root runtime user. This lets older Docker installs migrate to file-backed storage without manual `chown` steps. The runtime `.env` file is auto-created at `/app/data/.env`, and file-native storage is pinned to `/app/data/storage`, so both app settings and user data remain inside the mounted volume.
 
 To pull the latest image and restart:
 
@@ -58,6 +58,14 @@ podman run -d -p 127.0.0.1:7860:7860 -v marinara-data:/app/data ghcr.io/pasta-de
 ## Lite Image (Optional)
 
 A **lite** image variant is available that trades some offline features for a significantly smaller footprint (~60 % smaller than the full image). It is built on [Wolfi](https://wolfi.dev/) — a minimal, CVE-focused Linux (un)distribution designed for containers.
+
+> **Raspberry Pi 4 / Cortex-A72 note:** Known affected lite images include `1.5.7-lite`, `1.5.8-lite`, and the `:lite` tag published for v1.5.8 on 2026-05-05. They can crash with `SIGILL` on Pi 4-class ARM CPUs during outgoing LLM API calls because of an upstream Wolfi `nodejs-24` aarch64 regression. Until Wolfi publishes a fixed Node package, use the regular `:latest` image on those devices, or pin the last known-good lite image by digest:
+>
+> ```yaml
+> image: ghcr.io/pasta-devs/marinara-engine@sha256:726b3c82468a1e1b0ed84579c754202d700e8cf27861465d1c41fd2dc99adab8
+> ```
+>
+> See [Lite container crashes on Raspberry Pi 4 / Cortex-A72](../TROUBLESHOOTING.md#lite-container-crashes-on-raspberry-pi-4--cortex-a72) for details.
 
 ### What is removed
 

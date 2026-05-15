@@ -8,19 +8,23 @@ import {
   createChatSchema,
   createMessageSchema,
   getDefaultAgentPrompt,
+  markAutonomousUnreadSchema,
   nameToXmlTag,
   resolveMacros,
   summariesPatchSchema,
 } from "@marinara-engine/shared";
-import type { CharacterData, ChatMemoryChunk } from "@marinara-engine/shared";
+import type { CharacterData, ChatMemoryChunk, LorebookEntryTimingState } from "@marinara-engine/shared";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
 import { createCharactersStorage } from "../services/storage/characters.storage.js";
 import { createConnectionsStorage } from "../services/storage/connections.storage.js";
+import { createGameStateStorage, type GameStateVisibleAnchor } from "../services/storage/game-state.storage.js";
 import { createRegexScriptsStorage } from "../services/storage/regex-scripts.storage.js";
 import { getLocalSidecarProvider, LOCAL_SIDECAR_MODEL } from "../services/llm/local-sidecar.js";
 import { createLLMProvider } from "../services/llm/provider-registry.js";
 import { generateMissingConversationSummaries } from "../services/conversation/auto-summary.service.js";
+import { rebuildMemoryChunks } from "../services/memory-recall.js";
 import { wrapContent } from "../services/prompt/format-engine.js";
+import { getCharacterDescriptionWithExtensions } from "../services/prompt/index.js";
 import { newId } from "../utils/id-generator.js";
 import { characters, gameStateSnapshots, memoryChunks } from "../db/schema/index.js";
 import { and, desc, eq, inArray } from "drizzle-orm";
@@ -28,30 +32,34 @@ import { existsSync } from "fs";
 import { join } from "path";
 import { DATA_DIR } from "../utils/data-dir.js";
 import { normalizeTimestampOverrides } from "../services/import/import-timestamps.js";
-import { findLastIndex, parseExtra, shouldEnableAgentsForGeneration } from "./generate/generate-route-utils.js";
+import {
+  findLastIndex,
+  parseExtra,
+  resolveVisibleGameStateAnchor,
+  shouldEnableAgentsForGeneration,
+} from "./generate/generate-route-utils.js";
+import {
+  filterGameInternalAgentIds,
+  resolveGameLorebookScopeExclusions,
+} from "../services/lorebook/game-lorebook-scope.js";
+import {
+  isMemoryRecallVectorizerAvailable,
+  resolveMemoryRecallEmbeddingSource,
+} from "../services/memory-recall-embedding.js";
+import { applyRegexScriptsToPromptMessages } from "../services/regex/regex-application.js";
 
 type TrackerWrapFormat = "xml" | "markdown" | "none";
+type EntryStateOverrides = Record<string, { ephemeral?: number | null; enabled?: boolean }>;
 
-async function loadLatestChatGameSnapshot(app: FastifyInstance, chatId: string) {
-  const committedRows = await app.db
-    .select()
-    .from(gameStateSnapshots)
-    .where(and(eq(gameStateSnapshots.chatId, chatId), eq(gameStateSnapshots.committed, 1)))
-    .orderBy(desc(gameStateSnapshots.createdAt))
-    .limit(1);
-
-  let snap = committedRows[0];
-  if (!snap) {
-    const anyRows = await app.db
-      .select()
-      .from(gameStateSnapshots)
-      .where(eq(gameStateSnapshots.chatId, chatId))
-      .orderBy(desc(gameStateSnapshots.createdAt))
-      .limit(1);
-    snap = anyRows[0];
-  }
-
-  return snap ?? null;
+async function loadLatestChatGameSnapshot(
+  app: FastifyInstance,
+  chatId: string,
+  visibleAnchor?: GameStateVisibleAnchor | null,
+) {
+  return createGameStateStorage(app.db).getForGeneration(chatId, {
+    preferLatestVisible: true,
+    visibleAnchor,
+  });
 }
 
 function formatPeekTrackerContextBlock(args: {
@@ -123,7 +131,8 @@ function formatPeekTrackerContextBlock(args: {
     try {
       const stats = typeof snap.playerStats === "string" ? JSON.parse(snap.playerStats) : snap.playerStats;
 
-      if (hasPersonaStats && stats?.status) trackerParts.push(wrapContent(`Status: ${stats.status}`, "Status", wrapFormat));
+      if (hasPersonaStats && stats?.status)
+        trackerParts.push(wrapContent(`Status: ${stats.status}`, "Status", wrapFormat));
 
       if (hasQuest && Array.isArray(stats?.activeQuests) && stats.activeQuests.length > 0) {
         const questLines = stats.activeQuests.map((q: any) => {
@@ -174,6 +183,55 @@ function formatPeekTrackerContextBlock(args: {
     return `<context>\n${trackerParts.map((part) => "    " + part.replace(/\n/g, "\n    ")).join("\n")}\n</context>`;
   }
   return `# Context\n*(Established state as of the last message. Do not re-describe — advance from here.)*\n${trackerParts.join("\n")}`;
+}
+
+function resolveLorebookGenerationTriggers(mode: unknown): string[] {
+  const modeTrigger = mode === "game" ? "game" : typeof mode === "string" && mode.trim() ? mode.trim() : "roleplay";
+  return Array.from(new Set([modeTrigger, "chat"]));
+}
+
+async function buildPersonaSnapshotForChat(app: FastifyInstance, chat: { personaId?: string | null } | null) {
+  const charactersStore = createCharactersStorage(app.db);
+  const personas = await charactersStore.listPersonas();
+  const chatPersonaId = chat?.personaId ?? null;
+  const persona =
+    (chatPersonaId ? personas.find((candidate) => candidate.id === chatPersonaId) : null) ??
+    personas.find((candidate) => candidate.isActive === "true");
+
+  if (!persona) return null;
+
+  return {
+    personaId: persona.id,
+    name: persona.name,
+    description: persona.description ?? "",
+    personality: persona.personality ?? "",
+    scenario: persona.scenario ?? "",
+    backstory: persona.backstory ?? "",
+    appearance: persona.appearance ?? "",
+    avatarUrl: persona.avatarPath || null,
+    avatarCrop: persona.avatarCrop || null,
+    nameColor: persona.nameColor || null,
+    dialogueColor: persona.dialogueColor || null,
+    boxColor: persona.boxColor || null,
+  };
+}
+
+function resolveEntryStateOverrides(value: unknown): EntryStateOverrides | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+
+  const overrides: EntryStateOverrides = {};
+  for (const [entryId, override] of Object.entries(value)) {
+    if (typeof override !== "object" || override === null || Array.isArray(override)) return undefined;
+    const { ephemeral, enabled } = override as Record<string, unknown>;
+    if (ephemeral !== undefined && ephemeral !== null && typeof ephemeral !== "number") return undefined;
+    if (enabled !== undefined && typeof enabled !== "boolean") return undefined;
+    overrides[entryId] = {
+      ...(ephemeral !== undefined ? { ephemeral } : {}),
+      ...(enabled !== undefined ? { enabled } : {}),
+    };
+  }
+
+  return overrides;
 }
 
 export async function chatsRoutes(app: FastifyInstance) {
@@ -297,6 +355,21 @@ export async function chatsRoutes(app: FastifyInstance) {
     return storage.updateMetadata(req.params.id, merged);
   });
 
+  // Mark a chat as having autonomous messages the user has not viewed yet.
+  app.post<{ Params: { id: string } }>("/:id/autonomous-unread", async (req, reply) => {
+    const chat = await storage.getById(req.params.id);
+    if (!chat) return reply.status(404).send({ error: "Chat not found" });
+    const input = markAutonomousUnreadSchema.parse(req.body ?? {});
+    return storage.markAutonomousUnread(req.params.id, input);
+  });
+
+  // Clear autonomous unread state when the user views the relevant chat.
+  app.delete<{ Params: { id: string } }>("/:id/autonomous-unread", async (req, reply) => {
+    const chat = await storage.getById(req.params.id);
+    if (!chat) return reply.status(404).send({ error: "Chat not found" });
+    return storage.clearAutonomousUnread(req.params.id);
+  });
+
   // Update chat summaries (entry-level merge for day/week summaries).
   // Dedicated from generic metadata PATCH so concurrent user edits don't overwrite
   // the entire daySummaries/weekSummaries maps — we re-read fresh metadata here and
@@ -341,6 +414,8 @@ export async function chatsRoutes(app: FastifyInstance) {
       const providerDef = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
       baseUrl = providerDef?.defaultBaseUrl ?? "";
     }
+    if (!baseUrl && conn.provider === "claude_subscription") baseUrl = "claude-agent-sdk://local";
+    if (!baseUrl && conn.provider === "openai_chatgpt") baseUrl = "openai-chatgpt://codex-auth";
     if (!baseUrl) return reply.status(400).send({ error: "No base URL for this connection" });
 
     const characterIds: string[] = Array.isArray(chat.characterIds)
@@ -540,6 +615,10 @@ export async function chatsRoutes(app: FastifyInstance) {
   app.get<{ Params: { id: string } }>("/:id/memories", async (req, reply) => {
     const chat = await storage.getById(req.params.id);
     if (!chat) return reply.status(404).send({ error: "Chat not found" });
+    const vectorizerAvailable = await isMemoryRecallVectorizerAvailable(app.db, {
+      chatMetadata: chat.metadata,
+      connectionId: chat.connectionId,
+    });
 
     const chunks = await app.db
       .select({
@@ -561,8 +640,46 @@ export async function chatsRoutes(app: FastifyInstance) {
         ({
           ...chunk,
           hasEmbedding: !!embedding,
+          embeddingStatus: embedding ? "vectorized" : vectorizerAvailable ? "pending" : "unavailable",
         }) satisfies ChatMemoryChunk,
     );
+  });
+
+  // Rebuild memory-recall chunks for this chat from the current message log.
+  app.post<{ Params: { id: string } }>("/:id/memories/refresh", async (req, reply) => {
+    const chat = await storage.getById(req.params.id);
+    if (!chat) return reply.status(404).send({ error: "Chat not found" });
+
+    const characterIds: string[] = Array.isArray(chat.characterIds)
+      ? chat.characterIds
+      : typeof chat.characterIds === "string"
+        ? JSON.parse(chat.characterIds)
+        : [];
+    const charactersStore = createCharactersStorage(app.db);
+    const characterNames: Record<string, string> = {};
+    for (const characterId of characterIds) {
+      const row = await charactersStore.getById(characterId);
+      if (!row) continue;
+      try {
+        const data = JSON.parse(row.data as string) as { name?: unknown };
+        characterNames[characterId] = typeof data.name === "string" && data.name.trim() ? data.name : "Character";
+      } catch {
+        characterNames[characterId] = "Character";
+      }
+    }
+
+    const personas = await charactersStore.listPersonas();
+    const persona =
+      (chat.personaId ? personas.find((candidate) => candidate.id === chat.personaId) : null) ??
+      personas.find((candidate) => candidate.isActive === "true");
+    const userName = persona?.name ?? "User";
+
+    const embeddingSource = await resolveMemoryRecallEmbeddingSource(app.db, {
+      chatMetadata: chat.metadata,
+      connectionId: chat.connectionId,
+    });
+    const rebuilt = await rebuildMemoryChunks(app.db, req.params.id, { userName, characterNames }, { embeddingSource });
+    return { rebuilt };
   });
 
   // Clear all memory-recall chunks for this chat.
@@ -587,13 +704,21 @@ export async function chatsRoutes(app: FastifyInstance) {
   app.post<{ Params: { id: string } }>("/:id/messages", async (req) => {
     const input = createMessageSchema.parse({ ...(req.body as Record<string, unknown>), chatId: req.params.id });
     const body = req.body as Record<string, unknown>;
-    return storage.createMessage(
+    const created = await storage.createMessage(
       input,
       normalizeTimestampOverrides({
         createdAt: body.createdAt,
         updatedAt: body.updatedAt,
       }),
     );
+    if (created?.id && input.role === "user") {
+      const chat = await storage.getById(req.params.id);
+      const personaSnapshot = await buildPersonaSnapshotForChat(app, chat);
+      if (personaSnapshot) {
+        return (await storage.updateMessageExtra(created.id, { personaSnapshot })) ?? created;
+      }
+    }
+    return created;
   });
 
   // Delete message
@@ -643,23 +768,32 @@ export async function chatsRoutes(app: FastifyInstance) {
     },
   );
 
+  // Bulk-set hiddenFromAI on many messages (iterates per message through the storage layer)
+  app.patch<{ Params: { chatId: string }; Body: { messageIds: string[]; hidden: boolean } }>(
+    "/:chatId/messages/bulk-hidden",
+    async (req, reply) => {
+      const { messageIds, hidden } = req.body;
+      if (!Array.isArray(messageIds) || messageIds.length === 0) {
+        return reply.status(400).send({ error: "messageIds must be a non-empty array" });
+      }
+      if (typeof hidden !== "boolean") {
+        return reply.status(400).send({ error: "hidden must be a boolean" });
+      }
+      const count = await storage.bulkSetHiddenFromAI(req.params.chatId, messageIds, hidden);
+      return { updated: count };
+    },
+  );
+
   // Get latest game state for a chat (respects the active swipe of the last assistant message)
   app.get<{ Params: { id: string } }>("/:id/game-state", async (req, reply) => {
     const { createGameStateStorage } = await import("../services/storage/game-state.storage.js");
     const gameStateStore = createGameStateStorage(app.db);
-
-    // Try to find the snapshot for the last assistant message's active swipe
-    let row: Awaited<ReturnType<typeof gameStateStore.getLatest>> = null;
     const msgs = await storage.listMessages(req.params.id);
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i]!.role === "assistant") {
-        row = await gameStateStore.getByMessage(msgs[i]!.id, msgs[i]!.activeSwipeIndex);
-        break;
-      }
-    }
-    // Fall back to most recent snapshot if no swipe-specific one exists
-    const usedFallback = !row;
-    if (!row) row = await gameStateStore.getLatest(req.params.id);
+    const visibleAnchor = resolveVisibleGameStateAnchor(msgs);
+    const row = await gameStateStore.getForGeneration(req.params.id, {
+      preferLatestVisible: true,
+      visibleAnchor,
+    });
     if (!row) return reply.send(null);
     const presentCharacters = JSON.parse((row.presentCharacters as string) ?? "[]") as Array<Record<string, unknown>>;
     const playerStats = row.playerStats ? JSON.parse(row.playerStats as string) : null;
@@ -741,7 +875,13 @@ export async function chatsRoutes(app: FastifyInstance) {
     const manual = body.manual === true;
     // Explicit flag to wipe all manual overrides (e.g. from the Clear button)
     const clearOverrides = body.clearOverrides === true;
-    const fields = body as Partial<{
+    const targetMessageId = typeof body.messageId === "string" && body.messageId ? body.messageId : null;
+    const targetSwipeIndex =
+      typeof body.swipeIndex === "number" && Number.isInteger(body.swipeIndex) && body.swipeIndex >= 0
+        ? body.swipeIndex
+        : null;
+    const hasExplicitTarget = targetMessageId !== null && targetSwipeIndex !== null;
+    const fields: Partial<{
       date: string;
       time: string;
       location: string;
@@ -750,20 +890,42 @@ export async function chatsRoutes(app: FastifyInstance) {
       presentCharacters: any[];
       playerStats: any;
       personaStats: any[];
-    }>;
+    }> = {};
+    if (body.date !== undefined) fields.date = body.date as string;
+    if (body.time !== undefined) fields.time = body.time as string;
+    if (body.location !== undefined) fields.location = body.location as string;
+    if (body.weather !== undefined) fields.weather = body.weather as string;
+    if (body.temperature !== undefined) fields.temperature = body.temperature as string;
+    if (body.presentCharacters !== undefined) fields.presentCharacters = body.presentCharacters as any[];
+    if (body.playerStats !== undefined) fields.playerStats = body.playerStats;
+    if (body.personaStats !== undefined) fields.personaStats = body.personaStats as any[];
     // Target the same snapshot the GET endpoint returns — the one for the last
     // assistant message's active swipe — so edits persist to the row the user
     // actually sees. Falls back to updateLatest when no messages exist yet.
     let updated: Awaited<ReturnType<typeof gameStateStore.updateLatest>> = null;
-    const msgs = await storage.listMessages(req.params.id);
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i]!.role === "assistant") {
-        const msg = msgs[i]!;
-        updated = await gameStateStore.updateByMessage(msg.id, msg.activeSwipeIndex, req.params.id, fields, manual);
-        break;
+    if (hasExplicitTarget) {
+      const targetMessage = await storage.getMessage(targetMessageId);
+      if (targetMessage?.chatId === req.params.id) {
+        updated = await gameStateStore.updateByMessage(
+          targetMessageId,
+          targetSwipeIndex,
+          req.params.id,
+          fields,
+          manual,
+        );
       }
     }
-    if (!updated) {
+    if (!updated && !hasExplicitTarget) {
+      const msgs = await storage.listMessages(req.params.id);
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i]!.role === "assistant") {
+          const msg = msgs[i]!;
+          updated = await gameStateStore.updateByMessage(msg.id, msg.activeSwipeIndex, req.params.id, fields, manual);
+          break;
+        }
+      }
+    }
+    if (!updated && !hasExplicitTarget) {
       updated = await gameStateStore.updateLatest(req.params.id, fields, manual);
     }
     // Wipe all manual overrides when explicitly requested
@@ -777,7 +939,7 @@ export async function chatsRoutes(app: FastifyInstance) {
       updated = { ...updated, manualOverrides: null };
     }
     // If no snapshot exists yet, create one so manual edits aren't lost
-    if (!updated && manual) {
+    if (!updated && manual && !hasExplicitTarget) {
       const manualOverrides: Record<string, string> = {};
       const TRACKABLE = ["date", "time", "location", "weather", "temperature"] as const;
       for (const key of TRACKABLE) {
@@ -821,6 +983,7 @@ export async function chatsRoutes(app: FastifyInstance) {
 
     const chatMessages = await storage.listMessages(req.params.id);
     const chatMeta = typeof chat.metadata === "string" ? JSON.parse(chat.metadata) : (chat.metadata ?? {});
+    const visibleGameStateAnchor = resolveVisibleGameStateAnchor(chatMessages);
 
     // ── Primary: return the cached prompt from the last generation ──
     // This is an exact copy of what was actually sent to the model,
@@ -863,7 +1026,7 @@ export async function chatsRoutes(app: FastifyInstance) {
 
     // ── Fallback: live assembly preview (no generation has happened yet) ──
     // This is a best-effort approximation; it won't include runtime-only
-    // injections like lorebooks, game state, scene context, semantic memory, etc.
+    // injections like cached game state, scene context, semantic memory, etc.
     const presetId = chat.mode === "conversation" ? null : (chat.promptPresetId ?? chatMeta.presetId);
     if (presetId) {
       try {
@@ -902,51 +1065,6 @@ export async function chatsRoutes(app: FastifyInstance) {
           // Strip trailing assistant messages — peek should show only what we SEND to the model
           while (mappedMessages.length > 0 && mappedMessages[mappedMessages.length - 1]!.role === "assistant") {
             mappedMessages.pop();
-          }
-
-          // ── Apply prompt-only regex scripts (mirrors generate.routes.ts) ──
-          const regexStore = createRegexScriptsStorage(app.db);
-          const allRegexScripts = await regexStore.list();
-          const promptOnlyScripts = allRegexScripts.filter((s: any) => s.enabled === "true" && s.promptOnly === "true");
-          if (promptOnlyScripts.length > 0) {
-            const totalMessages = mappedMessages.length;
-            for (let msgIdx = 0; msgIdx < totalMessages; msgIdx++) {
-              const msg = mappedMessages[msgIdx]!;
-              const messageDepth = totalMessages - 1 - msgIdx;
-              const placement = msg.role === "user" ? "user_input" : "ai_output";
-              let text = msg.content;
-              for (const script of promptOnlyScripts) {
-                const placements: string[] = (() => {
-                  try {
-                    return JSON.parse(script.placement as string);
-                  } catch {
-                    return [];
-                  }
-                })();
-                if (!placements.includes(placement)) continue;
-                const sMinDepth = script.minDepth as number | null;
-                const sMaxDepth = script.maxDepth as number | null;
-                if (sMinDepth != null && messageDepth < sMinDepth) continue;
-                if (sMaxDepth != null && messageDepth > sMaxDepth) continue;
-                try {
-                  const re = new RegExp(script.findRegex as string, script.flags as string);
-                  text = text.replace(re, script.replaceString as string);
-                  const trims: string[] = (() => {
-                    try {
-                      return JSON.parse(script.trimStrings as string);
-                    } catch {
-                      return [];
-                    }
-                  })();
-                  for (const t of trims) {
-                    if (t) text = text.split(t).join("");
-                  }
-                } catch {
-                  /* invalid regex — skip */
-                }
-              }
-              msg.content = text;
-            }
           }
 
           const [sections, groups, choiceBlocks] = await Promise.all([
@@ -1027,6 +1145,20 @@ export async function chatsRoutes(app: FastifyInstance) {
             chatId: req.params.id,
           });
           const resolvePromptMacros = (value: string) => resolveMacros(value, promptMacroContext);
+          // Apply regex scripts to prompt context (mirrors generate.routes.ts).
+          const regexStore = createRegexScriptsStorage(app.db);
+          applyRegexScriptsToPromptMessages(mappedMessages, await regexStore.list(), {
+            resolveMacros: (value) => resolveMacros(value, promptMacroContext, { trimResult: false }),
+          });
+          promptMacroContext.lastInput = [...mappedMessages]
+            .reverse()
+            .find((message) => message.role === "user")?.content;
+          const entryStateOverrides = resolveEntryStateOverrides(chatMeta.entryStateOverrides);
+          const chatMode = (chat.mode as string) ?? "roleplay";
+          const lorebookScopeExclusions = resolveGameLorebookScopeExclusions(chatMode, chatMeta);
+          const promptActiveAgentIds = Array.isArray(chatMeta.activeAgentIds)
+            ? (chatMeta.activeAgentIds as string[])
+            : [];
 
           const assembled = await assemblePrompt({
             db: app.db,
@@ -1045,10 +1177,38 @@ export async function chatsRoutes(app: FastifyInstance) {
             chatMessages: mappedMessages,
             chatSummary: (chatMeta.summary as string) ?? null,
             enableAgents: chatMeta.enableAgents === true,
-            activeAgentIds: Array.isArray(chatMeta.activeAgentIds) ? (chatMeta.activeAgentIds as string[]) : [],
+            activeAgentIds: filterGameInternalAgentIds(chatMode, promptActiveAgentIds),
             activeLorebookIds: Array.isArray(chatMeta.activeLorebookIds)
               ? (chatMeta.activeLorebookIds as string[])
               : [],
+            excludedLorebookIds: lorebookScopeExclusions.excludedLorebookIds,
+            excludedLorebookSourceAgentIds: lorebookScopeExclusions.excludedSourceAgentIds,
+            entryStateOverrides:
+              (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) &&
+              typeof (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) === "object"
+                ? ((chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) as Record<
+                    string,
+                    { ephemeral?: number | null; enabled?: boolean }
+                  >)
+                : undefined,
+            entryTimingStates:
+              (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) &&
+              typeof (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) === "object"
+                ? ((chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) as Record<
+                    string,
+                    LorebookEntryTimingState
+                  >)
+                : undefined,
+            generationTriggers:
+              (chatMeta.generationTriggers ?? chatMeta.lorebookGenerationTriggers) &&
+              Array.isArray(chatMeta.generationTriggers ?? chatMeta.lorebookGenerationTriggers)
+                ? ((chatMeta.generationTriggers ?? chatMeta.lorebookGenerationTriggers) as string[])
+                : undefined,
+            lorebookTokenBudget:
+              typeof (chatMeta.lorebookTokenBudget ?? chatMeta.generationLorebookTokenBudget) === "number"
+                ? ((chatMeta.lorebookTokenBudget ?? chatMeta.generationLorebookTokenBudget) as number)
+                : undefined,
+            previewOnly: true,
             groupScenarioOverrideText:
               typeof chatMeta.groupScenarioText === "string" && (chatMeta.groupScenarioText as string).trim()
                 ? (chatMeta.groupScenarioText as string).trim()
@@ -1057,7 +1217,6 @@ export async function chatsRoutes(app: FastifyInstance) {
 
           // ── Strip <speaker> tags from chat history to save tokens (roleplay only) ──
           const isGroupChat = characterIds.length > 1;
-          const chatMode = (chat.mode as string) ?? "roleplay";
           if (isGroupChat && chatMode !== "conversation") {
             const speakerCloseRegex = /<\/speaker>/g;
             for (let i = 0; i < assembled.messages.length; i++) {
@@ -1180,7 +1339,7 @@ export async function chatsRoutes(app: FastifyInstance) {
             if (!charRow) continue;
             const charData = JSON.parse(charRow.data as string);
             const charName = charData.name ?? "Unknown";
-            const charDesc = charData.description ?? "";
+            const charDesc = getCharacterDescriptionWithExtensions(charData);
             const xmlTag = nameToXmlTag(charName);
             const hasCharInfo =
               (charDesc && allContent.includes(charDesc.split("\n")[0]!.trim().slice(0, 80))) ||
@@ -1194,7 +1353,7 @@ export async function chatsRoutes(app: FastifyInstance) {
                 ...promptMacroContext,
                 char: charName,
                 characterFields: {
-                  description: charData.description ?? "",
+                  description: charDesc,
                   personality: charData.personality ?? "",
                   scenario: charData.scenario ?? "",
                   backstory: charData.extensions?.backstory ?? "",
@@ -1295,7 +1454,7 @@ export async function chatsRoutes(app: FastifyInstance) {
             impersonateBlockAgents: false,
           });
           if (chatEnableAgents && activeAgentIds.length > 0) {
-            const snap = await loadLatestChatGameSnapshot(app, req.params.id);
+            const snap = await loadLatestChatGameSnapshot(app, req.params.id, visibleGameStateAnchor);
             const contextBlock = snap
               ? formatPeekTrackerContextBlock({ wrapFormat, snap, chatMeta, activeAgentIds })
               : null;
@@ -1713,6 +1872,8 @@ export async function chatsRoutes(app: FastifyInstance) {
         const providerDef = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
         baseUrl = providerDef?.defaultBaseUrl ?? "";
       }
+      if (!baseUrl && conn.provider === "claude_subscription") baseUrl = "claude-agent-sdk://local";
+      if (!baseUrl && conn.provider === "openai_chatgpt") baseUrl = "openai-chatgpt://codex-auth";
       if (!baseUrl) return reply.status(400).send({ error: "No base URL for this connection" });
 
       provider = createLLMProvider(

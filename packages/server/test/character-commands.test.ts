@@ -53,6 +53,68 @@ test("parses update_character with the expanded safe text fields", () => {
   ]);
 });
 
+test("parses assistant update text fields with escaped quotes and newlines", () => {
+  const { commands, cleanContent } = parseCharacterCommands(
+    `[update_character: name="Luna", description="She goes by \\"The Bread Witch\\" and everyone knows it.", scenario="First paragraph\\n\\nSecond paragraph"]` +
+      `[update_persona: name="Alex Storm", description="Known as \\"The Anchor\\"", backstory="Line one\\nLine two"]`,
+  );
+
+  assert.equal(cleanContent, "");
+  assert.deepEqual(commands, [
+    {
+      type: "update_character",
+      name: "Luna",
+      description: 'She goes by "The Bread Witch" and everyone knows it.',
+      scenario: "First paragraph\n\nSecond paragraph",
+    },
+    {
+      type: "update_persona",
+      name: "Alex Storm",
+      description: 'Known as "The Anchor"',
+      backstory: "Line one\nLine two",
+    },
+  ]);
+});
+
+test("parses assistant update fields delimited by smart quotes", () => {
+  const { commands, cleanContent } = parseCharacterCommands(
+    `[update_character: name=“Luna”, description=“She says ‘hi’ — then writes alternate greetings.”, alternate_greetings=““Hello” — warm || ‘Goodnight’ — soft”]`,
+  );
+
+  assert.equal(cleanContent, "");
+  assert.deepEqual(commands, [
+    {
+      type: "update_character",
+      name: "Luna",
+      description: "She says ‘hi’ — then writes alternate greetings.",
+      alternateGreetings: ["“Hello” — warm", "‘Goodnight’ — soft"],
+    },
+  ]);
+});
+
+test("keeps adjacent assistant command parsing stable with escaped characters", () => {
+  const { commands } = parseCharacterCommands(
+    `[create_character: name="Luna", first_message="She said \\"hello\\". Path C:\\\\Moon", tags="mystic, seer", alternate_greetings="Hi || Hello"]` +
+      `[update_character: name="Luna", system_prompt="", depth_prompt_role="system"]`,
+  );
+
+  assert.deepEqual(commands, [
+    {
+      type: "create_character",
+      name: "Luna",
+      firstMessage: 'She said "hello". Path C:\\Moon',
+      tags: ["mystic", "seer"],
+      alternateGreetings: ["Hi", "Hello"],
+    },
+    {
+      type: "update_character",
+      name: "Luna",
+      systemPrompt: "",
+      depthPromptRole: "system",
+    },
+  ]);
+});
+
 test("parses update_persona with scenario and backstory", () => {
   const { commands, cleanContent } = parseCharacterCommands(
     `[update_persona: name="Alex Storm", scenario="Urban fantasy city", backstory="Former detective"]`,
@@ -91,6 +153,48 @@ test("parses create_lorebook JSON block and strips it from visible text", () => 
           secondaryKeys: undefined,
           tag: "faction",
           constant: false,
+          selective: undefined,
+        },
+      ],
+    },
+  ]);
+});
+
+test("parses update_lorebook JSON block and strips it from visible text", () => {
+  const { commands, cleanContent } = parseCharacterCommands(
+    `I'll refine that lorebook.\n<update_lorebook>{"name":"Arcadia World Lore","description":"","tags":["fantasy","revised"],"entries":[{"matchName":"Silver Court","name":"Silver Court","content":"The Silver Court rules the northern border through old pacts.","keys":["Silver Court","northern border"],"tag":"faction","constant":true},{"name":"Moon Gate","content":"The Moon Gate opens only during eclipses.","keys":["Moon Gate"]}]}</update_lorebook>`,
+  );
+
+  assert.equal(cleanContent, "I'll refine that lorebook.");
+  assert.deepEqual(commands, [
+    {
+      type: "update_lorebook",
+      name: "Arcadia World Lore",
+      newName: undefined,
+      description: "",
+      category: undefined,
+      tags: ["fantasy", "revised"],
+      entries: [
+        {
+          name: "Silver Court",
+          matchName: "Silver Court",
+          content: "The Silver Court rules the northern border through old pacts.",
+          description: undefined,
+          keys: ["Silver Court", "northern border"],
+          secondaryKeys: undefined,
+          tag: "faction",
+          constant: true,
+          selective: undefined,
+        },
+        {
+          name: "Moon Gate",
+          matchName: undefined,
+          content: "The Moon Gate opens only during eclipses.",
+          description: undefined,
+          keys: ["Moon Gate"],
+          secondaryKeys: undefined,
+          tag: undefined,
+          constant: undefined,
           selective: undefined,
         },
       ],

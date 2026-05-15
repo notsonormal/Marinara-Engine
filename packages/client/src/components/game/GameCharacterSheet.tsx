@@ -18,7 +18,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { cn, getAvatarCropStyle } from "../../lib/utils";
+import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
 
 export interface GameCharacterSheetGameCard {
   shortDescription: string;
@@ -40,7 +40,7 @@ export interface CharacterSheetCard {
   status?: string;
   level?: number;
   avatarUrl?: string | null;
-  avatarCrop?: { zoom: number; offsetX: number; offsetY: number } | null;
+  avatarCrop?: AvatarCropValue | null;
   stats?: Array<{ name: string; value: number; max?: number; color?: string }>;
   inventory?: Array<{ name: string; quantity?: number; location?: string }>;
   customFields?: Record<string, string>;
@@ -78,6 +78,12 @@ const DEFAULT_ATTRIBUTES = [
   { name: "WIS", value: 10 },
   { name: "CHA", value: 10 },
 ];
+
+// Mirrors server's attributeModifier in skill-check.service.ts: floor((score - 10) / 2).
+function formatAttributeModifier(score: number): string {
+  const mod = Math.floor((score - 10) / 2);
+  return mod >= 0 ? `+${mod}` : `${mod}`;
+}
 
 const FIELD_LABEL_CLASS = "text-[0.6875rem] font-semibold uppercase tracking-wider text-[var(--muted-foreground)]";
 const TEXT_INPUT_CLASS =
@@ -440,7 +446,7 @@ export function GameCharacterSheet({
         <div className="relative border-b border-[var(--border)] bg-[var(--secondary)]/50 px-5 py-4">
           <div className="flex items-center gap-4">
             {card.avatarUrl ? (
-              <span className="block h-20 w-20 overflow-hidden rounded-xl border-2 border-[var(--border)] shadow-xl">
+              <span className="relative block h-20 w-20 overflow-hidden rounded-xl border-2 border-[var(--border)] shadow-xl">
                 <img
                   src={card.avatarUrl}
                   alt={card.title}
@@ -790,6 +796,9 @@ export function GameCharacterSheet({
                         {attr.name}
                       </span>
                       <span className="text-lg font-bold leading-tight text-[var(--foreground)]">{attr.value}</span>
+                      <span className="text-[0.625rem] font-mono leading-none text-[var(--muted-foreground)]">
+                        {formatAttributeModifier(attr.value)}
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -931,8 +940,10 @@ export function GameCharacterSheet({
                     key={`${item.name}-${item.location ?? "bag"}`}
                     className="flex items-center justify-between rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs"
                   >
-                    <div className="flex items-center gap-2">
-                      <span className="text-[var(--foreground)]/80">{item.name}</span>
+                    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                      <span className="min-w-0 whitespace-normal break-words text-[var(--foreground)]/80 [overflow-wrap:anywhere]">
+                        {item.name}
+                      </span>
                       {item.location && (
                         <span className="rounded bg-[var(--primary)]/10 px-1.5 py-0.5 text-[0.5625rem] text-[var(--muted-foreground)]">
                           {item.location}

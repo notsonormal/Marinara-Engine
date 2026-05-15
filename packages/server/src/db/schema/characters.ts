@@ -44,6 +44,8 @@ export const personas = sqliteTable("personas", {
   backstory: text("backstory").notNull().default(""),
   appearance: text("appearance").notNull().default(""),
   avatarPath: text("avatar_path"),
+  /** Avatar zoom/position settings (JSON of { zoom, offsetX, offsetY, fullImage? }). Empty string = unset. */
+  avatarCrop: text("avatar_crop").notNull().default(""),
   isActive: text("is_active").notNull().default("false"),
   /** Name display color/gradient (CSS value) */
   nameColor: text("name_color").notNull().default(""),
@@ -57,6 +59,8 @@ export const personas = sqliteTable("personas", {
   altDescriptions: text("alt_descriptions").notNull().default("[]"),
   /** Tags for organizing personas (JSON array of strings) */
   tags: text("tags").notNull().default("[]"),
+  /** Saved Conversation mode activity/status text options (JSON array of strings) */
+  savedStatusOptions: text("saved_status_options").notNull().default("[]"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });

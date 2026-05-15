@@ -19,12 +19,15 @@ import { logger } from "../../lib/logger.js";
 export interface ResolvedAgent extends AgentExecConfig {
   provider: BaseLLMProvider;
   model: string;
+  /** Maximum number of same-connection agent LLM jobs that may run in parallel. */
+  maxParallelJobs?: number;
   /** Optional tool context for agents that need function calling (e.g., Spotify). */
   toolContext?: AgentToolContext;
 }
 
 export interface AgentInjection {
   agentType: string;
+  agentName?: string;
   text: string;
 }
 
@@ -38,7 +41,14 @@ export type AgentResultCallback = (result: AgentResult) => void;
 interface AgentGroup {
   provider: BaseLLMProvider;
   model: string;
+  maxParallelJobs: number;
   agents: ResolvedAgent[];
+}
+
+export function normalizeAgentMaxParallelJobs(value: unknown): number {
+  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(numeric) || numeric < 1) return 1;
+  return Math.max(1, Math.min(16, Math.trunc(numeric)));
 }
 
 /**
@@ -54,13 +64,39 @@ function groupByProviderModel(agents: ResolvedAgent[]): AgentGroup[] {
     const key = `${providerKey(agent.provider)}::${agent.model}`;
     let group = groups.get(key);
     if (!group) {
-      group = { provider: agent.provider, model: agent.model, agents: [] };
+      group = {
+        provider: agent.provider,
+        model: agent.model,
+        maxParallelJobs: normalizeAgentMaxParallelJobs(agent.maxParallelJobs),
+        agents: [],
+      };
       groups.set(key, group);
+    } else {
+      group.maxParallelJobs = Math.max(group.maxParallelJobs, normalizeAgentMaxParallelJobs(agent.maxParallelJobs));
     }
     group.agents.push(agent);
   }
 
   return Array.from(groups.values());
+}
+
+function splitGroupForParallelJobs(group: AgentGroup): AgentGroup[] {
+  const jobCount = Math.min(normalizeAgentMaxParallelJobs(group.maxParallelJobs), group.agents.length);
+  if (jobCount <= 1) return [group];
+
+  const chunks = Array.from({ length: jobCount }, () => [] as ResolvedAgent[]);
+  for (let index = 0; index < group.agents.length; index++) {
+    chunks[index % jobCount]!.push(group.agents[index]!);
+  }
+
+  return chunks
+    .filter((agents) => agents.length > 0)
+    .map((agents) => ({
+      provider: group.provider,
+      model: group.model,
+      maxParallelJobs: group.maxParallelJobs,
+      agents,
+    }));
 }
 
 // Simple provider identity via a WeakMap-backed counter
@@ -137,10 +173,10 @@ async function executePhase(
   const phaseAgents = agents.filter((a) => a.phase === phase);
   if (phaseAgents.length === 0) return [];
 
-  const groups = groupByProviderModel(phaseAgents);
+  const groups = groupByProviderModel(phaseAgents).flatMap(splitGroupForParallelJobs);
 
   logger.debug(
-    '[agent-pipeline] Phase "%s": %d agents → %d group(s) %j',
+    '[agent-pipeline] Phase "%s": %d agents → %d job group(s) %j',
     phase,
     phaseAgents.length,
     groups.length,
@@ -220,7 +256,8 @@ export async function runPreGenerationAgents(
     // prose-guardian & director produce text to inject
     if (result.type === "context_injection" || result.type === "director_event") {
       const text = typeof result.data === "string" ? result.data : ((result.data as any)?.text ?? "");
-      if (text) injections.push({ agentType: result.agentType, text });
+      const agentName = agents.find((agent) => agent.type === result.agentType)?.name;
+      if (text) injections.push({ agentType: result.agentType, agentName, text });
     }
     // prompt_review is informational — the onResult callback streams it
   }

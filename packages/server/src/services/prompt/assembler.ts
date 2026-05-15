@@ -13,6 +13,7 @@ import type {
   MarkerConfig,
   WrapFormat,
   GenerationParameters,
+  LorebookEntryTimingState,
 } from "@marinara-engine/shared";
 import { resolveMacros } from "@marinara-engine/shared";
 import type { MacroContext } from "@marinara-engine/shared";
@@ -20,7 +21,11 @@ import { wrapContent, wrapGroup } from "./format-engine.js";
 import { expandMarker, type MarkerContext } from "./marker-expander.js";
 import { mergeAdjacentMessages, squashLeadingSystemMessages } from "./merger.js";
 import { injectAtDepth } from "../lorebook/prompt-injector.js";
-import { buildPromptMacroContext, collectCharacterDepthPromptEntries } from "./macro-context.js";
+import {
+  buildPromptMacroContext,
+  collectCharacterDepthPromptEntries,
+  resolveMacrosWithVariableSnapshot,
+} from "./macro-context.js";
 
 // ═══════════════════════════════════════════════
 //  Public Interface
@@ -97,6 +102,8 @@ export interface AssemblerInput {
   personaStats?: any;
   /** Chat messages from the DB (user + assistant + narrator etc.) */
   chatMessages: ChatMLMessage[];
+  /** Optional scan-only messages for lorebook matching. Keeps synthetic guidance out of chat history. */
+  lorebookScanMessages?: ChatMLMessage[];
   /** Current chat summary text (if any) */
   chatSummary?: string | null;
   /** Whether agents are enabled for this chat */
@@ -105,12 +112,26 @@ export interface AssemblerInput {
   activeAgentIds?: string[];
   /** Per-chat list of manually activated lorebook IDs from chat settings */
   activeLorebookIds?: string[];
+  /** Lorebook IDs that should be excluded even if otherwise scoped to the chat. */
+  excludedLorebookIds?: string[];
+  /** Source agent IDs whose generated lorebooks should be excluded from scanning. */
+  excludedLorebookSourceAgentIds?: string[];
+  /** When true, lorebook markers expand to empty content without scanning global or scoped lorebooks. */
+  disableLorebooks?: boolean;
   /** Pre-computed embedding of chat context for semantic lorebook matching. */
   chatEmbedding?: number[] | null;
   /** Per-chat ephemeral state overrides for lorebook entries (from chat metadata). */
   entryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
+  /** Per-chat sticky/cooldown/delay timing state for lorebook entries. */
+  entryTimingStates?: Record<string, LorebookEntryTimingState>;
+  /** Global lorebook token budget for this chat/generation. */
+  lorebookTokenBudget?: number;
+  /** Current game state for lorebook conditions and schedules. */
+  gameState?: Record<string, unknown> | null;
   /** Generation trigger labels used by per-entry lorebook include/exclude filters. */
   generationTriggers?: string[];
+  /** Preview/debug assembly: lorebook markers should not consume timing or ephemeral state. */
+  previewOnly?: boolean;
   /** When set, replaces individual character scenario fields with this group scenario. */
   groupScenarioOverrideText?: string | null;
 }
@@ -125,6 +146,8 @@ export interface AssemblerOutput {
   lorebookDepthEntriesCount: number;
   /** Updated per-chat entry state overrides after ephemeral processing. Caller should persist to chat metadata. */
   updatedEntryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
+  /** Updated per-chat sticky/cooldown/delay timing state. Caller should persist to chat metadata. */
+  updatedEntryTimingStates?: Record<string, LorebookEntryTimingState>;
 }
 
 // ═══════════════════════════════════════════════
@@ -212,14 +235,23 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     personaFields: input.personaFields,
     personaStats: input.personaStats,
     chatMessages: input.chatMessages,
+    lorebookScanMessages: input.lorebookScanMessages,
     chatSummary: input.chatSummary ?? null,
     wrapFormat,
     enableAgents: input.enableAgents ?? true,
     activeAgentIds: input.activeAgentIds ?? [],
     activeLorebookIds: input.activeLorebookIds ?? [],
+    excludedLorebookIds: input.excludedLorebookIds ?? [],
+    excludedLorebookSourceAgentIds: input.excludedLorebookSourceAgentIds ?? [],
+    disableLorebooks: input.disableLorebooks === true,
     chatEmbedding: input.chatEmbedding ?? null,
     entryStateOverrides: input.entryStateOverrides,
+    entryTimingStates: input.entryTimingStates,
+    lorebookTokenBudget: input.lorebookTokenBudget,
+    gameState: input.gameState ?? null,
     generationTriggers: input.generationTriggers ?? ["chat"],
+    previewOnly: input.previewOnly === true,
+    resolveLorebookContent: (value) => resolveMacrosWithVariableSnapshot(value, macroCtx),
     groupScenarioOverrideText: input.groupScenarioOverrideText ?? null,
   };
 
@@ -307,7 +339,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
         messages.push(...section.messages);
         chatHistoryEndIdx = messages.length;
       } else {
-        messages.push(...section.messages);
+        messages.push(...section.messages.map((message) => ({ ...message, contextKind: "prompt" as const })));
       }
     }
   }
@@ -323,10 +355,11 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
         messages[firstSystemIdx] = {
           ...messages[firstSystemIdx]!,
           content: `${messages[firstSystemIdx]!.content}\n\n${wrapped}`,
+          contextKind: "prompt",
         };
       } else {
         // No system message at all — prepend one
-        messages.unshift({ role: "system", content: wrapped });
+        messages.unshift({ role: "system", content: wrapped, contextKind: "prompt" });
       }
     }
   }
@@ -358,12 +391,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
   }
 
   if (markerCtx.lorebookDepthEntries && markerCtx.lorebookDepthEntries.length > 0) {
-    allDepthEntries.push(
-      markerCtx.lorebookDepthEntries.map((entry) => ({
-        ...entry,
-        content: resolveMacros(entry.content, macroCtx),
-      })),
-    );
+    allDepthEntries.push(markerCtx.lorebookDepthEntries);
   }
 
   const characterDepthEntries = await collectCharacterDepthPromptEntries(input.db, input.characterIds, macroCtx);
@@ -409,6 +437,9 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     ...(markerCtx.updatedEntryStateOverrides
       ? { updatedEntryStateOverrides: markerCtx.updatedEntryStateOverrides }
       : {}),
+    ...(markerCtx.updatedEntryTimingStates !== undefined
+      ? { updatedEntryTimingStates: markerCtx.updatedEntryTimingStates }
+      : {}),
   };
 }
 
@@ -442,6 +473,7 @@ async function resolveSection(
   const role = section.role as "system" | "user" | "assistant";
 
   let content = section.content;
+  let contentMacrosResolved = false;
 
   // Handle marker sections
   if (section.isMarker === "true" && section.markerConfig) {
@@ -475,12 +507,16 @@ async function resolveSection(
     } else {
       // Other markers return content to be wrapped
       content = expanded.content;
+      contentMacrosResolved =
+        markerConfig.type === "world_info_before" ||
+        markerConfig.type === "world_info_after" ||
+        markerConfig.type === "lorebook";
       if (!content.trim()) return null;
     }
   }
 
   // Resolve macros
-  content = resolveMacros(content, ctx.macroCtx);
+  content = contentMacrosResolved ? content : resolveMacros(content, ctx.macroCtx);
   if (!content.trim()) return null;
 
   // Auto-wrap in the preset's format
@@ -490,7 +526,7 @@ async function resolveSection(
     id: section.id,
     groupId: section.groupId,
     role,
-    messages: [{ role, content: wrapped || content }],
+    messages: [{ role, content: wrapped || content, contextKind: "prompt" }],
     depth: section.injectionDepth,
   };
 }
@@ -517,7 +553,7 @@ function buildGroupMessages(
     const role = sections[0]!.role;
     const innerContent = sections.flatMap((s) => s.messages.map((m) => m.content)).join("\n\n");
     const wrapped = wrapGroup(innerContent, group.name, wrapFormat);
-    return [{ role, content: wrapped || innerContent }];
+    return [{ role, content: wrapped || innerContent, contextKind: "prompt" }];
   }
 
   // Mixed roles — group consecutive same-role sections and wrap each group
@@ -532,6 +568,7 @@ function buildGroupMessages(
       result.push({
         role: currentRole as "system" | "user" | "assistant",
         content: combined,
+        contextKind: "prompt",
       });
     }
     currentParts = [];

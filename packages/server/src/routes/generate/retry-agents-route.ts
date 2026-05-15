@@ -2,18 +2,24 @@ import type { FastifyInstance } from "fastify";
 import { logger } from "../../lib/logger.js";
 import {
   BUILT_IN_AGENTS,
+  BUILT_IN_TOOLS,
+  DEFAULT_AGENT_TOOLS,
   getDefaultBuiltInAgentSettings,
   type AgentContext,
   type AgentResult,
+  type GameMap,
 } from "@marinara-engine/shared";
 import { eq } from "drizzle-orm";
-import { listCharacterSprites } from "../../services/game/sprite.service.js";
+import { buildSpriteExpressionChoices, listCharacterSprites } from "../../services/game/sprite.service.js";
 import { DATA_DIR } from "../../utils/data-dir.js";
-import type { ResolvedAgent } from "../../services/agents/agent-pipeline.js";
+import { normalizeAgentMaxParallelJobs, type ResolvedAgent } from "../../services/agents/agent-pipeline.js";
 import { executeAgent, executeAgentBatch, normalizeAgentContextSize } from "../../services/agents/agent-executor.js";
+import type { LLMToolDefinition } from "../../services/llm/base-provider.js";
 import { getLocalSidecarProvider, LOCAL_SIDECAR_MODEL } from "../../services/llm/local-sidecar.js";
 import { createLLMProvider } from "../../services/llm/provider-registry.js";
 import { sidecarModelService } from "../../services/sidecar/sidecar-model.service.js";
+import { resolveSpotifyCredentials } from "../../services/spotify/spotify.service.js";
+import { getAssetManifest } from "../../services/game/asset-manifest.service.js";
 import { createAgentsStorage } from "../../services/storage/agents.storage.js";
 import { createCharactersStorage } from "../../services/storage/characters.storage.js";
 import { createChatsStorage } from "../../services/storage/chats.storage.js";
@@ -24,7 +30,14 @@ import { createGameStateStorage } from "../../services/storage/game-state.storag
 import { createLorebooksStorage } from "../../services/storage/lorebooks.storage.js";
 import { syncGameMapMetaPartyPosition } from "../../services/game/map-position.service.js";
 import { gameStateSnapshots as gameStateSnapshotsTable } from "../../db/schema/index.js";
-import { isMessageHiddenFromAI, parseExtra, parseGameStateRow, resolveBaseUrl } from "./generate-route-utils.js";
+import {
+  isMessageHiddenFromAI,
+  parseExtra,
+  parseGameStateRow,
+  preserveTrackerCharacterUiFields,
+  resolveBaseUrl,
+  resolveVisibleGameStateAnchor,
+} from "./generate-route-utils.js";
 import {
   buildHistoricalLorebookKeeperContext,
   getLorebookKeeperBackfillTargets,
@@ -33,10 +46,13 @@ import {
   persistLorebookKeeperUpdates,
   resolveLorebookKeeperTarget,
 } from "./lorebook-keeper-utils.js";
+import { filterGameInternalAgentIds } from "../../services/lorebook/game-lorebook-scope.js";
 import { sendSseEvent, startSseReply } from "./sse.js";
 import {
+  buildDefaultAgentConnectionWarning,
   buildLocalSidecarUnavailableWarning,
   isLocalSidecarConnectionId,
+  resolveAgentConnectionId,
   type AgentConnectionWarning,
 } from "./agent-connection-guards.js";
 import { validateSpriteExpressionEntries } from "./expression-agent-utils.js";
@@ -45,7 +61,7 @@ import {
   normalizeSecretPlotSceneDirections,
   normalizeStringArray,
 } from "./agent-normalizers.js";
-import type { GameMap } from "@marinara-engine/shared";
+import { executeToolCalls, type MetadataPatchInput } from "../../services/tools/tool-executor.js";
 
 type PersonaContext = {
   personaId: string | null;
@@ -72,6 +88,19 @@ type ResolvedRetryAgents = {
 
 function parseJsonIfString<T>(value: T | string): T {
   return (typeof value === "string" ? JSON.parse(value) : value) as T;
+}
+
+function parseSettingsRecord(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+  return typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
 async function resolvePersonaContext(
@@ -242,25 +271,27 @@ async function buildRetryAgentContext(args: {
     memory: {},
   };
 
-  const lorebookKeeperSettings = getLorebookKeeperSettings(chatMeta);
-  const { writableLorebookIds, targetLorebookId, targetLorebookName } = await resolveLorebookKeeperTarget({
-    lorebooksStore,
-    chatId,
-    characterIds,
-    personaId: personaContext.personaId,
-    activeLorebookIds,
-    preferredTargetLorebookId: lorebookKeeperSettings.targetLorebookId,
-  });
-  agentContext.writableLorebookIds = writableLorebookIds;
-  if (targetLorebookId) {
-    agentContext.memory._lorebookKeeperTargetLorebookId = targetLorebookId;
-  }
-  if (targetLorebookName) {
-    agentContext.memory._lorebookKeeperTargetLorebookName = targetLorebookName;
-  }
-  const existingEntries = await loadLorebookKeeperExistingEntries(lorebooksStore, targetLorebookId);
-  if (existingEntries.length > 0) {
-    agentContext.memory._existingLorebookEntries = existingEntries;
+  if (resolvedAgentTypes.has("lorebook-keeper")) {
+    const lorebookKeeperSettings = getLorebookKeeperSettings(chatMeta);
+    const { writableLorebookIds, targetLorebookId, targetLorebookName } = await resolveLorebookKeeperTarget({
+      lorebooksStore,
+      chatId,
+      characterIds,
+      personaId: personaContext.personaId,
+      activeLorebookIds,
+      preferredTargetLorebookId: lorebookKeeperSettings.targetLorebookId,
+    });
+    agentContext.writableLorebookIds = writableLorebookIds;
+    if (targetLorebookId) {
+      agentContext.memory._lorebookKeeperTargetLorebookId = targetLorebookId;
+    }
+    if (targetLorebookName) {
+      agentContext.memory._lorebookKeeperTargetLorebookName = targetLorebookName;
+    }
+    const existingEntries = await loadLorebookKeeperExistingEntries(lorebooksStore, targetLorebookId);
+    if (existingEntries.length > 0) {
+      agentContext.memory._existingLorebookEntries = existingEntries;
+    }
   }
 
   if (historicalGameStateAnchor) {
@@ -275,7 +306,11 @@ async function buildRetryAgentContext(args: {
       agentContext.gameState = null;
     }
   } else if (useLatestGameStateFallback) {
-    const latestGS = await gameStateStore.getLatestCommitted(chatId);
+    const visibleAnchor = lastAssistant ? resolveVisibleGameStateAnchor([lastAssistant]) : null;
+    const latestGS = await gameStateStore.getForGeneration(chatId, {
+      preferLatestVisible: true,
+      visibleAnchor,
+    });
     if (latestGS) {
       agentContext.gameState = parseGameStateRow(latestGS as Record<string, unknown>);
     }
@@ -294,11 +329,21 @@ async function buildRetryAgentContext(args: {
   // If the expression agent is being retried, load available sprite expressions per character
   if (resolvedAgentTypes.has("expression")) {
     try {
-      const perChar: Array<{ characterId: string; characterName: string; expressions: string[] }> = [];
+      const perChar: Array<{
+        characterId: string;
+        characterName: string;
+        expressions: string[];
+        expressionChoices: string[];
+      }> = [];
       for (const char of agentContext.characters) {
         const sprites = listCharacterSprites(char.id);
         if (sprites && sprites.expressions.length > 0) {
-          perChar.push({ characterId: char.id, characterName: char.name, expressions: sprites.expressions });
+          perChar.push({
+            characterId: char.id,
+            characterName: char.name,
+            expressions: sprites.expressions,
+            expressionChoices: buildSpriteExpressionChoices(sprites.expressions),
+          });
         }
       }
       if (perChar.length > 0) {
@@ -314,6 +359,12 @@ async function buildRetryAgentContext(args: {
     try {
       const { readdirSync, readFileSync, existsSync } = await import("fs");
       const { join, extname } = await import("path");
+      const availableBackgrounds: Array<{
+        filename: string;
+        originalName?: string | null;
+        tags: string[];
+        source?: "user" | "game_asset";
+      }> = [];
       const bgDir = join(DATA_DIR, "backgrounds");
       if (existsSync(bgDir)) {
         const exts = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"]);
@@ -327,15 +378,46 @@ async function buildRetryAgentContext(args: {
             /* */
           }
         }
-        agentContext.memory._availableBackgrounds = files.map((f: string) => ({
-          filename: f,
-          originalName: meta[f]?.originalName ?? null,
-          tags: meta[f]?.tags ?? [],
-        }));
-        agentContext.memory._currentBackground = chatMeta.background ?? null;
+        availableBackgrounds.push(
+          ...files.map((f: string) => ({
+            filename: f,
+            originalName: meta[f]?.originalName ?? null,
+            tags: meta[f]?.tags ?? [],
+            source: "user" as const,
+          })),
+        );
       }
+      availableBackgrounds.push(
+        ...(getAssetManifest().byCategory.backgrounds ?? [])
+          .filter((entry) => !entry.path.startsWith("__user_bg__/"))
+          .map((entry) => ({
+            filename: `gameAsset:${entry.path}`,
+            originalName: entry.tag,
+            tags: entry.subcategory ? [entry.subcategory] : [],
+            source: "game_asset" as const,
+          })),
+      );
+      agentContext.memory._availableBackgrounds = availableBackgrounds;
+      agentContext.memory._currentBackground = chatMeta.background ?? null;
     } catch (err) {
       logger.warn(err, "[retry-agents] Failed to load available backgrounds for retry");
+    }
+  }
+
+  if (resolvedAgentTypes.has("spotify") && ((chat as any).mode ?? "conversation") === "game") {
+    const sourceType = typeof chatMeta.gameSpotifySourceType === "string" ? chatMeta.gameSpotifySourceType : "liked";
+    if (chatMeta.gameUseSpotifyMusic === true) {
+      agentContext.memory._spotifyDjConstraints = {
+        mode: "game",
+        replaceBuiltInMusic: true,
+        manualRetry: true,
+        forceFreshPick: true,
+        sourceType,
+        playlistId: typeof chatMeta.gameSpotifyPlaylistId === "string" ? chatMeta.gameSpotifyPlaylistId : null,
+        playlistName: typeof chatMeta.gameSpotifyPlaylistName === "string" ? chatMeta.gameSpotifyPlaylistName : null,
+        artist: typeof chatMeta.gameSpotifyArtist === "string" ? chatMeta.gameSpotifyArtist : null,
+        note: "This is a manual Spotify DJ retry from game mode. Pick a fresh fitting track now and call spotify_play unless Spotify playback is unavailable; do not keep the current track merely because it still fits.",
+      };
     }
   }
 
@@ -349,7 +431,7 @@ async function resolveRetryAgents(args: {
   agentsStore: ReturnType<typeof createAgentsStorage>;
 }): Promise<ResolvedRetryAgents> {
   const { agentTypes, chat, conns, agentsStore } = args;
-  const agentTypeSet = new Set(agentTypes);
+  const agentTypeSet = new Set(filterGameInternalAgentIds((chat as any).mode, agentTypes));
   const configs = await agentsStore.list();
   const enabledConfigs = configs.filter((config: any) => agentTypeSet.has(config.type));
   const resolvedTypeSet = new Set(enabledConfigs.map((config: any) => config.type));
@@ -385,28 +467,63 @@ async function resolveRetryAgents(args: {
     conn.openrouterProvider,
     conn.maxTokensOverride,
   );
+  const chatConnectionMaxParallelJobs = Number(conn.maxParallelJobs) || 1;
   const resolvedAgents: ResolvedRetryAgent[] = [];
   const skippedLocalSidecarAgents: string[] = [];
+  const defaultAgentConnectionAgents: string[] = [];
+  const defaultAgentConn = await conns.getDefaultForAgents();
+  const defaultAgentConnection = defaultAgentConn
+    ? (() => {
+        const baseUrl = resolveBaseUrl(defaultAgentConn);
+        if (!baseUrl) return null;
+        return {
+          connectionId: defaultAgentConn.id as string,
+          provider: createLLMProvider(
+            defaultAgentConn.provider,
+            baseUrl,
+            defaultAgentConn.apiKey,
+            defaultAgentConn.maxContext,
+            defaultAgentConn.openrouterProvider,
+            defaultAgentConn.maxTokensOverride,
+          ),
+          model: defaultAgentConn.model,
+          maxParallelJobs: Number(defaultAgentConn.maxParallelJobs) || 1,
+        };
+      })()
+    : null;
   const localSidecarAvailableForTrackers =
     sidecarModelService.getConfig().useForTrackers && sidecarModelService.getConfiguredModelRef() !== null;
 
   for (const cfg of enabledConfigs) {
     let agentProvider = provider;
     let agentModel = conn.model;
+    let agentMaxParallelJobs = chatConnectionMaxParallelJobs;
+    const effectiveConnectionId = resolveAgentConnectionId({
+      requestedConnectionId: cfg.connectionId as string | null,
+      defaultAgentConnectionId: defaultAgentConn?.id ?? null,
+      localSidecarAvailable: localSidecarAvailableForTrackers,
+    });
 
-    if (cfg.connectionId) {
-      if (isLocalSidecarConnectionId(cfg.connectionId) && localSidecarAvailableForTrackers) {
+    if (effectiveConnectionId === "skip-local-sidecar") {
+      skippedLocalSidecarAgents.push(cfg.name ?? cfg.type);
+      logger.warn(
+        "[retry-agents] Skipping agent %s because Local Model was requested but the sidecar is unavailable",
+        cfg.type,
+      );
+      continue;
+    }
+
+    if (effectiveConnectionId) {
+      if (isLocalSidecarConnectionId(effectiveConnectionId) && localSidecarAvailableForTrackers) {
         agentProvider = getLocalSidecarProvider();
         agentModel = LOCAL_SIDECAR_MODEL;
-      } else if (isLocalSidecarConnectionId(cfg.connectionId)) {
-        skippedLocalSidecarAgents.push(cfg.name ?? cfg.type);
-        logger.warn(
-          "[retry-agents] Skipping agent %s because Local Model was requested but the sidecar is unavailable",
-          cfg.type,
-        );
-        continue;
+      } else if (defaultAgentConnection && effectiveConnectionId === defaultAgentConnection.connectionId) {
+        agentProvider = defaultAgentConnection.provider;
+        agentModel = defaultAgentConnection.model;
+        agentMaxParallelJobs = defaultAgentConnection.maxParallelJobs;
+        defaultAgentConnectionAgents.push(cfg.name ?? cfg.type);
       } else {
-        const agentConn = await conns.getWithKey(cfg.connectionId as string);
+        const agentConn = await conns.getWithKey(effectiveConnectionId);
         if (agentConn) {
           const agentBaseUrl = resolveBaseUrl(agentConn);
           if (agentBaseUrl) {
@@ -419,6 +536,7 @@ async function resolveRetryAgents(args: {
               agentConn.maxTokensOverride,
             );
             agentModel = agentConn.model;
+            agentMaxParallelJobs = Number(agentConn.maxParallelJobs) || 1;
           }
         }
       }
@@ -432,10 +550,11 @@ async function resolveRetryAgents(args: {
         name: cfg.name,
         phase: cfg.phase as string,
         promptTemplate: cfg.promptTemplate as string,
-        connectionId: cfg.connectionId as string | null,
+        connectionId: effectiveConnectionId,
         settings: typeof cfg.settings === "string" ? JSON.parse(cfg.settings) : (cfg.settings ?? {}),
         provider: agentProvider,
         model: agentModel,
+        maxParallelJobs: agentMaxParallelJobs,
       },
       agentProvider,
       agentModel,
@@ -446,6 +565,16 @@ async function resolveRetryAgents(args: {
     skippedLocalSidecarAgents.length > 0 ? [buildLocalSidecarUnavailableWarning(skippedLocalSidecarAgents)] : [];
 
   for (const builtIn of builtInFallbackConfigs) {
+    const builtInProvider = defaultAgentConnection ?? {
+      provider,
+      model: conn.model,
+      connectionId: null,
+      maxParallelJobs: chatConnectionMaxParallelJobs,
+    };
+    if (defaultAgentConnection) {
+      defaultAgentConnectionAgents.push(builtIn.name);
+    }
+
     resolvedAgents.push({
       cfg: { id: `builtin:${builtIn.id}`, type: builtIn.id, name: builtIn.name } as any,
       resolved: {
@@ -454,14 +583,25 @@ async function resolveRetryAgents(args: {
         name: builtIn.name,
         phase: builtIn.phase,
         promptTemplate: "",
-        connectionId: null,
+        connectionId: builtInProvider.connectionId,
         settings: getDefaultBuiltInAgentSettings(builtIn.id),
-        provider,
-        model: conn.model,
+        provider: builtInProvider.provider,
+        model: builtInProvider.model,
+        maxParallelJobs: builtInProvider.maxParallelJobs,
       },
-      agentProvider: provider,
-      agentModel: conn.model,
+      agentProvider: builtInProvider.provider,
+      agentModel: builtInProvider.model,
     });
+  }
+
+  if (defaultAgentConn && defaultAgentConnectionAgents.length > 0) {
+    warnings.push(
+      buildDefaultAgentConnectionWarning({
+        agentNames: defaultAgentConnectionAgents,
+        connectionName: defaultAgentConn.name,
+        model: defaultAgentConn.model,
+      }),
+    );
   }
 
   return { conn, enabledConfigs, resolvedAgents, warnings };
@@ -482,6 +622,473 @@ function retryProviderKey(provider: unknown): string {
   return `provider:${id}`;
 }
 
+function toLLMToolDefinition(toolName: string): LLMToolDefinition | null {
+  const tool = BUILT_IN_TOOLS.find((entry) => entry.name === toolName);
+  if (!tool) return null;
+  return {
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters as unknown as Record<string, unknown>,
+    },
+  };
+}
+
+const CHAT_METADATA_TOOL_NAMES = new Set([
+  "read_chat_summary",
+  "append_chat_summary",
+  "read_chat_variable",
+  "write_chat_variable",
+]);
+
+async function attachRetryChatMetadataToolContexts(args: {
+  chats: ReturnType<typeof createChatsStorage>;
+  chatId: string;
+  chatMeta: Record<string, unknown>;
+  resolvedAgents: ResolvedRetryAgent[];
+}) {
+  const { chats, chatId, chatMeta, resolvedAgents } = args;
+
+  const updateChatMetadataForTools = async (patchOrUpdater: MetadataPatchInput) => {
+    let emittedPatch: Record<string, unknown> = {};
+    const updatedChat = await chats.patchMetadata(chatId, async (currentMeta) => {
+      const patch = typeof patchOrUpdater === "function" ? await patchOrUpdater({ ...currentMeta }) : patchOrUpdater;
+      emittedPatch = patch;
+      return patch;
+    });
+    const updatedMeta = updatedChat ? parseExtra(updatedChat.metadata) : { ...chatMeta, ...emittedPatch };
+    for (const key of Object.keys(chatMeta)) {
+      if (!(key in updatedMeta)) delete chatMeta[key];
+    }
+    Object.assign(chatMeta, updatedMeta);
+    return updatedMeta;
+  };
+
+  for (const entry of resolvedAgents) {
+    if (entry.resolved.toolContext?.tools.length) continue;
+    const settings = parseSettingsRecord(entry.resolved.settings);
+    const enabledNames = Array.isArray(settings.enabledTools) ? (settings.enabledTools as string[]) : [];
+    const metadataToolNames = enabledNames.filter((name) => CHAT_METADATA_TOOL_NAMES.has(name));
+    if (metadataToolNames.length === 0) continue;
+
+    const tools = metadataToolNames
+      .map((name) => toLLMToolDefinition(name))
+      .filter((tool): tool is LLMToolDefinition => tool !== null);
+    if (tools.length === 0) continue;
+
+    const allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    entry.resolved.toolContext = {
+      tools,
+      executeToolCall: async (call) => {
+        if (!allowedToolNames.has(call.function.name)) {
+          return JSON.stringify({
+            error: `Tool not allowed for agent ${entry.resolved.type}: ${call.function.name}`,
+            allowed: Array.from(allowedToolNames),
+          });
+        }
+        const results = await executeToolCalls([call], {
+          chatMeta,
+          onUpdateMetadata: updateChatMetadataForTools,
+        });
+        return results[0]?.result ?? "Tool execution failed";
+      },
+    };
+  }
+}
+
+async function attachRetrySpotifyToolContexts(args: {
+  agentsStore: ReturnType<typeof createAgentsStorage>;
+  resolvedAgents: ResolvedRetryAgent[];
+}) {
+  const { agentsStore, resolvedAgents } = args;
+  const spotifyToolNames = new Set(DEFAULT_AGENT_TOOLS.spotify ?? []);
+  let spotifyAccessToken: string | null = null;
+  let spotifyError: string | null = null;
+  let spotifyCredentialsResolved = false;
+
+  for (const entry of resolvedAgents) {
+    if (entry.resolved.toolContext?.tools.length) continue;
+    const settings = parseSettingsRecord(entry.resolved.settings);
+    const enabledNames = Array.isArray(settings.enabledTools) ? (settings.enabledTools as string[]) : [];
+    const spotifyEnabledNames =
+      entry.resolved.type === "spotify" && enabledNames.length === 0
+        ? [...spotifyToolNames]
+        : enabledNames.filter((name) => spotifyToolNames.has(name));
+    if (spotifyEnabledNames.length === 0) continue;
+
+    const tools = spotifyEnabledNames
+      .map((name) => toLLMToolDefinition(name))
+      .filter((tool): tool is LLMToolDefinition => tool !== null);
+    if (tools.length === 0) continue;
+
+    if (!spotifyCredentialsResolved) {
+      spotifyCredentialsResolved = true;
+      const credentials = await resolveSpotifyCredentials(agentsStore, { agentId: entry.resolved.id });
+      if ("accessToken" in credentials) {
+        spotifyAccessToken = credentials.accessToken;
+      } else {
+        spotifyError = credentials.error;
+        logger.warn("[retry-agents] Spotify credentials unavailable: %s", credentials.error);
+      }
+    }
+
+    const allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    if (entry.resolved.type === "spotify") {
+      entry.resolved.phase = "post_processing";
+      entry.resolved.settings = {
+        ...settings,
+        enabledTools: spotifyEnabledNames,
+      };
+      (entry.resolved as any).__spotifyToolCalls = new Set<string>();
+      (entry.resolved as any).__spotifyPlayApplied = false;
+      (entry.resolved as any).__spotifyPlayError = null;
+    }
+    entry.resolved.toolContext = {
+      tools,
+      executeToolCall: async (call) => {
+        const spotifyToolCalls = (entry.resolved as any).__spotifyToolCalls;
+        if (spotifyToolCalls instanceof Set) {
+          spotifyToolCalls.add(call.function.name);
+        }
+        if (!allowedToolNames.has(call.function.name)) {
+          return JSON.stringify({
+            error: `Tool not allowed for agent ${entry.resolved.type}: ${call.function.name}`,
+            allowed: Array.from(allowedToolNames),
+          });
+        }
+        if (!spotifyAccessToken) {
+          return JSON.stringify({
+            error: spotifyError ?? "Spotify is not connected. Open the Spotify DJ agent and connect your account.",
+          });
+        }
+        if (call.function.name === "spotify_play") {
+          const beforeResults = await executeToolCalls(
+            [
+              {
+                id: `spotify-before-play-${Date.now()}`,
+                type: "function",
+                function: { name: "spotify_get_current_playback", arguments: "{}" },
+              },
+            ],
+            { spotify: { accessToken: spotifyAccessToken } },
+          );
+          try {
+            const before = JSON.parse(beforeResults[0]?.result ?? "{}");
+            (entry.resolved as any).__spotifyCurrentBeforePlayUri = getSpotifyPlaybackTrackUri(before);
+          } catch {
+            (entry.resolved as any).__spotifyCurrentBeforePlayUri = null;
+          }
+        }
+        const results = await executeToolCalls([call], {
+          spotify: { accessToken: spotifyAccessToken },
+          spotifyRepeatAfterPlay: "track",
+        });
+        const result = results[0]?.result ?? "Tool execution failed";
+        if (call.function.name === "spotify_play") {
+          try {
+            const parsed = JSON.parse(result) as Record<string, unknown>;
+            if (parsed.applied === true) {
+              (entry.resolved as any).__spotifyPlayApplied = true;
+              (entry.resolved as any).__spotifyPlayError = null;
+              (entry.resolved as any).__spotifyPlayUris = getSpotifyTrackUris(parsed);
+              (entry.resolved as any).__spotifyCurrentAfterPlayUri = getSpotifyPlaybackTrackUri(parsed);
+              (entry.resolved as any).__spotifyRepeatAfterPlayState =
+                getStringField(parsed, "repeatState") || getStringField(parsed, "repeat");
+            } else if (typeof parsed.error === "string") {
+              (entry.resolved as any).__spotifyPlayError = parsed.error;
+            }
+          } catch {
+            // Keep the raw tool result for the model; validation below handles missing playback.
+          }
+        }
+        return result;
+      },
+    };
+  }
+}
+
+function getSpotifyTrackUris(data: unknown): string[] {
+  if (!data || typeof data !== "object") return [];
+  const record = data as Record<string, unknown>;
+  const raw =
+    (Array.isArray(record.trackUris) && record.trackUris) ||
+    (Array.isArray(record.uris) && record.uris) ||
+    (typeof record.trackUri === "string" ? [record.trackUri] : null) ||
+    (typeof record.uri === "string" ? [record.uri] : null) ||
+    [];
+  return raw.filter((uri): uri is string => typeof uri === "string" && uri.startsWith("spotify:"));
+}
+
+function getSpotifyPlaybackTrackUri(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const record = data as Record<string, unknown>;
+  if (typeof record.currentUri === "string" && record.currentUri.startsWith("spotify:track:")) {
+    return record.currentUri;
+  }
+  const track = record.track;
+  if (track && typeof track === "object") {
+    const uri = (track as Record<string, unknown>).uri;
+    if (typeof uri === "string" && uri.startsWith("spotify:track:")) return uri;
+  }
+  return null;
+}
+
+function getStringField(data: unknown, key: string): string {
+  if (!data || typeof data !== "object") return "";
+  const value = (data as Record<string, unknown>)[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+async function executeSpotifyRetryToolJson(
+  entry: ResolvedRetryAgent,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (!entry.resolved.toolContext) return { error: "Spotify tool context is unavailable." };
+  const raw = await entry.resolved.toolContext.executeToolCall({
+    id: `spotify-retry-${name}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    type: "function",
+    function: {
+      name,
+      arguments: JSON.stringify(args),
+    },
+  });
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : { raw };
+  } catch {
+    return { raw };
+  }
+}
+
+function getSpotifyTracks(data: Record<string, unknown>): Array<{ uri: string; name: string; artist: string }> {
+  const tracks = Array.isArray(data.tracks) ? data.tracks : [];
+  return tracks
+    .map((track) => {
+      if (!track || typeof track !== "object") return null;
+      const record = track as Record<string, unknown>;
+      const uri = typeof record.uri === "string" ? record.uri : "";
+      if (!uri.startsWith("spotify:track:")) return null;
+      return {
+        uri,
+        name: typeof record.name === "string" ? record.name : "Unknown track",
+        artist: typeof record.artist === "string" ? record.artist : "",
+      };
+    })
+    .filter((track): track is { uri: string; name: string; artist: string } => track !== null);
+}
+
+function buildSpotifyRetryQuery(result: AgentResult, context: AgentContext): { query: string; mood: string } {
+  const mood = getStringField(result.data, "mood");
+  const searchQuery = getStringField(result.data, "searchQuery");
+  const scene = typeof context.mainResponse === "string" ? context.mainResponse.replace(/\[[^\]]+\]/g, " ") : "";
+  const compactScene = scene.replace(/\s+/g, " ").trim().slice(0, 600);
+  return {
+    query: [searchQuery, mood, compactScene].filter(Boolean).join(" "),
+    mood,
+  };
+}
+
+async function applyDeterministicSpotifyRetryFallback(args: {
+  entry: ResolvedRetryAgent;
+  result: AgentResult;
+  context: AgentContext;
+  constraints: Record<string, unknown>;
+}): Promise<AgentResult> {
+  const { entry, result, context, constraints } = args;
+  if (!entry.resolved.toolContext) {
+    return { ...result, success: false, error: "Spotify tool context is unavailable." };
+  }
+
+  const { query, mood } = buildSpotifyRetryQuery(result, context);
+  const current = await executeSpotifyRetryToolJson(entry, "spotify_get_current_playback", {});
+  const currentUri = getSpotifyPlaybackTrackUri(current) ?? "";
+
+  const artist = typeof constraints.artist === "string" ? constraints.artist.trim() : "";
+  const sourceType = typeof constraints.sourceType === "string" ? constraints.sourceType : "liked";
+  const playlistId =
+    typeof constraints.playlistId === "string" && constraints.playlistId.trim()
+      ? constraints.playlistId.trim()
+      : sourceType === "playlist"
+        ? ""
+        : "liked";
+
+  let sourceResult: Record<string, unknown>;
+  if (artist) {
+    sourceResult = await executeSpotifyRetryToolJson(entry, "spotify_search", {
+      query: [`artist:"${artist}"`, query || mood || "instrumental scene music"].filter(Boolean).join(" "),
+      limit: 20,
+    });
+  } else {
+    sourceResult = await executeSpotifyRetryToolJson(entry, "spotify_get_playlist_tracks", {
+      playlistId: playlistId || "liked",
+      query: query || mood || "scene instrumental",
+      mood: mood || undefined,
+      candidateLimit: 40,
+    });
+  }
+
+  const tracks = getSpotifyTracks(sourceResult);
+  if (tracks.length === 0) {
+    const sourceError = typeof sourceResult.error === "string" ? sourceResult.error : "No Spotify candidates found.";
+    return { ...result, success: false, error: sourceError };
+  }
+
+  const picked = tracks.find((track) => track.uri !== currentUri) ?? tracks[0]!;
+  const play = await executeSpotifyRetryToolJson(entry, "spotify_play", {
+    uri: picked.uri,
+    reason: "Manual Spotify DJ retry fallback",
+  });
+  if (play.applied !== true) {
+    const playError = typeof play.error === "string" ? play.error : "Spotify play did not apply playback.";
+    return { ...result, success: false, error: playError };
+  }
+  const playedUri = getSpotifyPlaybackTrackUri(play);
+  if (playedUri !== picked.uri) {
+    return {
+      ...result,
+      success: false,
+      error: "Spotify accepted the retry, but the active track did not change to the selected song.",
+    };
+  }
+  const repeatState = getStringField(play, "repeatState") || getStringField(play, "repeat");
+  if (repeatState && repeatState !== "track") {
+    return {
+      ...result,
+      success: false,
+      error: `Spotify accepted the retry, but repeat-track did not stick (current repeat: ${repeatState}).`,
+    };
+  }
+
+  return {
+    ...result,
+    success: true,
+    error: null,
+    data: {
+      action: "play",
+      mood: mood || null,
+      searchQuery: query || null,
+      trackUris: [picked.uri],
+      trackNames: [`${picked.name}${picked.artist ? ` — ${picked.artist}` : ""}`],
+      volume: null,
+      deterministicFallbackApplied: true,
+      repeat: play.repeat ?? null,
+      repeatState: repeatState || null,
+      currentUri: playedUri ?? null,
+    },
+  };
+}
+
+async function validateSpotifyRetryPlayback(
+  entry: ResolvedRetryAgent,
+  result: AgentResult,
+  context: AgentContext,
+): Promise<AgentResult> {
+  if (entry.resolved.type !== "spotify") return result;
+
+  const constraints =
+    context.memory._spotifyDjConstraints && typeof context.memory._spotifyDjConstraints === "object"
+      ? (context.memory._spotifyDjConstraints as Record<string, unknown>)
+      : {};
+  const forceFreshPick = constraints.manualRetry === true || constraints.forceFreshPick === true;
+  if (!forceFreshPick) return result;
+
+  const toolCalls = (entry.resolved as any).__spotifyToolCalls;
+  const spotifyPlayCalled = toolCalls instanceof Set && toolCalls.has("spotify_play");
+  const spotifyPlayApplied = (entry.resolved as any).__spotifyPlayApplied === true;
+  const spotifyPlayError = (entry.resolved as any).__spotifyPlayError;
+  const spotifyPlayUris = Array.isArray((entry.resolved as any).__spotifyPlayUris)
+    ? ((entry.resolved as any).__spotifyPlayUris as string[])
+    : [];
+  const spotifyPlayUri = spotifyPlayUris.length === 1 ? spotifyPlayUris[0] : null;
+  const spotifyPlayIsSingleTrack = !!spotifyPlayUri && spotifyPlayUri.startsWith("spotify:track:");
+  const currentBeforePlay = (entry.resolved as any).__spotifyCurrentBeforePlayUri;
+  const currentAfterPlay = (entry.resolved as any).__spotifyCurrentAfterPlayUri;
+  const repeatAfterPlay = (entry.resolved as any).__spotifyRepeatAfterPlayState;
+  if (
+    spotifyPlayCalled &&
+    spotifyPlayApplied &&
+    spotifyPlayIsSingleTrack &&
+    currentBeforePlay !== spotifyPlayUri &&
+    currentAfterPlay === spotifyPlayUri &&
+    (!repeatAfterPlay || repeatAfterPlay === "track")
+  ) {
+    return result;
+  }
+
+  if (spotifyPlayCalled && spotifyPlayApplied) {
+    return applyDeterministicSpotifyRetryFallback({ entry, result, context, constraints });
+  }
+
+  const uris = getSpotifyTrackUris(result.data);
+  const requestedTrackUri = uris.find((uri) => uri.startsWith("spotify:track:")) ?? null;
+  if (!spotifyPlayCalled && result.success && requestedTrackUri && entry.resolved.toolContext) {
+    const fallbackResult = await entry.resolved.toolContext.executeToolCall({
+      id: `spotify-retry-fallback-${Date.now()}`,
+      type: "function",
+      function: {
+        name: "spotify_play",
+        arguments: JSON.stringify({
+          uri: requestedTrackUri,
+          reason: "Manual Spotify DJ retry fallback",
+        }),
+      },
+    });
+    try {
+      const parsed = JSON.parse(fallbackResult) as Record<string, unknown>;
+      if (parsed.applied === true) {
+        const fallbackCurrentBefore = (entry.resolved as any).__spotifyCurrentBeforePlayUri;
+        const fallbackPlayedUri = getSpotifyPlaybackTrackUri(parsed);
+        const fallbackRepeatState = getStringField(parsed, "repeatState") || getStringField(parsed, "repeat");
+        if (
+          fallbackCurrentBefore === requestedTrackUri ||
+          fallbackPlayedUri !== requestedTrackUri ||
+          (fallbackRepeatState && fallbackRepeatState !== "track")
+        ) {
+          return applyDeterministicSpotifyRetryFallback({ entry, result, context, constraints });
+        }
+        return {
+          ...result,
+          data:
+            result.data && typeof result.data === "object"
+              ? {
+                  ...(result.data as Record<string, unknown>),
+                  toolFallbackApplied: true,
+                  currentUri: fallbackPlayedUri,
+                  repeatState: fallbackRepeatState || null,
+                }
+              : {
+                  action: "play",
+                  trackUris: [requestedTrackUri],
+                  toolFallbackApplied: true,
+                  currentUri: fallbackPlayedUri,
+                  repeatState: fallbackRepeatState || null,
+                },
+        };
+      }
+      if (typeof parsed.error === "string") {
+        return { ...result, success: false, error: parsed.error };
+      }
+    } catch {
+      // Fall through to explicit failure below.
+    }
+  }
+
+  if (!spotifyPlayCalled) {
+    return applyDeterministicSpotifyRetryFallback({ entry, result, context, constraints });
+  }
+
+  return {
+    ...result,
+    success: false,
+    error:
+      typeof spotifyPlayError === "string" && spotifyPlayError.trim()
+        ? spotifyPlayError
+        : "Spotify DJ retry finished without applying spotify_play.",
+  };
+}
+
 async function executeRetryBatches(
   agentContext: AgentContext,
   resolvedAgents: ResolvedRetryAgent[],
@@ -489,7 +1096,7 @@ async function executeRetryBatches(
 ) {
   const providerModelGroups = new Map<
     string,
-    { agents: ResolvedRetryAgent[]; provider: any; model: string; context: AgentContext }
+    { agents: ResolvedRetryAgent[]; provider: any; model: string; context: AgentContext; maxParallelJobs: number }
   >();
 
   for (const entry of resolvedAgents) {
@@ -498,16 +1105,62 @@ async function executeRetryBatches(
     const contextKind = context === preGenerationContext ? "pre_generation" : "default";
     const key = `${retryProviderKey(entry.agentProvider)}::${entry.agentModel}::${contextKind}`;
     if (!providerModelGroups.has(key)) {
-      providerModelGroups.set(key, { agents: [], provider: entry.agentProvider, model: entry.agentModel, context });
+      providerModelGroups.set(key, {
+        agents: [],
+        provider: entry.agentProvider,
+        model: entry.agentModel,
+        context,
+        maxParallelJobs: normalizeAgentMaxParallelJobs(entry.resolved.maxParallelJobs),
+      });
+    } else {
+      const group = providerModelGroups.get(key)!;
+      group.maxParallelJobs = Math.max(
+        group.maxParallelJobs,
+        normalizeAgentMaxParallelJobs(entry.resolved.maxParallelJobs),
+      );
     }
     providerModelGroups.get(key)!.agents.push(entry);
   }
 
+  const jobGroups = [...providerModelGroups.values()].flatMap((group) => {
+    const jobCount = Math.min(normalizeAgentMaxParallelJobs(group.maxParallelJobs), group.agents.length);
+    if (jobCount <= 1) return [group];
+    const chunks = Array.from({ length: jobCount }, () => [] as ResolvedRetryAgent[]);
+    for (let index = 0; index < group.agents.length; index++) {
+      chunks[index % jobCount]!.push(group.agents[index]!);
+    }
+    return chunks
+      .filter((agents) => agents.length > 0)
+      .map((agents) => ({
+        ...group,
+        agents,
+      }));
+  });
+
   const results: AgentResult[] = [];
   const groupSettled = await Promise.allSettled(
-    [...providerModelGroups.values()].map(async (group) => {
-      const configs = group.agents.map((agent) => agent.resolved);
-      return executeAgentBatch(configs, group.context, group.provider, group.model);
+    jobGroups.map(async (group) => {
+      const toolAgents = group.agents.filter((agent) => agent.resolved.toolContext?.tools.length);
+      const batchAgents = group.agents.filter((agent) => !agent.resolved.toolContext?.tools.length);
+      const groupResults: AgentResult[] = [];
+
+      if (batchAgents.length > 0) {
+        const configs = batchAgents.map((agent) => agent.resolved);
+        groupResults.push(...(await executeAgentBatch(configs, group.context, group.provider, group.model)));
+      }
+
+      for (const entry of toolAgents) {
+        const result = await executeAgent(
+          entry.resolved,
+          group.context,
+          group.provider,
+          group.model,
+          entry.resolved.toolContext,
+        );
+        groupResults.push(await validateSpotifyRetryPlayback(entry, result, group.context));
+      }
+
+      return groupResults;
     }),
   );
 
@@ -652,6 +1305,24 @@ async function applyRetryResultEffects(args: {
   const chats = createChatsStorage(app.db);
   const agentsStore = createAgentsStorage(app.db);
   const chatMeta = parseExtra(chat.metadata) as Record<string, unknown>;
+  let currentResponseForRewrite = agentContext.mainResponse;
+  let retryBaseGameStateSnapshotPromise: ReturnType<typeof gameStateStore.getForGeneration> | null = null;
+  const loadRetryBaseGameStateSnapshot = () => {
+    retryBaseGameStateSnapshotPromise ??= gameStateStore.getForGeneration(chatId, {
+      preferLatestVisible: true,
+      visibleAnchor: retryMessageId ? { messageId: retryMessageId, swipeIndex: retrySwipeIndex } : null,
+      excludeMessageId: retryMessageId || null,
+    });
+    return retryBaseGameStateSnapshotPromise;
+  };
+  const loadRetryTargetGameStateSnapshot = async () => {
+    if (!retryMessageId) return loadRetryBaseGameStateSnapshot();
+    const existing = await gameStateStore.getByMessage(retryMessageId, retrySwipeIndex);
+    if (existing) return existing;
+    return gameStateStore.updateByMessage(retryMessageId, retrySwipeIndex, chatId, {}, undefined, {
+      baseSnapshot: await loadRetryBaseGameStateSnapshot(),
+    });
+  };
 
   for (const result of sortedResults) {
     if (result.success && result.type === "text_rewrite" && result.data && typeof result.data === "object") {
@@ -660,6 +1331,15 @@ async function applyRetryResultEffects(args: {
         const editedText = (rewriteData.editedText as string) ?? "";
         const changes = (rewriteData.changes as Array<{ description: string }>) ?? [];
         if (retryMessageId && editedText && changes.length > 0) {
+          const currentMessage = await chats.getMessage(retryMessageId);
+          if ((currentMessage?.content ?? "") !== currentResponseForRewrite) {
+            logger.info(
+              "[retry-agents] Skipping rewrite for message %s because the message was edited during agent retry",
+              retryMessageId,
+            );
+            break;
+          }
+          currentResponseForRewrite = editedText;
           await chats.updateMessageContent(retryMessageId, editedText);
           sendSseEvent(reply, { type: "text_rewrite", data: { editedText, changes } });
         }
@@ -678,7 +1358,14 @@ async function applyRetryResultEffects(args: {
         if (gs.weather != null) worldStatePatch.weather = gs.weather as string;
         if (gs.temperature != null) worldStatePatch.temperature = gs.temperature as string;
         if (Object.keys(worldStatePatch).length > 0) {
-          await gameStateStore.updateByMessage(retryMessageId, retrySwipeIndex, chatId, worldStatePatch as any);
+          await gameStateStore.updateByMessage(
+            retryMessageId,
+            retrySwipeIndex,
+            chatId,
+            worldStatePatch as any,
+            undefined,
+            { baseSnapshot: await loadRetryBaseGameStateSnapshot() },
+          );
         }
 
         const nextLocation = typeof worldStatePatch.location === "string" ? worldStatePatch.location : null;
@@ -715,7 +1402,8 @@ async function applyRetryResultEffects(args: {
           );
           const trimmedText = text.trim();
           if (trimmedText) {
-            const entry = { agentType: result.agentType, text: trimmedText };
+            const agentName = resolvedAgents.find((entry) => entry.resolved.type === result.agentType)?.cfg.name;
+            const entry = { agentType: result.agentType, agentName, text: trimmedText };
             const idx = list.findIndex((e) => e.agentType === result.agentType);
             if (idx >= 0) list[idx] = entry;
             else list.push(entry);
@@ -739,9 +1427,30 @@ async function applyRetryResultEffects(args: {
       try {
         const ctData = result.data as Record<string, unknown>;
         const presentCharacters = (ctData.presentCharacters as any[]) ?? [];
-        await gameStateStore.updateByMessage(retryMessageId, retrySwipeIndex, chatId, {
-          presentCharacters,
-        });
+        const previousSnapshot = await loadRetryTargetGameStateSnapshot();
+        let previousCharacters: any[] = [];
+        if (previousSnapshot?.presentCharacters) {
+          try {
+            const parsed =
+              typeof previousSnapshot.presentCharacters === "string"
+                ? JSON.parse(previousSnapshot.presentCharacters)
+                : previousSnapshot.presentCharacters;
+            previousCharacters = Array.isArray(parsed) ? parsed : [];
+          } catch {
+            previousCharacters = [];
+          }
+        }
+        preserveTrackerCharacterUiFields(presentCharacters, previousCharacters);
+        await gameStateStore.updateByMessage(
+          retryMessageId,
+          retrySwipeIndex,
+          chatId,
+          {
+            presentCharacters,
+          },
+          undefined,
+          { baseSnapshot: await loadRetryBaseGameStateSnapshot() },
+        );
         sendSseEvent(reply, { type: "game_state_patch", data: { presentCharacters } });
       } catch {
         // Non-critical patching failure.
@@ -754,9 +1463,7 @@ async function applyRetryResultEffects(args: {
         const bars = (psData.stats as any[]) ?? [];
         const status = (psData.status as string) ?? "";
         const inventory = (psData.inventory as any[]) ?? [];
-        const latest =
-          (await gameStateStore.getByMessage(retryMessageId, retrySwipeIndex)) ??
-          (await gameStateStore.getLatest(chatId));
+        const latest = await loadRetryTargetGameStateSnapshot();
         if (latest) {
           const updates: Record<string, unknown> = {};
           if (bars.length > 0) updates.personaStats = JSON.stringify(bars);
@@ -855,9 +1562,7 @@ async function applyRetryResultEffects(args: {
           JSON.stringify(qData).slice(0, 500),
         );
         if (updates.length > 0) {
-          const snap =
-            (await gameStateStore.getByMessage(retryMessageId, retrySwipeIndex)) ??
-            (await gameStateStore.getLatest(chatId));
+          const snap = await loadRetryTargetGameStateSnapshot();
           const existingPS = snap?.playerStats
             ? typeof snap.playerStats === "string"
               ? JSON.parse(snap.playerStats)
@@ -945,9 +1650,7 @@ async function applyRetryResultEffects(args: {
         const ctData = result.data as Record<string, unknown>;
         const fields = (ctData.fields as any[]) ?? [];
         if (fields.length > 0) {
-          const snap =
-            (await gameStateStore.getByMessage(retryMessageId, retrySwipeIndex)) ??
-            (await gameStateStore.getLatest(chatId));
+          const snap = await loadRetryTargetGameStateSnapshot();
           if (snap) {
             const existingPS = snap.playerStats
               ? typeof snap.playerStats === "string"
@@ -981,6 +1684,10 @@ async function applyRetryResultEffects(args: {
           const illustratorAgent = resolvedAgents.find(
             (a) => a.resolved.id === result.agentId || a.resolved.type === "illustrator",
           );
+          const rawImagePositivePrompt = illustratorAgent?.resolved.settings?.imagePositivePrompt;
+          const rawSavedNegativePrompt = illustratorAgent?.resolved.settings?.imageNegativePrompt;
+          const imagePositivePrompt = typeof rawImagePositivePrompt === "string" ? rawImagePositivePrompt.trim() : "";
+          const savedNegativePrompt = typeof rawSavedNegativePrompt === "string" ? rawSavedNegativePrompt.trim() : "";
           let imgConnId = (illustratorAgent?.resolved.settings?.imageConnectionId as string) ?? null;
           if (!imgConnId) {
             const defaultImageConn = (await conns.list()).find(
@@ -1020,6 +1727,10 @@ async function applyRetryResultEffects(args: {
               }
 
               let fullPrompt = style ? `${style}, ${imagePrompt}` : imagePrompt;
+              if (imagePositivePrompt) {
+                fullPrompt = `${fullPrompt}, ${imagePositivePrompt}`;
+              }
+              const finalNegativePrompt = [negativePrompt, savedNegativePrompt].filter(Boolean).join(", ");
 
               // Collect character avatar references when enabled
               const useAvatarRefs = illustratorAgent?.resolved.settings?.useAvatarReferences === true;
@@ -1073,7 +1784,7 @@ async function applyRetryResultEffects(args: {
 
               const imageResult = await generateImage(imgModel, imgBaseUrl, imgApiKey, imgServiceHint, {
                 prompt: fullPrompt,
-                negativePrompt: negativePrompt || undefined,
+                negativePrompt: finalNegativePrompt || undefined,
                 model: imgModel,
                 width: imgWidth,
                 height: imgHeight,
@@ -1100,7 +1811,13 @@ async function applyRetryResultEffects(args: {
               // Attach to message
               if (retryMessageId) {
                 const chatsDb = createChatsStorage(app.db);
-                const attachment = { type: "image", url: imageUrl, filename: `illustration.${imageResult.ext}` };
+                const attachment = {
+                  type: "image",
+                  url: imageUrl,
+                  filename: `illustration.${imageResult.ext}`,
+                  prompt: fullPrompt,
+                  galleryId: (galleryEntry as any)?.id,
+                };
                 const swipeRow = (await chatsDb.getSwipes(retryMessageId)).find(
                   (s: any) => s.index === retrySwipeIndex,
                 );
@@ -1274,6 +1991,8 @@ export async function registerRetryAgentsRoute(app: FastifyInstance) {
         conns,
         agentsStore,
       });
+      await attachRetrySpotifyToolContexts({ agentsStore, resolvedAgents });
+      await attachRetryChatMetadataToolContexts({ chats, chatId, chatMeta, resolvedAgents });
       const cyoaAgentWillRun = resolvedAgents.some((e) => e.resolved.type === "cyoa");
       const agentContext = await buildRetryAgentContext({
         cyoaAgentWillRun,

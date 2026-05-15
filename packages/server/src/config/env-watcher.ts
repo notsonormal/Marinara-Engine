@@ -1,7 +1,7 @@
 // ──────────────────────────────────────────────
 // .env hot-reload watcher
 // ──────────────────────────────────────────────
-// Polls the monorepo-root .env file and re-applies changes to process.env
+// Polls the active runtime .env file and re-applies changes to process.env
 // without requiring a server restart. Most security middleware (basic-auth,
 // IP allowlist, CSRF, admin secret, etc.) reads via getter functions in
 // runtime-config.ts, so updates take effect on the next request.
@@ -16,6 +16,13 @@ import { getEnvFilePath, reloadRuntimeEnv, type EnvReloadResult } from "./runtim
 
 // Keys whose values are bound at process / app startup and won't take effect
 // without a full restart, even though we propagate them to process.env.
+//
+// CORS_ORIGINS is intentionally NOT in this list — the @fastify/cors plugin
+// uses a function-based origin that re-reads getCorsConfig() per request
+// (see cors-config.ts), so adding/removing origins is hot-reloadable. The
+// only sub-case that still needs a restart is switching between an explicit
+// origin list and "*" (the credentials response header changes), but that's
+// rare enough that we don't list the var here as "always restart-required."
 const RESTART_REQUIRED_KEYS = new Set<string>([
   "PORT",
   "HOST",
@@ -26,21 +33,16 @@ const RESTART_REQUIRED_KEYS = new Set<string>([
   "FILE_STORAGE_DIR",
   "DATABASE_URL",
   "DATABASE_DRIVER",
+  "MARINARA_ENV_FILE",
   "ENCRYPTION_KEY",
   "TZ",
   "AUTO_OPEN_BROWSER",
   "AUTO_CREATE_DEFAULT_CONNECTION",
-  "CORS_ORIGINS",
   "NODE_ENV",
 ]);
 
 // Keys whose values must be masked when logged.
-const SENSITIVE_KEYS = new Set<string>([
-  "BASIC_AUTH_PASS",
-  "ADMIN_SECRET",
-  "ENCRYPTION_KEY",
-  "GIPHY_API_KEY",
-]);
+const SENSITIVE_KEYS = new Set<string>(["BASIC_AUTH_PASS", "ADMIN_SECRET", "ENCRYPTION_KEY", "GIPHY_API_KEY"]);
 
 function maskValue(key: string, value: string | undefined): string {
   if (value === undefined) return "<unset>";

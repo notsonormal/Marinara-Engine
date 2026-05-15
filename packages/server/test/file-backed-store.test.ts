@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { and, eq } from "drizzle-orm";
 import { characterCardVersions, characters, chats, lorebookFolders, lorebooks } from "../src/db/schema/index.js";
 import { createFileNativeDB } from "../src/db/file-backed-store.js";
+import { createChatsStorage } from "../src/services/storage/chats.storage.js";
 
 async function writeLegacyDb(path: string, rows: Array<{ id: string; name: string; updatedAt: string }>) {
   const { DatabaseSync } = await import("node:sqlite");
@@ -57,6 +58,60 @@ function withEnv<T>(name: string, value: string, fn: () => Promise<T>) {
   });
 }
 
+function readJsonFile<T>(path: string): T {
+  return JSON.parse(readFileSync(path, "utf8")) as T;
+}
+
+function validChatRows(id = "recovered-chat") {
+  const timestamp = "2026-05-11T00:00:00.000Z";
+  return [
+    {
+      id,
+      name: "Recovered Chat",
+      mode: "roleplay",
+      characterIds: "[]",
+      groupId: null,
+      personaId: null,
+      promptPresetId: null,
+      connectionId: null,
+      metadata: "{}",
+      connectedChatId: null,
+      folderId: null,
+      sortOrder: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+  ];
+}
+
+function writeFileStorageManifest(storageDir: string, tables: Record<string, number>) {
+  writeFileSync(
+    join(storageDir, "manifest.json"),
+    JSON.stringify({
+      version: 2,
+      savedAt: "2026-05-11T00:00:00.000Z",
+      backend: "file-native",
+      tables,
+    }),
+  );
+}
+
+function assertRecoveredChatIds(ids: string[]) {
+  assert.deepEqual(ids, ["recovered-chat"]);
+}
+
+async function loadChatIds(storageDir: string) {
+  return withFileStorageDir(storageDir, async () => {
+    const db = await createFileNativeDB([]);
+    try {
+      const rows = await db.select().from(chats);
+      return rows.map((row) => row.id);
+    } finally {
+      await db._fileStore.close();
+    }
+  });
+}
+
 async function removeTempDir(path: string) {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
@@ -74,6 +129,146 @@ async function removeTempDir(path: string) {
     }
   }
 }
+
+test("file-native self-heal preserves a valid backup when table primary has non-NUL corrupt JSON", async () => {
+  const root = mkdtempSync(join(tmpdir(), "marinara-file-table-backup-heal-"));
+  try {
+    const storageDir = join(root, "storage");
+    const tablesDir = join(storageDir, "tables");
+    const tablePath = join(tablesDir, "chats.json");
+    const backupPath = `${tablePath}.bak`;
+    const rows = validChatRows();
+    mkdirSync(tablesDir, { recursive: true });
+    writeFileStorageManifest(storageDir, { chats: rows.length });
+    writeFileSync(tablePath, '{"id":');
+    writeFileSync(backupPath, JSON.stringify(rows));
+
+    assertRecoveredChatIds(await loadChatIds(storageDir));
+
+    const healedRows = readJsonFile<Array<{ id: string }>>(tablePath);
+    const backupRows = readJsonFile<Array<{ id: string }>>(backupPath);
+    assert.deepEqual(
+      healedRows.map((row) => row.id),
+      ["recovered-chat"],
+    );
+    assert.deepEqual(
+      backupRows.map((row) => row.id),
+      ["recovered-chat"],
+    );
+
+    writeFileSync(tablePath, "[");
+    assertRecoveredChatIds(await loadChatIds(storageDir));
+  } finally {
+    await removeTempDir(root);
+  }
+});
+
+test("file-native self-heal preserves a valid backup when manifest primary has non-NUL corrupt JSON", async () => {
+  const root = mkdtempSync(join(tmpdir(), "marinara-file-manifest-backup-heal-"));
+  try {
+    const storageDir = join(root, "storage");
+    const tablesDir = join(storageDir, "tables");
+    const rows = validChatRows();
+    mkdirSync(tablesDir, { recursive: true });
+    writeFileSync(join(tablesDir, "chats.json"), JSON.stringify(rows));
+    writeFileSync(join(storageDir, "manifest.json"), '{"version":');
+    writeFileSync(
+      join(storageDir, "manifest.json.bak"),
+      JSON.stringify({
+        version: 2,
+        savedAt: "2026-05-11T00:00:00.000Z",
+        backend: "file-native",
+        tables: { chats: rows.length },
+      }),
+    );
+
+    assertRecoveredChatIds(await loadChatIds(storageDir));
+
+    const manifest = readJsonFile<{ tables: Record<string, number> }>(join(storageDir, "manifest.json"));
+    const backupManifest = readJsonFile<{ tables: Record<string, number> }>(join(storageDir, "manifest.json.bak"));
+    assert.equal(manifest.tables.chats, 1);
+    assert.equal(backupManifest.tables.chats, 1);
+  } finally {
+    await removeTempDir(root);
+  }
+});
+
+test("file-native subsequent save after self-heal refreshes .bak from the healed primary", async () => {
+  const root = mkdtempSync(join(tmpdir(), "marinara-file-post-heal-refresh-"));
+  try {
+    const storageDir = join(root, "storage");
+    const tablesDir = join(storageDir, "tables");
+    const tablePath = join(tablesDir, "chats.json");
+    const backupPath = `${tablePath}.bak`;
+    const rows = validChatRows();
+    mkdirSync(tablesDir, { recursive: true });
+    writeFileStorageManifest(storageDir, { chats: rows.length });
+    writeFileSync(tablePath, '{"id":');
+    writeFileSync(backupPath, JSON.stringify(rows));
+
+    // First pass: self-heal recovers from .bak and preserves it.
+    assertRecoveredChatIds(await loadChatIds(storageDir));
+
+    // Wreck .bak with a sentinel to prove the next save actually refreshes it.
+    writeFileSync(backupPath, "[]");
+
+    // Second pass: ordinary mutation + close should refresh .bak from the
+    // healed primary because the path is no longer flagged as recovered.
+    await withFileStorageDir(storageDir, async () => {
+      const db = await createFileNativeDB([]);
+      try {
+        await db.insert(chats).values(validChatRows("post-heal-chat")[0]!);
+      } finally {
+        await db._fileStore.close();
+      }
+    });
+
+    const refreshedBackupRows = readJsonFile<Array<{ id: string }>>(backupPath);
+    assert.deepEqual(
+      refreshedBackupRows.map((row) => row.id),
+      ["recovered-chat"],
+      ".bak should be refreshed from the pre-save healed primary, not left at the sentinel",
+    );
+
+    const refreshedPrimaryRows = readJsonFile<Array<{ id: string }>>(tablePath);
+    assert.deepEqual(
+      refreshedPrimaryRows.map((row) => row.id).sort(),
+      ["post-heal-chat", "recovered-chat"],
+    );
+  } finally {
+    await removeTempDir(root);
+  }
+});
+
+test("file-native self-heal keeps a valid backup when table primary is NUL-filled", async () => {
+  const root = mkdtempSync(join(tmpdir(), "marinara-file-nul-backup-heal-"));
+  try {
+    const storageDir = join(root, "storage");
+    const tablesDir = join(storageDir, "tables");
+    const tablePath = join(tablesDir, "chats.json");
+    const backupPath = `${tablePath}.bak`;
+    const rows = validChatRows();
+    mkdirSync(tablesDir, { recursive: true });
+    writeFileStorageManifest(storageDir, { chats: rows.length });
+    writeFileSync(tablePath, Buffer.alloc(8));
+    writeFileSync(backupPath, JSON.stringify(rows));
+
+    assertRecoveredChatIds(await loadChatIds(storageDir));
+
+    const healedRows = readJsonFile<Array<{ id: string }>>(tablePath);
+    const backupRows = readJsonFile<Array<{ id: string }>>(backupPath);
+    assert.deepEqual(
+      healedRows.map((row) => row.id),
+      ["recovered-chat"],
+    );
+    assert.deepEqual(
+      backupRows.map((row) => row.id),
+      ["recovered-chat"],
+    );
+  } finally {
+    await removeTempDir(root);
+  }
+});
 
 test("file-native import merges chats from every known legacy database source", async () => {
   const root = mkdtempSync(join(tmpdir(), "marinara-file-import-"));
@@ -121,6 +316,48 @@ test("file-native import falls back to node:sqlite when libSQL is unavailable", 
           assert.deepEqual(
             rows.map((row) => row.id),
             ["node-sqlite-chat"],
+          );
+        } finally {
+          await db._fileStore.close();
+        }
+      }),
+    );
+  } finally {
+    await removeTempDir(root);
+  }
+});
+
+test("file-native storage does not resurrect a deleted chat from the legacy import source", async () => {
+  const root = mkdtempSync(join(tmpdir(), "marinara-file-delete-legacy-"));
+  try {
+    const storageDir = join(root, "storage");
+    const legacyDb = join(root, "legacy.db");
+    await writeLegacyDb(legacyDb, [
+      { id: "keep-chat", name: "Keep Chat", updatedAt: "2026-05-02T00:00:00.000Z" },
+      { id: "delete-chat", name: "Delete Chat", updatedAt: "2026-05-02T00:00:00.000Z" },
+    ]);
+
+    await withEnv("MARINARA_DISABLE_LIBSQL_LEGACY_READER", "true", () =>
+      withFileStorageDir(storageDir, async () => {
+        let db = await createFileNativeDB([legacyDb]);
+        try {
+          const storage = createChatsStorage(db);
+          await storage.remove("delete-chat");
+          const afterDelete = await db.select().from(chats);
+          assert.deepEqual(
+            afterDelete.map((row) => row.id).sort(),
+            ["keep-chat"],
+          );
+        } finally {
+          await db._fileStore.close();
+        }
+
+        db = await createFileNativeDB([legacyDb]);
+        try {
+          const afterRestart = await db.select().from(chats);
+          assert.deepEqual(
+            afterRestart.map((row) => row.id).sort(),
+            ["keep-chat"],
           );
         } finally {
           await db._fileStore.close();

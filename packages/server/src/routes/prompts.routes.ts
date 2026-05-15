@@ -11,10 +11,12 @@ import {
   updatePromptGroupSchema,
   createChoiceBlockSchema,
   updateChoiceBlockSchema,
+  type LorebookEntryTimingState,
 } from "@marinara-engine/shared";
 import type { ExportEnvelope } from "@marinara-engine/shared";
 import { createPromptsStorage } from "../services/storage/prompts.storage.js";
 import { assemblePrompt, type AssemblerInput } from "../services/prompt/index.js";
+import { resolveGameLorebookScopeExclusions } from "../services/lorebook/game-lorebook-scope.js";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
 import { createCharactersStorage } from "../services/storage/characters.storage.js";
 import { normalizeTimestampOverrides } from "../services/import/import-timestamps.js";
@@ -280,6 +282,16 @@ export async function promptsRoutes(app: FastifyInstance) {
 
     const characterIds: string[] = JSON.parse(chat.characterIds as string);
     const chatMessages = await chats.listMessages(chatId);
+    let chatMeta: Record<string, unknown> = {};
+    try {
+      chatMeta =
+        typeof chat.metadata === "string"
+          ? JSON.parse(chat.metadata)
+          : ((chat.metadata as Record<string, unknown>) ?? {});
+    } catch {
+      chatMeta = {};
+    }
+    const lorebookScopeExclusions = resolveGameLorebookScopeExclusions(chat.mode, chatMeta);
     const mappedMessages = chatMessages.map((m: any) => ({
       role: m.role === "narrator" ? ("system" as const) : (m.role as "user" | "assistant" | "system"),
       content: m.content as string,
@@ -328,6 +340,31 @@ export async function promptsRoutes(app: FastifyInstance) {
       personaDescription,
       personaFields,
       chatMessages: mappedMessages,
+      activeLorebookIds: Array.isArray(chatMeta.activeLorebookIds) ? (chatMeta.activeLorebookIds as string[]) : [],
+      excludedLorebookIds: lorebookScopeExclusions.excludedLorebookIds,
+      excludedLorebookSourceAgentIds: lorebookScopeExclusions.excludedSourceAgentIds,
+      chatEmbedding: null,
+      entryStateOverrides:
+        (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) &&
+        typeof (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) === "object"
+          ? ((chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) as Record<
+              string,
+              { ephemeral?: number | null; enabled?: boolean }
+            >)
+          : undefined,
+      entryTimingStates:
+        (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) &&
+        typeof (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) === "object"
+          ? ((chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) as Record<
+              string,
+              LorebookEntryTimingState
+            >)
+          : undefined,
+      lorebookTokenBudget: typeof chatMeta.lorebookTokenBudget === "number" ? chatMeta.lorebookTokenBudget : undefined,
+      generationTriggers: Array.isArray(chatMeta.generationTriggers)
+        ? (chatMeta.generationTriggers as string[])
+        : undefined,
+      previewOnly: true,
     };
 
     const result = await assemblePrompt(assemblerInput);

@@ -1,18 +1,19 @@
 // ──────────────────────────────────────────────
 // Layout: Top Bar (polished, with hover glow)
 // ──────────────────────────────────────────────
-import { PanelLeft, Home, Settings, Link, BookOpen, Users, Sparkles, FileText, UserCircle, Bot } from "lucide-react";
+import { PanelLeft, Home, Settings, Link, BookOpen, Users, Sparkles, FileText, User, Bot, Folder } from "lucide-react";
 import { useUIStore } from "../../stores/ui.store";
 import { useChatStore } from "../../stores/chat.store";
 import { useAgentStore } from "../../stores/agent.store";
 import { cn } from "../../lib/utils";
+import { SpotifyMiniPlayer } from "../spotify/SpotifyMiniPlayer";
 
 const RIGHT_PANEL_BUTTONS = [
   { panel: "lorebooks" as const, icon: BookOpen, label: "Lorebooks", color: "from-amber-400 to-orange-500" },
   { panel: "presets" as const, icon: FileText, label: "Presets", color: "from-purple-400 to-violet-500" },
   { panel: "connections" as const, icon: Link, label: "Connections", color: "from-sky-400 to-blue-500" },
   { panel: "agents" as const, icon: Sparkles, label: "Agents", color: "from-pink-300 to-purple-400" },
-  { panel: "personas" as const, icon: UserCircle, label: "Personas", color: "from-emerald-400 to-teal-500" },
+  { panel: "personas" as const, icon: User, label: "Personas", color: "from-emerald-400 to-teal-500" },
 ] as const;
 
 export function TopBar() {
@@ -26,6 +27,9 @@ export function TopBar() {
 
   const isBotBrowserActive = rightPanelOpen && rightPanel === "bot-browser";
   const isCharactersPanelActive = rightPanelOpen && rightPanel === "characters";
+  const gameAssetsBrowserOpen = useUIStore((s) => s.gameAssetsBrowserOpen);
+  const openGameAssetsBrowser = useUIStore((s) => s.openGameAssetsBrowser);
+  const closeGameAssetsBrowser = useUIStore((s) => s.closeGameAssetsBrowser);
 
   return (
     <header
@@ -36,7 +40,7 @@ export function TopBar() {
       <div className="absolute inset-x-0 bottom-0 h-px bg-[var(--border)]/30" />
 
       {/* Left section: window controls + chat info */}
-      <div className="flex items-center gap-2">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
         <button
           onClick={toggleSidebar}
           data-tour="sidebar-toggle"
@@ -56,6 +60,7 @@ export function TopBar() {
         >
           <Home size="1.125rem" />
         </button>
+        <SpotifyMiniPlayer />
       </div>
 
       {/* Right section - Panel toggles */}
@@ -126,6 +131,23 @@ export function TopBar() {
             </button>
           );
         })}
+
+        {/* Game Assets */}
+        <button
+          onClick={() => (gameAssetsBrowserOpen ? closeGameAssetsBrowser() : openGameAssetsBrowser())}
+          className={cn(
+            "relative rounded-lg p-2 transition-all duration-200 max-sm:p-1.5",
+            gameAssetsBrowserOpen
+              ? "bg-[var(--accent)] text-[var(--primary)] shadow-sm"
+              : "text-[var(--muted-foreground)] hover:text-[var(--primary)]",
+          )}
+          title="Assets"
+        >
+          <Folder size="0.9375rem" />
+          {gameAssetsBrowserOpen && (
+            <span className="absolute -bottom-0.5 left-1/2 h-0.5 w-3 -translate-x-1/2 rounded-full bg-gradient-to-r from-emerald-400 to-teal-500" />
+          )}
+        </button>
 
         {/* Settings */}
         <button

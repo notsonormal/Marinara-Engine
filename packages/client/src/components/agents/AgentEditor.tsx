@@ -3,9 +3,10 @@
 // Click an agent → opens this editor
 // ──────────────────────────────────────────────
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useUIStore } from "../../stores/ui.store";
 import { showConfirmDialog } from "../../lib/app-dialogs";
-import { useAgentConfigs, useUpdateAgent, useCreateAgent, type AgentConfigRow } from "../../hooks/use-agents";
+import { agentKeys, useAgentConfigs, useUpdateAgent, useCreateAgent, type AgentConfigRow } from "../../hooks/use-agents";
 import { useConnections } from "../../hooks/use-connections";
 import {
   isCustomToolSelectable,
@@ -167,6 +168,7 @@ export function AgentEditor() {
   const { data: customToolCapabilities } = useCustomToolCapabilities();
   const updateAgent = useUpdateAgent();
   const createAgent = useCreateAgent();
+  const qc = useQueryClient();
   const deleteAgent = useDeleteAgent();
 
   // Find built-in meta (null for custom agents)
@@ -207,7 +209,10 @@ export function AgentEditor() {
   const [localSourceLorebookIds, setLocalSourceLorebookIds] = useState<string[]>([]);
   const [localSourceFileIds, setLocalSourceFileIds] = useState<string[]>([]);
   const [localAutoGenerateAvatars, setLocalAutoGenerateAvatars] = useState(false);
+  const [localAutoGenerateBackgrounds, setLocalAutoGenerateBackgrounds] = useState(false);
   const [localUseAvatarReferences, setLocalUseAvatarReferences] = useState(false);
+  const [localImagePositivePrompt, setLocalImagePositivePrompt] = useState("");
+  const [localImageNegativePrompt, setLocalImageNegativePrompt] = useState("");
   const [spotifyStatus, setSpotifyStatus] = useState<{
     connected: boolean;
     expired: boolean;
@@ -259,7 +264,10 @@ export function AgentEditor() {
       setLocalSourceLorebookIds(settings.sourceLorebookIds ?? []);
       setLocalSourceFileIds(settings.sourceFileIds ?? []);
       setLocalAutoGenerateAvatars(settings.autoGenerateAvatars ?? false);
+      setLocalAutoGenerateBackgrounds(settings.autoGenerateBackgrounds ?? false);
       setLocalUseAvatarReferences(settings.useAvatarReferences ?? false);
+      setLocalImagePositivePrompt((settings.imagePositivePrompt as string) ?? "");
+      setLocalImageNegativePrompt((settings.imageNegativePrompt as string) ?? "");
       setLocalResultType(normalizeCustomResultType(settings.resultType));
       setLocalPrompt(dbConfig.promptTemplate || "");
     } else if (builtIn) {
@@ -277,7 +285,10 @@ export function AgentEditor() {
       setLocalSourceLorebookIds([]);
       setLocalSourceFileIds([]);
       setLocalAutoGenerateAvatars(false);
+      setLocalAutoGenerateBackgrounds(false);
       setLocalUseAvatarReferences(false);
+      setLocalImagePositivePrompt("");
+      setLocalImageNegativePrompt("");
       setLocalResultType("context_injection");
       setLocalPrompt("");
     } else {
@@ -296,7 +307,10 @@ export function AgentEditor() {
       setLocalSourceLorebookIds([]);
       setLocalSourceFileIds([]);
       setLocalAutoGenerateAvatars(false);
+      setLocalAutoGenerateBackgrounds(false);
       setLocalUseAvatarReferences(false);
+      setLocalImagePositivePrompt("");
+      setLocalImageNegativePrompt("");
       setLocalResultType("context_injection");
       setLocalPrompt("");
     }
@@ -320,6 +334,8 @@ export function AgentEditor() {
   const isKnowledgeRetrievalAgent = agentDetailId === "knowledge-retrieval" || dbConfig?.type === "knowledge-retrieval";
   // Knowledge Router agent — also uses the lorebook source selector (file picker stays Retrieval-only)
   const isKnowledgeRouterAgent = agentDetailId === "knowledge-router" || dbConfig?.type === "knowledge-router";
+  // Background agent — can optionally generate missing roleplay backgrounds.
+  const isBackgroundAgent = agentDetailId === "background" || dbConfig?.type === "background";
 
   // Detect when both knowledge agents will actually run in parallel. Shows a
   // soft warning so users don't accidentally do overlapping work that bloats
@@ -405,7 +421,7 @@ export function AgentEditor() {
     (c) => c.provider !== "image_generation" && (c.defaultForAgents === true || c.defaultForAgents === "true"),
   );
 
-  const defaultIllustratorImageConn = imageConnections.find(
+  const defaultAgentImageConn = imageConnections.find(
     (c) => c.defaultForAgents === true || c.defaultForAgents === "true",
   );
 
@@ -425,6 +441,19 @@ export function AgentEditor() {
     const isEditingCustomAgent = isCustomAgent || isNewCustomAgent;
     const savedPhase = isEditingCustomAgent && localResultType === "text_rewrite" ? "post_processing" : localPhase;
 
+    // Preserve OAuth fields the form doesn't expose. The server replaces
+    // `settings` wholesale, so anything we omit here would be wiped — and the
+    // Spotify tokens live in settings rather than their own column.
+    const currentSettings: Record<string, unknown> = dbConfig?.settings
+      ? typeof dbConfig.settings === "string"
+        ? JSON.parse(dbConfig.settings as string)
+        : (dbConfig.settings as Record<string, unknown>)
+      : {};
+    const preservedSpotifyFields: Record<string, unknown> = {};
+    for (const key of ["spotifyAccessToken", "spotifyRefreshToken", "spotifyExpiresAt", "spotifyScope"]) {
+      if (currentSettings[key] !== undefined) preservedSpotifyFields[key] = currentSettings[key];
+    }
+
     const payload = {
       name: localName,
       description: localDescription,
@@ -433,6 +462,7 @@ export function AgentEditor() {
       connectionId: localConnectionId || null,
       promptTemplate: localPrompt,
       settings: {
+        ...preservedSpotifyFields,
         ...(isEditingCustomAgent ? { resultType: localResultType } : {}),
         ...(localContextSize !== "" ? { contextSize: Number(localContextSize) } : {}),
         ...(localMaxTokens !== "" ? { maxTokens: clampAgentMaxTokens(localMaxTokens) } : {}),
@@ -448,7 +478,10 @@ export function AgentEditor() {
         ...(isKnowledgeRetrievalAgent && localSourceFileIds.length > 0 ? { sourceFileIds: localSourceFileIds } : {}),
         ...(localImageConnectionId ? { imageConnectionId: localImageConnectionId } : {}),
         ...(localAutoGenerateAvatars ? { autoGenerateAvatars: true } : {}),
+        ...(localAutoGenerateBackgrounds ? { autoGenerateBackgrounds: true } : {}),
         ...(localUseAvatarReferences ? { useAvatarReferences: true } : {}),
+        ...(localImagePositivePrompt.trim() ? { imagePositivePrompt: localImagePositivePrompt.trim() } : {}),
+        ...(localImageNegativePrompt.trim() ? { imageNegativePrompt: localImageNegativePrompt.trim() } : {}),
       },
     };
 
@@ -492,7 +525,10 @@ export function AgentEditor() {
     localSourceLorebookIds,
     localSourceFileIds,
     localAutoGenerateAvatars,
+    localAutoGenerateBackgrounds,
     localUseAvatarReferences,
+    localImagePositivePrompt,
+    localImageNegativePrompt,
     dbConfig,
     builtIn,
     isCustomAgent,
@@ -798,8 +834,8 @@ export function AgentEditor() {
                 className="w-full rounded-xl bg-[var(--secondary)] px-3 py-2.5 text-sm ring-1 ring-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
               >
                 <option value="">
-                  {defaultIllustratorImageConn
-                    ? `Illustrator agent default (${defaultIllustratorImageConn.name})`
+                  {defaultAgentImageConn
+                    ? `Illustrator agent default (${defaultAgentImageConn.name})`
                     : "None (no image generation)"}
                 </option>
                 {imageConnections.map((conn) => (
@@ -812,6 +848,39 @@ export function AgentEditor() {
                 The Illustrator uses two connections: the LLM above analyzes the scene and writes an image prompt, then
                 this connection generates the actual image from that prompt. Leave this empty to use the default
                 Illustrator image connection from Settings → Connections, if one is configured.
+              </p>
+              <div className="mt-3 grid gap-3 md:grid-cols-2">
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[0.6875rem] font-medium text-[var(--muted-foreground)]">
+                    Positive prompt / tags
+                  </span>
+                  <textarea
+                    value={localImagePositivePrompt}
+                    onChange={(e) => {
+                      setLocalImagePositivePrompt(e.target.value);
+                      markDirty();
+                    }}
+                    placeholder="masterpiece, best quality, detailed lighting"
+                    className="min-h-[5rem] resize-y rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-2 text-xs text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)]/45 focus:border-[var(--primary)]/50"
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Negative prompt</span>
+                  <textarea
+                    value={localImageNegativePrompt}
+                    onChange={(e) => {
+                      setLocalImageNegativePrompt(e.target.value);
+                      markDirty();
+                    }}
+                    placeholder="lowres, bad anatomy, text artifacts"
+                    className="min-h-[5rem] resize-y rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-2 text-xs text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)]/45 focus:border-[var(--primary)]/50"
+                  />
+                </label>
+              </div>
+              <p className="mt-1 text-[0.625rem] text-[var(--muted-foreground)]">
+                Saved on the Illustrator agent. Positive tags are appended after the generated prompt; negative tags are
+                sent directly to the image generator and combine with any connection-level defaults. NovelAI tag syntax is
+                supported.
               </p>
               <label className="mt-3 flex items-center gap-2 cursor-pointer">
                 <input
@@ -871,6 +940,78 @@ export function AgentEditor() {
                       </option>
                     ))}
                   </select>
+                </div>
+              )}
+            </FieldGroup>
+          )}
+
+          {/* ── Missing Background Generation (Background agent only) ── */}
+          {isBackgroundAgent && (
+            <FieldGroup
+              label="Background Image Generation"
+              icon={<ImageIcon size="0.875rem" className="text-[var(--primary)]" />}
+              help="When enabled, the Background agent can generate a new reusable roleplay background when none of your existing backgrounds fit the scene."
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setLocalAutoGenerateBackgrounds(!localAutoGenerateBackgrounds);
+                  markDirty();
+                }}
+                className="flex w-full items-center gap-3 rounded-xl bg-[var(--secondary)] px-4 py-3 text-left ring-1 ring-[var(--border)] transition-all hover:bg-[var(--accent)]"
+              >
+                {localAutoGenerateBackgrounds ? (
+                  <ToggleRight size="1.25rem" className="shrink-0 text-emerald-400" />
+                ) : (
+                  <ToggleLeft size="1.25rem" className="shrink-0 text-[var(--muted-foreground)]" />
+                )}
+                <div>
+                  <p className="text-sm font-medium">
+                    {localAutoGenerateBackgrounds ? "Generate missing backgrounds" : "Only pick existing backgrounds"}
+                  </p>
+                  <p className="text-[0.625rem] text-[var(--muted-foreground)]">
+                    {localAutoGenerateBackgrounds
+                      ? "If nothing fits a changed location, the agent can request a new background image."
+                      : "The agent will choose the closest uploaded background and never create a new one."}
+                  </p>
+                </div>
+              </button>
+
+              {localAutoGenerateBackgrounds && (
+                <div className="mt-3 space-y-2">
+                  <div>
+                    <label className="mb-1 block text-xs text-[var(--muted-foreground)]">
+                      Image Generation Connection
+                    </label>
+                    <select
+                      value={localImageConnectionId}
+                      onChange={(e) => {
+                        setLocalImageConnectionId(e.target.value);
+                        markDirty();
+                      }}
+                      className="w-full rounded-xl bg-[var(--secondary)] px-3 py-2.5 text-sm ring-1 ring-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
+                    >
+                      <option value="">
+                        {defaultAgentImageConn
+                          ? `Agent image default (${defaultAgentImageConn.name})`
+                          : "None (select a connection)"}
+                      </option>
+                      {imageConnections.map((conn) => (
+                        <option key={conn.id} value={conn.id}>
+                          {conn.name} ({conn.provider})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <p className="text-[0.625rem] text-[var(--muted-foreground)]">
+                    Generated images are saved into your normal Backgrounds library, so later runs can reuse them
+                    instead of regenerating the same place.
+                  </p>
+                  {!localImageConnectionId && !defaultAgentImageConn && (
+                    <p className="rounded-lg border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-[0.625rem] text-amber-300">
+                      Add an image generation connection here or mark one as the default for agents in Connections.
+                    </p>
+                  )}
                 </div>
               )}
             </FieldGroup>
@@ -1170,6 +1311,27 @@ export function AgentEditor() {
                           expired: false,
                           redirectUri: spotifyStatus?.redirectUri ?? null,
                         });
+                        // Strip tokens from the cached agent row synchronously
+                        // so a Save click racing with the pending refetch can't
+                        // resurrect them via handleSave's preservation path.
+                        qc.setQueryData<AgentConfigRow[] | undefined>(agentKeys.all, (rows) =>
+                          rows?.map((row) => {
+                            if (row.id !== dbConfig.id) return row;
+                            const parsed: Record<string, unknown> =
+                              typeof row.settings === "string"
+                                ? JSON.parse(row.settings)
+                                : ((row.settings as unknown as Record<string, unknown>) ?? {});
+                            const {
+                              spotifyAccessToken: _a,
+                              spotifyRefreshToken: _b,
+                              spotifyExpiresAt: _c,
+                              spotifyScope: _d,
+                              ...rest
+                            } = parsed;
+                            return { ...row, settings: JSON.stringify(rest) };
+                          }),
+                        );
+                        await qc.invalidateQueries({ queryKey: agentKeys.all });
                       }}
                       className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-white/50 transition-colors hover:bg-red-500/10 hover:text-red-400 hover:border-red-500/20"
                     >
@@ -1236,6 +1398,9 @@ export function AgentEditor() {
                               setSpotifyPasteOpen(false);
                               setSpotifyPasteValue("");
                               setSpotifyPasteError(null);
+                              // Refetch so the cached settings include the new
+                              // tokens before any subsequent handleSave runs.
+                              await qc.invalidateQueries({ queryKey: agentKeys.all });
                             }
                           } catch {
                             // keep polling
@@ -1336,6 +1501,9 @@ export function AgentEditor() {
                                 setSpotifyConnecting(false);
                                 setSpotifyPasteOpen(false);
                                 setSpotifyPasteValue("");
+                                // Refetch so the cached settings include the
+                                // new tokens before any subsequent handleSave.
+                                await qc.invalidateQueries({ queryKey: agentKeys.all });
                               }
                             } catch (err) {
                               setSpotifyPasteError(err instanceof Error ? err.message : "Submission failed");

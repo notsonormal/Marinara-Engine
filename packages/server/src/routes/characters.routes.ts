@@ -14,7 +14,11 @@ import {
 import type { ExportEnvelope } from "@marinara-engine/shared";
 import { createCharactersStorage } from "../services/storage/characters.storage.js";
 import { createCharacterGalleryStorage } from "../services/storage/character-gallery.storage.js";
-import { writeFile, mkdir, readFile } from "fs/promises";
+import { createConnectionsStorage } from "../services/storage/connections.storage.js";
+import { generateImage } from "../services/image/image-generation.js";
+import { resolveConnectionImageDefaults } from "../services/image/image-generation-defaults.js";
+import { loadImageGenerationUserSettings } from "../services/image/image-generation-settings.js";
+import { writeFile, mkdir, readFile, readdir } from "fs/promises";
 import { join } from "path";
 import { DATA_DIR } from "../utils/data-dir.js";
 import { createWriteStream, existsSync, rmSync, unlinkSync } from "fs";
@@ -44,12 +48,155 @@ function toSafeExportName(name: string, fallback: string) {
   return sanitized || fallback;
 }
 
+type AvatarGenerationPromptOverride = {
+  id: string;
+  prompt: string;
+};
+
+type AvatarGenerationBody = {
+  connectionId?: string;
+  name?: string;
+  appearance?: string;
+  referenceImages?: string[];
+  width?: number;
+  height?: number;
+  promptOverrides?: AvatarGenerationPromptOverride[];
+};
+
+const avatarGenerationPromptId = (name: string) =>
+  `avatar:${
+    name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/(^-|-$)/g, "")
+      .slice(0, 120) || "character"
+  }`;
+
+function buildAvatarGenerationPrompt(body: AvatarGenerationBody): string {
+  const name = body.name?.trim() || "Character";
+  const appearance = body.appearance?.trim() || name;
+  return [
+    `Create a polished character avatar portrait for ${name}.`,
+    `Canonical appearance: ${appearance}.`,
+    `Composition: centered face-and-shoulders portrait, readable expression, clear silhouette, suitable as a chat avatar.`,
+    `Avoid text, captions, logos, watermarks, borders, UI, collage layouts, duplicate faces, extra people, and cropped-off heads.`,
+  ].join(" ");
+}
+
+async function resolveAvatarGenerationConnection(app: FastifyInstance, body: AvatarGenerationBody) {
+  if (!body.connectionId) {
+    return { error: "connectionId is required" as const };
+  }
+  if (!body.appearance?.trim()) {
+    return { error: "appearance description is required" as const };
+  }
+
+  const connections = createConnectionsStorage(app.db);
+  const conn = await connections.getWithKey(body.connectionId);
+  if (!conn || conn.provider !== "image_generation") {
+    return { error: "Image generation connection not found or could not be decrypted" as const };
+  }
+  return { conn };
+}
+
 type ExportFormat = "native" | "compatible";
 
-function buildNativeCharacterEnvelope(
-  char: { createdAt: string; updatedAt: string; comment?: string | null },
+// Read an image file and return it as a base64 data URL, or null if the file
+// is missing, outside the expected dir, or not a recognized image type. Used
+// by native exports to embed binary data (avatars, sprites, gallery shots)
+// directly into the JSON envelope so personas/characters round-trip with
+// every image intact.
+async function readImageAsDataUrl(rootDir: string, filename: string): Promise<string | null> {
+  if (!filename || filename.includes("..") || filename.includes("/") || filename.includes("\\")) return null;
+  let filepath: string;
+  try {
+    filepath = assertInsideDir(rootDir, join(rootDir, filename));
+  } catch {
+    return null;
+  }
+  if (!existsSync(filepath)) return null;
+  try {
+    const buf = await readFile(filepath);
+    const info = isAllowedImageBuffer(buf, extname(filename));
+    if (!info) return null;
+    return `data:${info.mimeType};base64,${buf.toString("base64")}`;
+  } catch {
+    return null;
+  }
+}
+
+// Pull the avatar off disk for the persona/character row's avatarPath
+// (format: /api/avatars/file/<filename>). Returns null if missing/invalid.
+async function readAvatarDataUrl(avatarPath: string | null | undefined): Promise<string | null> {
+  if (!avatarPath || typeof avatarPath !== "string") return null;
+  const filename = avatarPath.split("?")[0]!.split("/").pop();
+  if (!filename) return null;
+  return readImageAsDataUrl(join(DATA_DIR, "avatars"), filename);
+}
+
+// Read every sprite file in data/sprites/<id>/ and return it as
+// { filename, data } so import can restore the same expression set under a
+// new id.
+async function readSpritesForId(
+  id: string,
+): Promise<Array<{ filename: string; data: string }>> {
+  const dir = join(DATA_DIR, "sprites", id);
+  if (!existsSync(dir)) return [];
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const sprites: Array<{ filename: string; data: string }> = [];
+  for (const entry of entries) {
+    const dataUrl = await readImageAsDataUrl(dir, entry);
+    if (dataUrl) sprites.push({ filename: entry, data: dataUrl });
+  }
+  return sprites;
+}
+
+// Read every gallery image for a character (metadata row + binary on disk),
+// returning a serializable list that import can rebuild the gallery from.
+async function readGalleryForCharacter(
+  characterId: string,
+  galleryStorage: { listByCharacterId: (id: string) => Promise<any[]> },
+): Promise<Array<Record<string, unknown>>> {
+  const images = await galleryStorage.listByCharacterId(characterId);
+  const result: Array<Record<string, unknown>> = [];
+  for (const img of images) {
+    // img.filePath is stored relative to data/gallery/, e.g.
+    // "characters/<id>/<filename>". The original filename is the basename.
+    const relPath: string = typeof img.filePath === "string" ? img.filePath : "";
+    const filename = relPath.split("/").pop() ?? "";
+    if (!filename) continue;
+    const galleryDir = join(DATA_DIR, "gallery", "characters", characterId);
+    const dataUrl = await readImageAsDataUrl(galleryDir, filename);
+    if (!dataUrl) continue;
+    result.push({
+      filename,
+      data: dataUrl,
+      prompt: img.prompt ?? "",
+      provider: img.provider ?? "",
+      model: img.model ?? "",
+      width: img.width ?? null,
+      height: img.height ?? null,
+    });
+  }
+  return result;
+}
+
+async function buildNativeCharacterEnvelope(
+  char: { id: string; createdAt: string; updatedAt: string; comment?: string | null; avatarPath?: string | null },
   data: any,
+  galleryStorage: { listByCharacterId: (id: string) => Promise<any[]> },
 ) {
+  const [avatar, sprites, gallery] = await Promise.all([
+    readAvatarDataUrl(char.avatarPath),
+    readSpritesForId(char.id),
+    readGalleryForCharacter(char.id, galleryStorage),
+  ]);
   return {
     type: "marinara_character",
     version: 1,
@@ -58,6 +205,9 @@ function buildNativeCharacterEnvelope(
       spec: "chara_card_v2",
       spec_version: "2.0",
       data,
+      ...(avatar ? { avatar } : {}),
+      ...(sprites.length > 0 ? { sprites } : {}),
+      ...(gallery.length > 0 ? { gallery } : {}),
       metadata: {
         createdAt: char.createdAt,
         updatedAt: char.updatedAt,
@@ -75,14 +225,21 @@ function buildCompatibleCharacterExport(data: any) {
   };
 }
 
-function buildNativePersonaEnvelope(persona: Record<string, unknown>) {
-  const { id: _id, createdAt, updatedAt, avatarPath: _avatarPath, isActive: _isActive, ...personaData } = persona;
+async function buildNativePersonaEnvelope(persona: Record<string, unknown>) {
+  const { id: _id, createdAt, updatedAt, avatarPath, isActive: _isActive, ...personaData } = persona;
+  const personaId = typeof _id === "string" ? _id : "";
+  const [avatar, sprites] = await Promise.all([
+    readAvatarDataUrl(typeof avatarPath === "string" ? avatarPath : null),
+    personaId ? readSpritesForId(personaId) : Promise.resolve([] as Array<{ filename: string; data: string }>),
+  ]);
   return {
     type: "marinara_persona",
     version: 1,
     exportedAt: new Date().toISOString(),
     data: {
       ...personaData,
+      ...(avatar ? { avatar } : {}),
+      ...(sprites.length > 0 ? { sprites } : {}),
       metadata: {
         createdAt,
         updatedAt,
@@ -119,6 +276,75 @@ export async function charactersRoutes(app: FastifyInstance) {
 
   app.get("/", async () => {
     return storage.list();
+  });
+
+  app.post("/avatar-generation/preview", async (req, reply) => {
+    const body = req.body as AvatarGenerationBody;
+    const resolved = await resolveAvatarGenerationConnection(app, body);
+    if ("error" in resolved) return reply.status(400).send({ error: resolved.error });
+
+    const imageSettings = await loadImageGenerationUserSettings(app.db);
+    const width = body.width ?? imageSettings.portrait.width;
+    const height = body.height ?? imageSettings.portrait.height;
+    const prompt = buildAvatarGenerationPrompt(body);
+
+    return {
+      items: [
+        {
+          id: avatarGenerationPromptId(body.name ?? "character"),
+          kind: "avatar",
+          title: `Avatar: ${body.name?.trim() || "Character"}`,
+          prompt,
+          width,
+          height,
+        },
+      ],
+    };
+  });
+
+  app.post("/avatar-generation", async (req, reply) => {
+    const body = req.body as AvatarGenerationBody;
+    const resolved = await resolveAvatarGenerationConnection(app, body);
+    if ("error" in resolved) return reply.status(400).send({ error: resolved.error });
+
+    const conn = resolved.conn;
+    const imageSettings = await loadImageGenerationUserSettings(app.db);
+    const width = body.width ?? imageSettings.portrait.width;
+    const height = body.height ?? imageSettings.portrait.height;
+    const promptOverrideById = new Map((body.promptOverrides ?? []).map((item) => [item.id, item.prompt.trim()]));
+    const prompt =
+      promptOverrideById.get(avatarGenerationPromptId(body.name ?? "character")) ?? buildAvatarGenerationPrompt(body);
+    const referenceImages = (body.referenceImages ?? [])
+      .map((image) => image.trim())
+      .filter((image) => image.startsWith("data:image/") || /^[A-Za-z0-9+/=\s]+$/.test(image))
+      .slice(0, 4);
+
+    const imgModel = conn.model || "";
+    const imgBaseUrl = conn.baseUrl || "https://image.pollinations.ai";
+    const imgApiKey = conn.apiKey || "";
+    const imgSource = conn.imageGenerationSource || imgModel;
+    const imgServiceHint = conn.imageService || imgSource;
+    const imageDefaults = resolveConnectionImageDefaults(conn);
+
+    try {
+      const result = await generateImage(imgModel, imgBaseUrl, imgApiKey, imgServiceHint, {
+        prompt,
+        model: imgModel || undefined,
+        width,
+        height,
+        referenceImage: referenceImages[0],
+        referenceImages: referenceImages.length > 1 ? referenceImages : undefined,
+        comfyWorkflow: conn.comfyuiWorkflow || undefined,
+        imageDefaults,
+      });
+      return {
+        image: `data:${result.mimeType};base64,${result.base64}`,
+        prompt,
+      };
+    } catch (err) {
+      req.log.error(err, "Avatar generation failed");
+      return reply.status(500).send({ error: err instanceof Error ? err.message : "Avatar generation failed" });
+    }
   });
 
   app.get<{ Params: { id: string } }>("/:id", async (req, reply) => {
@@ -292,7 +518,7 @@ export async function charactersRoutes(app: FastifyInstance) {
     const compatible = req.query.format === "compatible";
     const payload = compatible
       ? buildCompatibleCharacterExport(charData)
-      : buildNativeCharacterEnvelope(char, charData);
+      : await buildNativeCharacterEnvelope(char, charData, characterGallery);
     return reply
       .header(
         "Content-Disposition",
@@ -316,7 +542,7 @@ export async function charactersRoutes(app: FastifyInstance) {
       const payload =
         format === "compatible"
           ? buildCompatibleCharacterExport(charData)
-          : buildNativeCharacterEnvelope(char, charData);
+          : await buildNativeCharacterEnvelope(char, charData, characterGallery);
       zip.addFile(
         `${toSafeExportName(String(charData.name ?? "character"), `character-${exportedCount + 1}`)}.${format === "compatible" ? "json" : "marinara.json"}`,
         Buffer.from(JSON.stringify(payload, null, 2), "utf-8"),
@@ -496,8 +722,10 @@ export async function charactersRoutes(app: FastifyInstance) {
       nameColor?: string;
       dialogueColor?: string;
       boxColor?: string;
+      avatarCrop?: string;
       createdAt?: string;
       updatedAt?: string;
+      savedStatusOptions?: string;
     };
     return storage.createPersona(
       name,
@@ -562,7 +790,7 @@ export async function charactersRoutes(app: FastifyInstance) {
       const compatible = req.query.format === "compatible";
       const payload = compatible
         ? buildCompatiblePersonaExport(persona as Record<string, unknown>)
-        : buildNativePersonaEnvelope(persona as Record<string, unknown>);
+        : await buildNativePersonaEnvelope(persona as Record<string, unknown>);
       return reply
         .header(
           "Content-Disposition",
@@ -586,7 +814,7 @@ export async function charactersRoutes(app: FastifyInstance) {
       const payload =
         format === "compatible"
           ? buildCompatiblePersonaExport(persona as Record<string, unknown>)
-          : buildNativePersonaEnvelope(persona as Record<string, unknown>);
+          : await buildNativePersonaEnvelope(persona as Record<string, unknown>);
       zip.addFile(
         `${toSafeExportName(String(persona.name ?? "persona"), `persona-${exportedCount + 1}`)}.${format === "compatible" ? "json" : "marinara.json"}`,
         Buffer.from(JSON.stringify(payload, null, 2), "utf-8"),

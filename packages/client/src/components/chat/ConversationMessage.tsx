@@ -9,24 +9,26 @@ import {
   Copy,
   RefreshCw,
   Eye,
+  ScrollText,
   Brain,
   X,
   User,
   Languages,
-  ChevronLeft,
-  ChevronRight,
 } from "lucide-react";
 import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
-import type { Message } from "@marinara-engine/shared";
+import type { Message, MessageExtra } from "@marinara-engine/shared";
 import { useUIStore } from "../../stores/ui.store";
 import { useChatStore } from "../../stores/chat.store";
-import { cn, copyToClipboard, getAvatarCropStyle } from "../../lib/utils";
+import { cn, copyToClipboard, getAvatarCropStyle, parseAvatarCropJson } from "../../lib/utils";
 import { applyInlineMarkdown, renderMarkdownBlocks } from "../../lib/markdown";
 import { chatKeys } from "../../hooks/use-chats";
 import { resolveMessageMacros } from "../../lib/chat-macros";
 import { useTranslate } from "../../hooks/use-translate";
 import { api } from "../../lib/api-client";
 import type { CharacterMap, MessageSelectionToggle, PersonaInfo } from "./chat-area.types";
+import { GenerationReplayDetailsModal, hasGenerationReplayDetails } from "./GenerationReplayDetailsModal";
+import { ImagePromptPanel } from "./ImagePromptPanel";
+import { SwipeJumpControl } from "./SwipeJumpControl";
 
 /** Build style object for name color (supports gradients). */
 function nameColorStyle(color?: string): CSSProperties | undefined {
@@ -228,7 +230,8 @@ interface MessageData {
     } | null;
     isConversationStart?: boolean;
     thinking?: string | null;
-    attachments?: Array<{ type: string; url: string; filename?: string }>;
+    generationReplay?: MessageExtra["generationReplay"];
+    attachments?: Array<{ type: string; url: string; filename?: string; prompt?: string; galleryId?: string }>;
   };
   createdAt: string;
 }
@@ -252,7 +255,7 @@ interface ConversationMessageProps {
   onEditClick?: () => void;
   /** Character IDs that actually belong to this chat. Speaker-name rendering is scoped to these IDs. */
   chatCharacterIds?: string[];
-  /** 1-based ordinal position in the message list. Shown under avatar when actions visible. */
+  /** 1-based ordinal position in the message list. Shown under avatar when actions or message numbers are visible. */
   messageIndex?: number;
   messageOrderIndex?: number;
   multiSelectMode?: boolean;
@@ -288,11 +291,13 @@ export const ConversationMessage = memo(function ConversationMessage({
   const [showActions, setShowActions] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
-  const [imageLightbox, setImageLightbox] = useState<string | null>(null);
+  const [showGenerationReplay, setShowGenerationReplay] = useState(false);
+  const [imageLightbox, setImageLightbox] = useState<{ url: string; prompt?: string | null } | null>(null);
   const editRef = useRef<HTMLTextAreaElement>(null);
   const hasInput = useChatStore((s) => s.currentInput.trim().length > 0);
   const guideGenerations = useUIStore((s) => s.guideGenerations);
   const chatFontSize = useUIStore((s) => s.chatFontSize);
+  const showMessageNumbers = useUIStore((s) => s.showMessageNumbers);
   const messageTextStyle = useMemo<CSSProperties>(() => ({ fontSize: `${chatFontSize}px` }), [chatFontSize]);
   const isGuided = guideGenerations && hasInput;
   const regenerateButtonTitle = isGuided ? "Regenerate (guided)" : "Regenerate";
@@ -313,6 +318,14 @@ export const ConversationMessage = memo(function ConversationMessage({
     if (!message.extra) return {} as Record<string, any>;
     return typeof message.extra === "string" ? JSON.parse(message.extra) : message.extra;
   }, [message.extra]);
+  const generationReplay = hasGenerationReplayDetails(extra.generationReplay) ? extra.generationReplay : null;
+  // canRegenerate lets assistant messages retry; isUser messages need generationReplay
+  // metadata from hasGenerationReplayDetails, such as /impersonate.
+  const canRegenerate = !isUser || generationReplay !== null;
+
+  useEffect(() => {
+    if (!generationReplay) setShowGenerationReplay(false);
+  }, [generationReplay]);
 
   const scopedCharacterMap = useMemo(() => {
     if (!characterMap) return null;
@@ -336,7 +349,10 @@ export const ConversationMessage = memo(function ConversationMessage({
   // Fall back to the current personaInfo prop for older messages without snapshots.
   const msgPersona = isUser && extra.personaSnapshot ? extra.personaSnapshot : null;
   const avatarUrl = isUser ? (msgPersona?.avatarUrl ?? personaInfo?.avatarUrl ?? null) : (charInfo?.avatarUrl ?? null);
-  const avatarCropStyle = isUser ? undefined : getAvatarCropStyle(charInfo?.avatarCrop);
+  const personaAvatarCrop = isUser
+    ? (parseAvatarCropJson(msgPersona?.avatarCrop) ?? personaInfo?.avatarCrop ?? null)
+    : null;
+  const avatarCropStyle = isUser ? getAvatarCropStyle(personaAvatarCrop) : getAvatarCropStyle(charInfo?.avatarCrop);
   const displayName = isUser
     ? (msgPersona?.name ?? personaInfo?.name ?? "You")
     : (primaryCharInfo?.name ?? "Assistant");
@@ -489,26 +505,6 @@ export const ConversationMessage = memo(function ConversationMessage({
   const swipeCount = message.swipeCount ?? 0;
   const hasSwipes = swipeCount > 1;
 
-  const handleSwipePrev = useCallback(
-    (e?: React.MouseEvent<HTMLButtonElement>) => {
-      e?.stopPropagation();
-      if (message.activeSwipeIndex > 0) {
-        onSetActiveSwipe?.(message.id, message.activeSwipeIndex - 1);
-      }
-    },
-    [message.activeSwipeIndex, message.id, onSetActiveSwipe],
-  );
-
-  const handleSwipeNext = useCallback(
-    (e?: React.MouseEvent<HTMLButtonElement>) => {
-      e?.stopPropagation();
-      if (message.activeSwipeIndex < swipeCount - 1) {
-        onSetActiveSwipe?.(message.id, message.activeSwipeIndex + 1);
-      }
-    },
-    [message.activeSwipeIndex, message.id, onSetActiveSwipe, swipeCount],
-  );
-
   // Actions
   const handleCopy = useCallback(() => {
     copyToClipboard(renderedContent);
@@ -528,6 +524,18 @@ export const ConversationMessage = memo(function ConversationMessage({
       }
     });
   }, [message.content]);
+
+  useEffect(() => {
+    if (!onEdit) return;
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ messageId?: string }>).detail;
+      if (detail?.messageId !== message.id) return;
+      if (onEditClick) onEditClick();
+      else startEditing();
+    };
+    window.addEventListener("marinara:start-edit-message", handler);
+    return () => window.removeEventListener("marinara:start-edit-message", handler);
+  }, [message.id, onEdit, onEditClick, startEditing]);
 
   const editValueRef = useRef(editValue);
   editValueRef.current = editValue;
@@ -668,7 +676,7 @@ export const ConversationMessage = memo(function ConversationMessage({
                     <div className="flex gap-4">
                       {/* Avatar */}
                       <div className="w-10 flex-shrink-0">
-                        <div className="h-10 w-10 overflow-hidden rounded-full bg-[var(--accent)]">
+                        <div className="relative h-10 w-10 overflow-hidden rounded-full bg-[var(--accent)]">
                           {segAvatar ? (
                             <img
                               src={segAvatar}
@@ -683,7 +691,7 @@ export const ConversationMessage = memo(function ConversationMessage({
                             </div>
                           )}
                         </div>
-                        {isFirst && (showActions || forceShowActions) && messageIndex != null && (
+                        {isFirst && (showActions || forceShowActions || showMessageNumbers) && messageIndex != null && (
                           <span className="mt-0.5 block text-center text-[0.5rem] font-medium text-[var(--muted-foreground)] select-none">
                             #{messageIndex}
                           </span>
@@ -746,28 +754,51 @@ export const ConversationMessage = memo(function ConversationMessage({
           <span className="ml-14 inline-block h-4 w-[0.125rem] animate-pulse rounded-full bg-[var(--foreground)]/50" />
         )}
 
-        {!hideActions && hasSwipes && (
-          <div className="ml-14 mt-2 flex items-center gap-1.5 px-1 text-[0.6875rem] text-[var(--muted-foreground)]">
-            <button
-              className="rounded p-0.5 transition-colors hover:bg-[var(--accent)] disabled:opacity-30"
-              onClick={handleSwipePrev}
-              disabled={message.activeSwipeIndex <= 0}
-              title="Previous swipe"
-            >
-              <ChevronLeft size="0.75rem" />
-            </button>
-            <span className="tabular-nums">
-              {message.activeSwipeIndex + 1}/{swipeCount}
-            </span>
-            <button
-              className="rounded p-0.5 transition-colors hover:bg-[var(--accent)] disabled:opacity-30"
-              onClick={handleSwipeNext}
-              disabled={message.activeSwipeIndex >= swipeCount - 1}
-              title="Next swipe"
-            >
-              <ChevronRight size="0.75rem" />
-            </button>
+        {/* Image attachments (selfies, illustrations) */}
+        {extra.attachments && extra.attachments.length > 0 && !IMAGE_URL_RE.test(renderedContent.trim()) && (
+          <div className="ml-14 mt-1.5 flex flex-col items-start gap-2">
+            {extra.attachments.map((att: any, i: number) =>
+              att.type === "image" || att.type?.startsWith("image/") ? (
+                <div key={i} className="group/att relative inline-block">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setImageLightbox({ url: att.url || att.data, prompt: att.prompt });
+                    }}
+                    className="block cursor-zoom-in rounded-lg text-left"
+                    title="Open image"
+                  >
+                    <img
+                      src={att.url || att.data}
+                      alt={att.filename || att.name || "image"}
+                      className="max-h-80 max-w-full rounded-lg"
+                      loading="lazy"
+                    />
+                  </button>
+                  <button
+                    onClick={() => handleRemoveAttachment(i)}
+                    title="Remove from message"
+                    className="absolute top-1.5 right-1.5 rounded-full bg-black/60 p-1 text-white/80 transition-opacity hover:bg-black/80 hover:text-white sm:opacity-0 sm:group-hover/att:opacity-100"
+                  >
+                    <X size="0.875rem" />
+                  </button>
+                </div>
+              ) : null,
+            )}
           </div>
+        )}
+
+        {!hideActions && hasSwipes && (
+          <SwipeJumpControl
+            messageId={message.id}
+            activeSwipeIndex={message.activeSwipeIndex}
+            swipeCount={swipeCount}
+            onSetActiveSwipe={(index) => onSetActiveSwipe?.(message.id, index)}
+            className="ml-14 mt-2 px-1 text-[0.6875rem] text-[var(--muted-foreground)]"
+            buttonClassName="rounded p-0.5 transition-colors hover:bg-[var(--accent)] disabled:opacity-30"
+            inputClassName="h-[1.5rem] w-[3rem] text-[0.6875rem]"
+          />
         )}
 
         {/* Hover action bar */}
@@ -794,6 +825,13 @@ export const ConversationMessage = memo(function ConversationMessage({
           />
           {isLastAssistantMessage && (
             <MsgAction icon={<Eye size="0.75rem" />} onClick={() => onPeekPrompt?.()} title="Peek prompt" />
+          )}
+          {generationReplay && (
+            <MsgAction
+              icon={<ScrollText size="0.75rem" />}
+              onClick={() => setShowGenerationReplay(true)}
+              title="Stored guidance"
+            />
           )}
           {thinking && (
             <MsgAction icon={<Brain size="0.75rem" />} onClick={() => setShowThinking(true)} title="View thoughts" />
@@ -839,6 +877,13 @@ export const ConversationMessage = memo(function ConversationMessage({
             </div>,
             document.body,
           )}
+        {generationReplay && (
+          <GenerationReplayDetailsModal
+            open={showGenerationReplay}
+            replay={generationReplay}
+            onClose={() => setShowGenerationReplay(false)}
+          />
+        )}
       </div>
     );
   }
@@ -888,7 +933,7 @@ export const ConversationMessage = memo(function ConversationMessage({
       <div className="mari-message-avatar w-10 flex-shrink-0">
         {!isGrouped && (
           <>
-            <div className="h-10 w-10 overflow-hidden rounded-full bg-[var(--accent)]">
+            <div className="relative h-10 w-10 overflow-hidden rounded-full bg-[var(--accent)]">
               {avatarUrl ? (
                 <img
                   src={avatarUrl}
@@ -903,7 +948,7 @@ export const ConversationMessage = memo(function ConversationMessage({
                 </div>
               )}
             </div>
-            {(showActions || forceShowActions) && messageIndex != null && (
+            {(showActions || forceShowActions || showMessageNumbers) && messageIndex != null && (
               <span className="mt-0.5 block text-center text-[0.5rem] font-medium text-[var(--muted-foreground)] select-none">
                 #{messageIndex}
               </span>
@@ -980,7 +1025,11 @@ export const ConversationMessage = memo(function ConversationMessage({
               </div>
             ) : (
               <>
-                <MessageContent content={renderedContent} mentionNames={mentionNames} onImageOpen={setImageLightbox} />
+                <MessageContent
+                  content={renderedContent}
+                  mentionNames={mentionNames}
+                  onImageOpen={(url) => setImageLightbox({ url })}
+                />
                 {isStreaming && (
                   <span className="ml-0.5 inline-block h-4 w-[0.125rem] animate-pulse rounded-full bg-[var(--foreground)]/50" />
                 )}
@@ -1012,7 +1061,7 @@ export const ConversationMessage = memo(function ConversationMessage({
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
-                      setImageLightbox(att.url || att.data);
+                      setImageLightbox({ url: att.url || att.data, prompt: att.prompt });
                     }}
                     className="block cursor-zoom-in rounded-lg text-left"
                     title="Open image"
@@ -1038,27 +1087,15 @@ export const ConversationMessage = memo(function ConversationMessage({
         )}
 
         {!hideActions && hasSwipes && (
-          <div className="mt-1.5 flex items-center gap-1.5 text-[0.6875rem] text-[var(--muted-foreground)]">
-            <button
-              className="rounded p-0.5 transition-colors hover:bg-[var(--accent)] disabled:opacity-30"
-              onClick={handleSwipePrev}
-              disabled={message.activeSwipeIndex <= 0}
-              title="Previous swipe"
-            >
-              <ChevronLeft size="0.75rem" />
-            </button>
-            <span className="tabular-nums">
-              {message.activeSwipeIndex + 1}/{swipeCount}
-            </span>
-            <button
-              className="rounded p-0.5 transition-colors hover:bg-[var(--accent)] disabled:opacity-30"
-              onClick={handleSwipeNext}
-              disabled={message.activeSwipeIndex >= swipeCount - 1}
-              title="Next swipe"
-            >
-              <ChevronRight size="0.75rem" />
-            </button>
-          </div>
+          <SwipeJumpControl
+            messageId={message.id}
+            activeSwipeIndex={message.activeSwipeIndex}
+            swipeCount={swipeCount}
+            onSetActiveSwipe={(index) => onSetActiveSwipe?.(message.id, index)}
+            className="mt-1.5 text-[0.6875rem] text-[var(--muted-foreground)]"
+            buttonClassName="rounded p-0.5 transition-colors hover:bg-[var(--accent)] disabled:opacity-30"
+            inputClassName="h-[1.5rem] w-[3rem] text-[0.6875rem]"
+          />
         )}
       </div>
 
@@ -1079,7 +1116,7 @@ export const ConversationMessage = memo(function ConversationMessage({
             className={translatedText ? "text-blue-400" : undefined}
           />
           <MsgAction icon={<Pencil size="0.75rem" />} onClick={onEditClick ?? startEditing} title="Edit" />
-          {!isUser && (
+          {canRegenerate && (
             <MsgAction
               icon={<RefreshCw size="0.75rem" />}
               onClick={() => onRegenerate?.(message.id)}
@@ -1089,6 +1126,13 @@ export const ConversationMessage = memo(function ConversationMessage({
           )}
           {isLastAssistantMessage && !isUser && (
             <MsgAction icon={<Eye size="0.75rem" />} onClick={() => onPeekPrompt?.()} title="Peek prompt" />
+          )}
+          {generationReplay && (
+            <MsgAction
+              icon={<ScrollText size="0.75rem" />}
+              onClick={() => setShowGenerationReplay(true)}
+              title="Stored guidance"
+            />
           )}
           {thinking && !isUser && (
             <MsgAction icon={<Brain size="0.75rem" />} onClick={() => setShowThinking(true)} title="View thoughts" />
@@ -1132,9 +1176,16 @@ export const ConversationMessage = memo(function ConversationMessage({
                 </pre>
               </div>
             </div>
-          </div>,
-          document.body,
-        )}
+            </div>,
+            document.body,
+          )}
+      {generationReplay && (
+        <GenerationReplayDetailsModal
+          open={showGenerationReplay}
+          replay={generationReplay}
+          onClose={() => setShowGenerationReplay(false)}
+        />
+      )}
 
       {imageLightbox &&
         createPortal(
@@ -1142,12 +1193,21 @@ export const ConversationMessage = memo(function ConversationMessage({
             className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm max-md:pt-[env(safe-area-inset-top)]"
             onClick={() => setImageLightbox(null)}
           >
-            <img
-              src={imageLightbox}
-              alt="Expanded image"
-              className="max-h-[90vh] max-w-[90vw] rounded-lg object-contain shadow-2xl"
+            <div
+              className="flex max-h-[90vh] w-[min(90vw,64rem)] max-w-[90vw] flex-col items-center gap-2"
               onClick={(e) => e.stopPropagation()}
-            />
+            >
+              <img
+                src={imageLightbox.url}
+                alt="Expanded image"
+                className={
+                  imageLightbox.prompt?.trim()
+                    ? "max-h-[calc(90vh-9rem)] max-w-full rounded-lg object-contain shadow-2xl"
+                    : "max-h-[90vh] max-w-full rounded-lg object-contain shadow-2xl"
+                }
+              />
+              <ImagePromptPanel prompt={imageLightbox.prompt} className="w-full max-w-3xl" />
+            </div>
             <button
               onClick={() => setImageLightbox(null)}
               className="absolute right-4 top-4 rounded-full bg-black/50 p-2 text-white/80 transition-colors hover:bg-black/70 hover:text-white"

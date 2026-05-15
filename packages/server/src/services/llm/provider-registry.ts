@@ -2,6 +2,7 @@
 // LLM Provider — Registry & Factory
 // ──────────────────────────────────────────────
 import { OpenAIProvider } from "./providers/openai.provider.js";
+import { OpenAIChatGPTProvider } from "./providers/openai-chatgpt.provider.js";
 import { AnthropicProvider } from "./providers/anthropic.provider.js";
 import { ClaudeSubscriptionProvider } from "./providers/claude-subscription.provider.js";
 import { GoogleProvider } from "./providers/google.provider.js";
@@ -29,6 +30,8 @@ export function createLLMProvider(
   maxContext?: number | null,
   openrouterProvider?: string | null,
   maxTokensOverride?: number | null,
+  /** Claude (Subscription) only. When true, asks the Agent SDK to use fast-mode routing. */
+  claudeFastMode?: boolean,
 ): BaseLLMProvider {
   const normalizedMaxContext =
     typeof maxContext === "number" && Number.isFinite(maxContext) && maxContext > 0
@@ -54,6 +57,14 @@ export function createLLMProvider(
         normalizedMaxTokensOverride,
         provider,
       );
+    case "openai_chatgpt":
+      return new OpenAIChatGPTProvider(
+        baseUrl,
+        apiKey,
+        normalizedMaxContext,
+        openrouterProvider,
+        normalizedMaxTokensOverride,
+      );
     case "cohere":
       return new OpenAIProvider(
         normalizeCohereOpenAIBaseUrl(baseUrl),
@@ -78,6 +89,7 @@ export function createLLMProvider(
         normalizedMaxContext,
         openrouterProvider,
         normalizedMaxTokensOverride,
+        claudeFastMode ?? false,
       );
     case "google":
       return new GoogleProvider(baseUrl, apiKey, normalizedMaxContext, openrouterProvider, normalizedMaxTokensOverride);

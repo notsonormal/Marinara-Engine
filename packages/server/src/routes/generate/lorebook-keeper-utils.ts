@@ -77,7 +77,9 @@ export async function resolveLorebookKeeperTarget(args: {
     name?: string | null;
     enabled?: unknown;
     characterId?: string | null;
+    characterIds?: string[] | null;
     personaId?: string | null;
+    personaIds?: string[] | null;
     chatId?: string | null;
   }>;
 
@@ -85,7 +87,9 @@ export async function resolveLorebookKeeperTarget(args: {
     if (preferredTargetLorebookId && book.id === preferredTargetLorebookId) return true;
     if (!isEnabledLorebook(book.enabled)) return false;
     if (activeLorebookIds.includes(book.id)) return true;
+    if (book.characterIds?.some((characterId) => characterIds.includes(characterId))) return true;
     if (book.characterId && characterIds.includes(book.characterId)) return true;
+    if (personaId && book.personaIds?.includes(personaId)) return true;
     if (book.personaId && book.personaId === personaId) return true;
     if (book.chatId && book.chatId === chatId) return true;
     return false;
@@ -226,6 +230,24 @@ function normalizeKeeperFacts(value: unknown): string[] {
   return facts;
 }
 
+function dedupeKeeperContentParagraphs(content: string): string {
+  const paragraphs = content
+    .split(/\r?\n\s*\r?\n+/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+
+  for (const paragraph of paragraphs) {
+    const comparable = normalizeKeeperFactForComparison(paragraph);
+    if (!comparable || seen.has(comparable)) continue;
+    seen.add(comparable);
+    deduped.push(paragraph);
+  }
+
+  return deduped.join("\n\n");
+}
+
 function mergeLorebookKeys(existingKeys: unknown, newKeys: string[]): string[] {
   const merged: string[] = [];
   const seen = new Set<string>();
@@ -251,8 +273,9 @@ export function mergeLorebookKeeperUpdateContent(args: {
   replacementContent: unknown;
   newFacts: unknown;
 }): string {
-  const existing = typeof args.existingContent === "string" ? args.existingContent.trim() : "";
-  const replacement = typeof args.replacementContent === "string" ? args.replacementContent.trim() : "";
+  const existing = typeof args.existingContent === "string" ? dedupeKeeperContentParagraphs(args.existingContent) : "";
+  const replacement =
+    typeof args.replacementContent === "string" ? dedupeKeeperContentParagraphs(args.replacementContent) : "";
   const facts = normalizeKeeperFacts(args.newFacts);
 
   if (facts.length === 0) {
@@ -264,10 +287,11 @@ export function mergeLorebookKeeperUpdateContent(args: {
     if (replacementComparable.includes(existingComparable)) return replacement;
     if (existingComparable.includes(replacementComparable)) return existing;
 
-    return `${existing}\n\n${replacement}`;
+    return dedupeKeeperContentParagraphs(`${existing}\n\n${replacement}`);
   }
 
-  const baseContent = existing || replacement;
+  const baseContent =
+    existing && replacement ? dedupeKeeperContentParagraphs(`${existing}\n\n${replacement}`) : existing || replacement;
   const existingComparable = normalizeKeeperFactForComparison(baseContent);
   const novelFacts = facts.filter((fact) => {
     const comparable = normalizeKeeperFactForComparison(fact);
@@ -278,6 +302,14 @@ export function mergeLorebookKeeperUpdateContent(args: {
 
   const addition = novelFacts.map((fact) => `- ${fact}`).join("\n");
   return baseContent ? `${baseContent}\n\n${addition}` : addition;
+}
+
+function getExplicitUpdateReplacementContent(update: Record<string, unknown>): string | null {
+  if (typeof update.action !== "string" || update.action.trim().toLowerCase() !== "update") return null;
+  if (typeof update.content !== "string") return null;
+
+  const replacement = dedupeKeeperContentParagraphs(update.content);
+  return replacement.length > 0 ? replacement : null;
 }
 
 export async function persistLorebookKeeperUpdates(args: {
@@ -334,11 +366,13 @@ export async function persistLorebookKeeperUpdates(args: {
     }
 
     if (existing) {
-      const mergedContent = mergeLorebookKeeperUpdateContent({
-        existingContent: existing.content,
-        replacementContent: content,
-        newFacts: update.newFacts,
-      });
+      const mergedContent =
+        getExplicitUpdateReplacementContent(update) ??
+        mergeLorebookKeeperUpdateContent({
+          existingContent: existing.content,
+          replacementContent: content,
+          newFacts: update.newFacts,
+        });
       const mergedKeys = mergeLorebookKeys(existing.keys, keys);
       const mergedTag = tag || existing.tag || "";
       await lorebooksStore.updateEntry(existing.id, {

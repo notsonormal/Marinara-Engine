@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { brotliCompressSync, gzipSync, zstdCompressSync } from "node:zlib";
 import { MODEL_LISTS } from "../../shared/src/constants/model-lists.ts";
 import { createLLMProvider } from "../src/services/llm/provider-registry.js";
 import { OpenAIProvider } from "../src/services/llm/providers/openai.provider.js";
@@ -11,11 +12,23 @@ async function captureChatRequestBody(
   baseUrl = "https://example.com/v1",
   provider = new OpenAIProvider(baseUrl, "test-key"),
 ) {
+  const request = await captureChatRequest(model, overrides, baseUrl, provider);
+  return request.body;
+}
+
+async function captureChatRequest(
+  model: string,
+  overrides: Partial<ChatOptions> = {},
+  baseUrl = "https://example.com/v1",
+  provider = new OpenAIProvider(baseUrl, "test-key"),
+) {
   const requests: Array<Record<string, unknown>> = [];
+  const urls: string[] = [];
   const originalFetch = globalThis.fetch;
   const originalLocalUrls = process.env.PROVIDER_LOCAL_URLS_ENABLED;
 
-  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+  globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    urls.push(String(input));
     requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
     return new Response(
       JSON.stringify({
@@ -52,7 +65,8 @@ async function captureChatRequestBody(
   }
 
   assert.equal(requests.length, 1);
-  return requests[0]!;
+  assert.equal(urls.length, 1);
+  return { url: urls[0]!, body: requests[0]! };
 }
 
 async function captureChatRequestBodyForMessages(
@@ -168,6 +182,32 @@ test("GLM models on native Z.AI endpoints still use enable_thinking for provider
   assert.equal("reasoning_effort" in body, false);
 });
 
+test("NanoGPT GLM models explicitly disable thinking when reasoning is off", async () => {
+  const provider = createLLMProvider("nanogpt", "https://nano-gpt.com/api/v1", "test-key");
+  const body = await captureChatRequestBody(
+    "glm-5.1",
+    { reasoningEffort: undefined },
+    "https://nano-gpt.com/api/v1",
+    provider,
+  );
+
+  assert.equal(body.enable_thinking, false);
+  assert.equal("reasoning_effort" in body, false);
+});
+
+test("NanoGPT GLM chatComplete requests explicitly disable thinking when reasoning is off", async () => {
+  const provider = createLLMProvider("nanogpt", "https://nano-gpt.com/api/v1", "test-key");
+  const body = await captureChatCompleteRequestBody(
+    "glm-5.1",
+    { reasoningEffort: undefined },
+    "https://nano-gpt.com/api/v1",
+    provider,
+  );
+
+  assert.equal(body.enable_thinking, false);
+  assert.equal("reasoning_effort" in body, false);
+});
+
 test("custom compatible endpoints omit enable_thinking even on native Z.AI URLs", async () => {
   const provider = createLLMProvider("custom", "https://api.z.ai/api/paas/v4", "test-key");
   const body = await captureChatRequestBody("glm-4.5", {}, "https://api.z.ai/api/paas/v4", provider);
@@ -214,21 +254,29 @@ test("custom compatible endpoints keep OpenAI reasoning model names on a standar
   assert.equal("enable_thinking" in body, false);
 });
 
-test("custom compatible endpoints do not force GPT-5.5 streaming extras", async () => {
+test("custom compatible GPT-5.5 endpoints stay on Chat Completions", async () => {
   const provider = createLLMProvider("custom", "https://example.com/v1", "test-key");
-  const body = await captureChatRequestBody(
+  const request = await captureChatRequest(
     "gpt-5.5",
-    { reasoningEffort: "xhigh", verbosity: "high" },
+    { reasoningEffort: "xhigh", verbosity: "high", temperature: 0.7, topP: 0.9 },
     "https://example.com/v1",
     provider,
   );
+  const body = request.body;
 
+  assert.equal(request.url, "https://example.com/v1/chat/completions");
   assert.equal(body.stream, false);
-  assert.equal(body.max_tokens, 512);
+  assert.equal(body.max_completion_tokens, 512);
+  assert.deepEqual(body.messages, [{ role: "user", content: "Hello" }]);
   assert.equal("stream_options" in body, false);
-  assert.equal("max_completion_tokens" in body, false);
-  assert.equal("reasoning_effort" in body, false);
-  assert.equal("verbosity" in body, false);
+  assert.equal("max_tokens" in body, false);
+  assert.equal("max_output_tokens" in body, false);
+  assert.equal("input" in body, false);
+  assert.equal("reasoning" in body, false);
+  assert.equal("text" in body, false);
+  assert.equal(body.reasoning_effort, "xhigh");
+  assert.equal("temperature" in body, false);
+  assert.equal("top_p" in body, false);
 });
 
 test("custom compatible streams accept SSE data lines without a space", async () => {
@@ -282,6 +330,176 @@ test("custom compatible streams accept SSE data lines without a space", async ()
   }
 });
 
+test("LLM streaming requests ask providers for identity encoding", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalLocalUrls = process.env.PROVIDER_LOCAL_URLS_ENABLED;
+  const seenAcceptEncodings: Array<string | null> = [];
+  const encoder = new TextEncoder();
+
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    seenAcceptEncodings.push(new Headers(init?.headers).get("accept-encoding"));
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data:{"choices":[{"delta":{"content":"identity"}}]}\n\n'));
+          controller.enqueue(encoder.encode("data:[DONE]\n\n"));
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    );
+  };
+
+  try {
+    process.env.PROVIDER_LOCAL_URLS_ENABLED = "true";
+    const provider = createLLMProvider("custom", "https://api.venice.ai/api/v1", "test-key");
+    const tokenChunks: string[] = [];
+    const result = await provider.chatComplete([{ role: "user", content: "Hello" }], {
+      model: "venice/test-model",
+      stream: true,
+      maxTokens: 512,
+      onToken: (chunk) => tokenChunks.push(chunk),
+    });
+
+    assert.equal(seenAcceptEncodings[0], "identity");
+    assert.equal(tokenChunks.join(""), "identity");
+    assert.equal(result.content, "identity");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalLocalUrls === undefined) {
+      delete process.env.PROVIDER_LOCAL_URLS_ENABLED;
+    } else {
+      process.env.PROVIDER_LOCAL_URLS_ENABLED = originalLocalUrls;
+    }
+  }
+});
+
+test("OpenRouter non-stream chat decodes raw gzip JSON without content-encoding", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalLocalUrls = process.env.PROVIDER_LOCAL_URLS_ENABLED;
+
+  globalThis.fetch = async () =>
+    new Response(
+      gzipSync(
+        Buffer.from(
+          JSON.stringify({
+            choices: [{ message: { content: "decoded" } }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        ),
+      ),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+  try {
+    process.env.PROVIDER_LOCAL_URLS_ENABLED = "true";
+    const provider = new OpenAIProvider("https://openrouter.ai/api/v1", "test-key");
+    const chunks: string[] = [];
+    for await (const chunk of provider.chat([{ role: "user", content: "Hello" }], {
+      model: "deepseek/deepseek-v4-pro",
+      stream: false,
+      maxTokens: 512,
+    })) {
+      chunks.push(chunk);
+    }
+
+    assert.equal(chunks.join(""), "decoded");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalLocalUrls === undefined) {
+      delete process.env.PROVIDER_LOCAL_URLS_ENABLED;
+    } else {
+      process.env.PROVIDER_LOCAL_URLS_ENABLED = originalLocalUrls;
+    }
+  }
+});
+
+test("OpenAI-compatible non-stream chat decodes raw zstd JSON without content-encoding", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalLocalUrls = process.env.PROVIDER_LOCAL_URLS_ENABLED;
+
+  globalThis.fetch = async () =>
+    new Response(
+      zstdCompressSync(
+        Buffer.from(
+          JSON.stringify({
+            choices: [{ message: { content: "decoded from zstd" } }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        ),
+      ),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+  try {
+    process.env.PROVIDER_LOCAL_URLS_ENABLED = "true";
+    const provider = new OpenAIProvider("https://api.venice.ai/api/v1", "test-key");
+    const chunks: string[] = [];
+    for await (const chunk of provider.chat([{ role: "user", content: "Hello" }], {
+      model: "venice/test-model",
+      stream: false,
+      maxTokens: 512,
+    })) {
+      chunks.push(chunk);
+    }
+
+    assert.equal(chunks.join(""), "decoded from zstd");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalLocalUrls === undefined) {
+      delete process.env.PROVIDER_LOCAL_URLS_ENABLED;
+    } else {
+      process.env.PROVIDER_LOCAL_URLS_ENABLED = originalLocalUrls;
+    }
+  }
+});
+
+test("OpenAI-compatible chatComplete decodes raw brotli JSON without content-encoding", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalLocalUrls = process.env.PROVIDER_LOCAL_URLS_ENABLED;
+
+  globalThis.fetch = async () =>
+    new Response(
+      brotliCompressSync(
+        Buffer.from(
+          JSON.stringify({
+            choices: [{ message: { content: "decoded from brotli" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        ),
+      ),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+  try {
+    process.env.PROVIDER_LOCAL_URLS_ENABLED = "true";
+    const provider = new OpenAIProvider("https://api.venice.ai/api/v1", "test-key");
+    const result = await provider.chatComplete([{ role: "user", content: "Hello" }], {
+      model: "venice/test-model",
+      stream: false,
+      maxTokens: 512,
+    });
+
+    assert.equal(result.content, "decoded from brotli");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalLocalUrls === undefined) {
+      delete process.env.PROVIDER_LOCAL_URLS_ENABLED;
+    } else {
+      process.env.PROVIDER_LOCAL_URLS_ENABLED = originalLocalUrls;
+    }
+  }
+});
+
 test("custom parameters can opt custom endpoints into provider-specific fields", async () => {
   const provider = createLLMProvider("custom", "https://api.venice.ai/api/v1", "test-key");
   const body = await captureChatRequestBody(
@@ -321,31 +539,58 @@ test("OpenRouter Claude chatComplete receives unified reasoning config", async (
   assert.equal("enable_thinking" in body, false);
 });
 
-test("gpt-5.5 uses Chat Completions reasoning and verbosity payloads", async () => {
+test("gpt-5.5 routes chat through Responses reasoning and text payloads", async () => {
   const body = await captureChatRequestBody("gpt-5.5", {
     reasoningEffort: "xhigh",
     verbosity: "high",
   });
 
   assert.equal(body.model, "gpt-5.5");
-  assert.equal(body.stream, true);
-  assert.equal(body.reasoning_effort, "xhigh");
-  assert.equal(body.verbosity, "high");
-  assert.equal("reasoning" in body, false);
-  assert.equal("text" in body, false);
+  assert.equal(body.stream, false);
+  assert.equal(body.store, false);
+  assert.deepEqual(body.input, [{ role: "user", content: "Hello" }]);
+  assert.equal(body.max_output_tokens, 512);
+  assert.deepEqual(body.reasoning, { effort: "xhigh" });
+  assert.deepEqual(body.text, { verbosity: "high" });
+  assert.equal("messages" in body, false);
+  assert.equal("reasoning_effort" in body, false);
+  assert.equal("verbosity" in body, false);
+  assert.equal("max_completion_tokens" in body, false);
 });
 
-test("gpt-5.5 chatComplete forces streaming and keeps generation parameters", async () => {
+test("gpt-5.5 omits Responses sampling parameters even without reasoning effort", async () => {
+  const body = await captureChatRequestBody("gpt-5.5", {
+    reasoningEffort: undefined,
+    temperature: 0.7,
+    topP: 0.9,
+    frequencyPenalty: 0.2,
+    presencePenalty: 0.3,
+  });
+
+  assert.equal(body.model, "gpt-5.5");
+  assert.equal(body.max_output_tokens, 512);
+  assert.equal("reasoning" in body, false);
+  assert.equal("temperature" in body, false);
+  assert.equal("top_p" in body, false);
+  assert.equal("frequency_penalty" in body, false);
+  assert.equal("presence_penalty" in body, false);
+});
+
+test("gpt-5.5 routes chatComplete through Responses without Chat Completions streaming extras", async () => {
   const body = await captureChatCompleteRequestBody("gpt-5.5", {
     reasoningEffort: "xhigh",
     verbosity: "high",
   });
 
   assert.equal(body.model, "gpt-5.5");
-  assert.equal(body.stream, true);
-  assert.deepEqual(body.stream_options, { include_usage: true });
-  assert.equal(body.reasoning_effort, "xhigh");
-  assert.equal(body.verbosity, "high");
+  assert.equal(body.stream, false);
+  assert.equal(body.max_output_tokens, 512);
+  assert.deepEqual(body.reasoning, { effort: "xhigh" });
+  assert.deepEqual(body.text, { verbosity: "high" });
+  assert.equal("stream_options" in body, false);
+  assert.equal("messages" in body, false);
+  assert.equal("reasoning_effort" in body, false);
+  assert.equal("verbosity" in body, false);
 });
 
 test("assistant reasoning_content metadata is replayed on Chat Completions messages", async () => {
@@ -554,4 +799,97 @@ test("responses requests include fallback input for system-only prompts", () => 
 
   assert.equal(body.instructions, "You are helpful.");
   assert.deepEqual(body.input, [{ role: "user", content: "Continue." }]);
+});
+
+test("OpenAI ChatGPT responses requests omit unsupported Codex parameters", () => {
+  const provider = new OpenAIProvider(
+    "https://chatgpt.com/backend-api/codex",
+    "test-key",
+    undefined,
+    null,
+    null,
+    "openai-chatgpt",
+  ) as any;
+  const body = provider.buildResponsesBody([{ role: "user", content: "Hello" }], {
+    model: "gpt-5.2",
+    stream: false,
+    maxTokens: 128,
+    temperature: 0.7,
+    topP: 0.9,
+    reasoningEffort: "high",
+    enableThinking: true,
+    verbosity: "medium",
+  } satisfies ChatOptions) as Record<string, unknown>;
+
+  assert.equal(body.stream, true);
+  assert.equal(body.instructions, "You are a helpful assistant.");
+  assert.equal("max_output_tokens" in body, false);
+  assert.equal(body.store, false);
+  assert.equal("include" in body, false);
+  assert.equal("temperature" in body, false);
+  assert.equal("top_p" in body, false);
+  assert.equal("reasoning" in body, false);
+  assert.equal("text" in body, false);
+});
+
+test("OpenAI ChatGPT chatComplete decodes SSE when caller requests non-streaming", async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  const originalFetch = globalThis.fetch;
+  const originalLocalUrls = process.env.PROVIDER_LOCAL_URLS_ENABLED;
+
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    return new Response(
+      [
+        'data: {"type":"response.output_text.delta","delta":"hel"}',
+        'data: {"type":"response.output_text.delta","delta":"lo"}',
+        'data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]}}',
+        "data: [DONE]",
+        "",
+      ].join("\n"),
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    );
+  };
+
+  try {
+    process.env.PROVIDER_LOCAL_URLS_ENABLED = "true";
+    const provider = new OpenAIProvider(
+      "https://chatgpt.com/backend-api/codex",
+      "test-key",
+      undefined,
+      null,
+      null,
+      "openai-chatgpt",
+    );
+    const result = await provider.chatComplete([{ role: "user", content: "Hi" }], {
+      model: "gpt-5.2",
+      stream: false,
+      maxTokens: 128,
+    });
+
+    assert.equal(result.content, "hello");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]!.stream, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalLocalUrls === undefined) {
+      delete process.env.PROVIDER_LOCAL_URLS_ENABLED;
+    } else {
+      process.env.PROVIDER_LOCAL_URLS_ENABLED = originalLocalUrls;
+    }
+  }
+});
+
+test("responses requests translate responseFormat to text.format", () => {
+  const provider = new OpenAIProvider("https://example.com/v1", "test-key") as any;
+  const body = provider.buildResponsesBody([{ role: "user", content: "Return JSON." }], {
+    model: "gpt-5.5",
+    stream: false,
+    maxTokens: 128,
+    verbosity: "medium",
+    responseFormat: { type: "json_object" },
+  } satisfies ChatOptions) as Record<string, unknown>;
+
+  assert.deepEqual(body.text, { verbosity: "medium", format: { type: "json_object" } });
+  assert.equal("response_format" in body, false);
 });

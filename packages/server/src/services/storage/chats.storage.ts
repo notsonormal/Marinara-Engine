@@ -7,11 +7,13 @@ import {
   chats,
   messages,
   messageSwipes,
+  gameStateSnapshots,
   chatImages,
   oocInfluences,
   conversationNotes,
   agentRuns,
   agentMemory,
+  memoryChunks,
 } from "../../db/schema/index.js";
 import { newId, now } from "../../utils/id-generator.js";
 import { existsSync, rmSync } from "fs";
@@ -23,6 +25,7 @@ import {
   normalizeTimestampOverrides,
   type TimestampOverrides,
 } from "../import/import-timestamps.js";
+import { scheduleNeedsRefresh, type CharacterSchedules, type WeekSchedule } from "../conversation/schedule.service.js";
 
 const GALLERY_DIR = join(DATA_DIR, "gallery");
 
@@ -75,6 +78,40 @@ function parseMetadata(raw: unknown): MetadataPatch {
   return typeof raw === "object" ? (raw as MetadataPatch) : {};
 }
 
+function readUnreadCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function readCharacterIds(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+    : [];
+}
+
+function hasConversationSchedules(value: unknown): value is CharacterSchedules {
+  return !!value && typeof value === "object" && Object.keys(value as Record<string, unknown>).length > 0;
+}
+
+function areConversationSchedulesEnabled(meta: MetadataPatch): boolean {
+  if (typeof meta.conversationSchedulesEnabled === "boolean") return meta.conversationSchedulesEnabled;
+  return hasConversationSchedules(meta.characterSchedules);
+}
+
+function parseCharacterIds(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.filter((id): id is string => typeof id === "string" && id.length > 0);
+  if (typeof raw !== "string") return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string" && id.length > 0) : [];
+  } catch {
+    return [];
+  }
+}
+
+function firstScheduleWeekStart(schedules: CharacterSchedules): string | undefined {
+  return Object.values(schedules).find((schedule): schedule is WeekSchedule => !!schedule)?.weekStart;
+}
+
 function resolveTimestamps(overrides?: TimestampOverrides | null) {
   const normalized = normalizeTimestampOverrides(overrides);
   const createdAt = normalized?.createdAt ?? now();
@@ -102,8 +139,38 @@ function parseMessageCursor(before?: string): { createdAt: string; rowid: number
   };
 }
 
+async function invalidateMemoryChunksFrom(db: DB, chatId: string, createdAt: string) {
+  await db.delete(memoryChunks).where(and(eq(memoryChunks.chatId, chatId), gt(memoryChunks.lastMessageAt, createdAt)));
+  await db.delete(memoryChunks).where(and(eq(memoryChunks.chatId, chatId), eq(memoryChunks.lastMessageAt, createdAt)));
+}
+
 /** Create the chat storage facade used by routes and importers. */
 export function createChatsStorage(db: DB) {
+  async function collectFreshConversationSchedules(
+    characterIds: string[],
+    excludeChatId?: string,
+  ): Promise<CharacterSchedules> {
+    const wanted = new Set(characterIds);
+    const sharedSchedules: CharacterSchedules = {};
+    if (wanted.size === 0) return sharedSchedules;
+
+    const allChats = await db.select().from(chats).orderBy(desc(chats.updatedAt));
+    for (const chat of allChats) {
+      if (chat.id === excludeChatId || chat.mode !== "conversation") continue;
+      const meta = parseMetadata(chat.metadata);
+      if (!areConversationSchedulesEnabled(meta) || !hasConversationSchedules(meta.characterSchedules)) continue;
+
+      for (const [characterId, schedule] of Object.entries(meta.characterSchedules)) {
+        if (!wanted.has(characterId) || sharedSchedules[characterId] || scheduleNeedsRefresh(schedule)) continue;
+        sharedSchedules[characterId] = schedule;
+      }
+
+      if (Object.keys(sharedSchedules).length === wanted.size) break;
+    }
+
+    return sharedSchedules;
+  }
+
   return {
     async list() {
       return db.select().from(chats).orderBy(desc(chats.updatedAt));
@@ -117,6 +184,22 @@ export function createChatsStorage(db: DB) {
     async create(input: CreateChatInput, timestampOverrides?: TimestampOverrides | null) {
       const id = newId();
       const timestamp = resolveTimestamps(timestampOverrides);
+      const inheritedSchedules =
+        input.mode === "conversation" ? await collectFreshConversationSchedules(input.characterIds) : {};
+      const metadata: MetadataPatch = {
+        summary: null,
+        tags: [],
+        enableAgents: true,
+        agentOverrides: {},
+        activeAgentIds: [],
+        activeToolIds: [],
+      };
+      if (hasConversationSchedules(inheritedSchedules)) {
+        metadata.conversationSchedulesEnabled = true;
+        metadata.characterSchedules = inheritedSchedules;
+        const scheduleWeekStart = firstScheduleWeekStart(inheritedSchedules);
+        if (scheduleWeekStart) metadata.scheduleWeekStart = scheduleWeekStart;
+      }
       await db.insert(chats).values({
         id,
         name: input.name,
@@ -126,22 +209,49 @@ export function createChatsStorage(db: DB) {
         personaId: input.personaId,
         promptPresetId: input.mode === "conversation" ? null : input.promptPresetId,
         connectionId: input.connectionId,
-        metadata: JSON.stringify({
-          summary: null,
-          tags: [],
-          enableAgents: true,
-          agentOverrides: {},
-          activeAgentIds: [],
-          activeToolIds: [],
-        }),
+        metadata: JSON.stringify(metadata),
         createdAt: timestamp.createdAt,
         updatedAt: timestamp.updatedAt,
       });
       return this.getById(id);
     },
 
-    async update(id: string, data: Partial<CreateChatInput> & { folderId?: string | null; sortOrder?: number }) {
-      await db
+    async inheritFreshConversationSchedules(id: string) {
+      const chat = await this.getById(id);
+      if (!chat || chat.mode !== "conversation") return {};
+
+      const meta = parseMetadata(chat.metadata);
+      if (meta.conversationSchedulesEnabled === false) return {};
+
+      const characterIds = parseCharacterIds(chat.characterIds);
+      const currentSchedules = hasConversationSchedules(meta.characterSchedules) ? meta.characterSchedules : {};
+      const missingOrStaleIds = characterIds.filter((characterId) => {
+        const existing = currentSchedules[characterId];
+        return !existing || scheduleNeedsRefresh(existing);
+      });
+      if (missingOrStaleIds.length === 0) return currentSchedules;
+
+      const sharedSchedules = await collectFreshConversationSchedules(missingOrStaleIds, id);
+      if (!hasConversationSchedules(sharedSchedules)) return currentSchedules;
+
+      const nextSchedules: CharacterSchedules = { ...currentSchedules, ...sharedSchedules };
+      const scheduleWeekStart = firstScheduleWeekStart(nextSchedules);
+      await this.patchMetadata(id, {
+        conversationSchedulesEnabled: true,
+        characterSchedules: nextSchedules,
+        ...(scheduleWeekStart ? { scheduleWeekStart } : {}),
+      });
+
+      return nextSchedules;
+    },
+
+    async update(
+      id: string,
+      data: Partial<CreateChatInput> & { folderId?: string | null; sortOrder?: number },
+      opts?: { tx?: Pick<DB, "select" | "update"> },
+    ) {
+      const conn = opts?.tx ?? db;
+      await conn
         .update(chats)
         .set({
           ...(data.name !== undefined && { name: data.name }),
@@ -156,7 +266,10 @@ export function createChatsStorage(db: DB) {
           updatedAt: now(),
         })
         .where(eq(chats.id, id));
-      return this.getById(id);
+      // Caller-level read; uses outer db so it reads committed state when no
+      // tx is in flight, or the in-flight tx state when one is provided.
+      const rows = await conn.select().from(chats).where(eq(chats.id, id));
+      return rows[0] ?? null;
     },
 
     /**
@@ -170,16 +283,19 @@ export function createChatsStorage(db: DB) {
      * Sibling branches are updated without bumping updatedAt so categorizing
      * a chat doesn't silently reorder its branch history.
      */
-    async setFolderForChat(chatId: string, folderId: string | null) {
-      const chat = await this.getById(chatId);
+    async setFolderForChat(chatId: string, folderId: string | null, opts?: { tx?: Pick<DB, "select" | "update"> }) {
+      const conn = opts?.tx ?? db;
+      const rows = await conn.select().from(chats).where(eq(chats.id, chatId));
+      const chat = rows[0];
       if (!chat) return null;
       if (chat.groupId) {
-        await db.update(chats).set({ folderId }).where(eq(chats.groupId, chat.groupId));
-        await db.update(chats).set({ updatedAt: now() }).where(eq(chats.id, chatId));
+        await conn.update(chats).set({ folderId }).where(eq(chats.groupId, chat.groupId));
+        await conn.update(chats).set({ updatedAt: now() }).where(eq(chats.id, chatId));
       } else {
-        await db.update(chats).set({ folderId, updatedAt: now() }).where(eq(chats.id, chatId));
+        await conn.update(chats).set({ folderId, updatedAt: now() }).where(eq(chats.id, chatId));
       }
-      return this.getById(chatId);
+      const updated = await conn.select().from(chats).where(eq(chats.id, chatId));
+      return updated[0] ?? null;
     },
 
     /** List all chats belonging to a group. */
@@ -195,7 +311,11 @@ export function createChatsStorage(db: DB) {
       return this.getById(id);
     },
 
-    async patchMetadata(id: string, patchOrUpdater: MetadataPatch | MetadataUpdater) {
+    async patchMetadata(
+      id: string,
+      patchOrUpdater: MetadataPatch | MetadataUpdater,
+      opts: { touchUpdatedAt?: boolean } = {},
+    ) {
       return withMetadataPatchQueue(id, async () => {
         const existing = await this.getById(id);
         if (!existing) return null;
@@ -206,10 +326,70 @@ export function createChatsStorage(db: DB) {
 
         await db
           .update(chats)
-          .set({ metadata: JSON.stringify(merged), updatedAt: now() })
+          .set({
+            metadata: JSON.stringify(merged),
+            ...(opts.touchUpdatedAt !== false && { updatedAt: now() }),
+          })
           .where(eq(chats.id, id));
         return this.getById(id);
       });
+    },
+
+    async markAutonomousUnread(id: string, input?: { characterId?: string | null; count?: number }) {
+      const timestamp = now();
+      return this.patchMetadata(id, (current) => {
+        const increment = Math.max(1, Math.floor(input?.count ?? 1));
+        const currentCount = readUnreadCount(current.autonomousUnreadCount);
+        const characterIds = new Set(readCharacterIds(current.autonomousUnreadCharacterIds));
+        if (input?.characterId) characterIds.add(input.characterId);
+
+        return {
+          ...current,
+          autonomousUnreadCount: currentCount + increment,
+          autonomousUnreadCharacterIds: Array.from(characterIds),
+          autonomousUnreadAt: timestamp,
+        };
+      });
+    },
+
+    async clearAutonomousUnread(id: string) {
+      return this.patchMetadata(
+        id,
+        (current) => {
+          if (
+            current.autonomousUnreadCount === undefined &&
+            current.autonomousUnreadCharacterIds === undefined &&
+            current.autonomousUnreadAt === undefined
+          ) {
+            return current;
+          }
+
+          return {
+            autonomousUnreadCount: undefined,
+            autonomousUnreadCharacterIds: undefined,
+            autonomousUnreadAt: undefined,
+          };
+        },
+        { touchUpdatedAt: false },
+      );
+    },
+
+    async removeLorebookFromChatMetadata(lorebookId: string) {
+      const allChats = await this.list();
+      for (const chat of allChats) {
+        const metadata = parseMetadata(chat.metadata);
+        if (!Array.isArray(metadata.activeLorebookIds)) continue;
+
+        const nextActiveLorebookIds = metadata.activeLorebookIds.filter((id) => id !== lorebookId);
+        if (nextActiveLorebookIds.length === metadata.activeLorebookIds.length) continue;
+
+        await this.patchMetadata(chat.id, (current) => {
+          const currentLorebookIds = Array.isArray(current.activeLorebookIds) ? current.activeLorebookIds : [];
+          return {
+            activeLorebookIds: currentLorebookIds.filter((id) => id !== lorebookId),
+          };
+        });
+      }
     },
 
     async remove(id: string) {
@@ -437,7 +617,11 @@ export function createChatsStorage(db: DB) {
     },
 
     async updateMessageContent(id: string, content: string) {
+      const existing = await this.getMessage(id);
       await db.update(messages).set({ content }).where(eq(messages.id, id));
+      if (existing) {
+        await invalidateMemoryChunksFrom(db, existing.chatId, existing.createdAt);
+      }
       // Also sync the edit to the active swipe row so it persists across swipe switches
       const msg = await this.getMessage(id);
       if (msg) {
@@ -465,6 +649,26 @@ export function createChatsStorage(db: DB) {
       });
     },
 
+    /**
+     * Bulk-set hiddenFromAI on many messages at once.
+     * Reuses updateMessageExtra() for each message (read-parse-merge-write) and
+     * syncs the flag to every swipe row so it survives setActiveSwipe() overwrites.
+     * Returns the number of messages updated.
+     */
+    async bulkSetHiddenFromAI(chatId: string, messageIds: string[], hidden: boolean): Promise<number> {
+      if (messageIds.length === 0) return 0;
+      for (const id of messageIds) {
+        await this.updateMessageExtra(id, { hiddenFromAI: hidden });
+        // Mirror what the single-message /extra route does: propagate the flag
+        // to all swipe rows so setActiveSwipe() cannot clobber it.
+        const swipes = await this.getSwipes(id);
+        for (const swipe of swipes) {
+          await this.updateSwipeExtra(id, swipe.index, { hiddenFromAI: hidden });
+        }
+      }
+      return messageIds.length;
+    },
+
     /** Atomically append an attachment to a message's extra JSON field. */
     async appendMessageAttachment(id: string, attachment: Record<string, unknown>) {
       return withPatchQueue(messageExtraPatchQueues, id, async () => {
@@ -482,18 +686,34 @@ export function createChatsStorage(db: DB) {
     },
 
     async removeMessage(id: string) {
+      const existing = await this.getMessage(id);
       await db.delete(messages).where(eq(messages.id, id));
+      if (existing) {
+        await invalidateMemoryChunksFrom(db, existing.chatId, existing.createdAt);
+      }
     },
 
     async removeMessages(ids: string[], chatId?: string) {
       if (ids.length === 0) return;
+      const earliestByChat = new Map<string, string>();
       const CHUNK = 500;
       for (let i = 0; i < ids.length; i += CHUNK) {
         const chunk = ids.slice(i, i + CHUNK);
         const condition = chatId
           ? and(inArray(messages.id, chunk), eq(messages.chatId, chatId))
           : inArray(messages.id, chunk);
+        const existingRows = await db
+          .select({ chatId: messages.chatId, createdAt: messages.createdAt })
+          .from(messages)
+          .where(condition);
+        for (const row of existingRows) {
+          const current = earliestByChat.get(row.chatId);
+          if (!current || row.createdAt < current) earliestByChat.set(row.chatId, row.createdAt);
+        }
         await db.delete(messages).where(condition);
+      }
+      for (const [affectedChatId, createdAt] of earliestByChat) {
+        await invalidateMemoryChunksFrom(db, affectedChatId, createdAt);
       }
     },
 
@@ -540,12 +760,16 @@ export function createChatsStorage(db: DB) {
               thinking: null,
               generationInfo: null,
               attachments: null,
+              generationReplay: null,
             }
           : {};
         await db
           .update(messages)
           .set({ activeSwipeIndex: nextIndex, content, extra: JSON.stringify(clearedExtra) })
           .where(eq(messages.id, messageId));
+        if (msg) {
+          await invalidateMemoryChunksFrom(db, msg.chatId, msg.createdAt);
+        }
       }
       return { id, index: nextIndex };
     },
@@ -578,6 +802,9 @@ export function createChatsStorage(db: DB) {
           extra: JSON.stringify(swipeExtra),
         })
         .where(eq(messages.id, messageId));
+      if (msg) {
+        await invalidateMemoryChunksFrom(db, msg.chatId, msg.createdAt);
+      }
       return this.getMessage(messageId);
     },
 
@@ -592,6 +819,7 @@ export function createChatsStorage(db: DB) {
       const remaining = swipes.filter((s: any) => s.index !== index);
       const currentExtra = typeof msg.extra === "string" ? JSON.parse(msg.extra) : (msg.extra ?? {});
 
+      const activeSwipeRemoved = msg.activeSwipeIndex === index;
       let nextActiveSwipeIndex = msg.activeSwipeIndex;
       let nextContent = msg.content;
       let nextExtra = currentExtra;
@@ -608,6 +836,10 @@ export function createChatsStorage(db: DB) {
       }
 
       await db.delete(messageSwipes).where(eq(messageSwipes.id, target.id));
+      await db
+        .delete(gameStateSnapshots)
+        .where(and(eq(gameStateSnapshots.messageId, messageId), eq(gameStateSnapshots.swipeIndex, index)));
+
       const swipesToShift = await db
         .select()
         .from(messageSwipes)
@@ -619,6 +851,17 @@ export function createChatsStorage(db: DB) {
           .where(eq(messageSwipes.id, swipe.id));
       }
 
+      const snapshotsToShift = await db
+        .select()
+        .from(gameStateSnapshots)
+        .where(and(eq(gameStateSnapshots.messageId, messageId), gt(gameStateSnapshots.swipeIndex, index)));
+      for (const snapshot of snapshotsToShift) {
+        await db
+          .update(gameStateSnapshots)
+          .set({ swipeIndex: snapshot.swipeIndex - 1 })
+          .where(eq(gameStateSnapshots.id, snapshot.id));
+      }
+
       await db
         .update(messages)
         .set({
@@ -627,6 +870,9 @@ export function createChatsStorage(db: DB) {
           extra: JSON.stringify(nextExtra),
         })
         .where(eq(messages.id, messageId));
+      if (activeSwipeRemoved) {
+        await invalidateMemoryChunksFrom(db, msg.chatId, msg.createdAt);
+      }
 
       return this.getMessage(messageId);
     },

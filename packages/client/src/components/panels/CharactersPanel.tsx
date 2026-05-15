@@ -13,8 +13,8 @@ import {
   useUpdateCharacter,
   useDuplicateCharacter,
 } from "../../hooks/use-characters";
-import { useUpdateChat, useCreateMessage, useCreateChat, chatKeys } from "../../hooks/use-chats";
-import { useChatPresets, useApplyChatPreset } from "../../hooks/use-chat-presets";
+import { useUpdateChat, useCreateMessage, chatKeys } from "../../hooks/use-chats";
+import { useStartChatFromCharacter } from "../../hooks/use-start-chat-from-character";
 import { api } from "../../lib/api-client";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { useChatStore } from "../../stores/chat.store";
@@ -46,7 +46,7 @@ import {
 } from "lucide-react";
 import { getCharacterTitle } from "../../lib/character-display";
 import { useUIStore } from "../../stores/ui.store";
-import { cn, getAvatarCropStyle } from "../../lib/utils";
+import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
 import { ExportFormatDialog, type ExportFormatChoice } from "../ui/ExportFormatDialog";
 
 type CharacterRow = {
@@ -102,10 +102,8 @@ export function CharactersPanel() {
   const activeChat = useChatStore((s) => s.activeChat);
   const updateChat = useUpdateChat();
   const createMessage = useCreateMessage(activeChat?.id ?? null);
-  const createChat = useCreateChat();
   const queryClient = useQueryClient();
-  const { data: chatPresetsData } = useChatPresets();
-  const applyChatPreset = useApplyChatPreset();
+  const { startChatFromCharacter, isStartingChat } = useStartChatFromCharacter();
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -114,67 +112,6 @@ export function CharactersPanel() {
     firstMes?: string;
     altGreetings?: string[];
   } | null>(null);
-
-  const quickStartFromCharacter = useCallback(
-    (
-      charId: string,
-      charName: string,
-      mode: "roleplay" | "conversation",
-      firstMes?: string,
-      altGreetings?: string[],
-    ) => {
-      const label = mode === "conversation" ? "Conversation" : "Roleplay";
-      // Resolve the user's starred default preset for this mode (skip the built-in Default — it's a no-op).
-      const presets = chatPresetsData ?? [];
-      const presetMode = mode === "conversation" ? "conversation" : "roleplay";
-      const starred = presets.find((p) => p.mode === presetMode && p.isActive && !p.isDefault);
-      createChat.mutate(
-        { name: charName ? `${charName} — ${label}` : `New ${label}`, mode, characterIds: [charId] },
-        {
-          onSuccess: async (chat) => {
-            useChatStore.getState().setActiveChatId(chat.id);
-            // Apply the user's starred default preset to the new chat so its
-            // settings start where they want them.
-            if (starred) {
-              try {
-                await applyChatPreset.mutateAsync({ presetId: starred.id, chatId: chat.id });
-              } catch {
-                /* non-fatal — chat still opens with system defaults */
-              }
-            }
-            // Mirror the wizard's roleplay first-message behavior — without this,
-            // a quick-started roleplay would open with no greeting from the character.
-            if (mode === "roleplay" && firstMes?.trim()) {
-              try {
-                const msg = await api.post<{ id: string }>(`/chats/${chat.id}/messages`, {
-                  role: "assistant",
-                  content: firstMes,
-                  characterId: charId,
-                });
-                if (msg?.id && altGreetings?.length) {
-                  for (const greeting of altGreetings) {
-                    if (greeting.trim()) {
-                      await api.post(`/chats/${chat.id}/messages/${msg.id}/swipes`, {
-                        content: greeting,
-                        silent: true,
-                      });
-                    }
-                  }
-                }
-                queryClient.invalidateQueries({ queryKey: chatKeys.messages(chat.id) });
-              } catch {
-                /* swallow — don't block the chat from opening if greeting injection fails */
-              }
-            }
-            useChatStore.getState().setShouldOpenSettings(true);
-            useChatStore.getState().setShouldOpenWizard(true);
-            useChatStore.getState().setShouldOpenWizardInShortcutMode(true);
-          },
-        },
-      );
-    },
-    [createChat, queryClient, chatPresetsData, applyChatPreset],
-  );
 
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<SortOption>("name-asc");
@@ -490,6 +427,19 @@ export function CharactersPanel() {
 
     exitSelectionMode();
   }, [selectedCharacterIds, deleteCharacter, exitSelectionMode]);
+
+  const handleStartNewChat = useCallback(
+    (characterId: string, characterName: string, firstMessage?: string, alternateGreetings?: string[]) => {
+      startChatFromCharacter({
+        characterId,
+        characterName,
+        mode: "roleplay",
+        firstMessage,
+        alternateGreetings,
+      });
+    },
+    [startChatFromCharacter],
+  );
 
   return (
     <div className="flex flex-col gap-2 p-3">
@@ -921,6 +871,25 @@ export function CharactersPanel() {
                               )}
                             </div>
                             <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const fullMember = parsedCharacters.find((c) => c.id === memberId);
+                                handleStartNewChat(
+                                  memberId,
+                                  member.name,
+                                  fullMember?.parsed?.first_mes as string | undefined,
+                                  (fullMember?.parsed?.alternate_greetings ?? []) as string[],
+                                );
+                              }}
+                              disabled={isStartingChat}
+                              className="rounded p-0.5 text-[var(--muted-foreground)] opacity-0 transition-all hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] group-hover/member:opacity-100 disabled:cursor-not-allowed disabled:opacity-50 max-md:opacity-100"
+                              title="Start New Chat"
+                              aria-label={`Start New Chat with ${member.name}`}
+                            >
+                              <MessageCircle size="0.6875rem" />
+                            </button>
+                            <button
                               onClick={(e) => {
                                 e.stopPropagation();
                                 toggleGroupMember(group.id, memberId, group.memberIds);
@@ -1063,7 +1032,7 @@ export function CharactersPanel() {
                       className="h-full w-full object-cover"
                       style={getAvatarCropStyle(
                         char.parsed.extensions?.avatarCrop as
-                          | { zoom: number; offsetX: number; offsetY: number }
+                          | AvatarCropValue
                           | undefined,
                       )}
                     />
@@ -1215,10 +1184,9 @@ export function CharactersPanel() {
               label: "Quick Start Roleplay",
               icon: <Wand2 size="0.75rem" />,
               onSelect: () =>
-                quickStartFromCharacter(
+                handleStartNewChat(
                   contextMenu.charId,
                   contextMenu.charName,
-                  "roleplay",
                   contextMenu.firstMes,
                   contextMenu.altGreetings,
                 ),
@@ -1226,7 +1194,12 @@ export function CharactersPanel() {
             {
               label: "Quick Start Conversation",
               icon: <MessageCircle size="0.75rem" />,
-              onSelect: () => quickStartFromCharacter(contextMenu.charId, contextMenu.charName, "conversation"),
+              onSelect: () =>
+                startChatFromCharacter({
+                  characterId: contextMenu.charId,
+                  characterName: contextMenu.charName,
+                  mode: "conversation",
+                }),
             },
           ];
           return <ContextMenu x={contextMenu.x} y={contextMenu.y} items={items} onClose={() => setContextMenu(null)} />;

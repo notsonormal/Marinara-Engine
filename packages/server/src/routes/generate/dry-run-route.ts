@@ -1,5 +1,11 @@
 import type { FastifyInstance } from "fastify";
-import { findKnownModel, LOCAL_SIDECAR_CONNECTION_ID, resolveMacros, type APIProvider } from "@marinara-engine/shared";
+import {
+  findKnownModel,
+  LOCAL_SIDECAR_CONNECTION_ID,
+  resolveMacros,
+  type APIProvider,
+  type LorebookEntryTimingState,
+} from "@marinara-engine/shared";
 import { randomUUID } from "crypto";
 import { createChatsStorage } from "../../services/storage/chats.storage.js";
 import { createConnectionsStorage } from "../../services/storage/connections.storage.js";
@@ -9,6 +15,7 @@ import { createLorebooksStorage } from "../../services/storage/lorebooks.storage
 import { createRegexScriptsStorage } from "../../services/storage/regex-scripts.storage.js";
 import { buildImpersonateInstruction } from "../../services/conversation/impersonate-prompt.js";
 import { processLorebooks } from "../../services/lorebook/index.js";
+import { resolveGameLorebookScopeExclusions } from "../../services/lorebook/game-lorebook-scope.js";
 import { injectAtDepth } from "../../services/lorebook/prompt-injector.js";
 import { createLLMProvider } from "../../services/llm/provider-registry.js";
 import { getLocalSidecarProvider } from "../../services/llm/local-sidecar.js";
@@ -16,11 +23,15 @@ import {
   assemblePrompt,
   buildPromptMacroContext,
   collectCharacterDepthPromptEntries,
+  getCharacterDescriptionWithExtensions,
+  resolveMacrosWithVariableSnapshot,
   type AssemblerInput,
 } from "../../services/prompt/index.js";
 import { mergeAdjacentMessages } from "../../services/prompt/merger.js";
 import { wrapContent } from "../../services/prompt/format-engine.js";
 import { fitMessagesToContext, type BaseLLMProvider, type ChatMessage } from "../../services/llm/base-provider.js";
+import { applyAllSegmentEdits } from "../../services/game/segment-edits.js";
+import { applyRegexScriptsToPromptMessages } from "../../services/regex/regex-application.js";
 import { sendSseEvent, startSseReply } from "./sse.js";
 import {
   appendReadableAttachmentsToContent,
@@ -30,11 +41,13 @@ import {
   mergeCustomParameters,
   parseExtra,
   parseStoredGenerationParameters,
+  resolveRegenerationGameStateAnchor,
+  resolveVisibleGameStateAnchor,
   resolveBaseUrl,
   type PromptAttachment,
 } from "../generate/generate-route-utils.js";
-import { gameStateSnapshots as gameStateSnapshotsTable } from "../../db/schema/index.js";
-import { and, desc, eq } from "drizzle-orm";
+import { buildGenerationPromptPresetCandidates, type PromptPresetCandidateSource } from "./prompt-preset-selection.js";
+import { createGameStateStorage, type GameStateVisibleAnchor } from "../../services/storage/game-state.storage.js";
 import { logger } from "../../lib/logger.js";
 
 type WrapFormat = "xml" | "markdown" | "none";
@@ -65,26 +78,22 @@ function resolveDryRunLorebookGenerationTriggers(
   return Array.from(triggers);
 }
 
-async function loadLatestGameSnapshot(app: FastifyInstance, chatId: string): Promise<any | null> {
-  const committedRows = await app.db
-    .select()
-    .from(gameStateSnapshotsTable)
-    .where(and(eq(gameStateSnapshotsTable.chatId, chatId), eq(gameStateSnapshotsTable.committed, 1)))
-    .orderBy(desc(gameStateSnapshotsTable.createdAt))
-    .limit(1);
+function resolveDryRunLorebookTokenBudget(chatMeta: Record<string, unknown>): number | undefined {
+  const raw = chatMeta.lorebookTokenBudget ?? chatMeta.generationLorebookTokenBudget;
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : undefined;
+}
 
-  let snap: any = committedRows[0];
-  if (!snap) {
-    const anyRows = await app.db
-      .select()
-      .from(gameStateSnapshotsTable)
-      .where(eq(gameStateSnapshotsTable.chatId, chatId))
-      .orderBy(desc(gameStateSnapshotsTable.createdAt))
-      .limit(1);
-    snap = anyRows[0];
-  }
-
-  return snap ?? null;
+async function loadLatestGameSnapshot(
+  app: FastifyInstance,
+  chatId: string,
+  visibleAnchor?: GameStateVisibleAnchor | null,
+  excludeMessageId?: string | null,
+): Promise<any | null> {
+  return createGameStateStorage(app.db).getForGeneration(chatId, {
+    preferLatestVisible: true,
+    visibleAnchor,
+    excludeMessageId,
+  });
 }
 
 function formatTrackersContextBlock(args: {
@@ -541,17 +550,12 @@ export async function registerDryRunRoute(app: FastifyInstance) {
     const resolvedInjectTrackers = body.injectTrackers === true || body.injectTrackerMetadata === true;
     const resolvedInjectChatSummary = body.injectChatSummary === true || body.injectChatSummaryInjection === true;
 
-    // Extensions sometimes send presetId as a number or `{id}`; accept these to avoid
-    // silently falling back to the chat's default preset.
-    const presetIdOverride =
-      (impersonate ? asNonEmptyString(body.impersonatePresetId) : null) || asNonEmptyString(body.presetId);
     const skipPreset = body.skipPreset === true;
     const presetText = typeof body.presetText === "string" ? body.presetText : "";
 
     // Resolve connection (allow override; otherwise use chat connection)
     // Extensions may send connectionId like presetId (number or `{id}`); accept it.
-    const impersonateConnectionOverride =
-      impersonate ? asNonEmptyString(body.impersonateConnectionId) : null;
+    const impersonateConnectionOverride = impersonate ? asNonEmptyString(body.impersonateConnectionId) : null;
     const fallbackConnectionId = asNonEmptyString(body.connectionId) || ((chat.connectionId as string | null) ?? null);
     let connId = impersonateConnectionOverride || fallbackConnectionId;
 
@@ -637,6 +641,13 @@ export async function registerDryRunRoute(app: FastifyInstance) {
     let chatMessages = supportsHiddenFromAI
       ? scopedMessages.filter((message: any) => !isMessageHiddenFromAI(message))
       : scopedMessages;
+    const regenerateMessageId =
+      typeof body.regenerateMessageId === "string" && body.regenerateMessageId.trim()
+        ? body.regenerateMessageId.trim()
+        : null;
+    const visibleGameStateAnchor = regenerateMessageId
+      ? resolveRegenerationGameStateAnchor(scopedMessages, regenerateMessageId)
+      : resolveVisibleGameStateAnchor(allChatMessages);
     const contextMessageLimit = chatMeta.contextMessageLimit as number | null;
     if (contextMessageLimit && contextMessageLimit > 0 && chatMessages.length > contextMessageLimit) {
       chatMessages = chatMessages.slice(-contextMessageLimit);
@@ -653,6 +664,8 @@ export async function registerDryRunRoute(app: FastifyInstance) {
       },
       chatMode,
     );
+    const lorebookScopeExclusions = resolveGameLorebookScopeExclusions(chatMode, chatMeta);
+    const lorebookTokenBudget = resolveDryRunLorebookTokenBudget(chatMeta);
     if (!impersonate && userMessage.trim()) {
       chatMessages = [
         ...chatMessages,
@@ -687,51 +700,11 @@ export async function registerDryRunRoute(app: FastifyInstance) {
       };
     });
 
-    // Apply prompt-only regex scripts (mirrors main /generate, but stays read-only)
-    const allRegexScripts = await regexScriptsStore.list();
-    const promptOnlyScripts = allRegexScripts.filter((s: any) => s.enabled === "true" && s.promptOnly === "true");
-    if (promptOnlyScripts.length > 0) {
-      const totalMessages = mappedMessages.length;
-      for (let msgIdx = 0; msgIdx < totalMessages; msgIdx++) {
-        const msg = mappedMessages[msgIdx]!;
-        const messageDepth = totalMessages - 1 - msgIdx;
-        const placement = msg.role === "user" ? "user_input" : "ai_output";
-        let text = msg.content;
-        for (const script of promptOnlyScripts) {
-          const placements: string[] = (() => {
-            try {
-              return JSON.parse(script.placement as string);
-            } catch {
-              return [];
-            }
-          })();
-          if (!placements.includes(placement)) continue;
-          const sMinDepth = script.minDepth as number | null;
-          const sMaxDepth = script.maxDepth as number | null;
-          if (sMinDepth != null && messageDepth < sMinDepth) continue;
-          if (sMaxDepth != null && messageDepth > sMaxDepth) continue;
-          try {
-            const re = new RegExp(script.findRegex as string, script.flags as string);
-            text = text.replace(re, script.replaceString as string);
-            const trims: string[] = (() => {
-              try {
-                return JSON.parse(script.trimStrings as string);
-              } catch {
-                return [];
-              }
-            })();
-            for (const t of trims) {
-              if (t) text = text.split(t).join("");
-            }
-          } catch {
-            /* invalid regex — skip */
-          }
-        }
-        msg.content = text;
-      }
-    }
-    for (const msg of mappedMessages) {
-      msg.content = msg.content.replace(/\n([ \t]*\n){2,}/g, "\n\n");
+    // Game mode prompt preview must mirror real generation: segment edits/deletes
+    // made in the VN log are model-visible overlays, even though raw DB messages
+    // still contain the original GM output.
+    if (chatMode === "game") {
+      applyAllSegmentEdits(mappedMessages, chatMeta, chatMessages);
     }
 
     // Build prompt messages
@@ -792,33 +765,55 @@ export async function registerDryRunRoute(app: FastifyInstance) {
       /* non-critical */
     }
 
-    const effectivePresetId =
-      skipPreset || chatMode === "conversation"
-        ? null
-        : (presetIdOverride ?? (chat.promptPresetId as string | null) ?? null);
+    const promptPresetCandidates = skipPreset
+      ? []
+      : buildGenerationPromptPresetCandidates({
+          chatMode,
+          chatPromptPresetId: chat.promptPresetId,
+          connectionPromptPresetId: conn.promptPresetId,
+          impersonate,
+          impersonatePromptPresetId: body.impersonatePresetId,
+          requestPromptPresetId: body.presetId,
+        });
+    let effectivePresetId: string | null = null;
+    let effectivePresetSource: PromptPresetCandidateSource | null = null;
+    let effectivePreset: Awaited<ReturnType<typeof presets.getById>> | null = null;
+    for (const candidate of promptPresetCandidates) {
+      const candidatePreset = await presets.getById(candidate.id);
+      if (candidatePreset) {
+        effectivePresetId = candidate.id;
+        effectivePresetSource = candidate.source;
+        effectivePreset = candidatePreset;
+        break;
+      }
+      if (candidate.source !== "chat") {
+        logger.warn(
+          "[dryRun] %s prompt preset override %s was not found; falling back to the next preset candidate",
+          candidate.source,
+          candidate.id,
+        );
+      }
+    }
 
     // Choice selections are stored per-chat (chat metadata), not per prompt preset.
-    // If an extension overrides the prompt preset, reusing the chat's stored selections can make it
+    // If a request or connection overrides the prompt preset, reusing the chat's stored selections can make it
     // *look* like the wrong preset is being used (because variables like {{role}} resolve to values
     // picked under a different preset).
     //
     // Dry-run-only behavior:
     // - If the request explicitly provides presetChoices, use those.
-    // - Else if the request overrides presetId to something different than the chat's promptPresetId,
+    // - Else if the effective preset differs from the chat's promptPresetId,
     //   start with empty choices so the assembler falls back to the preset's default/first options.
     // - Else fall back to the chat's stored selections.
     const requestChoices = parsePresetChoices((body as any).presetChoices);
 
     const chatChoicesFromMeta = (chatMeta.presetChoices ?? {}) as Record<string, string | string[]>;
     const isDifferentPresetOverride =
-      chatMode !== "conversation" &&
-      !!presetIdOverride &&
-      presetIdOverride !== ((chat.promptPresetId as string | null) ?? null);
-    const presetDefaultChoices = isDifferentPresetOverride
-      ? skipPreset
-        ? null
-        : parsePresetChoices((await presets.getById(presetIdOverride))?.defaultChoices)
-      : null;
+      !!effectivePresetId &&
+      effectivePresetSource !== "chat" &&
+      effectivePresetId !== ((chat.promptPresetId as string | null) ?? null);
+    const presetDefaultChoices =
+      isDifferentPresetOverride && effectivePreset ? parsePresetChoices(effectivePreset.defaultChoices) : null;
 
     const chatChoices: Record<string, string | string[]> =
       requestChoices ?? (isDifferentPresetOverride ? (presetDefaultChoices ?? {}) : chatChoicesFromMeta);
@@ -837,6 +832,18 @@ export async function registerDryRunRoute(app: FastifyInstance) {
       chatId,
     });
     const resolvePromptMacros = (value: string) => resolveMacros(value, promptMacroContext);
+    const resolvePromptMacrosForLorebook = (value: string) =>
+      resolveMacrosWithVariableSnapshot(value, promptMacroContext);
+
+    // Apply regex scripts to prompt messages (mirrors main /generate, but stays read-only).
+    applyRegexScriptsToPromptMessages(mappedMessages, await regexScriptsStore.list(), {
+      resolveMacros: (value) => resolveMacros(value, promptMacroContext, { trimResult: false }),
+    });
+
+    for (const msg of mappedMessages) {
+      msg.content = msg.content.replace(/\n([ \t]*\n){2,}/g, "\n\n");
+    }
+    promptMacroContext.lastInput = [...mappedMessages].reverse().find((message) => message.role === "user")?.content;
 
     const usePromptParts = !!promptParts;
     if (usePromptParts) {
@@ -847,11 +854,8 @@ export async function registerDryRunRoute(app: FastifyInstance) {
         promptParts.wrapFormat === "xml"
       ) {
         wrapFormat = promptParts.wrapFormat;
-      } else if (effectivePresetId) {
-        const preset = await presets.getById(effectivePresetId);
-        if (preset) {
-          wrapFormat = (preset.wrapFormat as "xml" | "markdown" | "none") || "xml";
-        }
+      } else if (effectivePreset) {
+        wrapFormat = (effectivePreset.wrapFormat as "xml" | "markdown" | "none") || "xml";
       }
 
       type PromptPartKey =
@@ -955,7 +959,6 @@ export async function registerDryRunRoute(app: FastifyInstance) {
           try {
             const data = JSON.parse(row.data) as Record<string, unknown>;
             const name = typeof data.name === "string" ? data.name : "Character";
-            const desc = typeof data.description === "string" ? data.description : "";
             const personality = typeof data.personality === "string" ? data.personality : "";
             const scenario = typeof data.scenario === "string" ? data.scenario : "";
             const mesExample = typeof data.mes_example === "string" ? data.mes_example : "";
@@ -963,6 +966,7 @@ export async function registerDryRunRoute(app: FastifyInstance) {
               data.extensions && typeof data.extensions === "object"
                 ? (data.extensions as Record<string, unknown>)
                 : {};
+            const desc = getCharacterDescriptionWithExtensions({ ...data, extensions } as any);
             const characterMacroContext = {
               ...promptMacroContext,
               char: name,
@@ -1016,13 +1020,32 @@ export async function registerDryRunRoute(app: FastifyInstance) {
               characterIds,
               personaId,
               activeLorebookIds,
+              excludedLorebookIds: lorebookScopeExclusions.excludedLorebookIds,
+              excludedSourceAgentIds: lorebookScopeExclusions.excludedSourceAgentIds,
+              tokenBudget: lorebookTokenBudget,
               chatEmbedding: null,
-              entryStateOverrides: undefined,
+              entryStateOverrides:
+                (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) &&
+                typeof (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) === "object"
+                  ? ((chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) as Record<
+                      string,
+                      { ephemeral?: number | null; enabled?: boolean }
+                    >)
+                  : undefined,
+              entryTimingStates:
+                (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) &&
+                typeof (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) === "object"
+                  ? ((chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) as Record<
+                      string,
+                      LorebookEntryTimingState
+                    >)
+                  : undefined,
               generationTriggers: lorebookGenerationTriggers,
+              previewOnly: true,
+              resolveContent: resolvePromptMacrosForLorebook,
             });
             const loreContent = [lorebookResult.worldInfoBefore, lorebookResult.worldInfoAfter]
               .filter((content): content is string => typeof content === "string" && content.length > 0)
-              .map((content) => resolvePromptMacros(content))
               .join("\n");
             const loreBlock = loreContent ? `<lore>\n${loreContent}\n</lore>` : "";
             return { loreBlock, depthEntries: lorebookResult.depthEntries };
@@ -1049,7 +1072,7 @@ export async function registerDryRunRoute(app: FastifyInstance) {
 
       const trackersBlock = includeTrackers
         ? await (async () => {
-            const snap = await loadLatestGameSnapshot(app, chatId);
+            const snap = await loadLatestGameSnapshot(app, chatId, visibleGameStateAnchor, regenerateMessageId);
             if (!snap) return null;
             return formatTrackersContextBlock({ wrapFormat, snap, chatMeta });
           })()
@@ -1141,13 +1164,7 @@ export async function registerDryRunRoute(app: FastifyInstance) {
             lorebookPayload.depthEntries.length > 0 &&
             finalMessages.some((m) => m.role === "user" || m.role === "assistant")
           ) {
-            finalMessages = injectAtDepth(
-              finalMessages as any,
-              lorebookPayload.depthEntries.map((entry) => ({
-                ...entry,
-                content: resolvePromptMacros(entry.content),
-              })),
-            ) as any;
+            finalMessages = injectAtDepth(finalMessages as any, lorebookPayload.depthEntries) as any;
           }
           continue;
         }
@@ -1159,74 +1176,92 @@ export async function registerDryRunRoute(app: FastifyInstance) {
           continue;
         }
       }
-    } else if (effectivePresetId) {
-      const preset = await presets.getById(effectivePresetId);
-      if (preset) {
-        wrapFormat = (preset.wrapFormat as "xml" | "markdown" | "none") || "xml";
-        const [sections, groups, choiceBlocks] = await Promise.all([
-          presets.listSections(effectivePresetId),
-          presets.listGroups(effectivePresetId),
-          presets.listChoiceBlocksForPreset(effectivePresetId),
-        ]);
+    } else if (effectivePresetId && effectivePreset) {
+      const preset = effectivePreset;
+      wrapFormat = (preset.wrapFormat as "xml" | "markdown" | "none") || "xml";
+      const [sections, groups, choiceBlocks] = await Promise.all([
+        presets.listSections(effectivePresetId),
+        presets.listGroups(effectivePresetId),
+        presets.listChoiceBlocksForPreset(effectivePresetId),
+      ]);
 
-        const assemblerInput: AssemblerInput = {
-          db: app.db,
-          preset: preset as any,
-          sections: sections as any,
-          groups: groups as any,
-          choiceBlocks: choiceBlocks as any,
-          chatChoices,
-          chatId,
-          characterIds,
-          personaId,
-          personaName,
-          personaDescription,
-          personaFields,
-          personaStats: (() => {
-            if (!persona?.personaStats) return undefined;
-            if (typeof persona.personaStats !== "string") return persona.personaStats;
-            try {
-              return JSON.parse(persona.personaStats);
-            } catch {
-              return undefined;
-            }
-          })(),
-          chatMessages: mappedMessages,
-          chatSummary: resolvedInjectChatSummary ? ((chatMeta.summary as string) ?? "").trim() || null : null,
-          enableAgents: false,
-          activeAgentIds: [],
-          activeLorebookIds: resolvedInjectLorebook
-            ? Array.isArray(chatMeta.activeLorebookIds)
-              ? (chatMeta.activeLorebookIds as string[])
-              : []
-            : [],
-          chatEmbedding: null,
-          entryStateOverrides: undefined,
-          groupScenarioOverrideText:
-            typeof chatMeta.groupScenarioText === "string" && (chatMeta.groupScenarioText as string).trim()
-              ? (chatMeta.groupScenarioText as string).trim()
-              : null,
-        };
+      const assemblerInput: AssemblerInput = {
+        db: app.db,
+        preset: preset as any,
+        sections: sections as any,
+        groups: groups as any,
+        choiceBlocks: choiceBlocks as any,
+        chatChoices,
+        chatId,
+        characterIds,
+        personaId,
+        personaName,
+        personaDescription,
+        personaFields,
+        personaStats: (() => {
+          if (!persona?.personaStats) return undefined;
+          if (typeof persona.personaStats !== "string") return persona.personaStats;
+          try {
+            return JSON.parse(persona.personaStats);
+          } catch {
+            return undefined;
+          }
+        })(),
+        chatMessages: mappedMessages,
+        chatSummary: resolvedInjectChatSummary ? ((chatMeta.summary as string) ?? "").trim() || null : null,
+        enableAgents: false,
+        activeAgentIds: [],
+        activeLorebookIds: resolvedInjectLorebook
+          ? Array.isArray(chatMeta.activeLorebookIds)
+            ? (chatMeta.activeLorebookIds as string[])
+            : []
+          : [],
+        excludedLorebookIds: lorebookScopeExclusions.excludedLorebookIds,
+        excludedLorebookSourceAgentIds: lorebookScopeExclusions.excludedSourceAgentIds,
+        chatEmbedding: null,
+        entryStateOverrides:
+          (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) &&
+          typeof (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) === "object"
+            ? ((chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) as Record<
+                string,
+                { ephemeral?: number | null; enabled?: boolean }
+              >)
+            : undefined,
+        entryTimingStates:
+          (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) &&
+          typeof (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) === "object"
+            ? ((chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) as Record<
+                string,
+                LorebookEntryTimingState
+              >)
+            : undefined,
+        lorebookTokenBudget,
+        generationTriggers: lorebookGenerationTriggers,
+        previewOnly: true,
+        groupScenarioOverrideText:
+          typeof chatMeta.groupScenarioText === "string" && (chatMeta.groupScenarioText as string).trim()
+            ? (chatMeta.groupScenarioText as string).trim()
+            : null,
+      };
 
-        const assembled = await assemblePrompt(assemblerInput);
-        finalMessages = assembled.messages;
-        temperature = assembled.parameters.temperature;
-        maxTokens = assembled.parameters.maxTokens;
-        topP = assembled.parameters.topP ?? 1;
-        topK = assembled.parameters.topK ?? 0;
-        frequencyPenalty = assembled.parameters.frequencyPenalty ?? 0;
-        presencePenalty = assembled.parameters.presencePenalty ?? 0;
-        showThoughts = assembled.parameters.showThoughts ?? true;
-        reasoningEffort = assembled.parameters.reasoningEffort ?? null;
-        verbosity = assembled.parameters.verbosity ?? null;
-        assistantPrefill = assembled.parameters.assistantPrefill ?? "";
-        customParameters = mergeCustomParameters(customParameters, assembled.parameters.customParameters);
+      const assembled = await assemblePrompt(assemblerInput);
+      finalMessages = assembled.messages;
+      temperature = assembled.parameters.temperature;
+      maxTokens = assembled.parameters.maxTokens;
+      topP = assembled.parameters.topP ?? 1;
+      topK = assembled.parameters.topK ?? 0;
+      frequencyPenalty = assembled.parameters.frequencyPenalty ?? 0;
+      presencePenalty = assembled.parameters.presencePenalty ?? 0;
+      showThoughts = assembled.parameters.showThoughts ?? true;
+      reasoningEffort = assembled.parameters.reasoningEffort ?? null;
+      verbosity = assembled.parameters.verbosity ?? null;
+      assistantPrefill = assembled.parameters.assistantPrefill ?? "";
+      customParameters = mergeCustomParameters(customParameters, assembled.parameters.customParameters);
 
-        const presetMaxContext = assembled.parameters.useMaxContext
-          ? knownModelContext
-          : normalizeMaxContext(assembled.parameters.maxContext);
-        effectiveMaxContext = minContextLimit(effectiveMaxContext, presetMaxContext);
-      }
+      const presetMaxContext = assembled.parameters.useMaxContext
+        ? knownModelContext
+        : normalizeMaxContext(assembled.parameters.maxContext);
+      effectiveMaxContext = minContextLimit(effectiveMaxContext, presetMaxContext);
     }
 
     applyParameterOverrides(connectionParams);
@@ -1278,13 +1313,32 @@ export async function registerDryRunRoute(app: FastifyInstance) {
         characterIds,
         personaId,
         activeLorebookIds,
+        excludedLorebookIds: lorebookScopeExclusions.excludedLorebookIds,
+        excludedSourceAgentIds: lorebookScopeExclusions.excludedSourceAgentIds,
+        tokenBudget: lorebookTokenBudget,
         chatEmbedding: null,
-        entryStateOverrides: undefined,
+        entryStateOverrides:
+          (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) &&
+          typeof (chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) === "object"
+            ? ((chatMeta.entryStateOverrides ?? chatMeta.lorebookEntryStateOverrides) as Record<
+                string,
+                { ephemeral?: number | null; enabled?: boolean }
+              >)
+            : undefined,
+        entryTimingStates:
+          (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) &&
+          typeof (chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) === "object"
+            ? ((chatMeta.entryTimingStates ?? chatMeta.lorebookEntryTimingStates) as Record<
+                string,
+                LorebookEntryTimingState
+              >)
+            : undefined,
         generationTriggers: lorebookGenerationTriggers,
+        previewOnly: true,
+        resolveContent: resolvePromptMacrosForLorebook,
       });
       const loreContent = [lorebookResult.worldInfoBefore, lorebookResult.worldInfoAfter]
         .filter((content): content is string => typeof content === "string" && content.length > 0)
-        .map((content) => resolvePromptMacros(content))
         .join("\n");
       if (loreContent) {
         const loreBlock = `<lore>\n${loreContent}\n</lore>`;
@@ -1293,13 +1347,7 @@ export async function registerDryRunRoute(app: FastifyInstance) {
         finalMessages.splice(insertAt, 0, { role: "system", content: loreBlock });
       }
       if (lorebookResult.depthEntries.length > 0) {
-        finalMessages = injectAtDepth(
-          finalMessages as any,
-          lorebookResult.depthEntries.map((entry) => ({
-            ...entry,
-            content: resolvePromptMacros(entry.content),
-          })),
-        ) as any;
+        finalMessages = injectAtDepth(finalMessages as any, lorebookResult.depthEntries) as any;
       }
     }
 
@@ -1313,7 +1361,7 @@ export async function registerDryRunRoute(app: FastifyInstance) {
     // Optional injection: tracker context (read-only snapshot)
     const resolvedInjectTrackersForRun = usePromptParts ? false : resolvedInjectTrackers;
     if (resolvedInjectTrackersForRun) {
-      const snap = await loadLatestGameSnapshot(app, chatId);
+      const snap = await loadLatestGameSnapshot(app, chatId, visibleGameStateAnchor, regenerateMessageId);
       const contextBlock = snap ? formatTrackersContextBlock({ wrapFormat, snap, chatMeta }) : null;
       if (contextBlock) {
         finalMessages = injectTrackerContext(finalMessages, contextBlock, "beforeLastUser");

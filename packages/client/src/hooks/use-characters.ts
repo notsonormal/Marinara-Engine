@@ -20,10 +20,11 @@ export const characterKeys = {
 
 // ── Characters ──
 
-export function useCharacters() {
+export function useCharacters(enabled = true) {
   return useQuery({
     queryKey: characterKeys.list(),
     queryFn: () => api.get<unknown[]>("/characters"),
+    enabled,
     staleTime: 5 * 60_000,
   });
 }
@@ -136,11 +137,39 @@ export interface SpriteInfo {
   url: string;
 }
 
+export type SpriteCleanupEngine = "auto" | "backgroundremover" | "builtin";
+
 export interface SpriteCapabilities {
   imageProcessingAvailable: boolean;
   spriteGenerationAvailable: boolean;
   backgroundRemovalAvailable: boolean;
   reason: string | null;
+  backgroundRemover?: {
+    engine: SpriteCleanupEngine;
+    installed: boolean;
+    command: string | null;
+    source: "env" | "local" | "path" | null;
+    runtimeDir: string;
+    reason: string | null;
+  };
+}
+
+export interface SpriteCleanupResult {
+  processed: number;
+  failed: Array<{ expression: string; error: string }>;
+  backupId?: string | null;
+  engine?: SpriteCleanupEngine;
+  backgroundRemoverProcessed?: number;
+  builtinProcessed?: number;
+  sprites: SpriteInfo[];
+  error?: string;
+}
+
+export interface SpriteCleanupRestoreResult {
+  restored: number;
+  failed: Array<{ expression: string; error: string }>;
+  sprites: SpriteInfo[];
+  error?: string;
 }
 
 export interface CharacterGalleryImage {
@@ -193,6 +222,38 @@ export function useDeleteSprite() {
   return useMutation({
     mutationFn: ({ characterId, expression }: { characterId: string; expression: string }) =>
       api.delete(`/sprites/${characterId}/${expression}`),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: spriteKeys.list(variables.characterId) });
+    },
+  });
+}
+
+export function useCleanupSavedSprites() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      characterId,
+      expressions,
+      cleanupStrength = 35,
+      engine = "auto",
+    }: {
+      characterId: string;
+      expressions?: string[];
+      cleanupStrength?: number;
+      engine?: SpriteCleanupEngine;
+    }) =>
+      api.post<SpriteCleanupResult>(`/sprites/${characterId}/cleanup-saved`, { expressions, cleanupStrength, engine }),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: spriteKeys.list(variables.characterId) });
+    },
+  });
+}
+
+export function useRestoreSpriteCleanupBackup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ characterId, backupId }: { characterId: string; backupId: string }) =>
+      api.post<SpriteCleanupRestoreResult>(`/sprites/${characterId}/cleanup-restore`, { backupId }),
     onSuccess: (_data, variables) => {
       qc.invalidateQueries({ queryKey: spriteKeys.list(variables.characterId) });
     },
@@ -253,10 +314,11 @@ export function useDeleteCharacterGalleryImage(characterId: string) {
 
 // ── Personas ──
 
-export function usePersonas() {
+export function usePersonas(enabled = true) {
   return useQuery({
     queryKey: characterKeys.personas,
     queryFn: () => api.get<unknown[]>("/characters/personas/list"),
+    enabled,
     staleTime: 5 * 60_000,
   });
 }
@@ -278,6 +340,8 @@ export function useCreatePersona() {
       personaStats?: string;
       altDescriptions?: string;
       tags?: string;
+      savedStatusOptions?: string;
+      avatarCrop?: string;
     }) => api.post("/characters/personas", data),
     onSuccess: () => qc.invalidateQueries({ queryKey: characterKeys.personas }),
   });
@@ -304,6 +368,8 @@ export function useUpdatePersona() {
       personaStats?: string;
       altDescriptions?: string;
       tags?: string;
+      savedStatusOptions?: string;
+      avatarCrop?: string;
     }) => api.patch(`/characters/personas/${id}`, data),
     onSuccess: (updatedPersona, variables) => {
       qc.setQueryData<unknown[] | undefined>(characterKeys.personas, (old) => {

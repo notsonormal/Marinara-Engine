@@ -11,6 +11,7 @@ import type { ActivatedEntry } from "./keyword-scanner.js";
 export interface PromptMessage {
   role: "system" | "user" | "assistant";
   content: string;
+  contextKind?: "prompt" | "history" | "injection";
   /** Optional name for multi-character */
   name?: string;
 }
@@ -57,7 +58,7 @@ export function getDepthInjectedEntries(activatedEntries: ActivatedEntry[]): Arr
   order: number;
 }> {
   return activatedEntries
-    .filter((a) => a.entry.position >= 2 && a.entry.depth > 0)
+    .filter((a) => a.entry.position >= 2 && a.entry.depth >= 0)
     .map((a) => ({
       content: a.entry.content,
       role: a.entry.role,
@@ -102,6 +103,7 @@ export function injectAtDepth(
     const toInsert: PromptMessage[] = entries.map((e) => ({
       role: e.role,
       content: e.content,
+      contextKind: "injection",
     }));
 
     result.splice(insertionIndex, 0, ...toInsert);

@@ -23,6 +23,9 @@ const UPDATE_REMOTE = "origin";
 const UPDATE_BRANCH = "main";
 const UPDATE_REF = `${UPDATE_REMOTE}/${UPDATE_BRANCH}`;
 const DEFAULT_PNPM_VERSION = "10.33.2";
+const ANDROID_APK_NOTICE =
+  "> [!IMPORTANT]\n" +
+  "> **Android APK notice:** The APK is not a standalone Marinara Engine app yet. It is a WebView shell for the local Marinara server, so Termux must be installed and `./start-termux.sh` must be running on the same Android device before you open the APK.";
 
 // ── Cached release info (15-min TTL) ──
 let cachedRelease: {
@@ -152,9 +155,17 @@ function buildFallbackRelease(tag: string) {
   return {
     latestVersion: normalizeTag(tag),
     releaseUrl: `${GITHUB_REPO_URL}/releases/tag/${tag}`,
-    releaseNotes: "",
+    releaseNotes: ANDROID_APK_NOTICE,
     publishedAt: "",
   };
+}
+
+function withAndroidApkNotice(notes: string) {
+  if (/Android APK notice|not a standalone Marinara Engine app|requires Termux/i.test(notes)) {
+    return notes;
+  }
+
+  return notes.trim() ? `${ANDROID_APK_NOTICE}\n\n${notes}` : ANDROID_APK_NOTICE;
 }
 
 function buildRequestHeaders() {
@@ -288,7 +299,7 @@ async function resolveLatestReleaseFromGitHub(signal: AbortSignal) {
   return {
     latestVersion: normalizeTag(latestTag),
     releaseUrl: release.html_url ?? `${GITHUB_REPO_URL}/releases/tag/${latestTag}`,
-    releaseNotes: release.body ?? "",
+    releaseNotes: withAndroidApkNotice(release.body ?? ""),
     publishedAt: release.published_at ?? "",
   };
 }
@@ -302,6 +313,29 @@ type ApplyUpdateBody = {
   targetCommit?: string;
 };
 
+function getApplyAvailability(gitInstall: boolean) {
+  const enabled = isUpdatesApplyEnabled();
+  if (!gitInstall) {
+    return {
+      applyAvailable: false,
+      updatesApplyEnabled: enabled,
+      applyUnavailableReason: "unsupported-install",
+    };
+  }
+  if (!enabled) {
+    return {
+      applyAvailable: false,
+      updatesApplyEnabled: false,
+      applyUnavailableReason: "disabled",
+    };
+  }
+  return {
+    applyAvailable: true,
+    updatesApplyEnabled: true,
+    applyUnavailableReason: null,
+  };
+}
+
 export async function updatesRoutes(app: FastifyInstance) {
   // ── Check for updates ──
   // GET /api/updates/check
@@ -313,6 +347,7 @@ export async function updatesRoutes(app: FastifyInstance) {
     const currentCommit = getBuildCommit();
     const currentBuild = getBuildLabel();
     const gitInstall = isGitInstall();
+    const applyAvailability = getApplyAvailability(gitInstall);
 
     // Check commits behind for git installs
     let commitsBehind: number | null = null;
@@ -338,6 +373,7 @@ export async function updatesRoutes(app: FastifyInstance) {
         versionUpdate,
         commitsBehind: commitsBehind ?? 0,
         installType: gitInstall ? "git" : "standalone",
+        ...applyAvailability,
         targetRef: UPDATE_REF,
         targetCommit: gitInstall ? await resolveGitRef(getMonorepoRoot(), UPDATE_REF) : null,
       };
@@ -363,6 +399,7 @@ export async function updatesRoutes(app: FastifyInstance) {
         versionUpdate,
         commitsBehind: commitsBehind ?? 0,
         installType: gitInstall ? "git" : "standalone",
+        ...applyAvailability,
         targetRef: UPDATE_REF,
         targetCommit: gitInstall ? await resolveGitRef(getMonorepoRoot(), UPDATE_REF) : null,
       };
@@ -375,6 +412,8 @@ export async function updatesRoutes(app: FastifyInstance) {
         currentBuild,
         updateAvailable: commitsBehind != null && commitsBehind > 0,
         commitsBehind: commitsBehind ?? 0,
+        installType: gitInstall ? "git" : "standalone",
+        ...applyAvailability,
       });
     }
   });

@@ -1,8 +1,10 @@
 import { promises as dns } from "node:dns";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { basename, extname, relative, resolve, sep, win32 } from "node:path";
+import { brotliDecompressSync, gunzipSync, zstdDecompressSync } from "node:zlib";
 import { Agent } from "undici";
 import { isLoopbackIp, isPrivateNetworkIp } from "../middleware/ip-allowlist.js";
+import { logger } from "../lib/logger.js";
 import { CSRF_HEADER, CSRF_HEADER_VALUE } from "@marinara-engine/shared";
 
 export { CSRF_HEADER, CSRF_HEADER_VALUE };
@@ -29,8 +31,15 @@ type AgentOptions = ConstructorParameters<typeof Agent>[0];
 export interface OutboundUrlPolicy {
   allowLocal?: boolean;
   allowLoopback?: boolean;
+  allowMdns?: boolean;
   allowedProtocols?: string[];
   maxRedirects?: number;
+  /**
+   * Optional name of the env var that, when set to true, would allow this
+   * fetch. Surfaced verbatim in the rejection error so the user knows which
+   * flag to flip (e.g. PROVIDER_LOCAL_URLS_ENABLED, IMAGE_LOCAL_URLS_ENABLED).
+   */
+  flagName?: string;
 }
 
 export interface SafeFetchOptions extends Omit<RequestInit, "dispatcher"> {
@@ -38,6 +47,7 @@ export interface SafeFetchOptions extends Omit<RequestInit, "dispatcher"> {
   maxResponseBytes?: number;
   allowedContentTypes?: string[];
   bufferResponse?: boolean;
+  decodeCompressedResponse?: boolean;
   agentOptions?: Omit<AgentOptions, "connect">;
   dispatcher?: unknown;
 }
@@ -217,6 +227,10 @@ function isLoopbackHostname(hostname: string): boolean {
   return LOCALHOST_NAMES.has(normalized) || isLoopbackIp(normalized);
 }
 
+function isMdnsHostname(hostname: string): boolean {
+  return normalizeHostnameForAddress(hostname).replace(/\.$/, "").toLowerCase().endsWith(".local");
+}
+
 export function normalizeLoopbackUrl(url: string | URL): string {
   const parsed = typeof url === "string" ? new URL(url) : new URL(url.toString());
   const normalized = normalizeHostnameForAddress(parsed.hostname).replace(/\.$/, "").toLowerCase();
@@ -242,33 +256,82 @@ function isBlockedResolvedAddress(address: string, policy: OutboundUrlPolicy): b
   return !(policy.allowLoopback && isLoopbackIp(address));
 }
 
+function preferIpv4Records(
+  records: Array<{ address: string; family: 4 | 6 }>,
+): Array<{ address: string; family: 4 | 6 }> {
+  return [...records].sort((a, b) => a.family - b.family);
+}
+
+function flagHint(policy: OutboundUrlPolicy): string {
+  if (!policy.flagName) return "";
+  return ` Set ${policy.flagName}=true in your .env file to allow this (changes take effect within ~2s without a restart).`;
+}
+
+function describeBlockedAddresses(addresses: Array<{ address: string }>, policy: OutboundUrlPolicy): string {
+  const blocked = addresses
+    .filter((record) => isBlockedResolvedAddress(record.address, policy))
+    .map((record) => record.address);
+  if (blocked.length === 0) return "";
+  return ` (resolved to ${blocked.join(", ")})`;
+}
+
 async function validateResolvedAddresses(
   hostname: string,
   policy: OutboundUrlPolicy,
+  originalUrl?: string,
 ): Promise<Array<{ address: string; family: 4 | 6 }>> {
   const addresses = await resolveHostname(hostname);
-  if (
-    !policy.allowLocal &&
-    (addresses.length === 0 || addresses.some((record) => isBlockedResolvedAddress(record.address, policy)))
-  ) {
-    throw new Error("Outbound URL resolved to a private, loopback, metadata, or reserved address");
+  if (policy.allowMdns && isMdnsHostname(hostname)) {
+    const preferred = preferIpv4Records(addresses);
+    if (preferred.length === 0) {
+      const target = originalUrl ?? hostname;
+      throw new Error(`Refused to fetch ${target}: hostname '${hostname}' did not resolve to any address.`);
+    }
+    return preferred;
+  }
+
+  if (!policy.allowLocal && addresses.length === 0) {
+    // DNS failure (NXDOMAIN, SRV mismatch, etc.). Setting the local-URLs flag
+    // wouldn't help here, so don't tell the operator to flip it.
+    const target = originalUrl ?? hostname;
+    throw new Error(`Refused to fetch ${target}: hostname '${hostname}' did not resolve to any address.`);
+  }
+  if (!policy.allowLocal && addresses.some((record) => isBlockedResolvedAddress(record.address, policy))) {
+    // Genuine policy.allowLocal-driven rejection — naming the flag is useful.
+    const target = originalUrl ?? hostname;
+    throw new Error(
+      `Refused to fetch ${target}: '${hostname}'${describeBlockedAddresses(addresses, policy)} is in a private, loopback, metadata, or reserved IP range.${flagHint(policy)}`,
+    );
   }
   return addresses;
 }
 
 export async function validateOutboundUrl(url: string | URL, policy: OutboundUrlPolicy = {}): Promise<URL> {
   const parsed = typeof url === "string" ? new URL(url) : new URL(url.toString());
+  const original = typeof url === "string" ? url : parsed.toString();
   const allowedProtocols = policy.allowedProtocols ?? ["https:"];
   if (!allowedProtocols.includes(parsed.protocol)) {
-    throw new Error(`Outbound URL protocol is not allowed: ${parsed.protocol}`);
+    // Protocol gate is independent of policy.allowLocal — flipping
+    // PROVIDER_LOCAL_URLS_ENABLED won't allow gopher://, ftp://, etc.
+    // Don't append the flag hint to this rejection.
+    throw new Error(
+      `Refused to fetch ${original}: protocol '${parsed.protocol.replace(/:$/, "")}' is not allowed (allowed: ${allowedProtocols.map((proto) => proto.replace(/:$/, "")).join(", ")}).`,
+    );
   }
 
   if (!policy.allowLocal) {
-    if (isLocalHostname(parsed.hostname) && !(policy.allowLoopback && isLoopbackHostname(parsed.hostname))) {
-      throw new Error("Outbound URL hostname is local or reserved");
+    if (
+      isLocalHostname(parsed.hostname) &&
+      !(policy.allowLoopback && isLoopbackHostname(parsed.hostname)) &&
+      !(policy.allowMdns && isMdnsHostname(parsed.hostname))
+    ) {
+      // Genuine policy.allowLocal-driven rejection — naming the flag is useful.
+      throw new Error(
+        `Refused to fetch ${original}: hostname '${parsed.hostname}' is local or reserved.${flagHint(policy)}`,
+      );
     }
 
-    await validateResolvedAddresses(parsed.hostname, policy);
+    await validateResolvedAddresses(parsed.hostname, policy, original);
   }
 
   return parsed;
@@ -282,7 +345,8 @@ async function validateOutboundUrlForFetch(
   const parsed = await validateOutboundUrl(url, policy);
   if (policy.allowLocal) return { url: parsed, dispatcher: agentOptions ? new Agent(agentOptions) : undefined };
 
-  const addresses = await validateResolvedAddresses(parsed.hostname, policy);
+  const original = typeof url === "string" ? url : parsed.toString();
+  const addresses = await validateResolvedAddresses(parsed.hostname, policy, original);
   let used = false;
   const dispatcher = new Agent({
     ...(agentOptions ?? {}),
@@ -303,7 +367,12 @@ async function validateOutboundUrlForFetch(
   return { url: parsed, dispatcher };
 }
 
-async function readCappedResponse(response: Response, maxBytes: number, dispatcher?: Agent): Promise<Response> {
+async function readCappedResponse(
+  response: Response,
+  maxBytes: number,
+  dispatcher?: Agent,
+  decodeCompressedResponse = false,
+): Promise<Response> {
   if (!response.body) {
     await dispatcher?.close().catch(() => undefined);
     return response;
@@ -325,11 +394,37 @@ async function readCappedResponse(response: Response, maxBytes: number, dispatch
   } finally {
     await dispatcher?.close().catch(() => undefined);
   }
-  return new Response(Buffer.concat(chunks), {
+  const rawBody = Buffer.concat(chunks);
+  const normalized = decodeCompressedResponse
+    ? normalizeCompressedBody(rawBody, response.headers, maxBytes)
+    : { body: rawBody, headers: response.headers };
+  return new Response(normalized.body, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers: normalized.headers,
   });
+}
+
+function normalizeCompressedBody(body: Buffer, headers: Headers, maxBytes: number): { body: Buffer; headers: Headers } {
+  const encoding = headers.get("content-encoding");
+  const normalized = decodePossiblyCompressedBody(body, maxBytes);
+  const shouldStripCompressionHeaders = normalized !== body || encoding != null;
+  if (normalized !== body) {
+    logger.debug(
+      "Decoded compressed outbound response body; contentEncoding=%s compressedBytes=%d decodedBytes=%d maxBytes=%d",
+      encoding?.trim() || "sniffed",
+      body.length,
+      normalized.length,
+      maxBytes,
+    );
+  }
+  if (shouldStripCompressionHeaders) {
+    const normalizedHeaders = new Headers(headers);
+    normalizedHeaders.delete("content-encoding");
+    normalizedHeaders.delete("content-length");
+    return { body: normalized, headers: normalizedHeaders };
+  }
+  return { body, headers };
 }
 
 function capStreamingResponse(response: Response, maxBytes: number, dispatcher?: Agent): Response {
@@ -373,14 +468,78 @@ function capStreamingResponse(response: Response, maxBytes: number, dispatcher?:
   });
 }
 
+export function decodePossiblyCompressedBody(buffer: Buffer, maxBytes = DEFAULT_MAX_RESPONSE_BYTES): Buffer {
+  let current = buffer;
+  let decoded = false;
+
+  for (let i = 0; i < 2; i += 1) {
+    const next = decodeByMagicBytes(current, maxBytes);
+    if (!next) break;
+    current = next;
+    decoded = true;
+  }
+
+  return decoded ? current : buffer;
+}
+
+function decodeByMagicBytes(buffer: Buffer, maxBytes: number): Buffer | null {
+  if (buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
+    return tryDecodeCompressedBody(buffer, "gzip", maxBytes);
+  }
+  if (buffer.length >= 4 && buffer[0] === 0x28 && buffer[1] === 0xb5 && buffer[2] === 0x2f && buffer[3] === 0xfd) {
+    return tryDecodeCompressedBody(buffer, "zstd", maxBytes);
+  }
+  if (!looksLikeProviderJsonOrSseBody(buffer)) {
+    const brotli = tryDecodeCompressedBody(buffer, "br", maxBytes);
+    if (brotli && looksLikeProviderJsonOrSseBody(brotli)) {
+      return brotli;
+    }
+  }
+  return null;
+}
+
+function looksLikeProviderJsonOrSseBody(buffer: Buffer): boolean {
+  const preview = buffer.subarray(0, 32).toString("utf8").trimStart();
+  return preview.startsWith("{") || preview.startsWith("[") || preview.startsWith("data:");
+}
+
+function tryDecodeCompressedBody(buffer: Buffer, algorithm: "gzip" | "br" | "zstd", maxBytes: number): Buffer | null {
+  try {
+    switch (algorithm) {
+      case "gzip":
+        return gunzipSync(buffer, { maxOutputLength: maxBytes });
+      case "br":
+        return brotliDecompressSync(buffer, { maxOutputLength: maxBytes });
+      case "zstd":
+        return zstdDecompressSync(buffer, { maxOutputLength: maxBytes });
+    }
+    return null;
+  } catch (err) {
+    if (err instanceof Error && "code" in err && err.code === "ERR_BUFFER_TOO_LARGE") {
+      throw new Error(`Outbound response exceeded ${maxBytes} bytes`);
+    }
+    return null;
+  }
+}
+
+export function requestHeadersWithIdentityEncoding(headersInit: RequestInit["headers"] | undefined): Headers {
+  const headers = new Headers(headersInit);
+  if (!headers.has("accept-encoding")) {
+    headers.set("accept-encoding", "identity");
+  }
+  return headers;
+}
+
 export async function safeFetch(url: string | URL, options: SafeFetchOptions = {}): Promise<Response> {
   const {
     policy,
     maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
     allowedContentTypes,
     bufferResponse = true,
+    decodeCompressedResponse = false,
     agentOptions,
     dispatcher,
+    headers,
     ...init
   } = options;
   if (dispatcher && !policy?.allowLocal) {
@@ -392,8 +551,10 @@ export async function safeFetch(url: string | URL, options: SafeFetchOptions = {
 
   for (let i = 0; i <= redirects; i += 1) {
     const internalDispatcher = dispatcher ? undefined : current.dispatcher;
+    const requestHeaders = decodeCompressedResponse ? requestHeadersWithIdentityEncoding(headers) : headers;
     const response = await fetch(current.url, {
       ...init,
+      ...(requestHeaders ? { headers: requestHeaders } : {}),
       redirect: "manual",
       dispatcher: dispatcher ?? internalDispatcher,
     } as unknown as RequestInit);
@@ -418,7 +579,7 @@ export async function safeFetch(url: string | URL, options: SafeFetchOptions = {
     }
 
     return bufferResponse
-      ? readCappedResponse(response, maxResponseBytes, internalDispatcher)
+      ? readCappedResponse(response, maxResponseBytes, internalDispatcher, decodeCompressedResponse)
       : capStreamingResponse(response, maxResponseBytes, internalDispatcher);
   }
 

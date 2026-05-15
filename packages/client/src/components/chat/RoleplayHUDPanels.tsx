@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
 import {
   CalendarDays,
   CheckCircle2,
@@ -16,6 +17,7 @@ import {
   Swords,
   Target,
   Thermometer,
+  Trash2,
   Users,
   X,
   RefreshCw,
@@ -466,6 +468,9 @@ export function PersonaStatsPanel({
     next[idx] = { ...next[idx]!, [field]: val };
     onUpdate(next);
   };
+  const removeBar = (idx: number) => {
+    onUpdate(bars.filter((_, index) => index !== idx));
+  };
 
   return (
     <>
@@ -491,6 +496,7 @@ export function PersonaStatsPanel({
             onUpdateName={(name) => updateBar(idx, "name", name)}
             onUpdateValue={(value) => updateBar(idx, "value", value)}
             onUpdateMax={(value) => updateBar(idx, "max", value)}
+            onRemove={() => removeBar(idx)}
           />
         ))}
       </div>
@@ -1042,6 +1048,116 @@ export function CombinedWorldPanel({
   );
 }
 
+type InlinePreviewPosition = {
+  top: number;
+  left: number;
+  maxWidth: number;
+  maxHeight: number;
+};
+
+function InlinePreviewPortal({
+  open,
+  value,
+  anchorRef,
+}: {
+  open: boolean;
+  value: string;
+  anchorRef: RefObject<HTMLElement | null>;
+}) {
+  const previewRef = useRef<HTMLSpanElement>(null);
+  const [position, setPosition] = useState<InlinePreviewPosition | null>(null);
+
+  const updatePosition = useCallback(() => {
+    if (!open || !value) {
+      setPosition(null);
+      return;
+    }
+
+    const anchor = anchorRef.current;
+    if (!anchor || typeof window === "undefined") return;
+
+    const rect = anchor.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      setPosition((current) => (current === null ? current : null));
+      return;
+    }
+
+    const margin = 8;
+    const gap = 4;
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const maxWidth = Math.min(224, Math.max(120, viewportWidth - margin * 2));
+    const measuredWidth = Math.min(maxWidth, Math.max(1, previewRef.current?.offsetWidth ?? 192));
+    const naturalHeight = Math.max(40, previewRef.current?.scrollHeight ?? previewRef.current?.offsetHeight ?? 72);
+    const availableAbove = Math.max(0, rect.top - margin - gap);
+    const availableBelow = Math.max(0, viewportHeight - rect.bottom - margin - gap);
+    const placeBelow = naturalHeight > availableAbove && availableBelow > availableAbove;
+    const laneHeight = placeBelow ? availableBelow : availableAbove;
+    const maxHeight = Math.max(40, Math.min(naturalHeight, laneHeight || viewportHeight - margin * 2));
+    const visibleHeight = Math.min(naturalHeight, maxHeight);
+    const rawLeft = rect.left + rect.width / 2 - measuredWidth / 2;
+    const left = Math.round(Math.max(margin, Math.min(viewportWidth - measuredWidth - margin, rawLeft)));
+    const top = Math.round(placeBelow ? rect.bottom + gap : Math.max(margin, rect.top - visibleHeight - gap));
+
+    setPosition((current) =>
+      current?.top === top &&
+      current.left === left &&
+      current.maxWidth === maxWidth &&
+      current.maxHeight === maxHeight
+        ? current
+        : { top, left, maxWidth, maxHeight },
+    );
+  }, [anchorRef, open, value]);
+
+  useLayoutEffect(() => {
+    if (!open || !value) {
+      setPosition(null);
+      return;
+    }
+    updatePosition();
+  }, [open, updatePosition, value]);
+
+  useEffect(() => {
+    if (!open || !value || typeof window === "undefined") return;
+
+    const update = () => updatePosition();
+    const anchor = anchorRef.current;
+    const resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+
+    if (anchor) resizeObserver?.observe(anchor);
+    if (previewRef.current) resizeObserver?.observe(previewRef.current);
+    window.addEventListener("resize", update);
+    const scrollOptions: AddEventListenerOptions = { capture: true, passive: true };
+    window.addEventListener("scroll", update, scrollOptions);
+
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, scrollOptions);
+    };
+  }, [anchorRef, open, updatePosition, value]);
+
+  if (!open || !value || typeof document === "undefined") return null;
+
+  return createPortal(
+    <span
+      ref={previewRef}
+      data-roleplay-inline-preview
+      className="pointer-events-none fixed z-[10000] animate-message-in whitespace-normal break-words rounded border border-[var(--border)] bg-[var(--popover)] px-1.5 py-1 text-[0.5625rem] text-[var(--foreground)]/80 shadow-xl"
+      style={{
+        top: position?.top ?? -9999,
+        left: position?.left ?? -9999,
+        maxWidth: position?.maxWidth ?? 224,
+        maxHeight: position?.maxHeight,
+        overflow: position ? "hidden" : undefined,
+      }}
+    >
+      {value}
+    </span>,
+    document.body,
+  );
+}
+
 function InlineEdit({
   value,
   onSave,
@@ -1058,6 +1174,7 @@ function InlineEdit({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
   const ref = useRef<HTMLInputElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
   const lastTapRef = useRef(0);
   const isTouchRef = useRef(false);
   const [showTip, setShowTip] = useState(false);
@@ -1066,6 +1183,12 @@ function InlineEdit({
   useEffect(() => {
     if (editing) ref.current?.focus();
   }, [editing]);
+
+  useEffect(() => {
+    return () => {
+      if (tipTimerRef.current) clearTimeout(tipTimerRef.current);
+    };
+  }, []);
 
   const commit = () => {
     const trimmed = draft.trim();
@@ -1121,9 +1244,11 @@ function InlineEdit({
 
   return (
     <button
+      ref={buttonRef}
       onClick={handleClick}
       onTouchStart={handleTouchStart}
       title={value || undefined}
+      aria-label={value || placeholder}
       className={cn(
         "group relative flex items-center gap-1 text-left hover:bg-[var(--muted)]/20 rounded px-0.5 transition-colors min-w-0",
         className,
@@ -1147,11 +1272,7 @@ function InlineEdit({
         )}
       </span>
       <Pencil size="0.4375rem" className="opacity-0 group-hover:opacity-40 shrink-0 transition-opacity" />
-      {showTip && value && (
-        <span className="absolute bottom-full left-0 mb-1 max-w-[12rem] break-words rounded bg-[var(--popover)] border border-[var(--border)] px-1.5 py-1 text-[0.5625rem] text-[var(--foreground)]/80 z-[9999] pointer-events-none animate-message-in whitespace-normal">
-          {value}
-        </span>
-      )}
+      <InlinePreviewPortal open={showTip} value={value} anchorRef={buttonRef} />
     </button>
   );
 }
@@ -1181,16 +1302,18 @@ function StatBarEditable({
   onUpdateName,
   onUpdateValue,
   onUpdateMax,
+  onRemove,
 }: {
   stat: CharacterStat;
   onUpdateName?: (name: string) => void;
   onUpdateValue: (v: number) => void;
   onUpdateMax: (v: number) => void;
+  onRemove?: () => void;
 }) {
   const pct = stat.max > 0 ? Math.min(100, Math.max(0, (stat.value / stat.max) * 100)) : 0;
 
   return (
-    <div>
+    <div className="group/stat relative">
       <div className="flex items-center justify-between mb-0.5">
         {onUpdateName ? (
           <InlineEdit
@@ -1218,6 +1341,17 @@ function StatBarEditable({
           />
         </div>
       </div>
+      {onRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          title="Remove stat"
+          aria-label={`Remove ${stat.name || "stat"}`}
+          className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded bg-[var(--popover)]/90 text-[var(--muted-foreground)]/45 opacity-0 shadow-sm ring-1 ring-[var(--border)]/70 transition-all hover:text-[var(--destructive)] hover:opacity-100 focus-visible:opacity-100 group-hover/stat:opacity-80 max-md:opacity-80"
+        >
+          <Trash2 size="0.5625rem" />
+        </button>
+      )}
       <div className="h-1.5 rounded-full bg-[var(--muted)]/30 overflow-hidden">
         <div
           className="h-full rounded-full transition-all duration-500"

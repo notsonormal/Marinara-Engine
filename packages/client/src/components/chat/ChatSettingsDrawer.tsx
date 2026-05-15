@@ -2,7 +2,7 @@
 // Chat: Settings Drawer — per-chat configuration
 // ──────────────────────────────────────────────
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
-import { useQueryClient, useQueries } from "@tanstack/react-query";
+import { useQuery, useQueryClient, useQueries } from "@tanstack/react-query";
 import {
   X,
   Users,
@@ -50,6 +50,7 @@ import {
   StickyNote,
   Drama,
   RotateCcw,
+  Music2,
 } from "lucide-react";
 import { cn, getAvatarCropStyle, type AvatarCrop } from "../../lib/utils";
 import { showAlertDialog, showConfirmDialog, showPromptDialog } from "../../lib/app-dialogs";
@@ -80,12 +81,14 @@ import {
   useChatMemories,
   useDeleteChatMemory,
   useClearChatMemories,
+  useRefreshChatMemories,
   useChatNotes,
   useDeleteChatNote,
   useClearChatNotes,
   chatKeys,
 } from "../../hooks/use-chats";
 import { api } from "../../lib/api-client";
+import { getConnectedChatDisplayName } from "../../lib/chat-display";
 import {
   getAgentRunIntervalMeta,
   getCadenceInputValue,
@@ -122,6 +125,7 @@ import {
   DEFAULT_IMPERSONATE_PROMPT,
   DEFAULT_AGENT_MAX_TOKENS,
   DEFAULT_AGENT_PROMPTS,
+  LIMITS,
   MAX_AGENT_MAX_TOKENS,
   MIN_AGENT_MAX_TOKENS,
   estimateAgentLoadCost,
@@ -129,7 +133,7 @@ import {
   AGENT_COST_HIGH_TOKENS,
   getDefaultBuiltInAgentSettings,
 } from "@marinara-engine/shared";
-import type { Chat, CharacterGroup } from "@marinara-engine/shared";
+import type { Chat, CharacterGroup, Lorebook } from "@marinara-engine/shared";
 import {
   isCustomToolSelectable,
   useCustomToolCapabilities,
@@ -157,6 +161,19 @@ const HIDDEN_ROLEPLAY_AGENTS = new Set([
   "autonomous-messenger",
 ]);
 
+type GameSpotifySourceType = "liked" | "playlist" | "artist" | "any";
+
+const GAME_SPOTIFY_SOURCE_OPTIONS: Array<{ id: GameSpotifySourceType; label: string; description: string }> = [
+  { id: "liked", label: "Liked Songs", description: "Pick from the user's saved tracks first." },
+  { id: "playlist", label: "Playlist", description: "Keep choices inside one Spotify playlist." },
+  { id: "artist", label: "Artist", description: "Search only around a named artist, like HOYO-MiX." },
+  { id: "any", label: "Any Spotify", description: "Let the DJ use Spotify search when it fits." },
+];
+
+function normalizeGameSpotifySourceType(value: unknown): GameSpotifySourceType {
+  return value === "playlist" || value === "artist" || value === "any" ? value : "liked";
+}
+
 const MODE_INTROS: Record<ChatMode, string> = {
   conversation:
     "Plain chat — no roleplay or game systems built in; autonomous messaging and other tools are optional below.",
@@ -174,6 +191,13 @@ type AvailableAgent = {
   category: string;
   phase: AgentPhase;
   builtIn: boolean;
+};
+
+type LorebookActiveReason = "Global" | "Character" | "Persona" | "Chat";
+
+type ActiveLorebookView = Lorebook & {
+  activeReasons: LorebookActiveReason[];
+  isPinned: boolean;
 };
 
 type AgentAddPreview = {
@@ -229,7 +253,8 @@ function normalizeNonNegativeInteger(value: unknown, fallback: number, max: numb
 
 function getChatActiveAgentIds(chat: Chat): string[] {
   const metadata = typeof chat.metadata === "string" ? JSON.parse(chat.metadata) : (chat.metadata ?? {});
-  const activeIds = metadata && typeof metadata === "object" ? (metadata as { activeAgentIds?: unknown }).activeAgentIds : [];
+  const activeIds =
+    metadata && typeof metadata === "object" ? (metadata as { activeAgentIds?: unknown }).activeAgentIds : [];
   return Array.isArray(activeIds) ? activeIds.filter((id): id is string => typeof id === "string") : [];
 }
 
@@ -254,6 +279,7 @@ export function ChatSettingsDrawer({
   const agentProcessing = useAgentStore((s) => s.isProcessing);
   const scheduleGenerationPreferences = useUIStore((s) => s.scheduleGenerationPreferences);
   const setScheduleGenerationPreferences = useUIStore((s) => s.setScheduleGenerationPreferences);
+  const roleplaySpriteScale = useUIStore((s) => s.roleplaySpriteScale);
 
   const { data: allCharacters } = useCharacters();
   const { data: characterGroups } = useCharacterGroups();
@@ -308,25 +334,101 @@ export function ChatSettingsDrawer({
   const conversationSchedulesEnabled =
     metadata.conversationSchedulesEnabled === true ||
     (metadata.conversationSchedulesEnabled == null && hasGeneratedConversationSchedules);
-  const activeLorebookIds: string[] = metadata.activeLorebookIds ?? [];
-  const activeAgentIds = useMemo<string[]>(() => metadata.activeAgentIds ?? [], [metadata.activeAgentIds]);
-  const activeToolIds: string[] = metadata.activeToolIds ?? [];
+  const activeLorebookIds = useMemo<string[]>(
+    () => (Array.isArray(metadata.activeLorebookIds) ? metadata.activeLorebookIds : []),
+    [metadata.activeLorebookIds],
+  );
   const gameLorebookKeeperEnabled = metadata.gameLorebookKeeperEnabled === true;
   const gameLorebookKeeperLorebookId =
     typeof metadata.gameLorebookKeeperLorebookId === "string" ? metadata.gameLorebookKeeperLorebookId : null;
+  const activeLorebooks = useMemo<ActiveLorebookView[]>(() => {
+    const pinnedIds = new Set(activeLorebookIds);
+    const lorebookList = (lorebooks ?? []) as Lorebook[];
+
+    return lorebookList.flatMap((lorebook) => {
+      if (
+        isGame &&
+        !gameLorebookKeeperEnabled &&
+        (lorebook.id === gameLorebookKeeperLorebookId || lorebook.sourceAgentId === "game-lorebook-keeper")
+      ) {
+        return [];
+      }
+
+      const reasons: LorebookActiveReason[] = [];
+      const isPinned = pinnedIds.has(lorebook.id);
+
+      if (lorebook.enabled !== false) {
+        if (isPinned) reasons.push("Chat");
+        if (lorebook.isGlobal) reasons.push("Global");
+        if (
+          lorebook.characterIds?.some((id) => chatCharIds.includes(id)) ||
+          (lorebook.characterId && chatCharIds.includes(lorebook.characterId))
+        ) {
+          reasons.push("Character");
+        }
+        if (
+          chat.personaId &&
+          (lorebook.personaIds?.includes(chat.personaId) || lorebook.personaId === chat.personaId)
+        ) {
+          reasons.push("Persona");
+        }
+        if (lorebook.chatId === chat.id && !reasons.includes("Chat")) reasons.push("Chat");
+      }
+
+      return reasons.length > 0 ? [{ ...lorebook, activeReasons: reasons, isPinned }] : [];
+    });
+  }, [
+    activeLorebookIds,
+    chat.id,
+    chat.personaId,
+    chatCharIds,
+    gameLorebookKeeperEnabled,
+    gameLorebookKeeperLorebookId,
+    isGame,
+    lorebooks,
+  ]);
+  const activeLorebookIdSet = useMemo(() => new Set(activeLorebooks.map((lorebook) => lorebook.id)), [activeLorebooks]);
+  const lorebookTokenBudget =
+    typeof metadata.lorebookTokenBudget === "number" && Number.isFinite(metadata.lorebookTokenBudget)
+      ? Math.max(0, Math.floor(metadata.lorebookTokenBudget))
+      : LIMITS.DEFAULT_LOREBOOK_TOKEN_BUDGET;
+  const activeAgentIds = useMemo<string[]>(() => metadata.activeAgentIds ?? [], [metadata.activeAgentIds]);
+  const activeToolIds: string[] = metadata.activeToolIds ?? [];
   const gameLorebookKeeperLorebook = gameLorebookKeeperLorebookId
     ? ((lorebooks ?? []) as Array<{ id: string; name: string }>).find(
         (book) => book.id === gameLorebookKeeperLorebookId,
       )
     : null;
-  const gameAgentFeatureCount = (metadata.enableAgents ? 1 : 0) + (gameLorebookKeeperEnabled ? 1 : 0);
+  const gameUseSpotifyMusic = metadata.gameUseSpotifyMusic === true;
+  const gameSpotifySourceType = normalizeGameSpotifySourceType(metadata.gameSpotifySourceType);
+  const gameSpotifyPlaylistId =
+    typeof metadata.gameSpotifyPlaylistId === "string" ? metadata.gameSpotifyPlaylistId : "";
+  const gameSpotifyArtist = typeof metadata.gameSpotifyArtist === "string" ? metadata.gameSpotifyArtist : "";
+  const gameAgentFeatureCount =
+    (metadata.enableAgents ? 1 : 0) + (gameLorebookKeeperEnabled ? 1 : 0) + (gameUseSpotifyMusic ? 1 : 0);
   const spriteCharacterIds: string[] = Array.isArray(metadata.spriteCharacterIds) ? metadata.spriteCharacterIds : [];
   const spritePosition: "left" | "right" = metadata.spritePosition === "right" ? "right" : "left";
-  const spriteScale = normalizeSpriteDisplayValue(metadata.spriteScale, 1, 0.5, 1.75);
+  const spriteScale = normalizeSpriteDisplayValue(metadata.spriteScale, roleplaySpriteScale, 0.5, 1.75);
   const spriteOpacity = normalizeSpriteDisplayValue(metadata.spriteOpacity, 1, 0.15, 1);
   const [spriteScalePercent, setSpriteScalePercent] = useState(() => Math.round(spriteScale * 100));
   const [spriteOpacityPercent, setSpriteOpacityPercent] = useState(() => Math.round(spriteOpacity * 100));
   const hasCustomSpritePlacements = Object.keys(normalizeSpritePlacements(metadata.spritePlacements)).length > 0;
+  const spotifyPlaylistsQuery = useQuery({
+    queryKey: ["spotify", "playlists", 50],
+    queryFn: () =>
+      api.get<{
+        playlists: Array<{
+          id: string;
+          name: string;
+          uri: string;
+          trackCount: number | null;
+          owned: boolean | null;
+        }>;
+      }>("/spotify/playlists?limit=50"),
+    enabled: open && isGame && gameUseSpotifyMusic && gameSpotifySourceType === "playlist",
+    staleTime: 60_000,
+    retry: false,
+  });
 
   useEffect(() => {
     setSpriteScalePercent(Math.round(spriteScale * 100));
@@ -343,6 +445,7 @@ export function ChatSettingsDrawer({
     }
     return map;
   }, [agentConfigs]);
+  const conversationCommandsEnabled = metadata.characterCommands !== false;
 
   // Build the available agent list: built-in + custom agents from DB
   // In roleplay mode, hide agents that are either automatic or handled internally.
@@ -728,6 +831,11 @@ export function ChatSettingsDrawer({
     updateMeta.mutate({ id: chat.id, activeLorebookIds: current });
   };
 
+  const pinLorebookToChat = (lbId: string) => {
+    if (activeLorebookIds.includes(lbId)) return;
+    updateMeta.mutate({ id: chat.id, activeLorebookIds: [...activeLorebookIds, lbId] });
+  };
+
   const hasSecretPlotMemory = (memory: Record<string, unknown> | null | undefined) => {
     if (!memory) return false;
     const arc = memory.overarchingArc;
@@ -746,11 +854,10 @@ export function ChatSettingsDrawer({
     const sceneDirections = memory.sceneDirections;
     if (
       Array.isArray(sceneDirections) &&
-      sceneDirections.some(
-        (entry) =>
-          typeof entry === "string"
-            ? entry.trim()
-            : !!(entry && typeof entry === "object" && String((entry as Record<string, unknown>).direction ?? "").trim()),
+      sceneDirections.some((entry) =>
+        typeof entry === "string"
+          ? entry.trim()
+          : !!(entry && typeof entry === "object" && String((entry as Record<string, unknown>).direction ?? "").trim()),
       )
     ) {
       return true;
@@ -814,10 +921,7 @@ export function ChatSettingsDrawer({
       }
       await showAlertDialog({
         title: isRemoving ? "Couldn't Remove Agent" : "Couldn't Add Agent",
-        message:
-          error instanceof Error
-            ? error.message
-            : "The agent list could not be updated. Please try again.",
+        message: error instanceof Error ? error.message : "The agent list could not be updated. Please try again.",
       });
     }
   };
@@ -835,6 +939,65 @@ export function ChatSettingsDrawer({
   };
 
   const currentPromptPresetHasVariables = (currentPromptPresetFull?.choiceBlocks?.length ?? 0) > 0;
+  const currentPromptPresetHasLorebookMarker = useMemo(() => {
+    const sections = currentPromptPresetFull?.sections ?? [];
+    return sections.some((section) => {
+      const enabled = (section as { enabled?: boolean | string }).enabled;
+      const isMarker = (section as { isMarker?: boolean | string }).isMarker;
+      if (enabled === false || enabled === "false") return false;
+      if (isMarker !== true && isMarker !== "true") return false;
+      try {
+        const config =
+          typeof section.markerConfig === "string" ? JSON.parse(section.markerConfig) : section.markerConfig;
+        return (
+          config?.type === "lorebook" || config?.type === "world_info_before" || config?.type === "world_info_after"
+        );
+      } catch {
+        return false;
+      }
+    });
+  }, [currentPromptPresetFull?.sections]);
+  const hasScopedOrGlobalLorebooks = useMemo(() => {
+    return (
+      (lorebooks ?? []) as Array<{
+        id: string;
+        enabled?: boolean;
+        isGlobal?: boolean;
+        characterId?: string | null;
+        characterIds?: string[];
+        personaId?: string | null;
+        personaIds?: string[];
+        chatId?: string | null;
+        sourceAgentId?: string | null;
+      }>
+    ).some(
+      (lorebook) =>
+        lorebook.enabled !== false &&
+        !(
+          isGame &&
+          !gameLorebookKeeperEnabled &&
+          (lorebook.id === gameLorebookKeeperLorebookId || lorebook.sourceAgentId === "game-lorebook-keeper")
+        ) &&
+        (lorebook.isGlobal ||
+          activeLorebookIds.includes(lorebook.id) ||
+          lorebook.characterIds?.some((id) => chatCharIds.includes(id)) ||
+          (lorebook.characterId && chatCharIds.includes(lorebook.characterId)) ||
+          (chat.personaId && lorebook.personaIds?.includes(chat.personaId)) ||
+          (lorebook.personaId && lorebook.personaId === chat.personaId) ||
+          (lorebook.chatId && lorebook.chatId === chat.id)),
+    );
+  }, [
+    activeLorebookIds,
+    chat.id,
+    chat.personaId,
+    chatCharIds,
+    gameLorebookKeeperEnabled,
+    gameLorebookKeeperLorebookId,
+    isGame,
+    lorebooks,
+  ]);
+  const showLorebookMarkerWarning =
+    !!chat.promptPresetId && hasScopedOrGlobalLorebooks && !currentPromptPresetHasLorebookMarker;
 
   const setPreset = (presetId: string | null) => {
     updateChat.mutate(
@@ -924,9 +1087,16 @@ export function ChatSettingsDrawer({
   const [scenePromptDraft, setScenePromptDraft] = useState(metadata.sceneSystemPrompt ?? "");
   const [groupScenarioDraft, setGroupScenarioDraft] = useState((metadata.groupScenarioText as string) ?? "");
   const [groupScenarioExpanded, setGroupScenarioExpanded] = useState(false);
-  const [gameAgentPool] = useState<string[]>(() => Array.from(new Set(activeAgentIds)));
+  const gameAgentPool = useMemo(
+    () => Array.from(new Set(activeAgentIds.filter((id) => id !== "spotify" && id !== "lorebook-keeper"))),
+    [activeAgentIds],
+  );
   const [extraPromptDraft, setExtraPromptDraft] = useState((metadata.gameExtraPrompt as string) ?? "");
   const [extraPromptExpanded, setExtraPromptExpanded] = useState(false);
+  const [gameImagePromptInstructionsDraft, setGameImagePromptInstructionsDraft] = useState(
+    (metadata.gameImagePromptInstructions as string) ?? "",
+  );
+  const [gameSpotifyArtistDraft, setGameSpotifyArtistDraft] = useState(gameSpotifyArtist);
 
   // ── Chat Settings Presets ──
   const presetMode = (chatMode === "visual_novel" ? "roleplay" : chatMode) as ChatMode;
@@ -957,6 +1127,14 @@ export function ChatSettingsDrawer({
       setAddingAgentToChat(false);
     }
   }, [open]);
+
+  useEffect(() => {
+    setGameImagePromptInstructionsDraft((metadata.gameImagePromptInstructions as string) ?? "");
+  }, [chat.id, metadata.gameImagePromptInstructions]);
+
+  useEffect(() => {
+    setGameSpotifyArtistDraft(gameSpotifyArtist);
+  }, [chat.id, gameSpotifyArtist]);
 
   const openAgentAddModal = (agent: AvailableAgent) => {
     setAgentAddCadenceInputFocused(false);
@@ -1033,6 +1211,96 @@ export function ChatSettingsDrawer({
       setAddingAgentToChat(false);
     }
   };
+
+  const ensureSpotifyAgent = useCallback(async () => {
+    const builtInMeta = BUILT_IN_AGENTS.find((entry) => entry.id === "spotify");
+    if (!builtInMeta) throw new Error("Spotify DJ agent metadata is missing.");
+    const config = agentConfigsByType.get("spotify") ?? null;
+    const nextSettings: Record<string, unknown> = {
+      ...getDefaultBuiltInAgentSettings("spotify"),
+      ...parseAgentSettings(config?.settings),
+      enabledTools: DEFAULT_AGENT_TOOLS.spotify ?? [],
+    };
+
+    if (config) {
+      await updateAgentConfig.mutateAsync({ id: config.id, enabled: true, settings: nextSettings });
+      return;
+    }
+
+    await createAgent.mutateAsync({
+      type: builtInMeta.id,
+      name: builtInMeta.name,
+      description: builtInMeta.description,
+      phase: builtInMeta.phase,
+      enabled: true,
+      connectionId: null,
+      promptTemplate: "",
+      settings: nextSettings,
+    });
+  }, [agentConfigsByType, createAgent, updateAgentConfig]);
+
+  const toggleGameSpotifyMusic = useCallback(async () => {
+    if (gameUseSpotifyMusic) {
+      await updateMeta.mutateAsync({
+        id: chat.id,
+        gameUseSpotifyMusic: false,
+        activeAgentIds: activeAgentIds.filter((id) => id !== "spotify"),
+      });
+      return;
+    }
+
+    try {
+      await ensureSpotifyAgent();
+      await updateMeta.mutateAsync({
+        id: chat.id,
+        enableAgents: true,
+        gameUseSpotifyMusic: true,
+        gameSpotifySourceType,
+        activeAgentIds: Array.from(new Set([...activeAgentIds, "spotify"])),
+      });
+    } catch (error) {
+      await showAlertDialog({
+        title: "Couldn't Enable Spotify DJ",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Spotify DJ could not be enabled for this game. Check the Spotify agent setup and try again.",
+      });
+    }
+  }, [activeAgentIds, chat.id, ensureSpotifyAgent, gameSpotifySourceType, gameUseSpotifyMusic, updateMeta]);
+
+  const toggleGameLorebookKeeper = useCallback(() => {
+    const nextActiveAgentIds = activeAgentIds.filter((id) => id !== "lorebook-keeper");
+    if (gameLorebookKeeperEnabled) {
+      const keeperLorebookIds = new Set(
+        ((lorebooks ?? []) as Lorebook[])
+          .filter((lorebook) => lorebook.sourceAgentId === "game-lorebook-keeper")
+          .map((lorebook) => lorebook.id),
+      );
+      if (gameLorebookKeeperLorebookId) keeperLorebookIds.add(gameLorebookKeeperLorebookId);
+      updateMeta.mutate({
+        id: chat.id,
+        gameLorebookKeeperEnabled: false,
+        activeAgentIds: nextActiveAgentIds,
+        activeLorebookIds: activeLorebookIds.filter((id) => !keeperLorebookIds.has(id)),
+      });
+      return;
+    }
+
+    updateMeta.mutate({
+      id: chat.id,
+      gameLorebookKeeperEnabled: true,
+      activeAgentIds: nextActiveAgentIds,
+    });
+  }, [
+    activeAgentIds,
+    activeLorebookIds,
+    chat.id,
+    gameLorebookKeeperEnabled,
+    gameLorebookKeeperLorebookId,
+    lorebooks,
+    updateMeta,
+  ]);
 
   const agentAddIntervalMeta = agentAddPreview
     ? getAgentRunIntervalMeta(agentAddPreview.agent.id, agentAddPreview.agent.builtIn)
@@ -1495,6 +1763,12 @@ export function ChatSettingsDrawer({
                   </button>
                 )}
               </div>
+              {showLorebookMarkerWarning && (
+                <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-400/10 px-3 py-2 text-[0.6875rem] text-amber-200 ring-1 ring-amber-400/25">
+                  <AlertTriangle size="0.75rem" className="mt-[0.125rem] shrink-0" />
+                  <span>This preset has active lorebooks available, but no lorebook marker.</span>
+                </div>
+              )}
             </Section>
           )}
 
@@ -1614,18 +1888,136 @@ export function ChatSettingsDrawer({
             >
               <div className="space-y-1.5">
                 <label className="text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Persona</label>
-                <select
-                  value={chat.personaId ?? ""}
-                  onChange={(e) => updateChat.mutate({ id: chat.id, personaId: e.target.value || null })}
-                  className="w-full rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
-                >
-                  <option value="">None</option>
-                  {personas.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-                </select>
+                {chat.personaId ? (
+                  <div className="flex items-center gap-2.5 rounded-lg bg-[var(--primary)]/10 px-2.5 py-2 ring-1 ring-[var(--primary)]/30">
+                    {(() => {
+                      const p = personas.find((persona) => persona.id === chat.personaId);
+                      return p ? (
+                        <>
+                          {p.avatarPath ? (
+                            <img
+                              src={p.avatarPath}
+                              alt={p.name}
+                              loading="lazy"
+                              className="h-7 w-7 shrink-0 rounded-full object-cover"
+                            />
+                          ) : (
+                            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-teal-500 text-white">
+                              <User size="0.75rem" />
+                            </div>
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <span className="block truncate text-xs">{p.name}</span>
+                            {p.comment && (
+                              <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                                {p.comment}
+                              </span>
+                            )}
+                          </div>
+                        </>
+                      ) : (
+                        <span className="flex-1 truncate text-xs text-[var(--muted-foreground)]">Unknown persona</span>
+                      );
+                    })()}
+                    <button
+                      onClick={() => updateChat.mutate({ id: chat.id, personaId: null })}
+                      className="ml-auto shrink-0 rounded p-0.5 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
+                      title="Remove persona"
+                    >
+                      <X size="0.75rem" />
+                    </button>
+                  </div>
+                ) : (
+                  <p className="text-[0.6875rem] text-[var(--muted-foreground)]">No persona selected.</p>
+                )}
+
+                {!showPersonaPicker ? (
+                  <button
+                    onClick={() => {
+                      setShowPersonaPicker(true);
+                      setPersonaSearch("");
+                    }}
+                    className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-[var(--border)] px-3 py-2 text-xs text-[var(--muted-foreground)] transition-colors hover:border-[var(--primary)]/40 hover:text-[var(--primary)]"
+                  >
+                    <Plus size="0.75rem" /> {chat.personaId ? "Change" : "Choose"} Persona
+                  </button>
+                ) : (
+                  <PickerDropdown
+                    search={personaSearch}
+                    onSearchChange={setPersonaSearch}
+                    onClose={() => setShowPersonaPicker(false)}
+                    placeholder="Search personas..."
+                  >
+                    <button
+                      onClick={() => {
+                        updateChat.mutate({ id: chat.id, personaId: null });
+                        setShowPersonaPicker(false);
+                      }}
+                      className={cn(
+                        "flex items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-all hover:bg-[var(--accent)]",
+                        !chat.personaId && "bg-[var(--primary)]/10",
+                      )}
+                    >
+                      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--muted-foreground)]">
+                        <X size="0.625rem" />
+                      </div>
+                      <span className="flex-1 truncate text-xs">None</span>
+                      {!chat.personaId && <Check size="0.625rem" className="ml-auto shrink-0 text-[var(--primary)]" />}
+                    </button>
+                    {personas
+                      .filter(
+                        (p) =>
+                          p.name.toLowerCase().includes(personaSearch.toLowerCase()) ||
+                          (p.comment && p.comment.toLowerCase().includes(personaSearch.toLowerCase())),
+                      )
+                      .map((p) => (
+                        <button
+                          key={p.id}
+                          onClick={() => {
+                            updateChat.mutate({ id: chat.id, personaId: p.id });
+                            setShowPersonaPicker(false);
+                          }}
+                          className={cn(
+                            "flex items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-all hover:bg-[var(--accent)]",
+                            chat.personaId === p.id && "bg-[var(--primary)]/10",
+                          )}
+                        >
+                          {p.avatarPath ? (
+                            <img
+                              src={p.avatarPath}
+                              alt={p.name}
+                              loading="lazy"
+                              className="h-6 w-6 shrink-0 rounded-full object-cover"
+                            />
+                          ) : (
+                            <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-teal-500 text-white">
+                              <User size="0.625rem" />
+                            </div>
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <span className="block truncate text-xs">{p.name}</span>
+                            {p.comment && (
+                              <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                                {p.comment}
+                              </span>
+                            )}
+                          </div>
+                          {chat.personaId === p.id && (
+                            <Check size="0.625rem" className="ml-auto shrink-0 text-[var(--primary)]" />
+                          )}
+                        </button>
+                      ))}
+                    {personas.filter(
+                      (p) =>
+                        p.name.toLowerCase().includes(personaSearch.toLowerCase()) ||
+                        (p.comment && p.comment.toLowerCase().includes(personaSearch.toLowerCase())),
+                    ).length === 0 && (
+                      <p className="px-3 py-2 text-[0.6875rem] text-[var(--muted-foreground)]">
+                        {personas.length === 0 ? "No personas created yet." : "No matches."}
+                      </p>
+                    )}
+                  </PickerDropdown>
+                )}
               </div>
 
               <div className="mt-2 space-y-1.5">
@@ -1644,14 +2036,38 @@ export function ChatSettingsDrawer({
                           key={c.id}
                           className="flex items-center gap-2.5 rounded-lg bg-[var(--primary)]/10 px-3 py-2 ring-1 ring-[var(--primary)]/30"
                         >
-                          <div className="min-w-0 flex-1">
-                            <span className="block truncate text-xs">{name}</span>
-                            {title && (
-                              <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
-                                {title}
+                          <button
+                            onClick={() => {
+                              onClose();
+                              useUIStore.getState().openCharacterDetail(c.id);
+                            }}
+                            className="flex min-w-0 flex-1 items-center gap-2.5 text-left transition-colors hover:opacity-80"
+                            title="Open character card"
+                          >
+                            {c.avatarPath ? (
+                              <span className="relative block h-7 w-7 shrink-0 overflow-hidden rounded-full">
+                                <img
+                                  src={c.avatarPath}
+                                  alt={name}
+                                  loading="lazy"
+                                  className="h-full w-full object-cover"
+                                  style={getAvatarCropStyle(charAvatarCrop(c))}
+                                />
                               </span>
+                            ) : (
+                              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[0.625rem] font-bold">
+                                {name[0]}
+                              </div>
                             )}
-                          </div>
+                            <div className="min-w-0 flex-1">
+                              <span className="block truncate text-xs">{name}</span>
+                              {title && (
+                                <span className="block truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                                  {title}
+                                </span>
+                              )}
+                            </div>
+                          </button>
                           <button
                             onClick={() => toggleCharacter(c.id)}
                             className="flex h-5 w-5 items-center justify-center rounded-md text-[var(--muted-foreground)] transition-colors hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]"
@@ -1723,7 +2139,7 @@ export function ChatSettingsDrawer({
           {!isGame && (
             <Section
               label="Persona"
-              icon={<Users size="0.875rem" />}
+              icon={<User size="0.875rem" />}
               help="Your persona defines who you are in this chat. The AI will address you by this persona's name and use its details for context."
             >
               {/* Currently selected persona */}
@@ -1920,7 +2336,7 @@ export function ChatSettingsDrawer({
                             title="Open character card"
                           >
                             {c.avatarPath ? (
-                              <span className="block h-7 w-7 shrink-0 overflow-hidden rounded-full">
+                              <span className="relative block h-7 w-7 shrink-0 overflow-hidden rounded-full">
                                 <img
                                   src={c.avatarPath}
                                   alt={name}
@@ -1998,7 +2414,7 @@ export function ChatSettingsDrawer({
                           className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-all hover:bg-[var(--accent)]"
                         >
                           {c.avatarPath ? (
-                            <span className="block h-6 w-6 shrink-0 overflow-hidden rounded-full">
+                            <span className="relative block h-6 w-6 shrink-0 overflow-hidden rounded-full">
                               <img
                                 src={c.avatarPath}
                                 alt={name}
@@ -2435,111 +2851,6 @@ export function ChatSettingsDrawer({
                   </div>
                 </button>
 
-                {/* Selfie Connection — connection picker for character selfies */}
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-2">
-                    <Image size="0.75rem" className="text-[var(--primary)]" />
-                    <span className="text-xs font-medium">Selfie Connection</span>
-                  </div>
-                  <select
-                    value={(metadata.imageGenConnectionId as string) ?? ""}
-                    onChange={(e) => updateMeta.mutate({ id: chat.id, imageGenConnectionId: e.target.value || null })}
-                    className="w-full rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
-                  >
-                    <option value="">None (selfies disabled)</option>
-                    {((connections ?? []) as Array<{ id: string; name: string; provider: string }>).map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name} ({c.provider})
-                      </option>
-                    ))}
-                  </select>
-                  <p className="text-[0.55rem] text-[var(--muted-foreground)]">
-                    Used for character selfies. The Illustrator agent uses its own connection from the Agents tab.
-                  </p>
-
-                  {/* Selfie resolution picker */}
-                  {(metadata.imageGenConnectionId as string) && (
-                    <div className="mt-2 space-y-1">
-                      <span className="text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Resolution</span>
-                      <div className="flex flex-wrap gap-1.5">
-                        {[
-                          { label: "512×512", w: 512, h: 512 },
-                          { label: "512×768", w: 512, h: 768 },
-                          { label: "768×768", w: 768, h: 768 },
-                          { label: "768×1024", w: 768, h: 1024 },
-                          { label: "1024×1024", w: 1024, h: 1024 },
-                        ].map((opt) => {
-                          const current = (metadata.selfieResolution as string) ?? "512x768";
-                          const val = `${opt.w}x${opt.h}`;
-                          const active = current === val;
-                          return (
-                            <button
-                              key={val}
-                              type="button"
-                              onClick={() => updateMeta.mutate({ id: chat.id, selfieResolution: val })}
-                              className={`rounded-md px-2 py-1 text-[0.625rem] font-medium transition-colors ${
-                                active
-                                  ? "bg-[var(--primary)] text-[var(--primary-foreground)]"
-                                  : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--accent)]"
-                              }`}
-                            >
-                              {opt.label}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Selfie tags */}
-                  {(metadata.imageGenConnectionId as string) && (
-                    <SelfieTagsEditor
-                      tags={(metadata.selfieTags as string[]) ?? []}
-                      onChange={(tags) => updateMeta.mutate({ id: chat.id, selfieTags: tags })}
-                    />
-                  )}
-                </div>
-
-                {/* Schedule generation preferences — free-form authorial guidance */}
-                <label className="flex flex-col gap-1.5">
-                  <span className="inline-flex items-center gap-1.5 text-xs font-medium">
-                    <Sparkles size="0.75rem" className="text-[var(--primary)]" />
-                    Schedule generation preferences
-                    <HelpTooltip text="Free-form guidance that steers how character schedules are generated. Both directives ('no characters past midnight') and factual constraints ('I work 9-5') work. This setting is global — it applies to every conversation chat." />
-                  </span>
-                  <textarea
-                    value={scheduleGenerationPreferences}
-                    onChange={(e) => setScheduleGenerationPreferences(e.target.value)}
-                    placeholder="e.g. Make everyone go to sleep before midnight. Give characters free time 10am-noon. I work 9-5 on weekdays."
-                    className="min-h-[5rem] resize-y rounded-lg border border-[var(--border)] bg-[var(--secondary)] p-2.5 text-[0.6875rem] text-[var(--foreground)] outline-none transition-colors focus:border-[var(--primary)]/50 placeholder:text-[var(--muted-foreground)]/40"
-                  />
-                  <p className="text-[0.59375rem] text-[var(--muted-foreground)]/70">
-                    Global setting. Applies to every conversation chat&apos;s next schedule regeneration — manual or
-                    weekly auto.
-                  </p>
-                </label>
-
-                {/* Active schedule-generation preference indicator */}
-                {scheduleGenerationPreferences.trim() && (
-                  <div
-                    className="flex items-start gap-2 rounded-lg border border-[var(--primary)]/30 bg-[var(--primary)]/10 px-3 py-2.5"
-                    title={scheduleGenerationPreferences.trim()}
-                  >
-                    <Sparkles size="0.875rem" className="mt-0.5 shrink-0 text-[var(--primary)]" />
-                    <div className="flex-1 min-w-0">
-                      <span className="block text-[0.6875rem] font-medium leading-snug text-[var(--foreground)]">
-                        Schedule generation preference active
-                      </span>
-                      <p className="mt-0.5 truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
-                        “{scheduleGenerationPreferences.trim()}”
-                      </p>
-                      <p className="mt-1 text-[0.59375rem] text-[var(--muted-foreground)]/70">
-                        Will be applied the next time schedules are regenerated.
-                      </p>
-                    </div>
-                  </div>
-                )}
-
                 {/* Schedule status */}
                 <div className="flex items-center gap-2 rounded-lg bg-[var(--secondary)] px-3 py-2.5">
                   <CalendarClock size="0.875rem" className="text-[var(--muted-foreground)]" />
@@ -2592,6 +2903,166 @@ export function ChatSettingsDrawer({
                       updateMeta.mutate({ id: chat.id, characterSchedules: updated });
                     }}
                   />
+                )}
+              </div>
+            </Section>
+          )}
+
+          {/* Commands — conversation mode only */}
+          {isConversation && (
+            <Section
+              label="Commands"
+              icon={<Sparkles size="0.875rem" />}
+              help="Allow characters to use hidden command tags for actions that happen outside the visible message."
+            >
+              <div className="space-y-3">
+                <button
+                  onClick={() => {
+                    updateMeta.mutate({ id: chat.id, characterCommands: !conversationCommandsEnabled });
+                  }}
+                  className={cn(
+                    "flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left transition-all",
+                    conversationCommandsEnabled
+                      ? "bg-[var(--primary)]/10 ring-1 ring-[var(--primary)]/30"
+                      : "bg-[var(--secondary)] hover:bg-[var(--accent)]",
+                  )}
+                >
+                  <div className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5 text-xs font-medium">
+                      <Sparkles size="0.75rem" className="text-[var(--primary)]" />
+                      Commands
+                    </span>
+                    <p className="text-[0.625rem] text-[var(--muted-foreground)]">
+                      Allow models to interact with you via commands. This way, they can send you selfies, play songs
+                      for you, change their schedules, start scenes, and do much more!
+                    </p>
+                  </div>
+                  <div
+                    className={cn(
+                      "h-5 w-9 shrink-0 rounded-full p-0.5 transition-colors",
+                      conversationCommandsEnabled ? "bg-[var(--primary)]" : "bg-[var(--muted-foreground)]/50",
+                    )}
+                  >
+                    <div
+                      className={cn(
+                        "h-4 w-4 rounded-full bg-white shadow-sm transition-transform",
+                        conversationCommandsEnabled && "translate-x-3.5",
+                      )}
+                    />
+                  </div>
+                </button>
+
+                {/* Selfie Connection — connection picker for character selfies */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <Image size="0.75rem" className="text-[var(--primary)]" />
+                    <span className="text-xs font-medium">Selfie Connection</span>
+                  </div>
+                  <select
+                    value={(metadata.imageGenConnectionId as string) ?? ""}
+                    onChange={(e) => updateMeta.mutate({ id: chat.id, imageGenConnectionId: e.target.value || null })}
+                    className="w-full rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
+                  >
+                    <option value="">None (selfies disabled)</option>
+                    {imageConnectionsList.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name} ({c.provider})
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-[0.55rem] text-[var(--muted-foreground)]">
+                    Used for character selfies when Commands are enabled. The Illustrator agent uses its own connection
+                    from the Agents tab.
+                  </p>
+
+                  {/* Selfie resolution picker */}
+                  {(metadata.imageGenConnectionId as string) && (
+                    <div className="mt-2 space-y-1">
+                      <span className="text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Resolution</span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {[
+                          { label: "512x512", w: 512, h: 512 },
+                          { label: "512x768", w: 512, h: 768 },
+                          { label: "768x768", w: 768, h: 768 },
+                          { label: "768x1024", w: 768, h: 1024 },
+                          { label: "1024x1024", w: 1024, h: 1024 },
+                        ].map((opt) => {
+                          const current = (metadata.selfieResolution as string) ?? "512x768";
+                          const val = `${opt.w}x${opt.h}`;
+                          const active = current === val;
+                          return (
+                            <button
+                              key={val}
+                              type="button"
+                              onClick={() => updateMeta.mutate({ id: chat.id, selfieResolution: val })}
+                              className={`rounded-md px-2 py-1 text-[0.625rem] font-medium transition-colors ${
+                                active
+                                  ? "bg-[var(--primary)] text-[var(--primary-foreground)]"
+                                  : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--accent)]"
+                              }`}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Selfie prompt controls */}
+                  {(metadata.imageGenConnectionId as string) && (
+                    <SelfiePromptControls
+                      positivePrompt={metadata.selfiePositivePrompt as string | undefined}
+                      legacyTags={(metadata.selfieTags as string[]) ?? []}
+                      negativePrompt={(metadata.selfieNegativePrompt as string) ?? ""}
+                      onCommitPositivePrompt={(selfiePositivePrompt) =>
+                        updateMeta.mutate({ id: chat.id, selfiePositivePrompt })
+                      }
+                      onCommitNegativePrompt={(selfieNegativePrompt) =>
+                        updateMeta.mutate({ id: chat.id, selfieNegativePrompt })
+                      }
+                    />
+                  )}
+                </div>
+
+                {/* Schedule generation preferences — free-form authorial guidance */}
+                <label className="flex flex-col gap-1.5">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-medium">
+                    <Sparkles size="0.75rem" className="text-[var(--primary)]" />
+                    Schedule generation preferences
+                    <HelpTooltip text="Free-form guidance that steers how character schedules are generated. Both directives ('no characters past midnight') and factual constraints ('I work 9-5') work. This setting is global, it applies to every conversation chat." />
+                  </span>
+                  <textarea
+                    value={scheduleGenerationPreferences}
+                    onChange={(e) => setScheduleGenerationPreferences(e.target.value)}
+                    placeholder="e.g. Make everyone go to sleep before midnight. Give characters free time 10am-noon. I work 9-5 on weekdays."
+                    className="min-h-[5rem] resize-y rounded-lg border border-[var(--border)] bg-[var(--secondary)] p-2.5 text-[0.6875rem] text-[var(--foreground)] outline-none transition-colors focus:border-[var(--primary)]/50 placeholder:text-[var(--muted-foreground)]/40"
+                  />
+                  <p className="text-[0.59375rem] text-[var(--muted-foreground)]/70">
+                    Global setting. Applies to every conversation chat&apos;s next schedule regeneration, manual or
+                    weekly auto.
+                  </p>
+                </label>
+
+                {/* Active schedule-generation preference indicator */}
+                {scheduleGenerationPreferences.trim() && (
+                  <div
+                    className="flex items-start gap-2 rounded-lg border border-[var(--primary)]/30 bg-[var(--primary)]/10 px-3 py-2.5"
+                    title={scheduleGenerationPreferences.trim()}
+                  >
+                    <Sparkles size="0.875rem" className="mt-0.5 shrink-0 text-[var(--primary)]" />
+                    <div className="min-w-0 flex-1">
+                      <span className="block text-[0.6875rem] font-medium leading-snug text-[var(--foreground)]">
+                        Schedule generation preference active
+                      </span>
+                      <p className="mt-0.5 truncate text-[0.625rem] italic text-[var(--muted-foreground)]">
+                        "{scheduleGenerationPreferences.trim()}"
+                      </p>
+                      <p className="mt-1 text-[0.59375rem] text-[var(--muted-foreground)]/70">
+                        Will be applied the next time schedules are regenerated.
+                      </p>
+                    </div>
+                  </div>
                 )}
               </div>
             </Section>
@@ -2655,7 +3126,9 @@ export function ChatSettingsDrawer({
                     <div className="flex items-center gap-2.5 rounded-lg bg-[var(--primary)]/10 px-3 py-2 ring-1 ring-[var(--primary)]/30">
                       <ArrowRightLeft size="0.875rem" className="text-[var(--primary)]" />
                       <div className="flex-1 min-w-0">
-                        <span className="truncate text-xs font-medium">{linked?.name ?? "Unknown chat"}</span>
+                        <span className="truncate text-xs font-medium">
+                          {linked ? getConnectedChatDisplayName(linked) : "Unknown chat"}
+                        </span>
                         <p className="text-[0.625rem] text-[var(--muted-foreground)]">
                           {linked ? (linked.mode === "roleplay" ? "Roleplay" : linked.mode) : "Deleted"}
                         </p>
@@ -2693,7 +3166,7 @@ export function ChatSettingsDrawer({
                         c.id !== chat.id &&
                         (c.mode === "roleplay" || c.mode === "game") &&
                         !c.connectedChatId &&
-                        c.name.toLowerCase().includes(connectionSearch.toLowerCase()),
+                        getConnectedChatDisplayName(c).toLowerCase().includes(connectionSearch.toLowerCase()),
                     )
                     .map((c) => (
                       <button
@@ -2705,7 +3178,7 @@ export function ChatSettingsDrawer({
                         className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs transition-colors hover:bg-[var(--accent)]"
                       >
                         <MessageSquare size="0.75rem" className="shrink-0 text-[var(--muted-foreground)]" />
-                        <span className="truncate">{c.name}</span>
+                        <span className="truncate">{getConnectedChatDisplayName(c)}</span>
                       </button>
                     ))}
                 </PickerDropdown>
@@ -2730,7 +3203,9 @@ export function ChatSettingsDrawer({
                       <div className="flex items-center gap-2.5 rounded-lg bg-[var(--primary)]/10 px-3 py-2 ring-1 ring-[var(--primary)]/30">
                         <MessageCircle size="0.875rem" className="text-[var(--primary)]" />
                         <div className="flex-1 min-w-0">
-                          <span className="truncate text-xs font-medium">{linked?.name ?? "Unknown chat"}</span>
+                          <span className="truncate text-xs font-medium">
+                            {linked ? getConnectedChatDisplayName(linked) : "Unknown chat"}
+                          </span>
                           <p className="text-[0.625rem] text-[var(--muted-foreground)]">Conversation</p>
                         </div>
                         <button
@@ -2804,7 +3279,9 @@ export function ChatSettingsDrawer({
                   <div className="flex items-center gap-2.5 rounded-lg bg-[var(--primary)]/10 px-3 py-2 ring-1 ring-[var(--primary)]/30">
                     <MessageCircle size="0.875rem" className="text-[var(--primary)]" />
                     <div className="flex-1 min-w-0">
-                      <span className="truncate text-xs font-medium">{linked?.name ?? "Unknown chat"}</span>
+                      <span className="truncate text-xs font-medium">
+                        {linked ? getConnectedChatDisplayName(linked) : "Unknown chat"}
+                      </span>
                       <p className="text-[0.625rem] text-[var(--muted-foreground)]">Conversation</p>
                     </div>
                     <button
@@ -2853,7 +3330,7 @@ export function ChatSettingsDrawer({
                         c.id !== chat.id &&
                         c.mode === "conversation" &&
                         !c.connectedChatId &&
-                        c.name.toLowerCase().includes(connectionSearch.toLowerCase()),
+                        getConnectedChatDisplayName(c).toLowerCase().includes(connectionSearch.toLowerCase()),
                     )
                     .map((c) => (
                       <button
@@ -2865,7 +3342,7 @@ export function ChatSettingsDrawer({
                         className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs transition-colors hover:bg-[var(--accent)]"
                       >
                         <MessageSquare size="0.75rem" className="shrink-0 text-[var(--muted-foreground)]" />
-                        <span className="truncate">{c.name}</span>
+                        <span className="truncate">{getConnectedChatDisplayName(c)}</span>
                       </button>
                     ))}
                 </PickerDropdown>
@@ -2877,33 +3354,70 @@ export function ChatSettingsDrawer({
           <Section
             label="Lorebooks"
             icon={<BookOpen size="0.875rem" />}
-            count={activeLorebookIds.length}
+            count={activeLorebooks.length}
             help="Lorebooks contain world info, character backstories, and lore that gets injected into the AI's context when relevant keywords appear."
           >
+            <div className="mb-2 rounded-lg bg-[var(--secondary)]/70 p-3 ring-1 ring-[var(--border)]">
+              <label className="mb-1.5 flex items-center gap-1 text-xs font-medium">
+                Lorebook Token Budget{" "}
+                <HelpTooltip
+                  text={`Context cap for activated lorebook retrievals in this chat. Default: ${LIMITS.DEFAULT_LOREBOOK_TOKEN_BUDGET}. Set to 0 for unlimited.`}
+                />
+              </label>
+              <input
+                type="number"
+                min={0}
+                value={lorebookTokenBudget}
+                onChange={(event) => {
+                  const next = Math.max(0, Math.floor(Number(event.target.value) || 0));
+                  updateMeta.mutate({ id: chat.id, lorebookTokenBudget: next });
+                }}
+                className="w-full rounded-lg bg-[var(--background)] px-3 py-2 text-xs ring-1 ring-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
+              />
+            </div>
+
             {/* Active lorebooks */}
-            {activeLorebookIds.length === 0 ? (
-              <p className="text-[0.6875rem] text-[var(--muted-foreground)]">No lorebooks added to this chat.</p>
+            {activeLorebooks.length === 0 ? (
+              <p className="text-[0.6875rem] text-[var(--muted-foreground)]">No lorebooks active in this chat.</p>
             ) : (
               <div className="flex flex-col gap-1">
-                {activeLorebookIds.map((lbId) => {
-                  const lb = (lorebooks ?? []).find((l: { id: string }) => l.id === lbId) as
-                    | { id: string; name: string }
-                    | undefined;
-                  if (!lb) return null;
+                {activeLorebooks.map((lb) => {
                   return (
                     <div
                       key={lb.id}
                       className="flex items-center gap-2.5 rounded-lg bg-[var(--primary)]/10 px-3 py-2 ring-1 ring-[var(--primary)]/30"
                     >
                       <BookOpen size="0.875rem" className="text-[var(--primary)]" />
-                      <span className="flex-1 truncate text-xs">{lb.name}</span>
-                      <button
-                        onClick={() => toggleLorebook(lb.id)}
-                        className="flex h-5 w-5 items-center justify-center rounded-md text-[var(--muted-foreground)] transition-colors hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]"
-                        title="Remove from chat"
-                      >
-                        <Trash2 size="0.6875rem" />
-                      </button>
+                      <div className="min-w-0 flex-1">
+                        <span className="block truncate text-xs">{lb.name}</span>
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {lb.activeReasons.map((reason) => (
+                            <span
+                              key={reason}
+                              className="rounded-full bg-[var(--background)]/70 px-1.5 py-0.5 text-[0.5625rem] font-medium text-[var(--muted-foreground)] ring-1 ring-[var(--border)]"
+                            >
+                              {reason}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      {lb.isPinned ? (
+                        <button
+                          onClick={() => toggleLorebook(lb.id)}
+                          className="flex h-5 w-5 items-center justify-center rounded-md text-[var(--muted-foreground)] transition-colors hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]"
+                          title="Remove from chat"
+                        >
+                          <Trash2 size="0.6875rem" />
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => pinLorebookToChat(lb.id)}
+                          className="flex h-5 w-5 items-center justify-center rounded-md text-[var(--muted-foreground)] transition-colors hover:bg-[var(--primary)]/15 hover:text-[var(--primary)]"
+                          title="Add to chat"
+                        >
+                          <Plus size="0.6875rem" />
+                        </button>
+                      )}
                     </div>
                   );
                 })}
@@ -2929,7 +3443,7 @@ export function ChatSettingsDrawer({
                 placeholder="Search lorebooks…"
               >
                 {((lorebooks ?? []) as Array<{ id: string; name: string }>)
-                  .filter((lb) => !activeLorebookIds.includes(lb.id))
+                  .filter((lb) => !activeLorebookIdSet.has(lb.id))
                   .filter((lb) => lb.name.toLowerCase().includes(lbSearch.toLowerCase()))
                   .map((lb) => (
                     <button
@@ -2946,12 +3460,12 @@ export function ChatSettingsDrawer({
                     </button>
                   ))}
                 {((lorebooks ?? []) as Array<{ id: string; name: string }>)
-                  .filter((lb) => !activeLorebookIds.includes(lb.id))
+                  .filter((lb) => !activeLorebookIdSet.has(lb.id))
                   .filter((lb) => lb.name.toLowerCase().includes(lbSearch.toLowerCase())).length === 0 && (
                   <p className="px-3 py-2 text-[0.6875rem] text-[var(--muted-foreground)]">
-                    {((lorebooks ?? []) as Array<{ id: string }>).filter((lb) => !activeLorebookIds.includes(lb.id))
+                    {((lorebooks ?? []) as Array<{ id: string }>).filter((lb) => !activeLorebookIdSet.has(lb.id))
                       .length === 0
-                      ? "All lorebooks already added."
+                      ? "All available lorebooks are already active here."
                       : "No matches."}
                   </p>
                 )}
@@ -2970,7 +3484,8 @@ export function ChatSettingsDrawer({
               <div className="space-y-2">
                 {isGame && metadata.enableAgents && (
                   <p className="px-1 text-[0.625rem] text-[var(--muted-foreground)]">
-                    Toggle agents for this game session. Only two are allowed to ensure the game's format doesn't break.
+                    Toggle agents for this game session. Only the ones below are allowed to ensure the game's format
+                    doesn't break.
                   </p>
                 )}
                 <button
@@ -3046,12 +3561,7 @@ export function ChatSettingsDrawer({
 
                 {isGame && (
                   <button
-                    onClick={() => {
-                      updateMeta.mutate({
-                        id: chat.id,
-                        gameLorebookKeeperEnabled: !gameLorebookKeeperEnabled,
-                      });
-                    }}
+                    onClick={toggleGameLorebookKeeper}
                     className={cn(
                       "flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left transition-all",
                       gameLorebookKeeperEnabled
@@ -3087,6 +3597,156 @@ export function ChatSettingsDrawer({
                       />
                     </div>
                   </button>
+                )}
+
+                {isGame && (
+                  <div className="space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => void toggleGameSpotifyMusic()}
+                      className={cn(
+                        "flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left transition-all",
+                        gameUseSpotifyMusic
+                          ? "bg-[var(--primary)]/10 ring-1 ring-[var(--primary)]/30"
+                          : "bg-[var(--secondary)] hover:bg-[var(--accent)]",
+                      )}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 text-xs font-medium">
+                          <Music2 size="0.75rem" className="text-[var(--primary)]" />
+                          <span>Spotify DJ Music</span>
+                        </div>
+                        <p className="mt-0.5 text-[0.625rem] text-[var(--muted-foreground)]">
+                          Use Spotify instead of the built-in Game Mode music library.
+                        </p>
+                      </div>
+                      <div
+                        className={cn(
+                          "h-5 w-9 shrink-0 rounded-full p-0.5 transition-colors",
+                          gameUseSpotifyMusic ? "bg-[var(--primary)]" : "bg-[var(--muted-foreground)]/50",
+                        )}
+                      >
+                        <div
+                          className={cn(
+                            "h-4 w-4 rounded-full bg-white shadow-sm transition-transform",
+                            gameUseSpotifyMusic && "translate-x-3.5",
+                          )}
+                        />
+                      </div>
+                    </button>
+
+                    {gameUseSpotifyMusic && (
+                      <div className="space-y-2 rounded-lg bg-[var(--background)]/55 p-3 ring-1 ring-[var(--border)]">
+                        <label className="flex flex-col gap-1">
+                          <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+                            Music source
+                          </span>
+                          <select
+                            value={gameSpotifySourceType}
+                            onChange={(event) => {
+                              const next = normalizeGameSpotifySourceType(event.target.value);
+                              updateMeta.mutate({
+                                id: chat.id,
+                                gameSpotifySourceType: next,
+                                gameSpotifyPlaylistId: next === "playlist" ? gameSpotifyPlaylistId || null : null,
+                                gameSpotifyPlaylistName:
+                                  next === "playlist" ? (metadata.gameSpotifyPlaylistName as string) || null : null,
+                                gameSpotifyArtist: next === "artist" ? gameSpotifyArtistDraft.trim() || null : null,
+                              });
+                            }}
+                            className="w-full rounded-lg border border-[var(--border)] bg-[var(--secondary)] px-2.5 py-1.5 text-xs text-[var(--foreground)]"
+                          >
+                            {GAME_SPOTIFY_SOURCE_OPTIONS.map((option) => (
+                              <option key={option.id} value={option.id}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                          <span className="text-[0.5625rem] text-[var(--muted-foreground)]">
+                            {GAME_SPOTIFY_SOURCE_OPTIONS.find((option) => option.id === gameSpotifySourceType)
+                              ?.description ?? ""}
+                          </span>
+                        </label>
+
+                        {gameSpotifySourceType === "playlist" && (
+                          <label className="flex flex-col gap-1">
+                            <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">Playlist</span>
+                            {spotifyPlaylistsQuery.data?.playlists.length ? (
+                              <select
+                                value={gameSpotifyPlaylistId}
+                                onChange={(event) => {
+                                  const playlist = spotifyPlaylistsQuery.data?.playlists.find(
+                                    (entry) => entry.id === event.target.value,
+                                  );
+                                  updateMeta.mutate({
+                                    id: chat.id,
+                                    gameSpotifyPlaylistId: event.target.value || null,
+                                    gameSpotifyPlaylistName: playlist?.name ?? null,
+                                  });
+                                }}
+                                className="w-full rounded-lg border border-[var(--border)] bg-[var(--secondary)] px-2.5 py-1.5 text-xs text-[var(--foreground)]"
+                              >
+                                <option value="">Choose playlist...</option>
+                                {spotifyPlaylistsQuery.data.playlists.map((playlist) => {
+                                  const suffix =
+                                    typeof playlist.trackCount === "number"
+                                      ? ` (${playlist.trackCount})`
+                                      : playlist.owned === false
+                                        ? " (followed — unavailable)"
+                                        : "";
+                                  return (
+                                    <option key={playlist.id} value={playlist.id}>
+                                      {playlist.name}
+                                      {suffix}
+                                    </option>
+                                  );
+                                })}
+                              </select>
+                            ) : (
+                              <input
+                                key={`${chat.id}-${gameSpotifyPlaylistId}`}
+                                defaultValue={gameSpotifyPlaylistId}
+                                onBlur={(event) =>
+                                  updateMeta.mutate({
+                                    id: chat.id,
+                                    gameSpotifyPlaylistId: event.target.value.trim() || null,
+                                    gameSpotifyPlaylistName: null,
+                                  })
+                                }
+                                placeholder={
+                                  spotifyPlaylistsQuery.isFetching ? "Loading playlists..." : "Paste playlist ID"
+                                }
+                                className="w-full rounded-lg border border-[var(--border)] bg-[var(--secondary)] px-2.5 py-1.5 text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]/50"
+                              />
+                            )}
+                            {spotifyPlaylistsQuery.isError && (
+                              <span className="text-[0.5625rem] text-amber-400/90">
+                                Connect Spotify in the Spotify DJ agent to load playlist names.
+                              </span>
+                            )}
+                          </label>
+                        )}
+
+                        {gameSpotifySourceType === "artist" && (
+                          <label className="flex flex-col gap-1">
+                            <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">Artist</span>
+                            <input
+                              value={gameSpotifyArtistDraft}
+                              onChange={(event) => setGameSpotifyArtistDraft(event.target.value)}
+                              onBlur={() =>
+                                updateMeta.mutate({
+                                  id: chat.id,
+                                  gameSpotifyArtist: gameSpotifyArtistDraft.trim() || null,
+                                })
+                              }
+                              placeholder="HOYO-MiX"
+                              className="w-full rounded-lg border border-[var(--border)] bg-[var(--secondary)] px-2.5 py-1.5 text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]/50"
+                            />
+                          </label>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 )}
 
                 {metadata.enableAgents && !isGame && (
@@ -3218,7 +3878,7 @@ export function ChatSettingsDrawer({
                                 title="Open character card"
                               >
                                 {character.avatarPath ? (
-                                  <span className="block h-8 w-8 shrink-0 overflow-hidden rounded-full">
+                                  <span className="relative block h-8 w-8 shrink-0 overflow-hidden rounded-full">
                                     <img
                                       src={character.avatarPath}
                                       alt={name}
@@ -3474,7 +4134,7 @@ export function ChatSettingsDrawer({
                       </div>
                     </button>
                     {metadata.enableSpriteGeneration && (
-                      <div className="mt-1.5 px-3">
+                      <div className="mt-1.5 space-y-2 px-3">
                         <select
                           value={(metadata.gameImageConnectionId as string) ?? ""}
                           onChange={(e) =>
@@ -3490,6 +4150,28 @@ export function ChatSettingsDrawer({
                             </option>
                           ))}
                         </select>
+                        <label className="flex flex-col gap-1">
+                          <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+                            Scene image instructions
+                          </span>
+                          <textarea
+                            value={gameImagePromptInstructionsDraft}
+                            onChange={(e) => setGameImagePromptInstructionsDraft(e.target.value)}
+                            onBlur={() => {
+                              const stored = (metadata.gameImagePromptInstructions as string) ?? "";
+                              if (gameImagePromptInstructionsDraft !== stored) {
+                                updateMeta.mutate({
+                                  id: chat.id,
+                                  gameImagePromptInstructions: gameImagePromptInstructionsDraft.trim() || null,
+                                });
+                              }
+                            }}
+                            placeholder="e.g. Dottore's mask completely covers his eyes; never render visible eyes behind it."
+                            rows={3}
+                            maxLength={1200}
+                            className="min-h-[4.75rem] w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--secondary)] px-2.5 py-2 text-xs leading-relaxed text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)]/40 focus:border-[var(--primary)]/50"
+                          />
+                        </label>
                       </div>
                     )}
                   </div>
@@ -3620,42 +4302,80 @@ export function ChatSettingsDrawer({
                               count={activeInCat.length}
                             >
                               {cat.key === "writer" && (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    updateMeta.mutate({
-                                      id: chat.id,
-                                      showInjectionsPanel: metadata.showInjectionsPanel !== true,
-                                    })
-                                  }
-                                  aria-pressed={metadata.showInjectionsPanel === true}
-                                  className="ml-auto flex w-fit max-w-full items-center gap-2 rounded-md bg-[var(--background)]/20 px-1.5 py-1 text-left text-[0.5625rem] text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)]/35 hover:text-[var(--foreground)]"
-                                  title={
-                                    metadata.showInjectionsPanel === true
-                                      ? "Hide the Injections tab in the roleplay Agents menu. This is mainly for troubleshooting Prose Guardian, Narrative Director, or custom injected text before regenerating the current reply."
-                                      : "Show the Injections tab in the roleplay Agents menu. This is mainly for troubleshooting Prose Guardian, Narrative Director, or custom injected text before regenerating the current reply."
-                                  }
-                                >
-                                  <span className="flex min-w-0 items-center gap-1.5">
-                                    <FilePlus2 size="0.625rem" className="shrink-0 text-[var(--primary)]" />
-                                    <span className="truncate font-medium">Injections tab</span>
-                                  </span>
-                                  <span
-                                    className={cn(
-                                      "h-3.5 w-6 shrink-0 rounded-full p-0.5 transition-colors",
-                                      metadata.showInjectionsPanel === true
-                                        ? "bg-[var(--primary)]"
-                                        : "bg-[var(--muted-foreground)]/50",
-                                    )}
+                                <div className="ml-auto flex w-fit max-w-full flex-wrap justify-end gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      updateMeta.mutate({
+                                        id: chat.id,
+                                        reviewWriterAgentOutputs: metadata.reviewWriterAgentOutputs !== true,
+                                      })
+                                    }
+                                    aria-pressed={metadata.reviewWriterAgentOutputs === true}
+                                    className="flex max-w-full items-center gap-2 rounded-md bg-[var(--background)]/20 px-1.5 py-1 text-left text-[0.5625rem] text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)]/35 hover:text-[var(--foreground)]"
+                                    title={
+                                      metadata.reviewWriterAgentOutputs === true
+                                        ? "Stop pausing before the main reply to review writer agent output."
+                                        : "Pause before the main reply so Prose Guardian, Narrative Director, and similar writer outputs can be reviewed and edited."
+                                    }
                                   >
+                                    <span className="flex min-w-0 items-center gap-1.5">
+                                      <Pencil size="0.625rem" className="shrink-0 text-[var(--primary)]" />
+                                      <span className="truncate font-medium">Review outputs</span>
+                                    </span>
                                     <span
                                       className={cn(
-                                        "block h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform",
-                                        metadata.showInjectionsPanel === true && "translate-x-2.5",
+                                        "h-3.5 w-6 shrink-0 rounded-full p-0.5 transition-colors",
+                                        metadata.reviewWriterAgentOutputs === true
+                                          ? "bg-[var(--primary)]"
+                                          : "bg-[var(--muted-foreground)]/50",
                                       )}
-                                    />
-                                  </span>
-                                </button>
+                                    >
+                                      <span
+                                        className={cn(
+                                          "block h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform",
+                                          metadata.reviewWriterAgentOutputs === true && "translate-x-2.5",
+                                        )}
+                                      />
+                                    </span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      updateMeta.mutate({
+                                        id: chat.id,
+                                        showInjectionsPanel: metadata.showInjectionsPanel !== true,
+                                      })
+                                    }
+                                    aria-pressed={metadata.showInjectionsPanel === true}
+                                    className="flex max-w-full items-center gap-2 rounded-md bg-[var(--background)]/20 px-1.5 py-1 text-left text-[0.5625rem] text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)]/35 hover:text-[var(--foreground)]"
+                                    title={
+                                      metadata.showInjectionsPanel === true
+                                        ? "Hide the Injections tab in the roleplay Agents menu. This is mainly for troubleshooting Prose Guardian, Narrative Director, or custom injected text before regenerating the current reply."
+                                        : "Show the Injections tab in the roleplay Agents menu. This is mainly for troubleshooting Prose Guardian, Narrative Director, or custom injected text before regenerating the current reply."
+                                    }
+                                  >
+                                    <span className="flex min-w-0 items-center gap-1.5">
+                                      <FilePlus2 size="0.625rem" className="shrink-0 text-[var(--primary)]" />
+                                      <span className="truncate font-medium">Injections tab</span>
+                                    </span>
+                                    <span
+                                      className={cn(
+                                        "h-3.5 w-6 shrink-0 rounded-full p-0.5 transition-colors",
+                                        metadata.showInjectionsPanel === true
+                                          ? "bg-[var(--primary)]"
+                                          : "bg-[var(--muted-foreground)]/50",
+                                      )}
+                                    >
+                                      <span
+                                        className={cn(
+                                          "block h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform",
+                                          metadata.showInjectionsPanel === true && "translate-x-2.5",
+                                        )}
+                                      />
+                                    </span>
+                                  </button>
+                                </div>
                               )}
                               {/* Active agents in this category */}
                               {activeInCat.length > 0 && (
@@ -3850,7 +4570,7 @@ export function ChatSettingsDrawer({
             <Section
               label="Memory Recall"
               icon={<Brain size="0.875rem" />}
-              help="When enabled, relevant fragments from this chat are automatically recalled and injected into the prompt as memories. Uses a local embedding model — no API cost."
+              help="When enabled, relevant fragments from this chat are automatically recalled and injected into the prompt as memories. Uses the local embedding model when available, or the configured embedding connection."
             >
               {renderMemoryRecallControls(true)}
             </Section>
@@ -4154,7 +4874,7 @@ export function ChatSettingsDrawer({
             <Section
               label="Memory Recall"
               icon={<Brain size="0.875rem" />}
-              help="When enabled, relevant fragments from this chat are automatically recalled and injected into the prompt as memories. Uses a local embedding model — no API cost."
+              help="When enabled, relevant fragments from this chat are automatically recalled and injected into the prompt as memories. Uses the local embedding model when available, or the configured embedding connection."
             >
               {renderMemoryRecallControls(metadata.sceneStatus === "active")}
             </Section>
@@ -4793,6 +5513,7 @@ function MemoryRecallMemoriesModal({ chatId, open, onClose }: { chatId: string; 
   const memoriesQuery = useChatMemories(chatId, open);
   const deleteMemory = useDeleteChatMemory(chatId);
   const clearMemories = useClearChatMemories(chatId);
+  const refreshMemories = useRefreshChatMemories(chatId);
   const memories = useMemo(() => memoriesQuery.data ?? [], [memoriesQuery.data]);
   const totalTokens = useMemo(() => estimateMemoryTokens(memories), [memories]);
 
@@ -4834,12 +5555,15 @@ function MemoryRecallMemoriesModal({ chatId, open, onClose }: { chatId: string; 
           <div className="flex items-center gap-1">
             <button
               type="button"
-              onClick={() => void memoriesQuery.refetch()}
-              disabled={memoriesQuery.isFetching}
+              onClick={() => refreshMemories.mutate()}
+              disabled={memoriesQuery.isFetching || refreshMemories.isPending}
               className="rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)] disabled:opacity-50"
-              title="Refresh"
+              title="Rebuild memories from current chat messages"
             >
-              <RefreshCw size="0.8125rem" className={cn(memoriesQuery.isFetching && "animate-spin")} />
+              <RefreshCw
+                size="0.8125rem"
+                className={cn((memoriesQuery.isFetching || refreshMemories.isPending) && "animate-spin")}
+              />
             </button>
             <button
               type="button"
@@ -4883,7 +5607,13 @@ function MemoryRecallMemoriesModal({ chatId, open, onClose }: { chatId: string; 
                     </div>
                     <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5">
                       <span>{memory.messageCount} messages</span>
-                      <span>{memory.hasEmbedding ? "Vectorized" : "Waiting for vector"}</span>
+                      <span>
+                        {memory.hasEmbedding
+                          ? "Vectorized"
+                          : memory.embeddingStatus === "unavailable"
+                            ? "Embedding unavailable"
+                            : "Waiting for vector"}
+                      </span>
                       <span>Created {formatMemoryDate(memory.createdAt)}</span>
                     </div>
                   </div>
@@ -5072,8 +5802,8 @@ function ImpersonateSettingsContent({
 }) {
   const promptTemplate = useUIStore((s) => s.impersonatePromptTemplate);
   const setPromptTemplate = useUIStore((s) => s.setImpersonatePromptTemplate);
-  const showQuickButton = useUIStore((s) => s.impersonateShowQuickButton);
-  const setShowQuickButton = useUIStore((s) => s.setImpersonateShowQuickButton);
+  const cyoaChoices = useUIStore((s) => s.impersonateCyoaChoices);
+  const setCyoaChoices = useUIStore((s) => s.setImpersonateCyoaChoices);
   const presetId = useUIStore((s) => s.impersonatePresetId);
   const setPresetId = useUIStore((s) => s.setImpersonatePresetId);
   const connectionId = useUIStore((s) => s.impersonateConnectionId);
@@ -5081,6 +5811,7 @@ function ImpersonateSettingsContent({
   const blockAgents = useUIStore((s) => s.impersonateBlockAgents);
   const setBlockAgents = useUIStore((s) => s.setImpersonateBlockAgents);
   const hasPromptTemplate = promptTemplate.trim().length > 0;
+  const promptStatus = hasPromptTemplate ? "Custom" : "Chat/default";
 
   const [defaultOpen, setDefaultOpen] = useState(false);
 
@@ -5092,8 +5823,8 @@ function ImpersonateSettingsContent({
             <span className="text-xs font-semibold">Prompt Template</span>
             <HelpTooltip text="Optional global instruction sent to the model when you /impersonate. Leave empty to use the chat-specific prompt, or the built-in default if that chat has none. Macros like {{user}}, {{persona_description}} and {{impersonate_direction}} are replaced before sending." />
           </div>
-          <span className="shrink-0 text-[0.625rem] text-[var(--muted-foreground)]/80">
-            {hasPromptTemplate ? "Custom" : "Using chat/built-in default"}
+          <span className="shrink-0 rounded-full bg-[var(--secondary)]/55 px-2 py-0.5 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
+            {promptStatus}
           </span>
         </div>
         <textarea
@@ -5111,7 +5842,7 @@ function ImpersonateSettingsContent({
             {defaultOpen ? <ChevronDown size="0.6875rem" /> : <ChevronRight size="0.6875rem" />}
             Built-in default
           </button>
-          {hasPromptTemplate ? (
+          {hasPromptTemplate && (
             <button
               onClick={() => setPromptTemplate("")}
               className="flex items-center gap-1 rounded-md bg-[var(--secondary)] px-2 py-0.5 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
@@ -5120,8 +5851,6 @@ function ImpersonateSettingsContent({
               <RotateCcw size="0.625rem" />
               Reset
             </button>
-          ) : (
-            <span className="text-[0.625rem] text-[var(--muted-foreground)]/80">Using chat/built-in default</span>
           )}
         </div>
         {defaultOpen && (
@@ -5131,75 +5860,93 @@ function ImpersonateSettingsContent({
         )}
       </div>
 
-      <div className="grid gap-x-2 gap-y-1.5 sm:grid-cols-[minmax(7.5rem,1fr)_8.75rem]">
-        <label className="order-1 space-y-1 rounded-lg bg-[var(--secondary)]/25 px-3 py-1.5 ring-1 ring-[var(--border)]">
-          <div className="flex items-center gap-1.5">
-            <span className="text-[0.6875rem] font-semibold">Preset</span>
-            <HelpTooltip text="Use a specific prompt preset for roleplay impersonate generations only. Conversation mode does not use prompt presets. Falls back to the chat's preset when set to 'Use chat default'." />
-          </div>
-          <select
-            value={presetId ?? ""}
-            onChange={(e) => setPresetId(e.target.value || null)}
-            className="w-full rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
-          >
-            <option value="">Use chat default</option>
-            {presets.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
-          </select>
-        </label>
+      <div className="space-y-1.5 rounded-lg bg-[var(--secondary)]/20 p-2 ring-1 ring-[var(--border)]">
+        <div className="grid gap-2 sm:grid-cols-2">
+          <label className="min-w-0 space-y-1">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[0.6875rem] font-semibold">Preset</span>
+              <HelpTooltip text="Use a specific prompt preset for roleplay impersonate generations only. Conversation mode does not use prompt presets. Falls back to the chat's preset when set to 'Use chat default'." />
+            </div>
+            <select
+              value={presetId ?? ""}
+              onChange={(e) => setPresetId(e.target.value || null)}
+              className="w-full rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
+            >
+              <option value="">Use chat default</option>
+              {presets.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </label>
 
-        <label className="order-3 space-y-1 rounded-lg bg-[var(--secondary)]/25 px-3 py-1.5 ring-1 ring-[var(--border)] sm:order-3">
-          <div className="flex items-center gap-1.5">
-            <span className="text-[0.6875rem] font-semibold">Connection</span>
-            <HelpTooltip text="Use a specific connection (model/provider) for impersonate generations only. Useful for routing impersonate to a cheaper or faster model." />
-          </div>
-          <select
-            value={connectionId ?? ""}
-            onChange={(e) => setConnectionId(e.target.value || null)}
-            className="w-full rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
-          >
-            <option value="">Use chat default</option>
-            <option value="random">Random</option>
-            {connections.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
-        </label>
+          <label className="min-w-0 space-y-1">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[0.6875rem] font-semibold">Connection</span>
+              <HelpTooltip text="Use a specific connection (model/provider) for impersonate generations only. Useful for routing impersonate to a cheaper or faster model." />
+            </div>
+            <select
+              value={connectionId ?? ""}
+              onChange={(e) => setConnectionId(e.target.value || null)}
+              className="w-full rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
+            >
+              <option value="">Use chat default</option>
+              <option value="random">Random</option>
+              {connections.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
 
-        <label className="order-2 flex min-h-[2.875rem] min-w-0 items-center justify-between gap-1.5 rounded-lg bg-[var(--secondary)]/25 px-2.5 py-1.5 text-xs font-semibold ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)]/40 sm:order-2">
-          <span className="min-w-0">Quick button</span>
-          <span className="flex shrink-0 items-center gap-1.5">
-            <input
-              type="checkbox"
-              checked={showQuickButton}
-              onChange={(e) => setShowQuickButton(e.target.checked)}
-              className="h-3.5 w-3.5 rounded border-[var(--border)] accent-[var(--primary)]"
-            />
-            <span onClick={(e) => e.preventDefault()}>
-              <HelpTooltip text="Show a one-click impersonate button in the chat input toolbar. When pressed with text in the input, it sends that text as the impersonate direction." />
+        <div className="grid gap-1 border-t border-[var(--border)]/60 pt-1.5">
+          <label className="flex min-w-0 items-center justify-between gap-3 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--accent)]/35">
+            <span className="min-w-0">
+              <span className="flex items-center gap-1.5 text-xs font-semibold">
+                Skip agents
+                <span onClick={(e) => e.preventDefault()}>
+                  <HelpTooltip text="When enabled, the agent pipeline (trackers, lorebook routers, etc.) is suppressed during impersonate so generations stay fast and don't trigger world-state mutations." />
+                </span>
+              </span>
+              <span className="mt-0.5 block text-[0.65rem] leading-tight text-[var(--muted-foreground)]">
+                Suppress trackers, routers, and other agent work.
+              </span>
             </span>
-          </span>
-        </label>
-
-        <label className="order-4 flex min-h-[2.875rem] min-w-0 items-center justify-between gap-1.5 rounded-lg bg-[var(--secondary)]/25 px-2.5 py-1.5 text-xs font-semibold ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)]/40">
-          <span className="min-w-0">Skip agents</span>
-          <span className="flex shrink-0 items-center gap-1.5">
             <input
               type="checkbox"
               checked={blockAgents}
               onChange={(e) => setBlockAgents(e.target.checked)}
-              className="h-3.5 w-3.5 rounded border-[var(--border)] accent-[var(--primary)]"
+              className="h-3.5 w-3.5 shrink-0 rounded border-[var(--border)] accent-[var(--primary)]"
             />
-            <span onClick={(e) => e.preventDefault()}>
-              <HelpTooltip text="When enabled, the agent pipeline (trackers, lorebook routers, etc.) is suppressed during impersonate so generations stay fast and don't trigger world-state mutations." />
+          </label>
+
+          <label className="flex min-w-0 items-center justify-between gap-3 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--accent)]/35">
+            <span className="min-w-0">
+              <span className="flex items-center gap-1.5 text-xs font-semibold">
+                Use CYOA as direction
+                <span onClick={(e) => e.preventDefault()}>
+                  <HelpTooltip text="When enabled, clicking a CYOA option uses it as the direction for an impersonate generation instead of sending the option as a normal user message." />
+                </span>
+              </span>
+              <span className="mt-0.5 block text-[0.65rem] leading-tight text-[var(--muted-foreground)]">
+                Treat choices as impersonate guidance.
+              </span>
             </span>
-          </span>
-        </label>
+            <input
+              type="checkbox"
+              checked={cyoaChoices}
+              onChange={(e) => setCyoaChoices(e.target.checked)}
+              className="h-3.5 w-3.5 shrink-0 rounded border-[var(--border)] accent-[var(--primary)]"
+            />
+          </label>
+        </div>
+
+        <p className="border-t border-[var(--border)]/60 px-2 pt-1.5 text-[0.65rem] leading-snug text-[var(--muted-foreground)]">
+          Enable Quick Send in Settings &gt; Advanced &gt; Quick replies.
+        </p>
       </div>
     </div>
   );
@@ -5434,62 +6181,69 @@ interface ScheduleBlock {
   status: "online" | "idle" | "dnd" | "offline";
 }
 
-function SelfieTagsEditor({ tags, onChange }: { tags: string[]; onChange: (tags: string[]) => void }) {
-  const [input, setInput] = useState("");
-  const addTag = () => {
-    const tag = input.trim();
-    if (!tag || tags.includes(tag)) return;
-    onChange([...tags, tag]);
-    setInput("");
-  };
+function SelfiePromptControls({
+  positivePrompt,
+  legacyTags,
+  negativePrompt,
+  onCommitPositivePrompt,
+  onCommitNegativePrompt,
+}: {
+  positivePrompt: string | undefined;
+  legacyTags: string[];
+  negativePrompt: string;
+  onCommitPositivePrompt: (value: string) => void;
+  onCommitNegativePrompt: (value: string) => void;
+}) {
+  const legacyTagText = legacyTags.join(", ");
+  const displayPositivePrompt = positivePrompt ?? legacyTagText;
+  const [positiveDraft, setPositiveDraft] = useState(displayPositivePrompt);
+  const [negativeDraft, setNegativeDraft] = useState(negativePrompt);
+
+  useEffect(() => {
+    setPositiveDraft(displayPositivePrompt);
+  }, [displayPositivePrompt]);
+
+  useEffect(() => {
+    setNegativeDraft(negativePrompt);
+  }, [negativePrompt]);
+
+  const commitPositivePrompt = useCallback(() => {
+    if (positiveDraft !== displayPositivePrompt) onCommitPositivePrompt(positiveDraft);
+  }, [displayPositivePrompt, onCommitPositivePrompt, positiveDraft]);
+
+  const commitNegativePrompt = useCallback(() => {
+    if (negativeDraft !== negativePrompt) onCommitNegativePrompt(negativeDraft);
+  }, [negativeDraft, negativePrompt, onCommitNegativePrompt]);
+
   return (
-    <div className="mt-2 space-y-1.5">
-      <span className="text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Tags</span>
-      <div className="flex flex-wrap items-center gap-1">
-        {tags.map((tag) => (
-          <span
-            key={tag}
-            className="inline-flex items-center gap-0.5 rounded-full bg-[var(--secondary)] px-1.5 py-0.5 text-[0.5625rem] text-[var(--muted-foreground)]"
-          >
-            {tag}
-            <button
-              onClick={() => onChange(tags.filter((t) => t !== tag))}
-              className="ml-0.5 hover:text-[var(--destructive)]"
-            >
-              <X size="0.5rem" />
-            </button>
-          </span>
-        ))}
-      </div>
-      <div className="flex items-center gap-1">
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              addTag();
-            }
-          }}
-          placeholder="Add tag…"
-          className="w-full min-w-0 rounded border border-[var(--border)] bg-[var(--background)] px-1.5 py-0.5 text-[0.625rem] text-[var(--foreground)] outline-none focus:border-[var(--primary)]"
+    <div className="mt-2 space-y-2">
+      <label className="flex flex-col gap-1">
+        <span className="text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Positive prompt / tags</span>
+        <textarea
+          value={positiveDraft}
+          onChange={(e) => setPositiveDraft(e.target.value)}
+          onBlur={commitPositivePrompt}
+          placeholder="masterpiece, best quality, detailed eyes"
+          className="min-h-[4rem] resize-y rounded-lg border border-[var(--border)] bg-[var(--secondary)] p-2 text-[0.6875rem] text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)]/45 focus:border-[var(--primary)]/50"
         />
-        <button
-          onClick={addTag}
-          disabled={!input.trim()}
-          className="shrink-0 rounded bg-[var(--primary)] px-1.5 py-0.5 text-[0.5625rem] text-[var(--primary-foreground)] disabled:opacity-40"
-        >
-          Add
-        </button>
-      </div>
+      </label>
+      <label className="flex flex-col gap-1">
+        <span className="text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Negative prompt</span>
+        <textarea
+          value={negativeDraft}
+          onChange={(e) => setNegativeDraft(e.target.value)}
+          onBlur={commitNegativePrompt}
+          placeholder="lowres, bad anatomy, extra fingers"
+          className="min-h-[4rem] resize-y rounded-lg border border-[var(--border)] bg-[var(--secondary)] p-2 text-[0.6875rem] text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)]/45 focus:border-[var(--primary)]/50"
+        />
+      </label>
       <p className="text-[0.55rem] text-[var(--muted-foreground)]">
-        Extra tags appended to every selfie prompt (e.g. art style, quality modifiers).
+        Saved for this chat. Positive tags are appended to the generated selfie prompt; negative tags are sent directly
+        to the image generator. NovelAI tag syntax is supported.
       </p>
     </div>
   );
 }
-
 function ScheduleEditor({
   characterSchedules,
   chatCharIds,

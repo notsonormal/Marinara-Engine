@@ -342,6 +342,12 @@ const SCENE_ANALYSIS_SCHEMA = {
     ambient: { type: ["string", "null"] as const },
     weather: { type: ["string", "null"] as const },
     timeOfDay: { type: ["string", "null"] as const },
+    musicGenre: { type: ["string", "null"] as const },
+    musicIntensity: { type: ["string", "null"] as const },
+    locationKind: { type: ["string", "null"] as const },
+    spotifyTrack: {
+      type: ["string", "null"] as const,
+    },
     reputationChanges: {
       type: "array" as const,
       maxItems: 5,

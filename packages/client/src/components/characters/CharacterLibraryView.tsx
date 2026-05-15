@@ -1,8 +1,20 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { ArrowLeft, ArrowUpDown, Download, Pencil, Plus, Search, Sparkles, Star, User } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowUpDown,
+  Download,
+  MessageCircle,
+  Pencil,
+  Plus,
+  Search,
+  Sparkles,
+  Star,
+  User,
+} from "lucide-react";
 import { useCharacters } from "../../hooks/use-characters";
+import { useStartChatFromCharacter } from "../../hooks/use-start-chat-from-character";
 import { getCharacterTitle } from "../../lib/character-display";
-import { cn, getAvatarCropStyle } from "../../lib/utils";
+import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
 import { useUIStore } from "../../stores/ui.store";
 import type { CharacterData } from "@marinara-engine/shared";
 
@@ -81,6 +93,7 @@ function CharacterLibraryDetailCard({
   character: ParsedCharacterRow;
   onEdit: (id: string) => void;
 }) {
+  const { startChatFromCharacter, isStartingChat } = useStartChatFromCharacter();
   const characterName = getText(character.parsed.name) || "Unnamed";
   const characterTitle = getCharacterTitle({ name: characterName, comment: character.comment });
   const characterMeta = getCharacterMeta(character);
@@ -90,7 +103,7 @@ function CharacterLibraryDetailCard({
   return (
     <div className="space-y-4">
       <div className="overflow-hidden rounded-[1.5rem] border border-[var(--border)]/50 bg-[var(--background)]/70 shadow-[0_24px_70px_-40px_rgba(15,23,42,0.95)] sm:rounded-[2rem]">
-        <div className="relative aspect-[4/3] overflow-hidden bg-gradient-to-br from-pink-400/25 via-rose-500/15 to-sky-400/15">
+        <div className="relative aspect-square overflow-hidden bg-gradient-to-br from-pink-400/25 via-rose-500/15 to-sky-400/15">
           {character.avatarPath ? (
             <img
               src={character.avatarPath}
@@ -98,7 +111,7 @@ function CharacterLibraryDetailCard({
               className="h-full w-full object-cover"
               style={getAvatarCropStyle(
                 character.parsed.extensions?.avatarCrop as
-                  | { zoom: number; offsetX: number; offsetY: number }
+                  | AvatarCropValue
                   | undefined,
               )}
             />
@@ -137,6 +150,25 @@ function CharacterLibraryDetailCard({
             )}
 
             <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() =>
+                  startChatFromCharacter({
+                    characterId: character.id,
+                    characterName,
+                    mode: "roleplay",
+                    firstMessage: getText(character.parsed.first_mes),
+                    alternateGreetings: Array.isArray(character.parsed.alternate_greetings)
+                      ? character.parsed.alternate_greetings
+                      : [],
+                  })
+                }
+                disabled={isStartingChat}
+                className="inline-flex items-center gap-2 rounded-2xl bg-[var(--primary)] px-4 py-2.5 text-sm font-medium text-[var(--primary-foreground)] shadow-lg shadow-pink-500/15 transition-all hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <MessageCircle size="0.875rem" />
+                Start New Chat
+              </button>
               <button
                 onClick={() => onEdit(character.id)}
                 className="inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-pink-400 to-rose-500 px-4 py-2.5 text-sm font-medium text-white shadow-lg shadow-pink-500/15 transition-all hover:shadow-pink-500/25"
@@ -352,7 +384,7 @@ export function CharacterLibraryView() {
           {isLoading && (
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
               {[1, 2, 3, 4, 5, 6].map((item) => (
-                <div key={item} className="shimmer aspect-[4/5] rounded-[1.75rem]" />
+                <div key={item} className="shimmer aspect-square rounded-[1.75rem]" />
               ))}
             </div>
           )}
@@ -394,7 +426,7 @@ export function CharacterLibraryView() {
                           : "border-[var(--border)]/50",
                       )}
                     >
-                      <div className="relative h-24 w-24 shrink-0 overflow-hidden bg-gradient-to-br from-pink-400/25 via-rose-500/15 to-sky-400/15 sm:h-auto sm:w-full sm:aspect-[4/3]">
+                      <div className="relative h-24 w-24 shrink-0 overflow-hidden bg-gradient-to-br from-pink-400/25 via-rose-500/15 to-sky-400/15 sm:h-auto sm:w-full sm:aspect-square">
                         {char.avatarPath ? (
                           <img
                             src={char.avatarPath}
@@ -403,7 +435,7 @@ export function CharacterLibraryView() {
                             className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
                             style={getAvatarCropStyle(
                               char.parsed.extensions?.avatarCrop as
-                                | { zoom: number; offsetX: number; offsetY: number }
+                                | AvatarCropValue
                                 | undefined,
                             )}
                           />

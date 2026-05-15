@@ -14,15 +14,15 @@ Anything else — your phone on the same Wi-Fi, a public-internet client, a coff
 
 ## Which option do I pick?
 
-| Your situation | Pick this | Section |
-| --- | --- | --- |
-| Tailscale, ZeroTier-on-100.64/10, or another VPN you control | **Already works** — no setup needed | [Option 4](#option-4-tailscale-or-docker-bypass-interface-scoped-on-by-default) |
-| Docker / Podman container, accessing from the same host | **Already works** — no setup needed | [Option 4](#option-4-tailscale-or-docker-bypass-interface-scoped-on-by-default) |
-| Phone, tablet, or laptop on your home Wi-Fi | **Basic Auth** | [Option 1](#option-1-basic-auth-recommended) |
-| Public-internet exposure (custom domain, port forwarding) | **Basic Auth + HTTPS** | [Option 1](#option-1-basic-auth-recommended) + [HTTPS](#serving-over-https) |
-| Stable LAN IPs and you'd rather not type a password | IP Allowlist | [Option 2](#option-2-ip-allowlist) |
-| You want a password from your Tailnet / containers TOO | Disable Option 4 + use Option 1 | [Option 4](#option-4-tailscale-or-docker-bypass-interface-scoped-on-by-default) + [Option 1](#option-1-basic-auth-recommended) |
-| You really, really don't want a password and your whole LAN is trusted | Private-network bypass | [Option 3](#option-3-private-network-bypass-no-password) |
+| Your situation                                                         | Pick this                           | Section                                                                                                                        |
+| ---------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Tailscale, ZeroTier-on-100.64/10, or another VPN you control           | **Already works** — no setup needed | [Option 4](#option-4-tailscale-or-docker-bypass-interface-scoped-on-by-default)                                                |
+| Docker / Podman container, accessing from the same host                | **Already works** — no setup needed | [Option 4](#option-4-tailscale-or-docker-bypass-interface-scoped-on-by-default)                                                |
+| Phone, tablet, or laptop on your home Wi-Fi                            | **Basic Auth**                      | [Option 1](#option-1-basic-auth-recommended)                                                                                   |
+| Public-internet exposure (custom domain, port forwarding)              | **Basic Auth + HTTPS**              | [Option 1](#option-1-basic-auth-recommended) + [HTTPS](#serving-over-https)                                                    |
+| Stable LAN IPs and you'd rather not type a password                    | IP Allowlist                        | [Option 2](#option-2-ip-allowlist)                                                                                             |
+| You want a password from your Tailnet / containers TOO                 | Disable Option 4 + use Option 1     | [Option 4](#option-4-tailscale-or-docker-bypass-interface-scoped-on-by-default) + [Option 1](#option-1-basic-auth-recommended) |
+| You really, really don't want a password and your whole LAN is trusted | Private-network bypass              | [Option 3](#option-3-private-network-bypass-no-password)                                                                       |
 
 Basic Auth is the most flexible choice — works from any IP, no per-device setup, and the browser remembers it. The IP Allowlist is handy when your client devices have stable IPs (Tailscale, static LAN leases) and you'd rather not type a password.
 
@@ -40,7 +40,7 @@ Edit it with any text editor. **Most security settings — Basic Auth credential
 - **Docker Compose** — `docker compose down && docker compose up -d`. You can also pass the variables in `docker-compose.yml` under `environment:` instead of using `.env`.
 - **Termux (Android)** — Ctrl+C to stop, then `./start-termux.sh` again.
 
-If you're running on a LAN or remote box and other devices still can't reach the server *at all* (different error than 403), make sure the server is binding to all interfaces with `HOST=0.0.0.0`. The shell launchers do this for you; `pnpm start` does not.
+If you're running on a LAN or remote box and other devices still can't reach the server _at all_ (different error than 403), make sure the server is binding to all interfaces with `HOST=0.0.0.0`. The shell launchers do this for you; `pnpm start` does not.
 
 ## Option 1: Basic Auth (recommended)
 
@@ -116,7 +116,7 @@ There is also `ALLOW_UNAUTHENTICATED_REMOTE=true` for unauthenticated public-int
 
 ## Option 4: Tailscale or Docker bypass (interface-scoped, on by default)
 
-Two interface-scoped flags let traffic from a Tailnet or a Docker bridge skip both the IP allowlist *and* Basic Auth, the same way loopback does. **Both flags default to `true`**, so a fresh Marinara install reachable over Tailscale or from your Docker containers Just Works without any `.env` setup.
+Two interface-scoped flags let traffic from a Tailnet or a Docker bridge skip both the IP allowlist _and_ Basic Auth, the same way loopback does. **Both flags default to `true`**, so a fresh Marinara install reachable over Tailscale or from your Docker containers Just Works without any `.env` setup.
 
 ```env
 # These are the defaults — listed here so you can see how to override them.
@@ -137,6 +137,8 @@ BYPASS_AUTH_DOCKER=true      # trusts 172.16.0.0/12 (Docker bridge)
 - **Your non-Docker LAN uses `172.16.x.x` / `172.20.x.x` addresses.** `BYPASS_AUTH_DOCKER=true` trusts the entire `172.16.0.0/12` block; non-Docker callers in that range would also bypass auth. Set `BYPASS_AUTH_DOCKER=false` and add the specific containers to `IP_ALLOWLIST` instead.
 - **You genuinely want a password from your Tailnet / containers too** — set the corresponding flag to `false`.
 
+If Marinara is behind a Docker reverse proxy or tunnel container on the default Docker bridge (`172.16.0.0/12`) and you expect Marinara's own Basic Auth/IP allowlist to protect forwarded clients, set `REQUIRE_AUTH_FOR_DOCKER_PROXY=true`. That setup can be valid; just choose one auth boundary: the proxy enforces access, or Marinara does. **Scope:** this flag only matches the same CIDR `BYPASS_AUTH_DOCKER` trusts. Proxies on Docker Swarm overlays, Kubernetes pod networks, or docker-compose user-defined networks with non-`172.16/12` IPAM present a different source IP and won't be affected — gate those by setting `BASIC_AUTH_USER`/`BASIC_AUTH_PASS` with `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK=false`, or by adding the specific proxy IP to `IP_ALLOWLIST`.
+
 The server logs an `[auth-bypass]` warning the first time a request actually exercises one of these flags, so you can confirm in the log when the bypass goes live.
 
 ## Serving over HTTPS
@@ -150,9 +152,9 @@ For sensitive deployments, consider Tailscale or Cloudflare Access — they avoi
 
 ## When a restart is required
 
-The server watches `.env` for changes and applies most updates within a couple of seconds — no restart needed. That includes `BASIC_AUTH_USER` / `BASIC_AUTH_PASS` / `BASIC_AUTH_REALM`, `IP_ALLOWLIST` / `IP_ALLOWLIST_ENABLED`, `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK`, `ALLOW_UNAUTHENTICATED_REMOTE`, `TRUSTED_PRIVATE_NETWORKS`, `ADMIN_SECRET`, `CSRF_TRUSTED_ORIGINS`, `LOG_LEVEL`, and the various `*_LOCAL_URLS_ENABLED` / privileged-feature flags.
+The server watches `.env` for changes and applies most updates within a couple of seconds — no restart needed. That includes `BASIC_AUTH_USER` / `BASIC_AUTH_PASS` / `BASIC_AUTH_REALM`, `IP_ALLOWLIST` / `IP_ALLOWLIST_ENABLED`, `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK`, `ALLOW_UNAUTHENTICATED_REMOTE`, `TRUSTED_PRIVATE_NETWORKS`, `BYPASS_AUTH_*`, `REQUIRE_AUTH_FOR_DOCKER_PROXY`, `ADMIN_SECRET`, `CSRF_TRUSTED_ORIGINS`, `LOG_LEVEL`, and the various `*_LOCAL_URLS_ENABLED` / privileged-feature flags.
 
-Changes to these still need a restart because they're bound at startup: `PORT`, `HOST`, `SSL_CERT`, `SSL_KEY`, `CORS_ORIGINS`, `DATA_DIR`, `STORAGE_BACKEND`, `FILE_STORAGE_DIR`, `DATABASE_URL`, `ENCRYPTION_KEY`, `TZ`, `AUTO_OPEN_BROWSER`, `AUTO_CREATE_DEFAULT_CONNECTION`. The server logs a warning when one of these changes so you don't wonder why it didn't take effect.
+Changes to these still need a restart because they're bound at startup: `PORT`, `HOST`, `SSL_CERT`, `SSL_KEY`, `DATA_DIR`, `STORAGE_BACKEND`, `FILE_STORAGE_DIR`, `DATABASE_URL`, `ENCRYPTION_KEY`, `TZ`, `AUTO_OPEN_BROWSER`, `AUTO_CREATE_DEFAULT_CONNECTION`. The server logs a warning when one of these changes so you don't wonder why it didn't take effect. (Note: `CORS_ORIGINS` _is_ hot-reloadable for adding/removing origins; only switching between an explicit list and `*` still needs a restart.)
 
 ## Verifying it works
 
@@ -174,7 +176,9 @@ Different error than 403?
 
 - **Connection refused / timeout** — the server isn't bound to a reachable interface. Set `HOST=0.0.0.0` in `.env`.
 - **404 / wrong page** — you're hitting the wrong port. Default is `7860`; check `PORT` in `.env`.
-- **CORS error in the browser console** — set `CORS_ORIGINS` to include the URL you're connecting from (e.g. `http://192.168.1.10:7860`).
+- **CORS error in the browser console** — Marinara's server log will show a `[cors]` line with the rejected origin and the exact `CORS_ORIGINS=…` line to add to `.env`. Adding it takes effect within ~2s — no restart needed.
+- **`{"code": "CSRF_ORIGIN_NOT_TRUSTED", "error": "Origin '…' is not in the trusted list (CSRF_TRUSTED_ORIGINS)."}`** — Marinara also pops a "Save blocked: origin not trusted" toast in the UI so saves can't silently fail. Loopback, LAN, Tailscale (100.64.0.0/10), and Docker bridge (172.16.0.0/12) IP-literal origins are auto-trusted; public IPs and DNS names need to be listed explicitly. Multiple origins are comma-separated, e.g. `CSRF_TRUSTED_ORIGINS=http://203.0.113.10:7831,https://chat.example.com,http://box.tailnet.ts.net:7860`. The error body's `hint` field has the exact line. No restart needed. Marinara also logs the active auto-trust scope on startup under `[csrf] Auto-trusted …`.
+- **`Refused to fetch http://… : '…' is in a private, loopback, metadata, or reserved IP range.`** — Marinara is refusing to call your local LLM provider for SSRF safety. The error message names the exact env var to set (`PROVIDER_LOCAL_URLS_ENABLED` for LLMs, `IMAGE_LOCAL_URLS_ENABLED` for image generation, etc.). Setting it takes effect on the next request.
 
 The full troubleshooting page is at [docs/TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 

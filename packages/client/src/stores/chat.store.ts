@@ -2,6 +2,7 @@
 // Zustand Store: Chat Slice
 // ──────────────────────────────────────────────
 import { create } from "zustand";
+import type { AvatarCropValue } from "../lib/utils";
 import { subscribeWithSelector } from "zustand/middleware";
 import type { Chat, ChatMode, Message } from "@marinara-engine/shared";
 import { useAgentStore } from "./agent.store";
@@ -10,24 +11,31 @@ import { useGameStateStore } from "./game-state.store";
 const STORAGE_KEY = "marinara-active-chat-id";
 const DRAFTS_KEY = "marinara-input-drafts";
 
-type NotificationAvatarCrop = { zoom: number; offsetX: number; offsetY: number } | null;
+type NotificationAvatarCrop = AvatarCropValue | null;
 
-/** Read drafts from sessionStorage (survives refreshes within the same tab). */
+/** Read drafts from localStorage so typed input survives reloads, tab closes, and app restarts. */
 function loadDrafts(): Map<string, string> {
   try {
-    const raw = sessionStorage.getItem(DRAFTS_KEY);
+    const raw = localStorage.getItem(DRAFTS_KEY);
     if (raw) return new Map(JSON.parse(raw));
+    const legacyRaw = sessionStorage.getItem(DRAFTS_KEY);
+    if (legacyRaw) {
+      localStorage.setItem(DRAFTS_KEY, legacyRaw);
+      sessionStorage.removeItem(DRAFTS_KEY);
+      return new Map(JSON.parse(legacyRaw));
+    }
   } catch {
     /* ignore */
   }
   return new Map();
 }
 
-/** Write drafts to sessionStorage. */
+/** Write drafts to localStorage. */
 function saveDrafts(m: Map<string, string>) {
   try {
-    if (m.size === 0) sessionStorage.removeItem(DRAFTS_KEY);
-    else sessionStorage.setItem(DRAFTS_KEY, JSON.stringify([...m]));
+    if (m.size === 0) localStorage.removeItem(DRAFTS_KEY);
+    else localStorage.setItem(DRAFTS_KEY, JSON.stringify([...m]));
+    sessionStorage.removeItem(DRAFTS_KEY);
   } catch {
     /* ignore */
   }
@@ -138,6 +146,16 @@ interface ChatState {
   clearInputDraft: (chatId: string) => void;
   setCurrentInput: (text: string) => void;
   incrementUnread: (chatId: string) => void;
+  hydrateUnread: (
+    unread: Array<{
+      chatId: string;
+      count: number;
+      characterName: string;
+      avatarUrl: string | null;
+      avatarCrop?: NotificationAvatarCrop;
+    }>,
+    knownChatIds?: string[],
+  ) => void;
   clearUnread: (chatId: string) => void;
   addNotification: (
     chatId: string,
@@ -455,6 +473,43 @@ export const useChatStore = create<ChatState>()(
         m.set(chatId, (m.get(chatId) || 0) + 1);
         return { unreadCounts: m };
       }),
+    hydrateUnread: (unread, knownChatIds) =>
+      set((state) => {
+        const unreadCounts = new Map(state.unreadCounts);
+        const chatNotifications = new Map(state.chatNotifications);
+        const serverChatIds = new Set<string>();
+        const known = knownChatIds ? new Set(knownChatIds) : null;
+
+        for (const item of unread) {
+          if (item.count <= 0 || state.activeChatId === item.chatId) continue;
+          serverChatIds.add(item.chatId);
+          unreadCounts.set(item.chatId, item.count);
+          if (!state.dismissedNotifications.has(item.chatId)) {
+            chatNotifications.set(item.chatId, {
+              chatId: item.chatId,
+              characterName: item.characterName,
+              avatarUrl: item.avatarUrl,
+              avatarCrop: item.avatarCrop ?? null,
+              count: item.count,
+            });
+          }
+        }
+
+        if (known) {
+          for (const chatId of Array.from(unreadCounts.keys())) {
+            if (!known.has(chatId) || !serverChatIds.has(chatId)) {
+              unreadCounts.delete(chatId);
+            }
+          }
+          for (const chatId of Array.from(chatNotifications.keys())) {
+            if (!known.has(chatId) || !serverChatIds.has(chatId)) {
+              chatNotifications.delete(chatId);
+            }
+          }
+        }
+
+        return { unreadCounts, chatNotifications };
+      }),
     clearUnread: (chatId: string) =>
       set((state) => {
         if (!state.unreadCounts.has(chatId)) return state;
@@ -535,6 +590,7 @@ export const useChatStore = create<ChatState>()(
       });
       try {
         localStorage.removeItem(STORAGE_KEY);
+        localStorage.removeItem(DRAFTS_KEY);
         sessionStorage.removeItem(DRAFTS_KEY);
       } catch {
         /* ignore */

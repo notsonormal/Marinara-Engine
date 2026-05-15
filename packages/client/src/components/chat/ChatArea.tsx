@@ -35,20 +35,27 @@ import { useCharacters, usePersonas } from "../../hooks/use-characters";
 import { useConnections } from "../../hooks/use-connections";
 import { usePageActivity } from "../../hooks/use-page-activity";
 import { api } from "../../lib/api-client";
+import { getChatDisplayName, getConnectedChatDisplayName, parseChatMetadata } from "../../lib/chat-display";
 import { parseCharacterDisplayData } from "../../lib/character-display";
 import { showConfirmDialog } from "../../lib/app-dialogs";
+import { chatBackgroundMetadataToUrl, chatBackgroundUrlToMetadata } from "../../lib/backgrounds";
 import { useGameStateStore } from "../../stores/game-state.store";
 import { toast } from "sonner";
-import { BookOpen, HelpCircle, MessageSquare, Theater } from "lucide-react";
-import type { SpritePlacement, SpriteSide } from "@marinara-engine/shared";
+import { BookOpen, Check, HelpCircle, MessageSquare, Theater, X } from "lucide-react";
+import {
+  APP_VERSION,
+  BUILT_IN_AGENTS,
+  buildGuidedGenerationInstructionMessage,
+  type SpritePlacement,
+  type SpriteSide,
+} from "@marinara-engine/shared";
 import { useUIStore } from "../../stores/ui.store";
 import { useAgentStore } from "../../stores/agent.store";
-import { cn } from "../../lib/utils";
+import { cn, parseAvatarCropJson } from "../../lib/utils";
+import { Modal } from "../ui/Modal";
 import { useEncounter } from "../../hooks/use-encounter";
 import { useScene } from "../../hooks/use-scene";
 import { useEncounterStore } from "../../stores/encounter.store";
-import { APP_VERSION } from "@marinara-engine/shared";
-import { BUILT_IN_AGENTS } from "@marinara-engine/shared";
 import { useTranslationStore } from "../../stores/translation.store";
 import { ttsService } from "../../lib/tts-service";
 import { useTTSConfig } from "../../hooks/use-tts";
@@ -66,19 +73,6 @@ const normalizeSpriteDisplayValue = (value: unknown, fallback: number, min: numb
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) return fallback;
   return Math.max(min, Math.min(max, numeric));
-};
-
-const parseMetadataRecord = (raw: unknown): Record<string, any> => {
-  if (!raw) return {};
-  if (typeof raw === "string") {
-    try {
-      const parsed = JSON.parse(raw);
-      return parsed && typeof parsed === "object" ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-  return typeof raw === "object" ? (raw as Record<string, any>) : {};
 };
 
 const INTUITIVE_SWIPE_MIN_DISTANCE = 56;
@@ -101,6 +95,17 @@ const shouldIgnoreIntuitiveSwipeTarget = (target: EventTarget | null): boolean =
       ].join(", "),
     ),
   );
+};
+
+type AgentInjectionReviewItem = {
+  agentType: string;
+  agentName: string;
+  text: string;
+};
+
+type AgentInjectionReviewRequest = {
+  chatId: string;
+  injections: AgentInjectionReviewItem[];
 };
 
 const ChatConversationSurface = lazy(async () => {
@@ -133,11 +138,14 @@ export function ChatArea() {
   const guideGenerations = useUIStore((s) => s.guideGenerations);
   const intuitiveSwipeNavigation = useUIStore((s) => s.intuitiveSwipeNavigation);
   const intuitiveSwipeRerollLatest = useUIStore((s) => s.intuitiveSwipeRerollLatest);
+  const editLastMessageOnArrowUp = useUIStore((s) => s.editLastMessageOnArrowUp);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const prevScrollHeightRef = useRef(0);
   const isLoadingMoreRef = useRef(false);
   const intuitiveTouchStartRef = useRef<{ x: number; y: number; target: EventTarget | null } | null>(null);
+  const swipeActionSeq = useRef(0);
+  const pendingSwipeMutationsRef = useRef(new Map<string, Promise<void>>());
   // Tracks whether the initial load stagger animation has played.
   // After the first render with messages, new/re-mounted messages
   // skip the entry animation to avoid a visible flash on refetch.
@@ -147,6 +155,8 @@ export function ChatArea() {
   const [galleryOpen, setGalleryOpen] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [spriteArrangeMode, setSpriteArrangeMode] = useState(false);
+  const [agentInjectionReview, setAgentInjectionReview] = useState<AgentInjectionReviewRequest | null>(null);
+  const [agentInjectionDrafts, setAgentInjectionDrafts] = useState<Record<string, string>>({});
 
   // Delete dialog & multi-select state
   const [deleteDialogMessageId, setDeleteDialogMessageId] = useState<string | null>(null);
@@ -214,6 +224,38 @@ export function ChatArea() {
   const pendingNewChatMode = useChatStore((s) => s.pendingNewChatMode);
   const failedAgentTypes = useAgentStore((s) => s.failedAgentTypes);
   const agentProcessing = useAgentStore((s) => s.isProcessing);
+
+  useEffect(() => {
+    const handleReviewRequest = (event: Event) => {
+      const detail = (event as CustomEvent<AgentInjectionReviewRequest>).detail;
+      if (!detail?.chatId || !Array.isArray(detail.injections)) return;
+      if (detail.chatId !== useChatStore.getState().activeChatId) return;
+      setAgentInjectionReview(detail);
+      setAgentInjectionDrafts(
+        Object.fromEntries(detail.injections.map((injection) => [injection.agentType, injection.text])),
+      );
+    };
+    window.addEventListener("marinara:agent-injection-review", handleReviewRequest);
+    return () => window.removeEventListener("marinara:agent-injection-review", handleReviewRequest);
+  }, []);
+
+  const handleContinueAgentInjectionReview = useCallback(() => {
+    if (!agentInjectionReview) return;
+    const overrides = agentInjectionReview.injections.map((injection) => ({
+      agentType: injection.agentType,
+      agentName: injection.agentName,
+      text: agentInjectionDrafts[injection.agentType] ?? injection.text,
+    }));
+    const chatId = agentInjectionReview.chatId;
+    setAgentInjectionReview(null);
+    setAgentInjectionDrafts({});
+    void generate({ chatId, connectionId: null, agentInjectionOverrides: overrides });
+  }, [agentInjectionDrafts, agentInjectionReview, generate]);
+
+  const handleCloseAgentInjectionReview = useCallback(() => {
+    setAgentInjectionReview(null);
+    setAgentInjectionDrafts({});
+  }, []);
 
   const handleQuickStart = useCallback(
     (mode: "conversation" | "roleplay" | "game") => {
@@ -298,6 +340,7 @@ export function ChatArea() {
       appearance?: string;
       altDescriptions?: string;
       avatarPath?: string | null;
+      avatarCrop?: string;
       nameColor?: string;
       dialogueColor?: string;
       boxColor?: string;
@@ -331,6 +374,7 @@ export function ChatArea() {
       backstory: persona.backstory || undefined,
       appearance: persona.appearance || undefined,
       avatarUrl: persona.avatarPath || undefined,
+      avatarCrop: parseAvatarCropJson(persona.avatarCrop),
       nameColor: persona.nameColor || undefined,
       dialogueColor: persona.dialogueColor || undefined,
       boxColor: persona.boxColor || undefined,
@@ -348,16 +392,17 @@ export function ChatArea() {
   const { startEncounter } = useEncounter();
   const { concludeScene, abandonScene, forkScene, isForking } = useScene();
   const encounterActive = useEncounterStore((s) => s.active || s.showConfigModal);
+  const roleplaySpriteScale = useUIStore((s) => s.roleplaySpriteScale);
 
   // Sprite sidebar settings from chat metadata
   const chatMeta = useMemo(() => {
     if (!chat) return {};
     const raw = (chat as unknown as { metadata?: string | Record<string, unknown> }).metadata;
-    return parseMetadataRecord(raw);
+    return parseChatMetadata(raw);
   }, [chat]);
   const spriteCharacterIds: string[] = Array.isArray(chatMeta.spriteCharacterIds) ? chatMeta.spriteCharacterIds : [];
   const spritePosition: SpriteSide = chatMeta.spritePosition === "right" ? "right" : "left";
-  const spriteScale = normalizeSpriteDisplayValue(chatMeta.spriteScale, 1, 0.5, 1.75);
+  const spriteScale = normalizeSpriteDisplayValue(chatMeta.spriteScale, roleplaySpriteScale, 0.5, 1.75);
   const spriteOpacity = normalizeSpriteDisplayValue(chatMeta.spriteOpacity, 1, 0.15, 1);
   const spritePlacements = useMemo(
     () => normalizeSpritePlacements(chatMeta.spritePlacements),
@@ -434,10 +479,16 @@ export function ChatArea() {
   // only set on truthy values, leaving the global chatBackground stale when
   // switching to a chat whose metadata has been cleared, which made a removed
   // background re-appear after a chat switch round-trip.
+  const restoredChatBackgroundRef = useRef<{ chatId: string | null; url: string | null; isSyncing: boolean }>({
+    chatId: null,
+    url: null,
+    isSyncing: false,
+  });
   useEffect(() => {
     if (!chat?.id) return;
-    const bg = chatMeta.background as string | null | undefined;
-    useUIStore.getState().setChatBackground(bg ? `/api/backgrounds/file/${encodeURIComponent(bg)}` : null);
+    const restoredUrl = chatBackgroundMetadataToUrl(chatMeta.background);
+    restoredChatBackgroundRef.current = { chatId: chat.id, url: restoredUrl, isSyncing: true };
+    useUIStore.getState().setChatBackground(restoredUrl);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id]);
 
@@ -451,10 +502,21 @@ export function ChatArea() {
   const bgPersistTimer = useRef<ReturnType<typeof setTimeout>>(null);
   useEffect(() => {
     if (!chat?.id) return;
-    const savedFilename = (chatMeta.background as string | null | undefined) ?? null;
+    const savedBackground = chatBackgroundUrlToMetadata(chatBackgroundMetadataToUrl(chatMeta.background));
+    const restoredBackground = restoredChatBackgroundRef.current;
+
+    if (
+      restoredBackground.isSyncing &&
+      (restoredBackground.chatId !== chat.id || chatBackground !== restoredBackground.url)
+    ) {
+      return;
+    }
+    if (restoredBackground.isSyncing) {
+      restoredBackground.isSyncing = false;
+    }
 
     if (!chatBackground) {
-      if (savedFilename === null) return;
+      if (savedBackground === null) return;
       if (bgPersistTimer.current) clearTimeout(bgPersistTimer.current);
       bgPersistTimer.current = setTimeout(() => {
         updateMeta.mutate({ id: chat!.id, background: null });
@@ -462,11 +524,11 @@ export function ChatArea() {
       return;
     }
 
-    const filename = decodeURIComponent(chatBackground.replace(/^\/api\/backgrounds\/file\//, ""));
-    if (filename === savedFilename) return;
+    const nextBackground = chatBackgroundUrlToMetadata(chatBackground);
+    if (nextBackground === savedBackground) return;
     if (bgPersistTimer.current) clearTimeout(bgPersistTimer.current);
     bgPersistTimer.current = setTimeout(() => {
-      updateMeta.mutate({ id: chat!.id, background: filename });
+      updateMeta.mutate({ id: chat!.id, background: nextBackground });
     }, 500);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatBackground, chat?.id]);
@@ -501,30 +563,41 @@ export function ChatArea() {
     };
   }, []);
 
+  const persistSpriteExpressions = useCallback(
+    (expressions: Record<string, string>) => {
+      if (!chat?.id) return;
+      updateMeta.mutate({ id: chat.id, spriteExpressions: expressions });
+      // Also persist to the last assistant message's extra so it's per-swipe
+      if (messages?.length) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const m = messages[i]!;
+          if (m.role === "assistant") {
+            updateMessageExtra.mutate({
+              messageId: m.id,
+              extra: { spriteExpressions: expressions },
+            });
+            break;
+          }
+        }
+      }
+    },
+    [chat?.id, updateMeta, messages, updateMessageExtra],
+  );
+
   const handleExpressionChange = useCallback(
-    (characterId: string, expression: string) => {
+    (characterId: string, expression: string, options?: { immediate?: boolean }) => {
       if (!chat?.id) return;
       pendingExpressions.current = { ...pendingExpressions.current, [characterId]: expression };
       if (expressionSaveTimer.current) clearTimeout(expressionSaveTimer.current);
+      if (options?.immediate) {
+        persistSpriteExpressions(pendingExpressions.current);
+        return;
+      }
       expressionSaveTimer.current = setTimeout(() => {
-        updateMeta.mutate({ id: chat!.id, spriteExpressions: pendingExpressions.current });
-        // Also persist to the last assistant message's extra so it's per-swipe
-        if (messages?.length) {
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const m = messages[i]!;
-            if (m.role === "assistant") {
-              updateMessageExtra.mutate({
-                messageId: m.id,
-                extra: { spriteExpressions: pendingExpressions.current },
-              });
-              break;
-            }
-          }
-        }
+        persistSpriteExpressions(pendingExpressions.current);
       }, 1000);
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [chat?.id, updateMeta, messages, updateMessageExtra],
+    [chat?.id, persistSpriteExpressions],
   );
 
   const handleSpritePlacementChange = useCallback(
@@ -577,6 +650,18 @@ export function ChatArea() {
 
   const combatAgentEnabled = enabledAgentTypes.has("combat");
   const expressionAgentEnabled = enabledAgentTypes.has("expression");
+  const shouldRefreshGameStateOnSwipe = isGameChat || Boolean(chatMeta.enableAgents);
+
+  const refreshVisibleGameState = useCallback(async () => {
+    if (!shouldRefreshGameStateOnSwipe || !activeChatId) return;
+    try {
+      const gs = await api.get<import("@marinara-engine/shared").GameState | null>(`/chats/${activeChatId}/game-state`);
+      if (useChatStore.getState().activeChatId !== activeChatId) return;
+      useGameStateStore.getState().setGameState(gs ?? null);
+    } catch {
+      // Non-critical refresh failure; the next tracker load will fetch again.
+    }
+  }, [activeChatId, shouldRefreshGameStateOnSwipe]);
 
   const handleDelete = useCallback((messageId: string) => {
     setDeleteDialogMessageId(messageId);
@@ -598,11 +683,49 @@ export function ChatArea() {
   }, [deleteDialogMessageId, deleteMessage]);
 
   const handleDeleteSwipe = useCallback(() => {
-    if (deleteDialogMessageId && deleteDialogCanDeleteSwipe) {
-      deleteSwipe.mutate({ messageId: deleteDialogMessageId, index: deleteDialogActiveSwipeIndex });
-    }
+    const messageId = deleteDialogMessageId;
+    const index = deleteDialogActiveSwipeIndex;
     setDeleteDialogMessageId(null);
-  }, [deleteDialogActiveSwipeIndex, deleteDialogCanDeleteSwipe, deleteDialogMessageId, deleteSwipe]);
+    if (!messageId || !deleteDialogCanDeleteSwipe) return;
+    const actionId = ++swipeActionSeq.current;
+    const refreshChatId = activeChatId;
+    void (async () => {
+      const gameStateStore = useGameStateStore.getState();
+      if (shouldRefreshGameStateOnSwipe && refreshChatId) gameStateStore.setRefreshingChat(refreshChatId);
+      try {
+        const flushPatch = useGameStateStore.getState().flushPatch;
+        if (flushPatch) {
+          try {
+            await flushPatch();
+          } catch {
+            if (swipeActionSeq.current === actionId) {
+              toast.error("Could not save tracker changes before deleting the swipe.");
+            }
+            return;
+          }
+        }
+        if (swipeActionSeq.current !== actionId) return;
+        await deleteSwipe.mutateAsync({ messageId, index });
+        if (swipeActionSeq.current !== actionId) return;
+        await refreshVisibleGameState();
+      } catch {
+        if (swipeActionSeq.current !== actionId) return;
+        toast.error("Could not delete the swipe.");
+      } finally {
+        if (swipeActionSeq.current === actionId) {
+          useGameStateStore.getState().clearRefreshingChat(refreshChatId);
+        }
+      }
+    })();
+  }, [
+    activeChatId,
+    deleteDialogActiveSwipeIndex,
+    deleteDialogCanDeleteSwipe,
+    deleteDialogMessageId,
+    deleteSwipe,
+    refreshVisibleGameState,
+    shouldRefreshGameStateOnSwipe,
+  ]);
 
   const handleDeleteMore = useCallback(() => {
     if (deleteDialogMessageId) {
@@ -731,7 +854,8 @@ export function ChatArea() {
                 chatId: activeChatId,
                 connectionId: null,
                 regenerateMessageId: messageId,
-                generationGuide: currentInput?.toString(),
+                generationGuide: buildGuidedGenerationInstructionMessage(currentInput.toString()),
+                generationGuideSource: "guide",
               }
             : { chatId: activeChatId, connectionId: null, regenerateMessageId: messageId },
         );
@@ -767,24 +891,59 @@ export function ChatArea() {
 
   const handleSetActiveSwipe = useCallback(
     (messageId: string, index: number) => {
-      setActiveSwipe.mutate(
-        { messageId, index },
-        {
-          onSuccess: () => {
-            // Refetch game state so the HUD shows trackers for the active swipe
-            if (activeChatId) {
-              api
-                .get<import("@marinara-engine/shared").GameState | null>(`/chats/${activeChatId}/game-state`)
-                .then((gs) => {
-                  useGameStateStore.getState().setGameState(gs ?? null);
-                })
-                .catch(() => {});
+      const actionId = ++swipeActionSeq.current;
+      const refreshChatId = activeChatId;
+      void (async () => {
+        const gameStateStore = useGameStateStore.getState();
+        if (shouldRefreshGameStateOnSwipe && refreshChatId) gameStateStore.setRefreshingChat(refreshChatId);
+        try {
+          const flushPatch = useGameStateStore.getState().flushPatch;
+          if (flushPatch) {
+            try {
+              await flushPatch();
+            } catch {
+              if (swipeActionSeq.current === actionId) {
+                toast.error("Could not save tracker changes before switching swipes.");
+              }
+              return;
             }
-          },
-        },
-      );
+          }
+          if (swipeActionSeq.current !== actionId) return;
+          const previousMutation = pendingSwipeMutationsRef.current.get(messageId);
+          if (previousMutation) {
+            try {
+              await previousMutation;
+            } catch {
+              // The active action below will report its own failure if needed.
+            }
+          }
+          if (swipeActionSeq.current !== actionId) return;
+          const mutation = setActiveSwipe.mutateAsync({ messageId, index });
+          const trackedMutation = mutation.then(
+            () => undefined,
+            () => undefined,
+          );
+          pendingSwipeMutationsRef.current.set(messageId, trackedMutation);
+          try {
+            await mutation;
+          } finally {
+            if (pendingSwipeMutationsRef.current.get(messageId) === trackedMutation) {
+              pendingSwipeMutationsRef.current.delete(messageId);
+            }
+          }
+          if (swipeActionSeq.current !== actionId) return;
+          await refreshVisibleGameState();
+        } catch {
+          if (swipeActionSeq.current !== actionId) return;
+          toast.error("Could not switch swipes.");
+        } finally {
+          if (swipeActionSeq.current === actionId) {
+            useGameStateStore.getState().clearRefreshingChat(refreshChatId);
+          }
+        }
+      })();
     },
-    [setActiveSwipe, activeChatId],
+    [activeChatId, setActiveSwipe, refreshVisibleGameState, shouldRefreshGameStateOnSwipe],
   );
 
   const handleEdit = useCallback(
@@ -859,6 +1018,27 @@ export function ChatArea() {
     return null;
   }, [messages]);
 
+  const latestMessageForEdit = useMemo(() => {
+    if (!messages) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const candidate = messages[i]!;
+      if (candidate.role !== "user" && candidate.role !== "assistant") continue;
+      const extra =
+        typeof candidate.extra === "string"
+          ? (() => {
+              try {
+                return JSON.parse(candidate.extra as unknown as string);
+              } catch {
+                return {};
+              }
+            })()
+          : (candidate.extra ?? {});
+      if (extra?.hiddenFromUser === true) continue;
+      return candidate;
+    }
+    return null;
+  }, [messages]);
+
   const intuitiveSwipeBlocked =
     settingsOpen ||
     filesOpen ||
@@ -914,6 +1094,7 @@ export function ChatArea() {
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
+
       if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
       if (shouldIgnoreIntuitiveSwipeTarget(event.target)) return;
 
@@ -929,7 +1110,63 @@ export function ChatArea() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [intuitiveSwipeBlocked, intuitiveSwipeNavigation, latestAssistantMessageForSwipes, navigateLatestSwipe]);
+  }, [
+    intuitiveSwipeBlocked,
+    intuitiveSwipeNavigation,
+    latestAssistantMessageForSwipes,
+    navigateLatestSwipe,
+  ]);
+
+  // Up-Arrow recall of the most recent message (user OR assistant) — runs
+  // independently of swipe nav so the shortcut works with that toggle off.
+  useEffect(() => {
+    if (!editLastMessageOnArrowUp || intuitiveSwipeBlocked) return;
+    const supportsMode = chatMode === "conversation" || isRoleplay;
+    if (!supportsMode) return;
+
+    const handleArrowUp = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.key !== "ArrowUp") return;
+      if (event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (!latestMessageForEdit) return;
+      // Don't try to edit a message that's currently streaming/regenerating.
+      if (isStreaming || agentProcessing) return;
+
+      const target = event.target;
+      if (target instanceof Element) {
+        // Allow recall when the chat input textarea is focused but empty
+        // (shell-style). Otherwise leave typing/editing alone.
+        if (target.tagName === "TEXTAREA") {
+          const ta = target as HTMLTextAreaElement;
+          if (ta.value.length > 0) return;
+        } else if (
+          target.tagName === "INPUT" ||
+          target.tagName === "SELECT" ||
+          target.getAttribute("contenteditable") === "true"
+        ) {
+          return;
+        }
+      }
+
+      event.preventDefault();
+      window.dispatchEvent(
+        new CustomEvent("marinara:start-edit-message", {
+          detail: { messageId: latestMessageForEdit.id },
+        }),
+      );
+    };
+
+    window.addEventListener("keydown", handleArrowUp);
+    return () => window.removeEventListener("keydown", handleArrowUp);
+  }, [
+    agentProcessing,
+    chatMode,
+    editLastMessageOnArrowUp,
+    intuitiveSwipeBlocked,
+    isRoleplay,
+    isStreaming,
+    latestMessageForEdit,
+  ]);
 
   useEffect(() => {
     if (!intuitiveSwipeNavigation || intuitiveSwipeBlocked) return;
@@ -1408,17 +1645,21 @@ export function ChatArea() {
   const chatList =
     (allChats as Array<{ id: string; name: string; metadata?: string | Record<string, unknown> }> | undefined) ?? [];
   const connectedChatName = chat?.connectedChatId
-    ? chatList.find((item) => item.id === chat.connectedChatId)?.name
+    ? getConnectedChatDisplayName(chatList.find((item) => item.id === chat.connectedChatId))
     : undefined;
   const activeSceneChat = chatMeta.activeSceneChatId
     ? chatList.find((item) => item.id === chatMeta.activeSceneChatId)
     : undefined;
-  const activeSceneMeta = parseMetadataRecord(activeSceneChat?.metadata);
+  const activeSceneMeta = parseChatMetadata(activeSceneChat?.metadata);
   const hasActiveLinkedScene = activeSceneChat && activeSceneMeta.sceneStatus === "active";
   const isSceneChat = chatMeta.sceneStatus === "active" || Boolean(chatMeta.sceneOriginChatId);
   const conversationSceneInfo =
     chatMeta.activeSceneChatId && hasActiveLinkedScene
-      ? { variant: "origin" as const, sceneChatId: chatMeta.activeSceneChatId, sceneChatName: activeSceneChat.name }
+      ? {
+          variant: "origin" as const,
+          sceneChatId: chatMeta.activeSceneChatId,
+          sceneChatName: getChatDisplayName(activeSceneChat),
+        }
       : chatMeta.sceneStatus === "active"
         ? {
             variant: "scene" as const,
@@ -1478,6 +1719,8 @@ export function ChatArea() {
             chatBackground={chatBackground}
             onOpenSettings={() => setSettingsOpen(true)}
             onDeleteMessage={handleDelete}
+            multiSelectMode={multiSelectMode}
+            selectedMessageIds={selectedMessageIds}
           />
 
           <ChatCommonOverlays
@@ -1715,6 +1958,15 @@ export function ChatArea() {
           isGrouped={isGrouped}
         />
       </Suspense>
+      {agentInjectionReview && (
+        <AgentInjectionReviewModal
+          request={agentInjectionReview}
+          drafts={agentInjectionDrafts}
+          onDraftChange={(agentType, text) => setAgentInjectionDrafts((current) => ({ ...current, [agentType]: text }))}
+          onContinue={handleContinueAgentInjectionReview}
+          onClose={handleCloseAgentInjectionReview}
+        />
+      )}
       {pendingNewChatMode && (
         <NewChatConnectionGate
           mode={pendingNewChatMode}
@@ -1736,6 +1988,67 @@ function TypingIndicator() {
         <span className="h-2 w-2 animate-bounce rounded-full bg-[var(--muted-foreground)]/60 [animation-delay:300ms]" />
       </div>
     </div>
+  );
+}
+
+function AgentInjectionReviewModal({
+  request,
+  drafts,
+  onDraftChange,
+  onContinue,
+  onClose,
+}: {
+  request: AgentInjectionReviewRequest;
+  drafts: Record<string, string>;
+  onDraftChange: (agentType: string, text: string) => void;
+  onContinue: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Modal open onClose={onClose} title="Writer Agent Review" width="max-w-3xl">
+      <div className="flex flex-col gap-3">
+        <p className="text-xs leading-relaxed text-[var(--muted-foreground)]">
+          Edit the writer guidance before the main reply starts.
+        </p>
+        <div className="flex max-h-[55dvh] flex-col gap-2 overflow-y-auto pr-1">
+          {request.injections.map((injection) => (
+            <div key={injection.agentType} className="rounded-lg border border-[var(--border)] bg-[var(--card)]/60">
+              <div className="flex items-center justify-between gap-2 border-b border-[var(--border)] px-3 py-2">
+                <div className="min-w-0">
+                  <div className="truncate text-xs font-semibold text-[var(--foreground)]">{injection.agentName}</div>
+                  <div className="truncate text-[0.625rem] text-[var(--muted-foreground)]">{injection.agentType}</div>
+                </div>
+              </div>
+              <textarea
+                value={drafts[injection.agentType] ?? injection.text}
+                onChange={(event) => onDraftChange(injection.agentType, event.target.value)}
+                rows={6}
+                className="min-h-32 w-full resize-y rounded-b-lg border-0 bg-[var(--secondary)]/35 px-3 py-2 font-mono text-xs leading-relaxed text-[var(--foreground)] outline-none focus:ring-1 focus:ring-[var(--ring)]"
+                spellCheck={false}
+              />
+            </div>
+          ))}
+        </div>
+        <div className="flex justify-end gap-2 border-t border-[var(--border)] pt-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-2 text-xs text-[var(--foreground)] transition-colors hover:bg-[var(--accent)]"
+          >
+            <X size="0.875rem" />
+            Close
+          </button>
+          <button
+            type="button"
+            onClick={onContinue}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-3 py-2 text-xs font-medium text-[var(--primary-foreground)] transition-opacity hover:opacity-90"
+          >
+            <Check size="0.875rem" />
+            Continue
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
