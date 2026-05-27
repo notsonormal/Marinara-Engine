@@ -64,6 +64,7 @@ import {
 import { generateWeather, inferBiome, shouldWeatherChange } from "../services/game/weather.service.js";
 import { rollEncounter, rollEnemyCount } from "../services/game/encounter.service.js";
 import { processReputationActions } from "../services/game/reputation.service.js";
+import { sanitizeGameNpcAvatarUrls } from "../services/game/npc-avatar-utils.js";
 import { createCheckpointService, type CheckpointTrigger } from "../services/game/checkpoint.service.js";
 import {
   resolveSkillCheck,
@@ -144,7 +145,21 @@ import {
 // Helpers
 // ──────────────────────────────────────────────
 
-const AVATAR_NAME_TITLE_WORDS = new Set(["a", "an", "the", "il", "lo", "la", "le", "l", "el", "sir", "lady", "lord"]);
+const AVATAR_NAME_TITLE_WORDS = new Set([
+  "a",
+  "an",
+  "the",
+  "il",
+  "lo",
+  "la",
+  "le",
+  "l",
+  "el",
+  "sir",
+  "lady",
+  "lord",
+  "professor",
+]);
 
 function normalizeAvatarLookupName(value: string): string {
   return value
@@ -172,7 +187,7 @@ function avatarLookupAliases(value: string): string[] {
   ).filter(Boolean);
 }
 
-function addNameLookupEntry(map: Map<string, string>, name: unknown, value: unknown): void {
+export function addNameLookupEntry(map: Map<string, string>, name: unknown, value: unknown): void {
   if (typeof name !== "string" || typeof value !== "string") return;
   const trimmedValue = value.trim();
   if (!trimmedValue) return;
@@ -207,7 +222,7 @@ const generatedOptionalStringSchema = z.preprocess((value) => generatedStringVal
  * Title aliases make "Il Dottore" resolve to a saved "Dottore" card and
  * "Il Capitano" resolve to "Capitano" before any image generation is attempted.
  */
-function findCharAvatarFuzzy(npcName: string, charAvatarByName: Map<string, string>): string | undefined {
+export function findCharAvatarFuzzy(npcName: string, charAvatarByName: Map<string, string>): string | undefined {
   const npcAliases = avatarLookupAliases(npcName);
 
   // 1. Exact
@@ -994,6 +1009,34 @@ function syncMoraleWidgetValue(rawWidgets: unknown, morale: number): unknown {
   });
 }
 
+function isNumericHudWidgetType(type: string): boolean {
+  return type === "progress_bar" || type === "gauge" || type === "relationship_meter";
+}
+
+function normalizeWidgetNumber(value: unknown): number | null {
+  const raw = typeof value === "string" && value.trim() ? Number(value.trim()) : value;
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+}
+
+function clampWidgetValue(value: number, max: number): number {
+  return Math.max(0, Math.min(max, value));
+}
+
+function normalizeSetupHudWidgetStartingValues(widgets: Array<{ type: string; config: Record<string, unknown> }>) {
+  for (const widget of widgets) {
+    if (!isNumericHudWidgetType(widget.type)) continue;
+
+    const max = Math.max(1, normalizeWidgetNumber(widget.config.max) ?? 100);
+    const startingValue = normalizeWidgetNumber(widget.config.startingValue);
+    const currentValue = normalizeWidgetNumber(widget.config.value);
+    const initialValue = clampWidgetValue(startingValue ?? currentValue ?? 0, max);
+
+    widget.config.max = max;
+    widget.config.startingValue = initialValue;
+    widget.config.value = initialValue;
+  }
+}
+
 function buildMoraleMetadataUpdates(meta: Record<string, unknown>, morale: number): Record<string, unknown> {
   const updates: Record<string, unknown> = { gameMorale: morale };
   const nextWidgetState = syncMoraleWidgetValue(meta.gameWidgetState, morale);
@@ -1654,7 +1697,7 @@ function inferKeeperKeys(entryName: string, tag: string): string[] {
   return Array.from(new Set([...words.slice(0, 5), tag].filter(Boolean))).slice(0, 6);
 }
 
-function normalizeGameLorebookKeeperEntries(raw: unknown): GameLorebookKeeperEntry[] {
+export function normalizeGameLorebookKeeperEntries(raw: unknown): GameLorebookKeeperEntry[] {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
   const container = raw as { entries?: unknown; updates?: unknown };
   const rawEntries = Array.isArray(container.entries)
@@ -1667,21 +1710,40 @@ function normalizeGameLorebookKeeperEntries(raw: unknown): GameLorebookKeeperEnt
     .flatMap((entry): GameLorebookKeeperEntry[] => {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
       const source = entry as Record<string, unknown>;
+      const nestedEntry =
+        source.entry && typeof source.entry === "object" && !Array.isArray(source.entry)
+          ? (source.entry as Record<string, unknown>)
+          : {};
       const rawName =
-        typeof source.entryName === "string" ? source.entryName : typeof source.name === "string" ? source.name : "";
-      const content = typeof source.content === "string" ? source.content.trim() : "";
+        typeof source.entryName === "string"
+          ? source.entryName
+          : typeof source.name === "string"
+            ? source.name
+            : typeof nestedEntry.name === "string"
+              ? nestedEntry.name
+              : "";
+      const content =
+        typeof source.content === "string"
+          ? source.content.trim()
+          : typeof nestedEntry.content === "string"
+            ? nestedEntry.content.trim()
+            : "";
       if (!rawName.trim() || !content) return [];
 
       const tag =
         typeof source.tag === "string" && source.tag.trim()
           ? source.tag.trim().replace(/\s+/g, "_").toLowerCase()
-          : "game_lore";
+          : typeof nestedEntry.tag === "string" && nestedEntry.tag.trim()
+            ? nestedEntry.tag.trim().replace(/\s+/g, "_").toLowerCase()
+            : "game_lore";
       const entryName = truncateKeeperName(rawName);
-      const keys = normalizeKeeperStringList(source.keys, 10);
+      const keys = normalizeKeeperStringList(source.keys ?? nestedEntry.keys, 10);
       const description =
         typeof source.description === "string" && source.description.trim()
           ? source.description.trim()
-          : `Game Lorebook Keeper entry tagged ${tag}.`;
+          : typeof nestedEntry.description === "string" && nestedEntry.description.trim()
+            ? nestedEntry.description.trim()
+            : `Game Lorebook Keeper entry tagged ${tag}.`;
 
       return [
         {
@@ -2395,8 +2457,9 @@ function buildSceneAssetNpcCandidates(
 function upsertGameNpcAvatarEntries(currentNpcs: GameNpc[], avatarEntries: SceneAssetNpcAvatarEntry[]): GameNpc[] {
   if (avatarEntries.length === 0) return currentNpcs;
 
-  const nextNpcs = [...currentNpcs];
-  let changed = false;
+  const sanitizedCurrentNpcs = sanitizeGameNpcAvatarUrls(currentNpcs);
+  const nextNpcs = [...sanitizedCurrentNpcs];
+  let changed = sanitizedCurrentNpcs !== currentNpcs;
 
   for (const entry of avatarEntries) {
     const normalizedName = normalizeJournalMatch(entry.name);
@@ -2407,7 +2470,7 @@ function upsertGameNpcAvatarEntries(currentNpcs: GameNpc[], avatarEntries: Scene
       const existing = nextNpcs[existingIndex]!;
       let nextNpc = existing;
 
-      if (!existing.avatarUrl) {
+      if (existing.avatarUrl !== entry.avatarUrl) {
         nextNpc = { ...nextNpc, avatarUrl: entry.avatarUrl };
       }
       if (!nextNpc.description && entry.description) {
@@ -2428,7 +2491,6 @@ function upsertGameNpcAvatarEntries(currentNpcs: GameNpc[], avatarEntries: Scene
       description: entry.description,
       location: "",
       reputation: 0,
-      met: false,
       notes: [],
       avatarUrl: entry.avatarUrl,
       descriptionSource: entry.description ? "narration" : undefined,
@@ -2437,54 +2499,6 @@ function upsertGameNpcAvatarEntries(currentNpcs: GameNpc[], avatarEntries: Scene
   }
 
   return changed ? nextNpcs : currentNpcs;
-}
-
-function locationMatches(candidate: string, aliases: string[]): boolean {
-  const candidateKey = normalizeJournalMatch(candidate);
-  if (!candidateKey) return false;
-
-  return aliases.some((alias) => {
-    const aliasKey = normalizeJournalMatch(alias);
-    if (!aliasKey) return false;
-    const shortest = Math.min(candidateKey.length, aliasKey.length);
-    return (
-      candidateKey === aliasKey ||
-      (shortest >= 4 && (candidateKey.includes(aliasKey) || aliasKey.includes(candidateKey)))
-    );
-  });
-}
-
-function getCurrentMapLocation(map: GameMap | null): { name: string; description: string; aliases: string[] } | null {
-  if (!map) return null;
-
-  if (map.type === "node" && typeof map.partyPosition === "string") {
-    const node = map.nodes?.find((entry) => entry.id === map.partyPosition);
-    if (!node) {
-      return {
-        name: map.partyPosition,
-        description: "",
-        aliases: [map.partyPosition],
-      };
-    }
-    return {
-      name: node.label,
-      description: node.description ?? "",
-      aliases: [node.id, node.label],
-    };
-  }
-
-  if (map.type === "grid" && typeof map.partyPosition === "object" && "x" in map.partyPosition) {
-    const position = map.partyPosition;
-    const cell = map.cells?.find((entry) => entry.x === position.x && entry.y === position.y);
-    if (!cell) return null;
-    return {
-      name: cell.label,
-      description: cell.description ?? "",
-      aliases: [cell.label, `${cell.x},${cell.y}`, `${cell.x}:${cell.y}`],
-    };
-  }
-
-  return null;
 }
 
 function collectDiscoveredMapLocations(map: GameMap | null): Array<{ name: string; description: string }> {
@@ -2501,9 +2515,9 @@ function collectDiscoveredMapLocations(map: GameMap | null): Array<{ name: strin
     .map((cell) => ({ name: cell.label, description: cell.description ?? "" }));
 }
 
-function buildNpcMetInteraction(npc: GameNpc): string {
+function buildNpcTrackedInteraction(npc: GameNpc): string {
   const location = npc.location?.trim();
-  return location && location.toLowerCase() !== "unknown" ? `Met at ${location}.` : "Met.";
+  return location && location.toLowerCase() !== "unknown" ? `Tracked at ${location}.` : "Tracked.";
 }
 
 function extractActiveQuests(playerStatsRaw: unknown): QuestProgress[] {
@@ -2514,43 +2528,6 @@ function extractActiveQuests(playerStatsRaw: unknown): QuestProgress[] {
     (quest): quest is QuestProgress =>
       !!quest && typeof quest === "object" && typeof (quest as QuestProgress).name === "string",
   );
-}
-
-function extractPresentCharacterNames(presentCharactersRaw: unknown): string[] {
-  const presentCharacters = parseStoredJson<Array<{ name?: string }>>(presentCharactersRaw);
-  if (!Array.isArray(presentCharacters)) return [];
-  return presentCharacters.map((entry) => entry?.name?.trim()).filter((name): name is string => !!name);
-}
-
-function markNpcsMetByNames(meta: Record<string, unknown>, names: string[]): Record<string, unknown> {
-  if (names.length === 0) return meta;
-
-  const knownNames = new Set(names.map((name) => normalizeJournalMatch(name)));
-  const npcs = (meta.gameNpcs as GameNpc[]) ?? [];
-  let changed = false;
-  const updatedNpcs = npcs.map((npc) => {
-    if (npc.met || !knownNames.has(normalizeJournalMatch(npc.name))) return npc;
-    changed = true;
-    return { ...npc, met: true };
-  });
-
-  return changed ? { ...meta, gameNpcs: updatedNpcs } : meta;
-}
-
-function markNpcsMetAtCurrentLocation(meta: Record<string, unknown>): Record<string, unknown> {
-  const map = (meta.gameMap as GameMap) ?? null;
-  const location = getCurrentMapLocation(map);
-  if (!location) return meta;
-
-  const npcs = (meta.gameNpcs as GameNpc[]) ?? [];
-  let changed = false;
-  const updatedNpcs = npcs.map((npc) => {
-    if (npc.met || !locationMatches(npc.location, location.aliases)) return npc;
-    changed = true;
-    return { ...npc, met: true };
-  });
-
-  return changed ? { ...meta, gameNpcs: updatedNpcs } : meta;
 }
 
 function reconcileJournal(
@@ -2583,8 +2560,7 @@ function reconcileJournal(
   }
 
   for (const npc of (meta.gameNpcs as GameNpc[]) ?? []) {
-    if (!npc.met) continue;
-    const interaction = buildNpcMetInteraction(npc);
+    const interaction = buildNpcTrackedInteraction(npc);
     const hasInteraction = next.npcLog.some(
       (entry) => entry.npcName === npc.name && entry.interactions.includes(interaction),
     );
@@ -2650,11 +2626,11 @@ export async function gameRoutes(app: FastifyInstance) {
     const latestState = await gameStateStore.getLatest(chatId);
 
     let hydratedMeta = baseMeta;
-    const presentCharacterNames = extractPresentCharacterNames(latestState?.presentCharacters);
-    if (presentCharacterNames.length > 0) {
-      hydratedMeta = markNpcsMetByNames(hydratedMeta, presentCharacterNames);
+    const gameNpcs = Array.isArray(hydratedMeta.gameNpcs) ? (hydratedMeta.gameNpcs as GameNpc[]) : null;
+    if (gameNpcs) {
+      const sanitizedNpcs = sanitizeGameNpcAvatarUrls(gameNpcs);
+      if (sanitizedNpcs !== gameNpcs) hydratedMeta = { ...hydratedMeta, gameNpcs: sanitizedNpcs };
     }
-
     const activeQuests = extractActiveQuests(latestState?.playerStats);
     // Prefer a caller-supplied explicit location over the most recent snapshot. The snapshot's
     // location field only refreshes after /generate persists a new game state, so callers that
@@ -2822,7 +2798,6 @@ export async function gameRoutes(app: FastifyInstance) {
           pronouns: typeof n.pronouns === "string" ? n.pronouns : null,
           location: (n.location as string) || "Unknown",
           reputation: (n.reputation as number) || 0,
-          met: false,
           notes: [] as string[],
           avatarUrl: charAvatarByName.get(name.toLowerCase()) ?? undefined,
         };
@@ -2971,6 +2946,7 @@ export async function gameRoutes(app: FastifyInstance) {
       const parsed = blueprintSchema.safeParse(setupData.blueprint);
       if (parsed.success) {
         normalizeStatBlocks(parsed.data.hudWidgets);
+        normalizeSetupHudWidgetStartingValues(parsed.data.hudWidgets);
         updates.gameBlueprint = parsed.data;
       } else {
         // Last-ditch recovery: keep the user's HUD widgets even if campaignPlan
@@ -2986,6 +2962,7 @@ export async function gameRoutes(app: FastifyInstance) {
         });
         if (hudOnly.success && hudOnly.data.hudWidgets.length > 0) {
           normalizeStatBlocks(hudOnly.data.hudWidgets);
+          normalizeSetupHudWidgetStartingValues(hudOnly.data.hudWidgets);
           updates.gameBlueprint = { hudWidgets: hudOnly.data.hudWidgets };
         }
       }
@@ -3071,6 +3048,11 @@ export async function gameRoutes(app: FastifyInstance) {
       gamePlotTwists: [],
       gameDialogueChatId: null,
       gameCombatChatId: null,
+      gameSceneBackground: null,
+      gameSceneMusic: null,
+      gameSceneAmbient: null,
+      gameRecentMusic: [],
+      gameRecentSpotifyTracks: [],
       gameSetupConfig: setupConfig,
       gameCharacterConnectionId: null,
       gameSceneConnectionId: setupConfig.sceneConnectionId || null,
@@ -3639,6 +3621,11 @@ export async function gameRoutes(app: FastifyInstance) {
         gameLastIllustrationTurn: _previousIllustrationTurn,
         gameLastIllustrationSessionNumber: _previousIllustrationSessionNumber,
         gameLastIllustrationTag: _previousIllustrationTag,
+        gameSceneBackground: _previousSceneBackground,
+        gameSceneMusic: _previousSceneMusic,
+        gameSceneAmbient: _previousSceneAmbient,
+        gameRecentMusic: _previousRecentMusic,
+        gameRecentSpotifyTracks: _previousRecentSpotifyTracks,
         ...carryMeta
       } = prevMeta;
 
@@ -3655,6 +3642,11 @@ export async function gameRoutes(app: FastifyInstance) {
         gamePreviousSessionSummaries: summaries,
         gameDialogueChatId: null,
         gameCombatChatId: null,
+        gameSceneBackground: null,
+        gameSceneMusic: null,
+        gameSceneAmbient: null,
+        gameRecentMusic: [],
+        gameRecentSpotifyTracks: [],
         ...(carriedSetupConfig ? { gameSetupConfig: carriedSetupConfig } : {}),
         gamePartyCharacterIds: carriedPartyIds,
         enableAgents: true,
@@ -5225,8 +5217,9 @@ export async function gameRoutes(app: FastifyInstance) {
         ? (updatedMap.nodes?.find((node) => node.id === position)?.label ?? position)
         : (updatedMap.cells?.find((cell) => cell.x === position.x && cell.y === position.y)?.label ?? null);
 
-    const nextMeta = markNpcsMetAtCurrentLocation(withActiveGameMapMeta(meta, updatedMap));
-    const hydratedMeta = await buildHydratedGameMeta(chatId, nextMeta, { explicitLocation });
+    const hydratedMeta = await buildHydratedGameMeta(chatId, withActiveGameMapMeta(meta, updatedMap), {
+      explicitLocation,
+    });
     // syncGameMapMetaPartyPosition matches by label across all maps, so a label collision
     // could leave hydratedMeta.gameMap pointing at a different map than the one the client
     // clicked within. Anchor finalMap to the hydrated copy of the target map (falling back
@@ -6343,6 +6336,7 @@ export async function gameRoutes(app: FastifyInstance) {
             const imgSource = (imgConn as any).imageGenerationSource || imgModel;
             const imgServiceHint = imgConn.imageService || imgSource;
             const imgComfyWorkflow = imgConn.comfyuiWorkflow || undefined;
+            const imgEndpointId = imgConn.imageEndpointId || undefined;
             const imgDefaults = resolveConnectionImageDefaults(imgConn);
 
             const setupCfg = meta.gameSetupConfig as Record<string, unknown> | null;
@@ -6402,6 +6396,7 @@ export async function gameRoutes(app: FastifyInstance) {
                 imgBaseUrl,
                 imgApiKey,
                 imgService: imgServiceHint,
+                imgEndpointId,
                 imgComfyWorkflow,
                 imgDefaults,
                 debugLog: debugLogsEnabled ? debugLog : undefined,
@@ -6469,6 +6464,7 @@ export async function gameRoutes(app: FastifyInstance) {
                   imgBaseUrl,
                   imgApiKey,
                   imgService: imgServiceHint,
+                  imgEndpointId,
                   imgComfyWorkflow,
                   imgDefaults,
                   debugLog: debugLogsEnabled ? debugLog : undefined,
@@ -6518,6 +6514,7 @@ export async function gameRoutes(app: FastifyInstance) {
                   imgBaseUrl,
                   imgApiKey,
                   imgService: imgServiceHint,
+                  imgEndpointId,
                   imgComfyWorkflow,
                   imgDefaults,
                   debugLog: debugLogsEnabled ? debugLog : undefined,
@@ -6685,6 +6682,7 @@ export async function gameRoutes(app: FastifyInstance) {
     const imgSource = (imgConn as any).imageGenerationSource || imgModel;
     const imgComfyWorkflow = imgConn.comfyuiWorkflow || undefined;
     const imgServiceHint = imgConn.imageService || imgSource;
+    const imgEndpointId = imgConn.imageEndpointId || undefined;
     const imgDefaults = resolveConnectionImageDefaults(imgConn);
     const promptOverridesStorage = createPromptOverridesStorage(app.db);
 
@@ -6720,6 +6718,7 @@ export async function gameRoutes(app: FastifyInstance) {
         imgBaseUrl,
         imgApiKey,
         imgService: imgServiceHint,
+        imgEndpointId,
         imgComfyWorkflow,
         imgDefaults,
         promptOverridesStorage,
@@ -6791,6 +6790,7 @@ export async function gameRoutes(app: FastifyInstance) {
           imgBaseUrl,
           imgApiKey,
           imgService: imgServiceHint,
+          imgEndpointId,
           imgComfyWorkflow,
           imgDefaults,
           promptOverridesStorage,
@@ -6859,6 +6859,7 @@ export async function gameRoutes(app: FastifyInstance) {
           imgBaseUrl,
           imgApiKey,
           imgService: imgServiceHint,
+          imgEndpointId,
           imgComfyWorkflow,
           imgDefaults,
           promptOverridesStorage,
@@ -6949,6 +6950,7 @@ export async function gameRoutes(app: FastifyInstance) {
     const imgSource = (imgConn as any).imageGenerationSource || imgModel;
     const imgComfyWorkflow = imgConn.comfyuiWorkflow || undefined;
     const imgServiceHint = imgConn.imageService || imgSource;
+    const imgEndpointId = imgConn.imageEndpointId || undefined;
     const imgDefaults = resolveConnectionImageDefaults(imgConn);
 
     const setupCfg = meta.gameSetupConfig as Record<string, unknown> | null;
@@ -6986,6 +6988,7 @@ export async function gameRoutes(app: FastifyInstance) {
         imgBaseUrl,
         imgApiKey,
         imgService: imgServiceHint,
+        imgEndpointId,
         imgComfyWorkflow,
         imgDefaults,
         debugLog: debugLogsEnabled ? debugLog : undefined,
@@ -7073,6 +7076,7 @@ export async function gameRoutes(app: FastifyInstance) {
           imgBaseUrl,
           imgApiKey,
           imgService: imgServiceHint,
+          imgEndpointId,
           imgComfyWorkflow,
           imgDefaults,
           debugLog: debugLogsEnabled ? debugLog : undefined,
@@ -7171,6 +7175,7 @@ export async function gameRoutes(app: FastifyInstance) {
           imgBaseUrl,
           imgApiKey,
           imgService: imgServiceHint,
+          imgEndpointId,
           imgComfyWorkflow,
           imgDefaults,
           debugLog: debugLogsEnabled ? debugLog : undefined,
@@ -7182,7 +7187,7 @@ export async function gameRoutes(app: FastifyInstance) {
         if (avatarUrl) {
           generatedNpcAvatars.push({
             name: npc.name,
-            avatarUrl: forceNpcAvatar ? `${avatarUrl.split("?")[0]}?v=${Date.now()}` : avatarUrl,
+            avatarUrl: `${avatarUrl.split("?")[0]}?v=${Date.now()}`,
           });
         }
       }

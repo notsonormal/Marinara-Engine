@@ -14,7 +14,11 @@ import { lorebookKeys } from "./use-lorebooks";
 import type {
   Chat,
   ChatMemoryChunk,
+  ChatMemoryRecallExportPayload,
+  ChatMemoryRecallImportResult,
+  ChatSummaryEntry,
   ConversationNote,
+  ExportEnvelope,
   Message,
   MessageSwipe,
   DaySummaryEntry,
@@ -236,6 +240,35 @@ export function useRefreshChatMemories(chatId: string | null) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.post<{ rebuilt: number }>(`/chats/${chatId}/memories/refresh`),
+    onSuccess: () => {
+      if (chatId) qc.invalidateQueries({ queryKey: chatKeys.memories(chatId) });
+    },
+  });
+}
+
+export function useExportChatMemories(chatId: string | null) {
+  return useMutation({
+    mutationFn: () => {
+      if (!chatId) throw new Error("Chat ID is required");
+      return api.download(`/chats/${chatId}/memories/export`, "memory-recall.marinara.json");
+    },
+  });
+}
+
+export function useImportChatMemories(chatId: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      envelope,
+      replace = false,
+    }: {
+      envelope: ExportEnvelope<ChatMemoryRecallExportPayload>;
+      replace?: boolean;
+    }) => {
+      if (!chatId) throw new Error("Chat ID is required");
+      const query = replace ? "?replace=true" : "";
+      return api.post<ChatMemoryRecallImportResult>(`/chats/${chatId}/memories/import${query}`, envelope);
+    },
     onSuccess: () => {
       if (chatId) qc.invalidateQueries({ queryKey: chatKeys.memories(chatId) });
     },
@@ -482,6 +515,60 @@ export function useUpdateChatSummaries() {
   });
 }
 
+export type SummaryEntryOperation =
+  | { operation: "replace"; entry: Partial<ChatSummaryEntry> & { id: string; content: string } }
+  | { operation: "delete"; entryId: string }
+  | { operation: "toggle"; entryId: string; enabled: boolean };
+
+function useSummaryEntryMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ chatId, ...body }: { chatId: string } & SummaryEntryOperation) =>
+      api.patch<Chat>(`/chats/${chatId}/summary-entries`, body),
+    onSuccess: (data, vars) => {
+      if (data) {
+        qc.setQueryData(chatKeys.detail(vars.chatId), data);
+      } else {
+        qc.invalidateQueries({ queryKey: chatKeys.detail(vars.chatId) });
+      }
+      qc.invalidateQueries({ queryKey: chatKeys.list() });
+      qc.invalidateQueries({ queryKey: lorebookKeys.active(vars.chatId) });
+    },
+  });
+}
+
+export function useUpdateSummaryEntry() {
+  const mutation = useSummaryEntryMutation();
+  return {
+    ...mutation,
+    mutate: (input: { chatId: string; entry: Partial<ChatSummaryEntry> & { id: string; content: string } }) =>
+      mutation.mutate({ ...input, operation: "replace" }),
+    mutateAsync: (input: { chatId: string; entry: Partial<ChatSummaryEntry> & { id: string; content: string } }) =>
+      mutation.mutateAsync({ ...input, operation: "replace" }),
+  };
+}
+
+export function useDeleteSummaryEntry() {
+  const mutation = useSummaryEntryMutation();
+  return {
+    ...mutation,
+    mutate: (input: { chatId: string; entryId: string }) => mutation.mutate({ ...input, operation: "delete" }),
+    mutateAsync: (input: { chatId: string; entryId: string }) =>
+      mutation.mutateAsync({ ...input, operation: "delete" }),
+  };
+}
+
+export function useToggleSummaryEntry() {
+  const mutation = useSummaryEntryMutation();
+  return {
+    ...mutation,
+    mutate: (input: { chatId: string; entryId: string; enabled: boolean }) =>
+      mutation.mutate({ ...input, operation: "toggle" }),
+    mutateAsync: (input: { chatId: string; entryId: string; enabled: boolean }) =>
+      mutation.mutateAsync({ ...input, operation: "toggle" }),
+  };
+}
+
 /** Backfill missing conversation day/week summaries via the LLM. */
 export function useBackfillConversationSummaries() {
   const qc = useQueryClient();
@@ -636,6 +723,52 @@ export function useUpdateMessageExtra(chatId: string | null) {
   });
 }
 
+export function useBulkSetMessagesHiddenFromAI() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ chatId, messageIds, hidden }: { chatId: string; messageIds: string[]; hidden: boolean }) =>
+      api.patch<{ updated: number }>(`/chats/${chatId}/messages/bulk-hidden`, { messageIds, hidden }),
+    onMutate: async ({ chatId, messageIds, hidden }) => {
+      await qc.cancelQueries({ queryKey: chatKeys.messages(chatId) });
+      const previous = qc.getQueryData<InfiniteData<Message[]>>(chatKeys.messages(chatId));
+      const idSet = new Set(messageIds);
+
+      qc.setQueryData<InfiniteData<Message[]>>(chatKeys.messages(chatId), (old) => {
+        if (!old?.pages) return old;
+        return {
+          ...old,
+          pages: old.pages.map((page) =>
+            page.map((msg) => {
+              if (!idSet.has(msg.id)) return msg;
+              let currentExtra: Record<string, unknown> = {};
+              try {
+                currentExtra =
+                  typeof msg.extra === "string"
+                    ? JSON.parse(msg.extra)
+                    : ((msg.extra ?? {}) as unknown as Record<string, unknown>);
+              } catch {
+                currentExtra = {};
+              }
+              return { ...msg, extra: { ...currentExtra, hiddenFromAI: hidden } as unknown as Message["extra"] };
+            }),
+          ),
+        };
+      });
+
+      return { previous };
+    },
+    onError: (_err, vars, context) => {
+      if (context?.previous) {
+        qc.setQueryData(chatKeys.messages(vars.chatId), context.previous);
+      }
+    },
+    onSettled: (_data, _err, vars) => {
+      qc.invalidateQueries({ queryKey: chatKeys.messages(vars.chatId) });
+      qc.invalidateQueries({ queryKey: lorebookKeys.active(vars.chatId) });
+    },
+  });
+}
+
 function replaceCachedMessage(
   old: InfiniteData<Message[]> | undefined,
   messageId: string,
@@ -668,6 +801,7 @@ export function usePeekPrompt() {
           showThoughts?: boolean | null;
           reasoningEffort?: string | null;
           verbosity?: string | null;
+          serviceTier?: string | null;
           assistantPrefill?: string | null;
           tokensPrompt?: number | null;
           tokensCompletion?: number | null;
@@ -701,6 +835,21 @@ export function useExportChat() {
   });
 }
 
+/** Export selected or all chats as a zip of JSONL/text transcripts */
+export function useBulkExportChats() {
+  return useMutation({
+    mutationFn: ({
+      chatIds,
+      format = "jsonl",
+      scope = "selected",
+    }: {
+      chatIds?: string[];
+      format?: "jsonl" | "text";
+      scope?: "selected" | "all";
+    }) => api.downloadPost("/chats/export/bulk", { chatIds, format, scope }, `chat-transcripts-${format}.zip`),
+  });
+}
+
 /** Create a branch (copy) of an existing chat */
 export function useBranchChat() {
   const qc = useQueryClient();
@@ -723,11 +872,41 @@ export function useBranchChat() {
 }
 
 /** Generate a rolling summary for a chat via the LLM */
+export type GenerateSummaryInput = {
+  chatId: string;
+  contextSize?: number;
+  rangeStartMessageId?: string;
+  rangeEndMessageId?: string;
+  rangeStartIndex?: number;
+  rangeEndIndex?: number;
+  promptTemplateId?: string | null;
+};
+
 export function useGenerateSummary() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ chatId, contextSize }: { chatId: string; contextSize?: number }) =>
-      api.post<{ summary: string }>(`/chats/${chatId}/generate-summary`, { contextSize }),
+    mutationFn: ({
+      chatId,
+      contextSize,
+      rangeStartMessageId,
+      rangeEndMessageId,
+      rangeStartIndex,
+      rangeEndIndex,
+      promptTemplateId,
+    }: GenerateSummaryInput) =>
+      api.post<{
+        summary: string | null;
+        entry: ChatSummaryEntry | null;
+        entries: ChatSummaryEntry[];
+        messageIds: string[];
+      }>(`/chats/${chatId}/generate-summary`, {
+        contextSize,
+        rangeStartMessageId,
+        rangeEndMessageId,
+        rangeStartIndex,
+        rangeEndIndex,
+        promptTemplateId,
+      }),
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: chatKeys.detail(vars.chatId) });
     },

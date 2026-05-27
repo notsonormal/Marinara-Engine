@@ -30,6 +30,7 @@ import { useChatPresets, useApplyChatPreset } from "../../hooks/use-chat-presets
 import { useUIStore } from "../../stores/ui.store";
 import { useChatStore } from "../../stores/chat.store";
 import { api } from "../../lib/api-client";
+import { filterLanguageGenerationConnections } from "../../lib/connection-filters";
 import { getCharacterTitle, parseCharacterDisplayData } from "../../lib/character-display";
 import { ChoiceSelectionModal } from "../presets/ChoiceSelectionModal";
 import type { Chat, ChatMode, ChatPreset } from "@marinara-engine/shared";
@@ -241,11 +242,13 @@ function PersonaPicker({
 function SetupGenerationParametersPanel({
   enabled,
   value,
+  showOpenRouterServiceTier,
   onEnabledChange,
   onChange,
 }: {
   enabled: boolean;
   value: EditableGenerationParameters;
+  showOpenRouterServiceTier: boolean;
   onEnabledChange: (enabled: boolean) => void;
   onChange: (next: EditableGenerationParameters) => void;
 }) {
@@ -273,7 +276,11 @@ function SetupGenerationParametersPanel({
       </button>
       {enabled && (
         <div className="mt-3 border-t border-[var(--border)] pt-3">
-          <GenerationParametersFields value={value} onChange={onChange} />
+          <GenerationParametersFields
+            value={value}
+            showOpenRouterServiceTier={showOpenRouterServiceTier}
+            onChange={onChange}
+          />
         </div>
       )}
     </div>
@@ -337,10 +344,9 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
     const raw = (chat as unknown as { metadata?: string | Record<string, unknown> }).metadata;
     return typeof raw === "string" ? JSON.parse(raw) : (raw ?? {});
   }, [chat]);
-  const connectionOptions = useMemo(() => ((connections ?? []) as ConnectionSetupOption[]) ?? [], [connections]);
-  const textConnectionOptions = useMemo(
-    () => connectionOptions.filter((connection) => connection.provider !== "image_generation"),
-    [connectionOptions],
+  const connectionOptions = useMemo(
+    () => filterLanguageGenerationConnections((connections ?? []) as ConnectionSetupOption[]),
+    [connections],
   );
   const selectedConnection = useMemo(
     () => connectionOptions.find((connection) => connection.id === chat.connectionId) ?? null,
@@ -550,13 +556,13 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
               >
                 <option value="">None</option>
                 <option value="random">🎲 Random</option>
-                {textConnectionOptions.map((c) => (
+                {connectionOptions.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.name}
                   </option>
                 ))}
               </select>
-              {textConnectionOptions.length === 0 && (
+              {connectionOptions.length === 0 && (
                 <button
                   onClick={() => {
                     openRightPanel("connections");
@@ -571,6 +577,7 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
               <SetupGenerationParametersPanel
                 enabled={customizeParameters}
                 value={generationParameters}
+                showOpenRouterServiceTier={selectedConnection?.provider === "openrouter"}
                 onEnabledChange={setCustomizeParameters}
                 onChange={setGenerationParameters}
               />
@@ -869,7 +876,10 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
       (allCharacters ?? []) as Array<{ id: string; data: string; comment?: string | null; avatarPath: string | null }>,
     [allCharacters],
   );
-  const connectionOptions = useMemo(() => ((connections ?? []) as ConnectionSetupOption[]) ?? [], [connections]);
+  const connectionOptions = useMemo(
+    () => filterLanguageGenerationConnections((connections ?? []) as ConnectionSetupOption[]),
+    [connections],
+  );
   const selectedConnection = useMemo(
     () => connectionOptions.find((connection) => connection.id === chat.connectionId) ?? null,
     [connectionOptions, chat.connectionId],
@@ -1137,6 +1147,7 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
         <SetupGenerationParametersPanel
           enabled={customizeParameters}
           value={generationParameters}
+          showOpenRouterServiceTier={selectedConnection?.provider === "openrouter"}
           onEnabledChange={setCustomizeParameters}
           onChange={setGenerationParameters}
         />

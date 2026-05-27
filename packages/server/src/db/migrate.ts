@@ -75,6 +75,7 @@ const CREATE_TABLES: string[] = [
     name_color TEXT NOT NULL DEFAULT '',
     dialogue_color TEXT NOT NULL DEFAULT '',
     box_color TEXT NOT NULL DEFAULT '',
+    tracker_card_colors TEXT NOT NULL DEFAULT '{"mode":"chat"}',
     persona_stats TEXT NOT NULL DEFAULT '',
     alt_descriptions TEXT NOT NULL DEFAULT '[]',
     tags TEXT NOT NULL DEFAULT '[]',
@@ -104,10 +105,12 @@ const CREATE_TABLES: string[] = [
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     category TEXT NOT NULL DEFAULT 'uncategorized',
+    image_path TEXT,
     scan_depth INTEGER NOT NULL DEFAULT 2,
     token_budget INTEGER NOT NULL DEFAULT 2048,
     recursive_scanning TEXT NOT NULL DEFAULT 'false',
     max_recursion_depth INTEGER NOT NULL DEFAULT 3,
+    exclude_from_vectorization TEXT NOT NULL DEFAULT 'false',
     character_id TEXT,
     persona_id TEXT,
     chat_id TEXT,
@@ -410,6 +413,7 @@ const CREATE_TABLES: string[] = [
     content TEXT NOT NULL,
     embedding TEXT,
     message_count INTEGER NOT NULL,
+    source_chat_id TEXT,
     first_message_at TEXT NOT NULL,
     last_message_at TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -518,6 +522,11 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     table: "lorebooks",
     column: "max_recursion_depth",
     definition: "INTEGER NOT NULL DEFAULT 3",
+  },
+  {
+    table: "lorebooks",
+    column: "exclude_from_vectorization",
+    definition: "TEXT NOT NULL DEFAULT 'false'",
   },
   {
     table: "lorebooks",
@@ -635,6 +644,11 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     definition: "TEXT NOT NULL DEFAULT 'false'",
   },
   {
+    table: "lorebooks",
+    column: "image_path",
+    definition: "TEXT",
+  },
+  {
     table: "api_connections",
     column: "default_parameters",
     definition: "TEXT",
@@ -715,6 +729,11 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     definition: "TEXT NOT NULL DEFAULT ''",
   },
   {
+    table: "personas",
+    column: "tracker_card_colors",
+    definition: `TEXT NOT NULL DEFAULT '{"mode":"chat"}'`,
+  },
+  {
     table: "api_connections",
     column: "folder_id",
     definition: "TEXT",
@@ -723,6 +742,16 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     table: "api_connections",
     column: "sort_order",
     definition: "INTEGER NOT NULL DEFAULT 0",
+  },
+  {
+    table: "api_connections",
+    column: "image_endpoint_id",
+    definition: "TEXT",
+  },
+  {
+    table: "memory_chunks",
+    column: "source_chat_id",
+    definition: "TEXT",
   },
 ];
 

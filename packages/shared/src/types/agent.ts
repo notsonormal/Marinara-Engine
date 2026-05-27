@@ -140,6 +140,10 @@ export interface AgentContext {
   writableLorebookIds: string[] | null;
   /** Chat summary text (if any) — helps agents avoid duplicating summarized info */
   chatSummary: string | null;
+  /** Current-turn pre-generation injections, only present for agents that opt in */
+  preGenInjections?: Array<{ agentType: string; agentName?: string; text: string }>;
+  /** Current-turn parallel-phase results, only present for agents that opt in */
+  parallelResults?: AgentResult[];
   /** Whether internal agent LLM calls should use transport streaming. */
   streaming?: boolean;
   /** Abort signal — when triggered, agent execution should stop. Typed as `any` to avoid DOM/Node lib dependency. */
@@ -455,6 +459,7 @@ export const BUILT_IN_AGENTS: BuiltInAgentMeta[] = [
 
 export const BUILT_IN_AGENT_RUN_INTERVAL_DEFAULTS: Readonly<Record<string, number>> = {
   director: 5,
+  illustrator: 5,
   "lorebook-keeper": 8,
   "card-evolution-auditor": 8,
   "chat-summary": 5,
@@ -478,6 +483,10 @@ export function getDefaultBuiltInAgentSettings(agentType: string): Record<string
   const runInterval = BUILT_IN_AGENT_RUN_INTERVAL_DEFAULTS[agentType];
   if (runInterval !== undefined) {
     settings.runInterval = runInterval;
+  }
+
+  if (agentType === "knowledge-retrieval" || agentType === "knowledge-router") {
+    settings.useChatActiveLorebooks = true;
   }
 
   return settings;

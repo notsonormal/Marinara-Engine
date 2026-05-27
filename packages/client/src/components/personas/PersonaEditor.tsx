@@ -44,6 +44,7 @@ import { HelpTooltip } from "../ui/HelpTooltip";
 import { ColorPicker } from "../ui/ColorPicker";
 import { ExpandedTextarea } from "../ui/ExpandedTextarea";
 import { api } from "../../lib/api-client";
+import { parseTrackerCardColorConfig, serializeTrackerCardColorConfig } from "../../lib/tracker-card-colors";
 import {
   useCharacterSprites,
   useUploadSprite,
@@ -62,6 +63,8 @@ import { SpriteFrameEditor } from "../ui/SpriteFrameEditor";
 import { SpriteWandCleanupEditor } from "../ui/SpriteWandCleanupEditor";
 import { ExportFormatDialog, type ExportFormatChoice } from "../ui/ExportFormatDialog";
 import { Modal } from "../ui/Modal";
+import type { TrackerCardColorConfig } from "@marinara-engine/shared";
+import { useQuoteFormatter } from "../../hooks/use-quote-formatter";
 
 // ── Tabs ──
 const TABS = [
@@ -95,6 +98,7 @@ interface PersonaFormData {
   nameColor: string;
   dialogueColor: string;
   boxColor: string;
+  trackerCardColors: TrackerCardColorConfig;
   personaStats: string;
   altDescriptions: AltDescriptionEntry[];
   tags: string[];
@@ -120,9 +124,43 @@ interface PersonaRow {
   nameColor?: string;
   dialogueColor?: string;
   boxColor?: string;
+  trackerCardColors?: string;
   personaStats?: string;
   altDescriptions?: string;
   tags?: string;
+}
+
+function appendNewTags(existingTags: string[], rawInput: string) {
+  const seen = new Set(existingTags);
+  const additions: string[] = [];
+
+  for (const tag of rawInput.split(",").map((part) => part.trim())) {
+    if (!tag || seen.has(tag)) continue;
+    seen.add(tag);
+    additions.push(tag);
+  }
+
+  return additions.length > 0 ? [...existingTags, ...additions] : existingTags;
+}
+
+const PERSONA_QUOTE_FIELD_KEYS = new Set<string>(["description", "personality", "scenario", "backstory", "appearance"]);
+
+function formatPersonaFieldValue<K extends keyof PersonaFormData>(
+  key: K,
+  value: PersonaFormData[K],
+  formatQuotes: (value: string) => string,
+): PersonaFormData[K] {
+  if (PERSONA_QUOTE_FIELD_KEYS.has(String(key)) && typeof value === "string") {
+    return formatQuotes(value) as PersonaFormData[K];
+  }
+  if (key === "altDescriptions" && Array.isArray(value)) {
+    return value.map((entry) =>
+      entry && typeof entry === "object" && "content" in entry && typeof entry.content === "string"
+        ? { ...entry, content: formatQuotes(entry.content) }
+        : entry,
+    ) as PersonaFormData[K];
+  }
+  return value;
 }
 
 export function PersonaEditor() {
@@ -142,6 +180,7 @@ export function PersonaEditor() {
   const [avatarGeneratorOpen, setAvatarGeneratorOpen] = useState(false);
   const loadedPersonaIdRef = useRef<string | null>(null);
   const latestAvatarUploadTokenRef = useRef<string | null>(null);
+  const formatQuotes = useQuoteFormatter();
   const setEditorDirty = useUIStore((s) => s.setEditorDirty);
   useEffect(() => {
     setEditorDirty(dirty);
@@ -234,6 +273,7 @@ export function PersonaEditor() {
       nameColor: rawPersona.nameColor ?? "",
       dialogueColor: rawPersona.dialogueColor ?? "",
       boxColor: rawPersona.boxColor ?? "",
+      trackerCardColors: parseTrackerCardColorConfig(rawPersona.trackerCardColors),
       personaStats: rawPersona.personaStats ?? "",
       altDescriptions: parsedAltDescs,
       tags: (() => {
@@ -249,10 +289,14 @@ export function PersonaEditor() {
     setDirty(false);
   }, [rawPersona, dirty]);
 
-  const updateField = useCallback(<K extends keyof PersonaFormData>(key: K, value: PersonaFormData[K]) => {
-    setFormData((prev) => (prev ? { ...prev, [key]: value } : prev));
-    setDirty(true);
-  }, []);
+  const updateField = useCallback(
+    <K extends keyof PersonaFormData>(key: K, value: PersonaFormData[K]) => {
+      const nextValue = formatPersonaFieldValue(key, value, formatQuotes);
+      setFormData((prev) => (prev ? { ...prev, [key]: nextValue } : prev));
+      setDirty(true);
+    },
+    [formatQuotes],
+  );
 
   const handleSave = async () => {
     if (!personaId || !formData) return;
@@ -264,6 +308,7 @@ export function PersonaEditor() {
         ...rest,
         altDescriptions: JSON.stringify(altDescriptions),
         tags: JSON.stringify(tags),
+        trackerCardColors: serializeTrackerCardColorConfig(formData.trackerCardColors),
         // Persist as JSON string; empty string means "no crop" so the row keeps
         // the legacy default in render sites.
         avatarCrop: avatarCrop ? JSON.stringify(avatarCrop) : "",
@@ -396,6 +441,7 @@ export function PersonaEditor() {
       {/* ── Header ── */}
       <div className="flex flex-wrap items-center gap-3 border-b border-[var(--border)] bg-[var(--card)] px-4 py-3 max-md:gap-2 max-md:px-3">
         <button
+          type="button"
           onClick={handleClose}
           className="rounded-xl p-2 transition-all hover:bg-[var(--accent)] active:scale-95"
           title="Back"
@@ -458,6 +504,7 @@ export function PersonaEditor() {
 
         {/* Export */}
         <button
+          type="button"
           onClick={() => setExportDialogOpen(true)}
           className="rounded-xl p-2 text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
           title="Export persona"
@@ -476,6 +523,7 @@ export function PersonaEditor() {
 
         {/* Delete */}
         <button
+          type="button"
           onClick={handleDelete}
           className="rounded-xl p-2 text-[var(--muted-foreground)] transition-all hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]"
           title="Delete persona"
@@ -485,6 +533,7 @@ export function PersonaEditor() {
 
         {/* Save */}
         <button
+          type="button"
           onClick={handleSave}
           disabled={!dirty || saving}
           className={cn(
@@ -505,18 +554,21 @@ export function PersonaEditor() {
           <AlertTriangle size="0.9375rem" className="shrink-0 text-amber-500" />
           <p className="flex-1 text-xs font-medium text-amber-500">You have unsaved changes. Close without saving?</p>
           <button
+            type="button"
             onClick={() => setShowUnsavedWarning(false)}
             className="rounded-lg px-3 py-1 text-xs font-medium text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)]"
           >
             Keep editing
           </button>
           <button
+            type="button"
             onClick={forceClose}
             className="rounded-lg bg-amber-500/15 px-3 py-1 text-xs font-medium text-amber-500 transition-all hover:bg-amber-500/25"
           >
             Discard & close
           </button>
           <button
+            type="button"
             onClick={async () => {
               await handleSave();
               closeDetail();
@@ -536,6 +588,7 @@ export function PersonaEditor() {
             const Icon = tab.icon;
             return (
               <button
+                type="button"
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
                 className={cn(
@@ -853,7 +906,7 @@ function PersonaSpritesTab({
     if (
       !(await showConfirmDialog({
         title: "Clean Sprite Backgrounds",
-        message: `Run the local backgroundremover model on ${visibleSprites.length} saved ${modeLabel} sprite${visibleSprites.length === 1 ? "" : "s"} at strength ${savedCleanupStrength}? Marinara will keep a restore point in case the cleanup looks wrong.`,
+        message: `Clean backgrounds on ${visibleSprites.length} saved ${modeLabel} sprite${visibleSprites.length === 1 ? "" : "s"} at strength ${savedCleanupStrength}? Marinara will keep a restore point in case the cleanup looks wrong.`,
         confirmLabel: "Clean",
       }))
     ) {
@@ -866,14 +919,18 @@ function PersonaSpritesTab({
         characterId: personaId,
         expressions: visibleSprites.map((sprite) => sprite.expression),
         cleanupStrength: savedCleanupStrength,
-        engine: "backgroundremover",
+        engine: "auto",
       });
 
       if (result.processed > 0) {
         setLastCleanupBackupId(result.backupId ?? null);
-        toast.success(
-          `Cleaned ${result.processed} saved sprite${result.processed === 1 ? "" : "s"} with backgroundremover.`,
-        );
+        const engineDetails =
+          result.backgroundRemoverProcessed && result.builtinProcessed
+            ? ` with backgroundremover and built-in fallback`
+            : result.backgroundRemoverProcessed
+              ? ` with backgroundremover`
+              : ` with built-in cleanup`;
+        toast.success(`Cleaned ${result.processed} saved sprite${result.processed === 1 ? "" : "s"}${engineDetails}.`);
       }
       if (result.failed.length > 0) {
         toast.warning(`${result.failed.length} sprite${result.failed.length === 1 ? "" : "s"} could not be cleaned.`);
@@ -959,6 +1016,7 @@ function PersonaSpritesTab({
 
       <div className="inline-flex rounded-xl bg-[var(--secondary)] p-1 ring-1 ring-[var(--border)]">
         <button
+          type="button"
           onClick={() => setCategory("expressions")}
           className={cn(
             "rounded-lg px-3 py-1.5 text-xs font-medium transition-colors",
@@ -970,6 +1028,7 @@ function PersonaSpritesTab({
           Facial Expressions
         </button>
         <button
+          type="button"
           onClick={() => setCategory("full-body")}
           className={cn(
             "rounded-lg px-3 py-1.5 text-xs font-medium transition-colors",
@@ -1003,6 +1062,7 @@ function PersonaSpritesTab({
           </h4>
           <div className="flex flex-wrap items-center gap-2 md:justify-end">
             <button
+              type="button"
               onClick={() => setSpriteGenOpen(true)}
               disabled={spriteGenerationUnavailable}
               className="flex min-w-0 items-center justify-center gap-1.5 rounded-lg bg-purple-500/10 px-3 py-1.5 text-center text-[0.6875rem] font-medium leading-tight text-purple-400 ring-1 ring-purple-500/20 transition-all hover:bg-purple-500/20 disabled:cursor-not-allowed disabled:opacity-40 max-md:flex-1 max-md:basis-[calc(50%-0.25rem)] max-md:px-2.5"
@@ -1014,6 +1074,7 @@ function PersonaSpritesTab({
               Generate Sprite
             </button>
             <button
+              type="button"
               onClick={() => folderInputRef.current?.click()}
               disabled={!!folderProgress}
               className="flex min-w-0 items-center justify-center gap-1.5 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-center text-[0.6875rem] font-medium leading-tight text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] disabled:opacity-40 max-md:flex-1 max-md:basis-[calc(50%-0.25rem)] max-md:px-2.5"
@@ -1023,20 +1084,14 @@ function PersonaSpritesTab({
               Upload Folder
             </button>
             <button
+              type="button"
               onClick={() => void handleCleanVisibleSprites()}
-              disabled={
-                cleaningSprites ||
-                backgroundCleanupUnavailable ||
-                backgroundRemoverUnavailable ||
-                visibleSprites.length === 0
-              }
+              disabled={cleaningSprites || backgroundCleanupUnavailable || visibleSprites.length === 0}
               className="flex min-w-0 items-center justify-center gap-1.5 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-center text-[0.6875rem] font-medium leading-tight text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] disabled:opacity-40 max-md:flex-1 max-md:basis-[calc(50%-0.25rem)] max-md:px-2.5"
               title={
                 backgroundCleanupUnavailable
                   ? backgroundCleanupReason
-                  : backgroundRemoverUnavailable
-                    ? backgroundRemoverReason
-                    : "Run the local backgroundremover model on the currently visible saved sprites"
+                  : "Clean backgrounds on the currently visible saved sprites"
               }
             >
               {cleaningSprites ? <Loader2 size="0.8125rem" className="animate-spin" /> : <Eraser size="0.8125rem" />}
@@ -1044,6 +1099,7 @@ function PersonaSpritesTab({
             </button>
             <div className="relative max-md:flex-1 max-md:basis-[calc(50%-0.25rem)]">
               <button
+                type="button"
                 onClick={() => setExportMenuOpen((open) => !open)}
                 disabled={exporting || allSprites.length === 0}
                 className="flex w-full min-w-0 items-center justify-center gap-1.5 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-center text-[0.6875rem] font-medium leading-tight text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] disabled:opacity-40 max-md:px-2.5"
@@ -1055,6 +1111,7 @@ function PersonaSpritesTab({
               {exportMenuOpen && !exporting && (
                 <div className="absolute right-0 top-[calc(100%+0.35rem)] z-30 min-w-44 rounded-lg border border-[var(--border)] bg-[var(--card)] p-1 text-xs shadow-xl">
                   <button
+                    type="button"
                     onClick={() => {
                       setExportMenuOpen(false);
                       void handleExportSprites(visibleSprites, "visible");
@@ -1066,6 +1123,7 @@ function PersonaSpritesTab({
                     {category === "full-body" ? "Full-body only" : "Expressions only"}
                   </button>
                   <button
+                    type="button"
                     onClick={() => {
                       setExportMenuOpen(false);
                       void handleExportSprites(allSprites, "all");
@@ -1117,6 +1175,7 @@ function PersonaSpritesTab({
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs text-[var(--muted-foreground)]">
             <span>Last cleanup has a restore point.</span>
             <button
+              type="button"
               onClick={() => void handleRestoreLastCleanup()}
               disabled={restoringCleanup}
               className="flex items-center gap-1.5 rounded-md bg-[var(--card)] px-2.5 py-1 text-[0.6875rem] font-medium text-[var(--foreground)] ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)] disabled:opacity-40"
@@ -1158,6 +1217,7 @@ function PersonaSpritesTab({
             }}
           />
           <button
+            type="button"
             onClick={() => newExpression.trim() && startUpload(normalizeExpressionForCategory(newExpression))}
             disabled={!newExpression.trim() || uploading}
             className="flex items-center gap-1.5 rounded-xl bg-[var(--primary)] px-4 py-2 text-xs font-medium text-[var(--primary-foreground)] shadow-sm transition-all hover:shadow-md disabled:opacity-40"
@@ -1173,6 +1233,7 @@ function PersonaSpritesTab({
             <div className="flex flex-wrap gap-1">
               {suggestedExpressions.slice(0, 12).map((expr) => (
                 <button
+                  type="button"
                   key={expr}
                   onClick={() => startUpload(expr)}
                   className="rounded-lg bg-[var(--secondary)] px-2.5 py-1 text-[0.6875rem] font-medium text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
@@ -1239,6 +1300,7 @@ function PersonaSpritesTab({
                 </span>
                 <div className="flex gap-1 opacity-0 group-hover:opacity-100 max-md:opacity-100 transition-opacity">
                   <button
+                    type="button"
                     onClick={() => setFramingSprite(sprite)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
                     title="Frame"
@@ -1246,6 +1308,7 @@ function PersonaSpritesTab({
                     <Crop size="0.6875rem" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => void downloadSpriteFile(sprite)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
                     title="Download"
@@ -1253,6 +1316,7 @@ function PersonaSpritesTab({
                     <ImageDown size="0.6875rem" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => startUpload(sprite.expression)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
                     title="Replace"
@@ -1260,6 +1324,7 @@ function PersonaSpritesTab({
                     <Upload size="0.6875rem" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => setDeleteSpriteRequest(sprite)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]"
                     title="Delete"
@@ -1637,6 +1702,7 @@ function PersonaStatsTab({
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold">Status Bars</h3>
               <button
+                type="button"
                 onClick={addBar}
                 className="flex items-center gap-1 rounded-lg bg-emerald-500/15 px-2.5 py-1 text-[0.6875rem] font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25"
               >
@@ -1670,6 +1736,7 @@ function PersonaStatsTab({
                       min={1}
                     />
                     <button
+                      type="button"
                       onClick={() => removeBar(i)}
                       className="rounded-lg p-1 text-[var(--muted-foreground)] transition-colors hover:bg-red-500/15 hover:text-red-400"
                     >
@@ -1750,6 +1817,7 @@ function PersonaStatsTab({
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold">Attributes</h3>
                 <button
+                  type="button"
                   onClick={addRpgAttribute}
                   className="flex items-center gap-1 rounded-lg bg-purple-500/15 px-2.5 py-1 text-[0.6875rem] font-medium text-purple-400 transition-colors hover:bg-purple-500/25"
                 >
@@ -1777,6 +1845,7 @@ function PersonaStatsTab({
                       className="w-16 rounded-lg border border-[var(--border)] bg-[var(--input)] px-2 py-1 text-center text-xs"
                     />
                     <button
+                      type="button"
                       onClick={() => removeRpgAttribute(i)}
                       className="rounded-lg p-1 text-[var(--muted-foreground)] transition-colors hover:bg-red-500/15 hover:text-red-400"
                     >
@@ -1835,10 +1904,9 @@ function DescriptionTab({
   const [newTag, setNewTag] = useState("");
 
   const addTag = () => {
-    const tag = newTag.trim();
-    if (!tag) return;
-    if (formData.tags.includes(tag)) return;
-    updateField("tags", [...formData.tags, tag]);
+    const nextTags = appendNewTags(formData.tags, newTag);
+    if (nextTags === formData.tags) return;
+    updateField("tags", nextTags);
     setNewTag("");
   };
 
@@ -1894,6 +1962,7 @@ function DescriptionTab({
             </p>
           </div>
           <button
+            type="button"
             onClick={() => setExpandedField("description")}
             className="shrink-0 rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
             title="Expand editor"
@@ -1928,6 +1997,7 @@ function DescriptionTab({
               <Tag size="0.625rem" />
               {tag}
               <button
+                type="button"
                 onClick={() => removeTag(tag)}
                 className="ml-0.5 rounded-full transition-colors hover:text-[var(--destructive)]"
               >
@@ -1950,6 +2020,7 @@ function DescriptionTab({
             className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-1.5 text-xs outline-none focus:border-emerald-400/40"
           />
           <button
+            type="button"
             onClick={addTag}
             className="rounded-xl bg-emerald-400/15 px-3 py-1.5 text-xs font-medium text-emerald-400 transition-all hover:bg-emerald-400/25"
           >
@@ -1969,6 +2040,7 @@ function DescriptionTab({
             </p>
           </div>
           <button
+            type="button"
             onClick={addAltDesc}
             className="flex items-center gap-1 rounded-lg bg-emerald-500/15 px-2.5 py-1 text-[0.6875rem] font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25"
           >
@@ -1996,6 +2068,7 @@ function DescriptionTab({
                 <div className="flex items-center gap-2 mb-3">
                   {/* Toggle */}
                   <button
+                    type="button"
                     onClick={() => toggleAltDesc(desc.id)}
                     className={cn(
                       "flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors",
@@ -2018,6 +2091,7 @@ function DescriptionTab({
                   />
                   {/* Remove */}
                   <button
+                    type="button"
                     onClick={() => removeAltDesc(desc.id)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] transition-colors hover:bg-red-500/15 hover:text-red-400"
                     title="Remove extension"
@@ -2026,6 +2100,7 @@ function DescriptionTab({
                   </button>
                   {/* Expand */}
                   <button
+                    type="button"
                     onClick={() => setExpandedField(desc.id)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
                     title="Expand editor"
@@ -2106,6 +2181,7 @@ function TextareaTab({
           {subtitle && <p className="mt-0.5 text-xs text-[var(--muted-foreground)]">{subtitle}</p>}
         </div>
         <button
+          type="button"
           onClick={() => setExpanded(true)}
           className="shrink-0 rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
           title="Expand editor"

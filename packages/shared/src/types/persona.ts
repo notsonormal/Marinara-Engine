@@ -27,6 +27,8 @@ export interface Persona {
   dialogueColor: string;
   /** Chat bubble / dialogue box background color */
   boxColor: string;
+  /** Tracker card color source + optional custom palette. */
+  trackerCardColors?: TrackerCardColorConfig | string;
   /** Persona status bars configuration (Satiety, Energy, etc.) */
   personaStats?: PersonaStatsConfig;
   /** Alternative description extensions (toggleable additions to the main description) */
@@ -37,6 +39,47 @@ export interface Persona {
   savedStatusOptions?: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export type TrackerCardColorMode = "default" | "chat" | "custom";
+export type TrackerCardPortraitStageBackground = "ambient" | "spotlight" | "soft" | "plain";
+
+export interface TrackerCardColorConfig {
+  mode?: TrackerCardColorMode;
+  /** Whether the Display channel is allowed to contribute paint. */
+  displayEnabled?: boolean;
+  /** Tracker card display color/gradient. */
+  nameColor?: string;
+  /** Tracker card display paint opacity, 0-100. */
+  nameColorOpacity?: number;
+  /** Whether the Accent channel is allowed to contribute paint. */
+  accentEnabled?: boolean;
+  /** Tracker card dialogue/accent color. */
+  dialogueColor?: string;
+  /** Tracker card dialogue/accent paint opacity, 0-100. */
+  dialogueColorOpacity?: number;
+  /** Whether the Surface channel is allowed to contribute paint. */
+  surfaceEnabled?: boolean;
+  /** Tracker card surface tint color. */
+  boxColor?: string;
+  /** Tracker card surface paint opacity, 0-100. */
+  boxColorOpacity?: number;
+  /** Deprecated: old tracker material tint control. */
+  tintIntensity?: number;
+  /** Tracker card material brightness, 0 = nearly black, 50 = unchanged, 100 = nearly white. */
+  materialBrightness?: number;
+  /** How strongly selected colors affect glows, borders, and hairlines, 0-100. */
+  glowIntensity?: number;
+  /** How much neutral readability veil sits over the card, 0-100. */
+  contrastIntensity?: number;
+  /** Portrait stage background treatment behind transparent sprites. */
+  portraitStageBackground?: TrackerCardPortraitStageBackground;
+  /** Tracker portrait horizontal focus, 0 = left, 100 = right. */
+  portraitFocusX?: number;
+  /** Tracker portrait vertical focus, 0 = top, 100 = bottom; expression sprites may exceed 100 to dip below the frame. */
+  portraitFocusY?: number;
+  /** Tracker portrait zoom multiplier. */
+  portraitZoom?: number;
 }
 
 /** Avatar crop — current source-rectangle format. A square region of the source

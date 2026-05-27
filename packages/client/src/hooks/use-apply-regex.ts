@@ -3,7 +3,8 @@
 // ──────────────────────────────────────────────
 import { useCallback, useMemo } from "react";
 import { useRegexScripts, type RegexScriptRow } from "./use-regex-scripts";
-import { applyRegexReplacement, type RegexPlacement } from "@marinara-engine/shared";
+import { applyRegexReplacement, formatTextQuotes, type RegexPlacement } from "@marinara-engine/shared";
+import { useUIStore } from "../stores/ui.store";
 
 /**
  * Parses a RegexScriptRow from DB into a usable form.
@@ -47,8 +48,12 @@ function applyScripts(
   for (const script of scripts) {
     if (!script.enabledBool) continue;
     if (!script.placements.includes(placement)) continue;
-    // If we're rendering display text and script is prompt-only, skip
-    if (!options?.promptOnly && script.promptOnlyBool) continue;
+    // Prompt context is opt-in. Display context runs visual scripts only.
+    if (options?.promptOnly) {
+      if (!script.promptOnlyBool) continue;
+    } else if (script.promptOnlyBool) {
+      continue;
+    }
 
     // Depth range filtering
     if (options?.depth != null) {
@@ -84,6 +89,7 @@ function applyScripts(
  */
 export function useApplyRegex() {
   const { data: regexScripts } = useRegexScripts();
+  const quoteFormat = useUIStore((s) => s.quoteFormat);
 
   // Pre-parse all scripts (sorted by order, which is done server-side)
   const parsedScripts = useMemo(() => {
@@ -93,17 +99,17 @@ export function useApplyRegex() {
 
   const applyToAIOutput = useCallback(
     (text: string, options?: { depth?: number; resolveMacros?: (value: string) => string }) =>
-      applyScripts(text, parsedScripts, "ai_output", options),
-    [parsedScripts],
+      formatTextQuotes(applyScripts(text, parsedScripts, "ai_output", options), quoteFormat),
+    [parsedScripts, quoteFormat],
   );
 
   const applyToUserInput = useCallback(
     (text: string, options?: { depth?: number; resolveMacros?: (value: string) => string }) =>
-      applyScripts(text, parsedScripts, "user_input", options),
-    [parsedScripts],
+      formatTextQuotes(applyScripts(text, parsedScripts, "user_input", options), quoteFormat),
+    [parsedScripts, quoteFormat],
   );
 
-  // Applies scripts in prompt context, including scripts marked prompt-only.
+  // Applies scripts in prompt context. Visual scripts are intentionally skipped.
   const applyPromptOnly = useCallback(
     (
       text: string,

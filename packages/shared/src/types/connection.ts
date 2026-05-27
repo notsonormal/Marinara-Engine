@@ -9,6 +9,7 @@ export type APIProvider =
   | "anthropic"
   | "claude_subscription"
   | "google"
+  | "google_vertex"
   | "mistral"
   | "cohere"
   | "openrouter"
@@ -42,6 +43,8 @@ export interface APIConnection {
   embeddingModel: string | null;
   /** Separate base URL for the embedding backend (e.g. a second llama.cpp on a different port) */
   embeddingBaseUrl: string | null;
+  /** Optional dedicated connection, or synthetic local sidecar id, to use for embeddings */
+  embeddingConnectionId: string | null;
   /** Preferred provider when using OpenRouter (e.g. "anthropic", "google") */
   openrouterProvider: string | null;
   /** Explicit image backend selection for image-generation connections (e.g. ComfyUI on a remote host). */
@@ -50,6 +53,8 @@ export interface APIConnection {
   comfyuiWorkflow: string | null;
   /** Explicitly selected image generation service ID (e.g. "comfyui", "automatic1111"). Overrides URL inference when set. */
   imageService: string | null;
+  /** For endpoint-based image services (e.g. RunPod Serverless): the endpoint ID sent alongside the base URL. */
+  imageEndpointId: string | null;
   /** Default generation parameters for new chats using this connection (JSON) */
   defaultParameters: string | null;
   /** Prompt preset to use instead of a chat's selected preset when this connection is active */

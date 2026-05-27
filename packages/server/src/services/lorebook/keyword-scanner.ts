@@ -12,6 +12,7 @@ import type {
   LorebookSchedule,
 } from "@marinara-engine/shared";
 import { testPrimaryKeys, testSecondaryKeys } from "@marinara-engine/shared";
+import { vmRegexExecutor } from "./regex-timeout.js";
 
 /** Compute cosine similarity between two vectors. Returns 0 for empty/mismatched vectors. */
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -41,6 +42,8 @@ export interface ActivatedEntry {
   rawContent?: string;
   /** Which key(s) matched */
   matchedKeys: string[];
+  /** True when a primary key matched the latest user message directly. */
+  matchedLatestUserMessage?: boolean;
   /** Priority order for injection */
   injectionOrder: number;
   /** True when sticky state kept this entry active without a fresh keyword match */
@@ -406,6 +409,8 @@ export function scanForActivatedEntries(
   // Build the text to scan from recent messages
   const messagesToScan = scanDepth > 0 ? messages.slice(-scanDepth) : messages;
   const combinedText = messagesToScan.map((m) => m.content).join("\n");
+  const latestUserMessage = [...messages].reverse().find((message) => message.role === "user");
+  const latestUserText = latestUserMessage?.content ?? "";
 
   const activated: ActivatedEntry[] = [];
   const activatedIds = new Set<string>();
@@ -463,11 +468,14 @@ export function scanForActivatedEntries(
       useRegex: entry.useRegex,
       matchWholeWords: entry.matchWholeWords,
       caseSensitive: entry.caseSensitive,
+      regexExecutor: vmRegexExecutor,
     };
 
     // Test primary keys
     const { matched, matchedKeys } = testPrimaryKeys(entry.keys, entryScanText, matchOptions);
     if (!matched) continue;
+    const matchedLatestUserMessage =
+      latestUserText.length > 0 ? testPrimaryKeys(entry.keys, latestUserText, matchOptions).matched : false;
 
     // Test secondary keys (selective mode)
     if (entry.selective && entry.secondaryKeys.length > 0) {
@@ -481,6 +489,7 @@ export function scanForActivatedEntries(
     activated.push({
       entry,
       matchedKeys,
+      matchedLatestUserMessage,
       injectionOrder: entry.order,
     });
     activatedIds.add(entry.id);

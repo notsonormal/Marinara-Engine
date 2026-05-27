@@ -22,8 +22,8 @@ import {
   X,
   Flag,
   Eye,
+  Search,
   ScrollText,
-  Circle,
   Brain,
   Languages,
   Volume2,
@@ -31,8 +31,10 @@ import {
   Loader2,
   Pause,
   Play,
+  ChevronRight,
+  EyeOff,
 } from "lucide-react";
-import type { Message } from "@marinara-engine/shared";
+import { formatTextQuotes, type Message, type QuoteFormat } from "@marinara-engine/shared";
 import { memo, useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
@@ -46,16 +48,93 @@ import { useTranslate } from "../../hooks/use-translate";
 import { api } from "../../lib/api-client";
 import { ttsService } from "../../lib/tts-service";
 import { useTTSConfig } from "../../hooks/use-tts";
-import { buildTTSMessageText, resolveTTSVoiceForSpeaker } from "../../lib/tts-dialogue";
+import { buildTTSVoiceRequests, normalizeTTSCharacterName, withTTSVoiceRequestCacheKeys } from "../../lib/tts-dialogue";
 import { DIALOGUE_QUOTE_PATTERN_SOURCE, HTML_SAFE_DIALOGUE_QUOTE_PATTERN_SOURCE } from "../../lib/dialogue-quotes";
 import DOMPurify from "dompurify";
-import type { CharacterMap, MessageSelectionToggle, PersonaInfo } from "./chat-area.types";
+import type { CharacterMap, ExpressionAvatarResolver, MessageSelectionToggle, PersonaInfo } from "./chat-area.types";
 import { GenerationReplayDetailsModal, hasGenerationReplayDetails } from "./GenerationReplayDetailsModal";
 import { ImagePromptPanel } from "./ImagePromptPanel";
 import { SwipeJumpControl } from "./SwipeJumpControl";
 
 const MESSAGE_ACTION_ICON_SIZE = "1em";
 const MESSAGE_SWIPE_ICON_SIZE = "1.15em";
+const MESSAGE_DOUBLE_TAP_MS = 320;
+const MESSAGE_DOUBLE_TAP_DISTANCE_PX = 26;
+
+function isMessageQuickEditIgnoredTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(
+    target.closest(
+      'button, a, input, textarea, select, option, [contenteditable="true"], [role="button"], [data-no-message-quick-edit]',
+    ),
+  );
+}
+
+function HiddenFromAIMessageButton({
+  roleplay,
+  canCollapse,
+  onExpand,
+  isHiddenExpanded,
+}: {
+  roleplay?: boolean;
+  canCollapse: boolean;
+  onExpand: () => void;
+  isHiddenExpanded: boolean;
+}) {
+  const statusClassName = cn(
+    "inline-flex items-center gap-1 rounded px-1 py-0.5 text-[0.625rem] font-medium text-amber-500/80",
+    roleplay && "text-amber-200/60",
+  );
+
+  if (!canCollapse) {
+    return (
+      <span className={cn(statusClassName, "align-middle")} title="Hidden from AI">
+        <EyeOff size="0.7rem" className="shrink-0" />
+      </span>
+    );
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1 align-middle">
+      <button
+        type="button"
+        onClick={onExpand}
+        className={cn(
+          "inline-flex items-center gap-1 rounded px-1 py-0.5 text-[0.625rem] font-medium text-amber-500/80 transition-colors hover:bg-amber-500/10 hover:text-amber-400",
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/40",
+          roleplay && "text-amber-200/60 hover:bg-white/5 hover:text-amber-100/80",
+        )}
+        aria-label={isHiddenExpanded ? "Collapse hidden from AI message" : "Expand hidden from AI message"}
+        title={isHiddenExpanded ? "Collapse hidden from AI message" : "Expand hidden from AI message"}
+      >
+        <ChevronRight size="0.7rem" className={cn("shrink-0 transition-transform", isHiddenExpanded && "rotate-90")} />
+        <EyeOff size="0.7rem" className="shrink-0" />
+      </button>
+    </span>
+  );
+}
+
+function HiddenFromAIMessageSummary({ roleplay, onExpand }: { roleplay?: boolean; onExpand: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        onExpand();
+      }}
+      className={cn(
+        "flex w-full items-center gap-2 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-left text-[0.75rem] text-amber-600/90 transition-colors hover:bg-amber-500/15 dark:text-amber-200/75",
+        roleplay && "border-amber-200/15 bg-white/5 text-amber-100/70 hover:bg-white/10",
+      )}
+      title="Expand hidden from AI message"
+      aria-label="Expand hidden from AI message"
+    >
+      <EyeOff size="0.8rem" className="shrink-0" />
+      <span className="min-w-0 flex-1 truncate">Hidden from AI</span>
+      <span className="shrink-0 text-[0.625rem] opacity-70">Show</span>
+    </button>
+  );
+}
 
 /** Isolated edit textarea — uncontrolled to avoid React re-renders on every keystroke. */
 const EditTextarea = memo(function EditTextarea({
@@ -153,6 +232,7 @@ interface ChatMessageProps {
   personaInfo?: PersonaInfo;
   groupChatMode?: string;
   chatCharacterIds?: string[];
+  expressionAvatarResolver?: ExpressionAvatarResolver;
   /** Distance from the latest message (0 = newest). Used for depth-range regex filtering. */
   messageDepth?: number;
   /** 1-based ordinal position in the message list. Shown under avatar when actions visible. */
@@ -474,9 +554,9 @@ function renderContent(
   speakerColorMap?: Map<string, string>,
   boldDialogue = true,
   htmlScopeClass = "mari-html-message-content",
+  quoteFormat: QuoteFormat = "straight",
 ): ReactNode {
-  // Normalise curly quotes to straight so they display consistently
-  const normalized = text.replace(/[“”„‟]/g, '"').replace(/[‘’]/g, "'");
+  const normalized = formatTextQuotes(text, quoteFormat);
 
   // Strip speaker tags before HTML detection (they aren't real HTML)
   const withoutSpeakerTags = normalized.replace(/<\/?speaker(?:="[^"]*")?>/g, "");
@@ -581,22 +661,31 @@ function renderContent(
   return <div className={cn("overflow-hidden", htmlScopeClass)} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-/** Build style object for name color (supports gradients). */
-function nameColorStyle(color?: string): React.CSSProperties | undefined {
-  if (!color) return undefined;
-  if (color.startsWith("linear-gradient")) {
-    return {
-      background: color,
-      backgroundRepeat: "no-repeat",
-      backgroundSize: "100% 100%",
-      WebkitBackgroundClip: "text",
-      WebkitTextFillColor: "transparent",
-      backgroundClip: "text",
-      color: "transparent",
-      display: "inline-block",
-    };
-  }
-  return { color };
+function isGradientNameColor(color?: string): color is string {
+  return typeof color === "string" && /gradient\(/i.test(color.trim());
+}
+
+function solidNameColorStyle(color?: string): React.CSSProperties | undefined {
+  const value = color?.trim();
+  if (!value || isGradientNameColor(value)) return undefined;
+  return { color: value, WebkitTextFillColor: value };
+}
+
+function gradientNameColorStyle(color: string): React.CSSProperties {
+  return {
+    backgroundImage: color.trim(),
+    backgroundRepeat: "no-repeat",
+    backgroundSize: "100% 100%",
+    WebkitBackgroundClip: "text",
+    WebkitTextFillColor: "transparent",
+    backgroundClip: "text",
+    color: "transparent",
+    display: "inline-block",
+  };
+}
+
+function NameColorText({ color, children }: { color?: string; children: ReactNode }) {
+  return isGradientNameColor(color) ? <span style={gradientNameColorStyle(color)}>{children}</span> : <>{children}</>;
 }
 
 export const ChatMessage = memo(function ChatMessage({
@@ -619,6 +708,7 @@ export const ChatMessage = memo(function ChatMessage({
   personaInfo,
   groupChatMode,
   chatCharacterIds,
+  expressionAvatarResolver,
   messageDepth,
   messageIndex,
   messageOrderIndex,
@@ -713,10 +803,13 @@ export const ChatMessage = memo(function ChatMessage({
   const [showThinking, setShowThinking] = useState(false);
   const [showGenerationReplay, setShowGenerationReplay] = useState(false);
   const [showActions, setShowActions] = useState(false);
+  const [manuallyExpandedHidden, setManuallyExpandedHidden] = useState(false);
+  const collapseHiddenMessages = useUIStore((s) => s.summaryPopoverSettings.collapseHiddenMessages);
   const [avatarLightbox, setAvatarLightbox] = useState<string | null>(null);
   const [avatarLightboxPrompt, setAvatarLightboxPrompt] = useState<string | null>(null);
   const scrollRestoreRef = useRef<{ el: HTMLElement; top: number } | null>(null);
   const msgRef = useRef<HTMLDivElement>(null);
+  const lastQuickTapRef = useRef<{ time: number; x: number; y: number } | null>(null);
   const openImageLightbox = useCallback((url: string, prompt?: unknown) => {
     setAvatarLightbox(url);
     setAvatarLightboxPrompt(typeof prompt === "string" ? prompt.trim() : null);
@@ -734,12 +827,41 @@ export const ChatMessage = memo(function ChatMessage({
   // TTS
   const { data: ttsConfig } = useTTSConfig();
   const ttsEnabled = ttsConfig?.enabled ?? false;
-  const ttsSpeakerName = message.characterId ? characterMap?.get(message.characterId)?.name : undefined;
-  const ttsVoice = ttsConfig ? resolveTTSVoiceForSpeaker(ttsConfig, ttsSpeakerName, message.characterId) : "";
-  const ttsSpeakText =
-    ttsConfig && (ttsConfig.source !== "elevenlabs" || ttsVoice)
-      ? buildTTSMessageText(message.content, ttsConfig, ttsSpeakerName)
-      : "";
+  const ttsSpeakerName =
+    message.role === "narrator"
+      ? "Narrator"
+      : message.characterId
+        ? characterMap?.get(message.characterId)?.name
+        : undefined;
+  const resolveTTSCharacterId = useCallback(
+    (speaker?: string | null) => {
+      const normalizedSpeaker = normalizeTTSCharacterName(speaker);
+      if (!normalizedSpeaker || !characterMap) return null;
+      for (const [characterId, character] of characterMap) {
+        if (normalizeTTSCharacterName(character.name) === normalizedSpeaker) return characterId;
+      }
+      return null;
+    },
+    [characterMap],
+  );
+  const ttsVoiceRequests = useMemo(
+    () =>
+      ttsConfig
+        ? withTTSVoiceRequestCacheKeys(
+            buildTTSVoiceRequests(
+              message.content,
+              ttsConfig,
+              ttsSpeakerName,
+              message.characterId,
+              resolveTTSCharacterId,
+            ),
+            ttsConfig,
+            message.id,
+          )
+        : [],
+    [message.characterId, message.content, message.id, resolveTTSCharacterId, ttsConfig, ttsSpeakerName],
+  );
+  const hasTTSContent = ttsVoiceRequests.length > 0;
   const [ttsState, setTTSState] = useState(ttsService.getState());
   const [ttsActiveId, setTTSActiveId] = useState<string | null>(ttsService.getActiveId());
   useEffect(
@@ -765,10 +887,10 @@ export const ChatMessage = memo(function ChatMessage({
     if (liveIsThis) {
       ttsService.stop();
     } else {
-      if (!ttsSpeakText) return;
-      void ttsService.speak(ttsSpeakText, message.id, { speaker: ttsSpeakerName, voice: ttsVoice });
+      if (!hasTTSContent) return;
+      void ttsService.speakSequence(ttsVoiceRequests, message.id);
     }
-  }, [message.id, ttsSpeakText, ttsSpeakerName, ttsVoice]);
+  }, [hasTTSContent, message.id, ttsVoiceRequests]);
 
   const handlePauseResumeTTS = useCallback(() => {
     if (ttsService.getActiveId() !== message.id) return;
@@ -784,6 +906,34 @@ export const ChatMessage = memo(function ChatMessage({
       ttsService.restart();
     }
   }, [message.id]);
+
+  const startEditing = useCallback(() => {
+    if (!onEdit || isStreaming) return;
+    const sp = msgRef.current?.closest("[class*='overflow-y']") as HTMLElement | null;
+    if (sp) scrollRestoreRef.current = { el: sp, top: sp.scrollTop };
+    setEditing(true);
+  }, [isStreaming, onEdit]);
+
+  const startQuickEdit = useCallback(
+    (target: EventTarget | null) => {
+      if (!isRoleplay || !onEdit || editing || isStreaming || multiSelectMode) return false;
+      if (isMessageQuickEditIgnoredTarget(target)) return false;
+      window.getSelection()?.removeAllRanges();
+      setShowActions(false);
+      startEditing();
+      return true;
+    },
+    [editing, isRoleplay, isStreaming, multiSelectMode, onEdit, startEditing],
+  );
+
+  const handleRoleplayDoubleClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (!startQuickEdit(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+    },
+    [startQuickEdit],
+  );
 
   // Dismiss actions when tapping outside on mobile
   useEffect(() => {
@@ -814,9 +964,26 @@ export const ChatMessage = memo(function ChatMessage({
       // Don't toggle when tapping buttons, links, or the edit textarea
       const target = e.target as HTMLElement;
       if (target.closest("button, a, textarea")) return;
+      if (isRoleplay) {
+        const now = Date.now();
+        const lastTap = lastQuickTapRef.current;
+        const dx = lastTap ? Math.abs(e.clientX - lastTap.x) : Number.POSITIVE_INFINITY;
+        const dy = lastTap ? Math.abs(e.clientY - lastTap.y) : Number.POSITIVE_INFINITY;
+        const isDoubleTap =
+          !!lastTap &&
+          now - lastTap.time <= MESSAGE_DOUBLE_TAP_MS &&
+          dx <= MESSAGE_DOUBLE_TAP_DISTANCE_PX &&
+          dy <= MESSAGE_DOUBLE_TAP_DISTANCE_PX;
+        lastQuickTapRef.current = isDoubleTap ? null : { time: now, x: e.clientX, y: e.clientY };
+        if (isDoubleTap && startQuickEdit(e.target)) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+      }
       setShowActions((v) => !v);
     },
-    [isSelected, message.id, messageOrderIndex, multiSelectMode, onToggleSelect],
+    [isRoleplay, isSelected, message.id, messageOrderIndex, multiSelectMode, onToggleSelect, startQuickEdit],
   );
 
   // Parse message extra for conversation start flag
@@ -828,6 +995,14 @@ export const ChatMessage = memo(function ChatMessage({
   const isHiddenFromAI = extra.hiddenFromAI === true;
   const thinking = extra.thinking as string | undefined;
   const generationReplay = hasGenerationReplayDetails(extra.generationReplay) ? extra.generationReplay : null;
+
+  useEffect(() => {
+    setManuallyExpandedHidden(false);
+  }, [message.id]);
+
+  useEffect(() => {
+    if (!isHiddenFromAI || !collapseHiddenMessages) setManuallyExpandedHidden(false);
+  }, [collapseHiddenMessages, isHiddenFromAI]);
 
   useEffect(() => {
     if (!generationReplay) setShowGenerationReplay(false);
@@ -891,12 +1066,6 @@ export const ChatMessage = memo(function ChatMessage({
       scrollRestoreRef.current = null;
     }
   }, [editing]);
-
-  const startEditing = useCallback(() => {
-    const sp = msgRef.current?.closest("[class*='overflow-y']") as HTMLElement | null;
-    if (sp) scrollRestoreRef.current = { el: sp, top: sp.scrollTop };
-    setEditing(true);
-  }, []);
 
   useEffect(() => {
     if (!onEdit) return;
@@ -1002,10 +1171,17 @@ export const ChatMessage = memo(function ChatMessage({
 
   const displayName = isUser ? userName : charName;
   const avatarUrl = isUser ? (msgPersona?.avatarUrl ?? personaInfo?.avatarUrl ?? null) : (charInfo?.avatarUrl ?? null);
+  const expressionAvatarUrl =
+    !isUser && message.characterId ? (expressionAvatarResolver?.(message, message.characterId) ?? null) : null;
+  const displayAvatarUrl = expressionAvatarUrl ?? avatarUrl;
   const personaAvatarCrop = isUser
     ? (parseAvatarCropJson(msgPersona?.avatarCrop) ?? personaInfo?.avatarCrop ?? null)
     : null;
-  const avatarCropStyle = isUser ? getAvatarCropStyle(personaAvatarCrop) : getAvatarCropStyle(charInfo?.avatarCrop);
+  const avatarCropStyle = expressionAvatarUrl
+    ? {}
+    : isUser
+      ? getAvatarCropStyle(personaAvatarCrop)
+      : getAvatarCropStyle(charInfo?.avatarCrop);
 
   // Resolve colors: character colors for assistant, persona colors for user
   // Prefer per-message persona snapshot colors over current persona
@@ -1045,11 +1221,13 @@ export const ChatMessage = memo(function ChatMessage({
     return chatCharacterIds
       .map((id) => {
         const info = characterMap.get(id);
-        if (!info?.avatarUrl) return null;
-        return { url: info.avatarUrl, crop: info.avatarCrop };
+        const expressionUrl = expressionAvatarResolver?.(message, id) ?? null;
+        const url = expressionUrl ?? info?.avatarUrl;
+        if (!url) return null;
+        return { id, url, crop: expressionUrl ? null : info?.avatarCrop };
       })
-      .filter(Boolean) as { url: string; crop?: AvatarCropValue | null }[];
-  }, [isMergedGroup, characterMap, chatCharacterIds]);
+      .filter(Boolean) as { id: string; url: string; crop?: AvatarCropValue | null }[];
+  }, [isMergedGroup, characterMap, chatCharacterIds, expressionAvatarResolver, message]);
   const mergedNameColors = useMemo(() => {
     if (!isMergedGroup || !characterMap || !chatCharacterIds) return [];
     const fallbackPalette = ["#c084fc", "#f472b6", "#fb923c", "#4ade80", "#60a5fa", "#facc15"];
@@ -1093,23 +1271,6 @@ export const ChatMessage = memo(function ChatMessage({
     };
   }, [isMergedGroup, mergedAvatars.length, mergedNameColors.length]);
 
-  /** Build a stable style object for a given name color (gradient or plain). */
-  function nameColorToStyle(c: string): React.CSSProperties {
-    if (c.startsWith("linear-gradient")) {
-      return {
-        background: c,
-        backgroundRepeat: "no-repeat",
-        backgroundSize: "100% 100%",
-        WebkitBackgroundClip: "text",
-        WebkitTextFillColor: "transparent",
-        backgroundClip: "text",
-        color: "transparent",
-        display: "inline-block",
-      };
-    }
-    return { color: c, WebkitTextFillColor: c };
-  }
-
   /** Render a stack of absolutely-positioned "Narrator" labels that crossfade via opacity. */
   const mergedNameElement =
     isMergedGroup && mergedNameColors.length > 0 ? (
@@ -1122,12 +1283,12 @@ export const ChatMessage = memo(function ChatMessage({
             data-cycle-name
             className="absolute inset-0"
             style={{
-              ...nameColorToStyle(c),
+              ...solidNameColorStyle(c),
               opacity: i === 0 ? 1 : 0,
               transition: "opacity 1s ease",
             }}
           >
-            Narrator
+            <NameColorText color={c}>Narrator</NameColorText>
           </span>
         ))}
       </span>
@@ -1135,6 +1296,7 @@ export const ChatMessage = memo(function ChatMessage({
 
   // Render content with dialogue highlighting (or HTML rendering)
   const text = typeof displayContent === "string" ? displayContent : message.content;
+  const quoteFormat = useUIStore((s) => s.quoteFormat);
   const isHtmlContent = HTML_TAG_RE.test(text);
   const htmlScopeClass = useMemo(() => {
     const suffix = message.id.replace(/[^a-zA-Z0-9_-]/g, "");
@@ -1142,8 +1304,8 @@ export const ChatMessage = memo(function ChatMessage({
   }, [message.id]);
 
   const renderedContent = useMemo(() => {
-    return renderContent(text, dialogueColor, speakerColorMap, boldDialogue, htmlScopeClass);
-  }, [text, dialogueColor, speakerColorMap, boldDialogue, htmlScopeClass]);
+    return renderContent(text, dialogueColor, speakerColorMap, boldDialogue, htmlScopeClass, quoteFormat);
+  }, [text, dialogueColor, speakerColorMap, boldDialogue, htmlScopeClass, quoteFormat]);
 
   const handleCopy = () => {
     copyToClipboard(message.content);
@@ -1155,6 +1317,7 @@ export const ChatMessage = memo(function ChatMessage({
   const swipeCount = message.swipeCount ?? 0;
   const hasSwipes = swipeCount > 1;
 
+  const hideRoleplayAvatars = isRoleplay && roleplayAvatarStyle === "none";
   const useCompactRectangleAvatar = isRoleplay && roleplayAvatarStyle === "rectangles";
   const compactAvatarFrameClass = useCompactRectangleAvatar
     ? "h-[calc(3.5rem*var(--roleplay-avatar-scale))] w-[calc(2.75rem*var(--roleplay-avatar-scale))] rounded-xl"
@@ -1181,7 +1344,9 @@ export const ChatMessage = memo(function ChatMessage({
   };
   const compactAvatarCrop: AvatarCropValue | null = isUser
     ? (personaAvatarCrop ?? null)
-    : (charInfo?.avatarCrop ?? null);
+    : expressionAvatarUrl
+      ? null
+      : (charInfo?.avatarCrop ?? null);
   const compactAvatarCropStyle: React.CSSProperties = useCompactRectangleAvatar
     ? rectangleSafeCropStyle(compactAvatarCrop, avatarCropStyle)
     : avatarCropStyle;
@@ -1199,12 +1364,13 @@ export const ChatMessage = memo(function ChatMessage({
     ? `${Math.max(1, Math.min(1.75, 1.125 * roleplayAvatarScale))}rem`
     : `${Math.max(0.875, Math.min(1.5, roleplayAvatarScale))}rem`;
   const showRoleplayAvatarPanel = isRoleplay && roleplayAvatarStyle === "panel" && !isGrouped;
+  const showCompactRoleplayAvatar = isRoleplay && !isGrouped && !hideRoleplayAvatars && !showRoleplayAvatarPanel;
   const roleplayAvatarPanelTail = showRoleplayAvatarPanel ? (
     isMergedGroup && mergedAvatars.length > 0 ? (
       <div className="rpg-avatar-panel-tail absolute inset-0 pointer-events-none overflow-hidden">
         {mergedAvatars.map((avatar, i) => (
           <img
-            key={`tail-${avatar.url}`}
+            key={`tail-${avatar.id}`}
             ref={(el) => {
               mergedAvatarTailRefs.current[i] = el;
             }}
@@ -1218,10 +1384,10 @@ export const ChatMessage = memo(function ChatMessage({
           />
         ))}
       </div>
-    ) : avatarUrl ? (
+    ) : displayAvatarUrl ? (
       <div className="rpg-avatar-panel-tail absolute inset-0 pointer-events-none overflow-hidden">
         <img
-          src={avatarUrl}
+          src={displayAvatarUrl}
           alt=""
           aria-hidden="true"
           loading="lazy"
@@ -1232,7 +1398,20 @@ export const ChatMessage = memo(function ChatMessage({
       </div>
     ) : null
   ) : null;
-  const roleplayBubbleContent = editing ? (
+  const isHiddenExpanded =
+    isHiddenFromAI && (!collapseHiddenMessages || manuallyExpandedHidden || editing || !!isStreaming);
+  const isHiddenCollapsed = isHiddenFromAI && collapseHiddenMessages && !isHiddenExpanded;
+  const hiddenFromAIHeader = isHiddenFromAI ? (
+    <HiddenFromAIMessageButton
+      roleplay={isRoleplay}
+      canCollapse={collapseHiddenMessages}
+      isHiddenExpanded={isHiddenExpanded}
+      onExpand={() => setManuallyExpandedHidden((value) => !value)}
+    />
+  ) : null;
+  const roleplayBubbleContent = isHiddenCollapsed ? (
+    <HiddenFromAIMessageSummary roleplay={isRoleplay} onExpand={() => setManuallyExpandedHidden(true)} />
+  ) : editing ? (
     <EditTextarea
       initialContent={message.content}
       fontSize={chatFontSize}
@@ -1241,7 +1420,10 @@ export const ChatMessage = memo(function ChatMessage({
     />
   ) : (
     <>
-      <div className={cn("mari-message-content break-words", !isHtmlContent && "whitespace-pre-wrap")}>
+      <div
+        className={cn("mari-message-content break-words", !isHtmlContent && "whitespace-pre-wrap")}
+        style={messageTextStyle}
+      >
         {isStreaming && !message.content ? (
           <div className="mari-message-typing flex items-center gap-1 py-0.5">
             <span className="h-2 w-2 animate-bounce rounded-full bg-blue-400/60 [animation-delay:0ms]" />
@@ -1322,6 +1504,7 @@ export const ChatMessage = memo(function ChatMessage({
             multiSelectMode && isSelected && "rounded-lg bg-[var(--destructive)]/5 ring-2 ring-[var(--destructive)]/50",
           )}
           onClick={handleMobileTap}
+          onDoubleClick={handleRoleplayDoubleClick}
         >
           <div className="flex gap-3">
             {multiSelectMode && (
@@ -1360,15 +1543,20 @@ export const ChatMessage = memo(function ChatMessage({
               )}
               <div className="mb-1 flex items-center gap-2 text-[0.625rem] font-semibold uppercase tracking-widest text-amber-400/70">
                 <span className="h-px flex-1 bg-amber-400/20" />
+                {hiddenFromAIHeader}
                 Narrator
                 <span className="h-px flex-1 bg-amber-400/20" />
               </div>
-              <div
-                className={cn("mari-message-content break-words italic", !isHtmlContent && "whitespace-pre-wrap")}
-                style={messageTextStyle}
-              >
-                {renderedContent}
-              </div>
+              {isHiddenCollapsed ? (
+                <HiddenFromAIMessageSummary roleplay onExpand={() => setManuallyExpandedHidden(true)} />
+              ) : (
+                <div
+                  className={cn("mari-message-content break-words italic", !isHtmlContent && "whitespace-pre-wrap")}
+                  style={messageTextStyle}
+                >
+                  {renderedContent}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -1387,6 +1575,7 @@ export const ChatMessage = memo(function ChatMessage({
           data-message-id={message.id}
           data-message-role={message.role}
           onClick={handleMobileTap}
+          onDoubleClick={handleRoleplayDoubleClick}
           style={roleplayAvatarScaleStyle}
         >
           {/* Multi-select checkbox */}
@@ -1409,7 +1598,7 @@ export const ChatMessage = memo(function ChatMessage({
             </div>
           )}
           {/* Avatar Column */}
-          {!isGrouped && !showRoleplayAvatarPanel && (
+          {showCompactRoleplayAvatar && (
             <div className="mari-message-avatar flex flex-col items-center flex-shrink-0 pt-1">
               {isMergedGroup && mergedAvatars.length > 0 ? (
                 <button
@@ -1439,7 +1628,7 @@ export const ChatMessage = memo(function ChatMessage({
                     />
                   ))}
                 </button>
-              ) : avatarUrl ? (
+              ) : displayAvatarUrl ? (
                 <div className={cn(!isUser && "rpg-avatar-glow")}>
                   <button
                     type="button"
@@ -1447,11 +1636,11 @@ export const ChatMessage = memo(function ChatMessage({
                       "relative cursor-pointer overflow-hidden ring-2 ring-white/10",
                       compactAvatarFrameClass,
                     )}
-                    onClick={() => openImageLightbox(avatarUrl)}
+                    onClick={() => openImageLightbox(displayAvatarUrl)}
                     aria-label={`Open ${displayName} avatar`}
                   >
                     <img
-                      src={avatarUrl}
+                      src={displayAvatarUrl}
                       alt={displayName}
                       loading="lazy"
                       decoding="async"
@@ -1486,7 +1675,7 @@ export const ChatMessage = memo(function ChatMessage({
           )}
 
           {/* Spacer if grouped (no avatar) */}
-          {isGrouped && <div className={cn("flex-shrink-0", compactAvatarSpacerClass)} />}
+          {isGrouped && !hideRoleplayAvatars && <div className={cn("flex-shrink-0", compactAvatarSpacerClass)} />}
 
           {/* Content */}
           <div
@@ -1499,14 +1688,19 @@ export const ChatMessage = memo(function ChatMessage({
             {/* Name + time (only if not grouped) */}
             {!isGrouped && (
               <div className={cn("flex items-baseline gap-2 px-1", isUser && "flex-row-reverse")}>
+                {hiddenFromAIHeader}
                 <span
                   className={cn(
                     "mari-message-name text-[0.75rem] font-bold tracking-tight",
                     !msgNameColor && !isMergedGroup && (isUser ? "text-neutral-300" : "rpg-char-name"),
                   )}
-                  style={!isMergedGroup ? nameColorStyle(msgNameColor) : undefined}
+                  style={!isMergedGroup ? solidNameColorStyle(msgNameColor) : undefined}
                 >
-                  {isMergedGroup ? mergedNameElement : displayName}
+                  {isMergedGroup ? (
+                    mergedNameElement
+                  ) : (
+                    <NameColorText color={msgNameColor}>{displayName}</NameColorText>
+                  )}
                 </span>
                 <span className="text-[0.625rem] text-white/30">{formatTime(message.createdAt)}</span>
                 {genLabel && (
@@ -1514,9 +1708,11 @@ export const ChatMessage = memo(function ChatMessage({
                     {genLabel}
                   </span>
                 )}
-                {showRoleplayAvatarPanel && (showActions || showMessageNumbers) && messageIndex != null && (
-                  <span className="text-[0.5625rem] font-medium text-white/25 select-none">#{messageIndex}</span>
-                )}
+                {(showRoleplayAvatarPanel || hideRoleplayAvatars) &&
+                  (showActions || showMessageNumbers) &&
+                  messageIndex != null && (
+                    <span className="text-[0.5625rem] font-medium text-white/25 select-none">#{messageIndex}</span>
+                  )}
               </div>
             )}
 
@@ -1553,11 +1749,14 @@ export const ChatMessage = memo(function ChatMessage({
                 <div className={cn("flex min-h-full items-stretch", isUser && "flex-row-reverse")}>
                   <div
                     className={cn(
-                      "relative flex w-[calc(4.75rem*var(--roleplay-avatar-scale))] shrink-0 items-start self-stretch overflow-hidden md:w-[calc(5.25rem*var(--roleplay-avatar-scale))]",
+                      "relative flex w-[calc(5.5rem*var(--roleplay-avatar-scale))] shrink-0 items-start self-stretch overflow-hidden md:w-[calc(6rem*var(--roleplay-avatar-scale))]",
                       isUser ? "border-l border-white/8" : "border-r border-white/8",
+                      isUser
+                        ? "bg-gradient-to-b from-neutral-500/18 via-neutral-600/10 to-transparent"
+                        : "bg-gradient-to-b from-purple-500/18 via-pink-600/10 to-transparent",
                     )}
                   >
-                    <div className="rpg-avatar-panel-stack relative h-full max-h-[calc(11rem*var(--roleplay-avatar-scale))] w-full overflow-hidden">
+                    <div className="rpg-avatar-panel-stack absolute left-0 top-0 h-[calc(11rem*var(--roleplay-avatar-scale))] w-full overflow-hidden">
                       {isMergedGroup && mergedAvatars.length > 0 ? (
                         <button
                           type="button"
@@ -1570,7 +1769,7 @@ export const ChatMessage = memo(function ChatMessage({
                         >
                           {mergedAvatars.map((avatar, i) => (
                             <img
-                              key={avatar.url}
+                              key={avatar.id}
                               ref={(el) => {
                                 mergedAvatarRefs.current[i] = el;
                               }}
@@ -1583,18 +1782,18 @@ export const ChatMessage = memo(function ChatMessage({
                             />
                           ))}
                         </button>
-                      ) : avatarUrl ? (
+                      ) : displayAvatarUrl ? (
                         <button
                           type="button"
                           className={cn(
                             "rpg-avatar-panel-media absolute inset-0 block h-full w-full cursor-zoom-in overflow-hidden",
                             !isUser && "rpg-avatar-panel",
                           )}
-                          onClick={() => openImageLightbox(avatarUrl)}
+                          onClick={() => openImageLightbox(displayAvatarUrl)}
                           aria-label={`Open ${displayName} avatar`}
                         >
                           <img
-                            src={avatarUrl}
+                            src={displayAvatarUrl}
                             alt={displayName}
                             loading="lazy"
                             decoding="async"
@@ -1638,11 +1837,11 @@ export const ChatMessage = memo(function ChatMessage({
                       />
                     </div>
                   </div>
-                  <div className="min-w-0 flex-1 px-3 py-3">{roleplayBubbleContent}</div>
+                  {roleplayBubbleContent && <div className="min-w-0 flex-1 px-3 py-3">{roleplayBubbleContent}</div>}
                 </div>
-              ) : (
+              ) : roleplayBubbleContent ? (
                 <div className="px-4 py-3">{roleplayBubbleContent}</div>
-              )}
+              ) : null}
             </div>
 
             {/* Image attachments (illustrations, selfies) */}
@@ -1734,7 +1933,11 @@ export const ChatMessage = memo(function ChatMessage({
               {onToggleHiddenFromAI && (
                 <ActionBtn
                   icon={
-                    isHiddenFromAI ? <Circle size={MESSAGE_ACTION_ICON_SIZE} /> : <X size={MESSAGE_ACTION_ICON_SIZE} />
+                    isHiddenFromAI ? (
+                      <Eye size={MESSAGE_ACTION_ICON_SIZE} />
+                    ) : (
+                      <EyeOff size={MESSAGE_ACTION_ICON_SIZE} />
+                    )
                   }
                   onClick={() => onToggleHiddenFromAI(message.id, isHiddenFromAI)}
                   title={isHiddenFromAI ? "Unhide from AI" : "Hide from AI"}
@@ -1744,7 +1947,7 @@ export const ChatMessage = memo(function ChatMessage({
               )}
               {isLastAssistantMessage && !isUser && (
                 <ActionBtn
-                  icon={<Eye size={MESSAGE_ACTION_ICON_SIZE} />}
+                  icon={<Search size={MESSAGE_ACTION_ICON_SIZE} />}
                   onClick={() => onPeekPrompt?.()}
                   title="Peek prompt"
                   dark
@@ -1828,7 +2031,7 @@ export const ChatMessage = memo(function ChatMessage({
                     }
                     onClick={handleSpeak}
                     title={
-                      !ttsSpeakText
+                      !hasTTSContent
                         ? "No dialogue to speak"
                         : isLoadingThis
                           ? "Loading…"
@@ -1837,7 +2040,7 @@ export const ChatMessage = memo(function ChatMessage({
                             : "Speak"
                     }
                     className={isSpeakingThis ? "text-sky-400 hover:text-sky-300" : undefined}
-                    disabled={!ttsSpeakText || (ttsBusy && !isSpeakingThis)}
+                    disabled={!hasTTSContent || (ttsBusy && !isSpeakingThis)}
                     dark
                   />
                 </>
@@ -1912,7 +2115,7 @@ export const ChatMessage = memo(function ChatMessage({
         className={cn("flex min-w-0 max-w-[72%] gap-2", isUser && "flex-row-reverse", editing && "w-[85%] max-w-[85%]")}
       >
         {/* Avatar — only show for first in group */}
-        {(!isUser || avatarUrl) && (
+        {(!isUser || displayAvatarUrl) && (
           <div
             className={cn(
               "mari-message-avatar flex flex-col items-center flex-shrink-0 self-end",
@@ -1931,7 +2134,7 @@ export const ChatMessage = memo(function ChatMessage({
               >
                 {mergedAvatars.map((avatar, i) => (
                   <img
-                    key={avatar.url}
+                    key={avatar.id}
                     ref={(el) => {
                       mergedAvatarRefs.current[i] = el;
                     }}
@@ -1944,15 +2147,15 @@ export const ChatMessage = memo(function ChatMessage({
                   />
                 ))}
               </button>
-            ) : avatarUrl ? (
+            ) : displayAvatarUrl ? (
               <button
                 type="button"
                 className="relative h-8 w-8 cursor-pointer overflow-hidden rounded-full"
-                onClick={() => openImageLightbox(avatarUrl)}
+                onClick={() => openImageLightbox(displayAvatarUrl)}
                 aria-label={`Open ${displayName} avatar`}
               >
                 <img
-                  src={avatarUrl}
+                  src={displayAvatarUrl}
                   alt={displayName}
                   loading="lazy"
                   decoding="async"
@@ -1982,15 +2185,18 @@ export const ChatMessage = memo(function ChatMessage({
         >
           {/* Name — only for first in group */}
           {!isGrouped && !isUser && (
-            <span
-              className={cn(
-                "mari-message-name px-3 text-[0.6875rem] font-semibold",
-                !msgNameColor && !isMergedGroup && "text-[var(--muted-foreground)]",
-              )}
-              style={!isMergedGroup ? nameColorStyle(msgNameColor) : undefined}
-            >
-              {isMergedGroup ? mergedNameElement : displayName}
-            </span>
+            <div className="flex items-center gap-2 px-3">
+              {hiddenFromAIHeader}
+              <span
+                className={cn(
+                  "mari-message-name text-[0.6875rem] font-semibold",
+                  !msgNameColor && !isMergedGroup && "text-[var(--muted-foreground)]",
+                )}
+                style={!isMergedGroup ? solidNameColorStyle(msgNameColor) : undefined}
+              >
+                {isMergedGroup ? mergedNameElement : <NameColorText color={msgNameColor}>{displayName}</NameColorText>}
+              </span>
+            </div>
           )}
 
           {/* Conversation start marker */}
@@ -2019,7 +2225,9 @@ export const ChatMessage = memo(function ChatMessage({
             )}
             style={{ ...messageTextStyle, ...(boxBgColor ? { backgroundColor: boxBgColor } : {}) }}
           >
-            {editing ? (
+            {isHiddenCollapsed ? (
+              <HiddenFromAIMessageSummary onExpand={() => setManuallyExpandedHidden(true)} />
+            ) : editing ? (
               <EditTextarea
                 initialContent={message.content}
                 fontSize={chatFontSize}
@@ -2028,7 +2236,10 @@ export const ChatMessage = memo(function ChatMessage({
               />
             ) : (
               <>
-                <div className={cn("mari-message-content break-words", !isHtmlContent && "whitespace-pre-wrap")}>
+                <div
+                  className={cn("mari-message-content break-words", !isHtmlContent && "whitespace-pre-wrap")}
+                  style={messageTextStyle}
+                >
                   {isStreaming && !message.content ? (
                     <div className="mari-message-typing flex items-center gap-1 py-0.5">
                       <span className="h-2 w-2 animate-bounce rounded-full bg-[var(--muted-foreground)]/60 [animation-delay:0ms]" />
@@ -2160,7 +2371,7 @@ export const ChatMessage = memo(function ChatMessage({
             />
             {isLastAssistantMessage && !isUser && (
               <ActionBtn
-                icon={<Eye size={MESSAGE_ACTION_ICON_SIZE} />}
+                icon={<Search size={MESSAGE_ACTION_ICON_SIZE} />}
                 onClick={() => onPeekPrompt?.()}
                 title="Peek prompt"
               />
@@ -2192,6 +2403,17 @@ export const ChatMessage = memo(function ChatMessage({
                 onClick={() => onCloneSceneFromHere(message.id)}
                 title="Clone from here"
                 disabled={isCloneSceneFromHereDisabled}
+              />
+            )}
+            {onToggleHiddenFromAI && (
+              <ActionBtn
+                icon={
+                  isHiddenFromAI ? <Eye size={MESSAGE_ACTION_ICON_SIZE} /> : <EyeOff size={MESSAGE_ACTION_ICON_SIZE} />
+                }
+                onClick={() => onToggleHiddenFromAI(message.id, isHiddenFromAI)}
+                title={isHiddenFromAI ? "Unhide from AI" : "Hide from AI"}
+                className={isHiddenFromAI ? "text-amber-400/90 hover:text-amber-300" : undefined}
+                dark
               />
             )}
             <ActionBtn
@@ -2236,7 +2458,7 @@ export const ChatMessage = memo(function ChatMessage({
                   }
                   onClick={handleSpeak}
                   title={
-                    !ttsSpeakText
+                    !hasTTSContent
                       ? "No dialogue to speak"
                       : isLoadingThis
                         ? "Loading…"
@@ -2245,7 +2467,7 @@ export const ChatMessage = memo(function ChatMessage({
                           : "Speak"
                   }
                   className={isSpeakingThis ? "text-sky-500" : undefined}
-                  disabled={!ttsSpeakText || (ttsBusy && !isSpeakingThis)}
+                  disabled={!hasTTSContent || (ttsBusy && !isSpeakingThis)}
                 />
               </>
             )}

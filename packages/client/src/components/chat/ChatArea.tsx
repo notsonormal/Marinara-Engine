@@ -12,6 +12,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { useQueries } from "@tanstack/react-query";
 import {
   useChatMessages,
   useChatMessageCount,
@@ -31,11 +32,13 @@ import {
 
 import { useChatStore } from "../../stores/chat.store";
 import { useGenerate } from "../../hooks/use-generate";
-import { useCharacters, usePersonas } from "../../hooks/use-characters";
+import { spriteKeys, useCharacters, usePersonas, type SpriteInfo } from "../../hooks/use-characters";
 import { useConnections } from "../../hooks/use-connections";
 import { usePageActivity } from "../../hooks/use-page-activity";
-import { api } from "../../lib/api-client";
+import { api, ApiError } from "../../lib/api-client";
+import { filterLanguageGenerationConnections } from "../../lib/connection-filters";
 import { getChatDisplayName, getConnectedChatDisplayName, parseChatMetadata } from "../../lib/chat-display";
+import { resolveCurrentGameSessionChatId } from "../../lib/game-session-resolution";
 import { parseCharacterDisplayData } from "../../lib/character-display";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { chatBackgroundMetadataToUrl, chatBackgroundUrlToMetadata } from "../../lib/backgrounds";
@@ -59,9 +62,16 @@ import { useEncounterStore } from "../../stores/encounter.store";
 import { useTranslationStore } from "../../stores/translation.store";
 import { ttsService } from "../../lib/tts-service";
 import { useTTSConfig } from "../../hooks/use-tts";
-import { buildTTSMessageText, resolveTTSVoiceForSpeaker } from "../../lib/tts-dialogue";
+import { buildTTSVoiceRequests, normalizeTTSCharacterName, withTTSVoiceRequestCacheKeys } from "../../lib/tts-dialogue";
 import { mirrorSpritePlacements, normalizeSpritePlacements } from "./sprite-placement";
-import type { CharacterMap, MessageSelectionToggle, MessageWithSwipes, PeekPromptData } from "./chat-area.types";
+import { normalizeSpriteDisplayModes } from "./sprite-display-modes";
+import type {
+  CharacterMap,
+  ExpressionAvatarResolver,
+  MessageSelectionToggle,
+  MessageWithSwipes,
+  PeekPromptData,
+} from "./chat-area.types";
 import { RecentChats } from "./RecentChats";
 import { HomeFaq } from "./HomeFaq";
 import { NewChatConnectionGate } from "./NewChatConnectionGate";
@@ -69,11 +79,51 @@ import { ChatCommonOverlays } from "./ChatCommonOverlays";
 
 export type { CharacterMap };
 
+const BUILT_IN_AGENT_ID_SET = new Set(BUILT_IN_AGENTS.map((agent) => agent.id));
+const BUILT_IN_TRACKER_AGENT_ID_SET = new Set(
+  BUILT_IN_AGENTS.filter((agent) => agent.category === "tracker").map((agent) => agent.id),
+);
+
 const normalizeSpriteDisplayValue = (value: unknown, fallback: number, min: number, max: number): number => {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) return fallback;
   return Math.max(min, Math.min(max, numeric));
 };
+
+function parseMessageExtraRecord(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+  return typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function normalizeMessageSpriteExpressions(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const expressions: Record<string, string> = {};
+  for (const [key, expression] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof expression !== "string") continue;
+    const trimmed = expression.trim();
+    if (key && trimmed) expressions[key] = trimmed;
+  }
+  return expressions;
+}
+
+function resolveExpressionAvatarSpriteUrl(sprites: SpriteInfo[] | undefined, expression: string): string | null {
+  const normalizedExpression = expression.trim().toLowerCase();
+  if (!normalizedExpression) return null;
+  const exact = (sprites ?? []).find(
+    (sprite) =>
+      !sprite.expression.toLowerCase().startsWith("full_") &&
+      sprite.expression.trim().toLowerCase() === normalizedExpression,
+  );
+  return exact?.url ?? null;
+}
 
 const INTUITIVE_SWIPE_MIN_DISTANCE = 56;
 const INTUITIVE_SWIPE_MAX_VERTICAL_DRIFT = 44;
@@ -164,7 +214,7 @@ export function ChatArea() {
   const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(new Set());
   const [selectionAnchorIndex, setSelectionAnchorIndex] = useState<number | null>(null);
 
-  const { data: chat } = useChat(activeChatId);
+  const { data: chat, error: chatError } = useChat(activeChatId);
   const { data: allChats } = useChats();
   // Game mode loads ALL messages (no pagination) so the in-game log
   // shows the full session history instead of only the latest page.
@@ -226,6 +276,18 @@ export function ChatArea() {
   const agentProcessing = useAgentStore((s) => s.isProcessing);
 
   useEffect(() => {
+    if (!activeChatId || !(chatError instanceof ApiError) || chatError.status !== 404) return;
+    setActiveChatId(null);
+  }, [activeChatId, chatError, setActiveChatId]);
+
+  const currentGameSessionChatId = useMemo(() => resolveCurrentGameSessionChatId(chat, allChats), [allChats, chat]);
+
+  useEffect(() => {
+    if (!currentGameSessionChatId || currentGameSessionChatId === activeChatId) return;
+    setActiveChatId(currentGameSessionChatId);
+  }, [activeChatId, currentGameSessionChatId, setActiveChatId]);
+
+  useEffect(() => {
     const handleReviewRequest = (event: Event) => {
       const detail = (event as CustomEvent<AgentInjectionReviewRequest>).detail;
       if (!detail?.chatId || !Array.isArray(detail.injections)) return;
@@ -259,7 +321,9 @@ export function ChatArea() {
 
   const handleQuickStart = useCallback(
     (mode: "conversation" | "roleplay" | "game") => {
-      const connectionRows = ((connections ?? []) as Array<{ id: string }>).filter((connection) => !!connection.id);
+      const connectionRows = filterLanguageGenerationConnections(
+        (connections ?? []) as Array<{ id: string; provider?: string }>,
+      ).filter((connection) => !!connection.id);
       if (connectionRows.length === 0) {
         useChatStore.getState().setPendingNewChatMode(mode);
         return;
@@ -400,7 +464,14 @@ export function ChatArea() {
     const raw = (chat as unknown as { metadata?: string | Record<string, unknown> }).metadata;
     return parseChatMetadata(raw);
   }, [chat]);
-  const spriteCharacterIds: string[] = Array.isArray(chatMeta.spriteCharacterIds) ? chatMeta.spriteCharacterIds : [];
+  const spriteCharacterIds = useMemo<string[]>(
+    () =>
+      Array.isArray(chatMeta.spriteCharacterIds)
+        ? chatMeta.spriteCharacterIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+        : [],
+    [chatMeta.spriteCharacterIds],
+  );
+  const spriteDisplayModes = normalizeSpriteDisplayModes(chatMeta.spriteDisplayModes);
   const spritePosition: SpriteSide = chatMeta.spritePosition === "right" ? "right" : "left";
   const spriteScale = normalizeSpriteDisplayValue(chatMeta.spriteScale, roleplaySpriteScale, 0.5, 1.75);
   const spriteOpacity = normalizeSpriteDisplayValue(chatMeta.spriteOpacity, 1, 0.15, 1);
@@ -430,12 +501,6 @@ export function ChatArea() {
 
   const updateMeta = useUpdateChatMetadata();
   const summaryContextSize: number = (chatMeta.summaryContextSize as number) ?? 50;
-  const handleSummaryContextSizeChange = useCallback(
-    (size: number) => {
-      if (chat?.id) updateMeta.mutate({ id: chat.id, summaryContextSize: size });
-    },
-    [chat?.id, updateMeta],
-  );
 
   // Sync translation config from chat metadata to the translation store
   useEffect(() => {
@@ -650,6 +715,40 @@ export function ChatArea() {
 
   const combatAgentEnabled = enabledAgentTypes.has("combat");
   const expressionAgentEnabled = enabledAgentTypes.has("expression");
+  const expressionAvatarsEnabled =
+    isRoleplay && chatMeta.expressionAvatarsEnabled === true && expressionAgentEnabled && chatCharIds.length > 0;
+  const expressionAvatarCharacterIds = useMemo(() => {
+    const configuredIds =
+      spriteCharacterIds.length > 0 ? spriteCharacterIds.filter((id) => chatCharIds.includes(id)) : chatCharIds;
+    return Array.from(new Set(configuredIds.filter((id) => typeof id === "string" && id.trim())));
+  }, [chatCharIds, spriteCharacterIds]);
+  const expressionAvatarSpriteQueries = useQueries({
+    queries: expressionAvatarCharacterIds.map((characterId) => ({
+      queryKey: spriteKeys.list(characterId),
+      queryFn: () => api.get<SpriteInfo[]>(`/sprites/${characterId}`),
+      enabled: expressionAvatarsEnabled,
+      staleTime: 5 * 60_000,
+    })),
+  });
+  const expressionAvatarSpriteMap = useMemo(() => {
+    const map = new Map<string, SpriteInfo[]>();
+    expressionAvatarCharacterIds.forEach((characterId, index) => {
+      const sprites = expressionAvatarSpriteQueries[index]?.data;
+      if (Array.isArray(sprites) && sprites.length > 0) map.set(characterId, sprites);
+    });
+    return map;
+  }, [expressionAvatarCharacterIds, expressionAvatarSpriteQueries]);
+  const expressionAvatarResolver = useMemo<ExpressionAvatarResolver | undefined>(() => {
+    if (!expressionAvatarsEnabled) return undefined;
+    return (message, characterId) => {
+      const extra = parseMessageExtraRecord(message.extra);
+      const expressions = normalizeMessageSpriteExpressions(extra.spriteExpressions);
+      const characterName = characterMap.get(characterId)?.name;
+      const expression = expressions[characterId] ?? (characterName ? expressions[characterName] : undefined);
+      if (!expression) return null;
+      return resolveExpressionAvatarSpriteUrl(expressionAvatarSpriteMap.get(characterId), expression);
+    };
+  }, [characterMap, expressionAvatarSpriteMap, expressionAvatarsEnabled]);
   const shouldRefreshGameStateOnSwipe = isGameChat || Boolean(chatMeta.enableAgents);
 
   const refreshVisibleGameState = useCallback(async () => {
@@ -873,8 +972,9 @@ export function ChatArea() {
 
   const handleRerunTrackers = useCallback(async () => {
     if (!activeChatId || isStreaming || agentProcessing) return;
-    const trackerIds = new Set(BUILT_IN_AGENTS.filter((a) => a.category === "tracker").map((a) => a.id));
-    const types = Array.from(enabledAgentTypes).filter((t) => trackerIds.has(t));
+    const types = Array.from(enabledAgentTypes).filter(
+      (type) => BUILT_IN_TRACKER_AGENT_ID_SET.has(type) || !BUILT_IN_AGENT_ID_SET.has(type),
+    );
     if (types.length === 0) return;
     await retryAgents(activeChatId, types);
   }, [activeChatId, isStreaming, agentProcessing, enabledAgentTypes, retryAgents]);
@@ -882,8 +982,7 @@ export function ChatArea() {
   const handleRerunSingleTracker = useCallback(
     async (agentType: string) => {
       if (!activeChatId || isStreaming || agentProcessing) return;
-      const trackerIds = new Set(BUILT_IN_AGENTS.filter((a) => a.category === "tracker").map((a) => a.id));
-      if (!trackerIds.has(agentType) || !enabledAgentTypes.has(agentType)) return;
+      if (!BUILT_IN_TRACKER_AGENT_ID_SET.has(agentType) || !enabledAgentTypes.has(agentType)) return;
       await retryAgents(activeChatId, [agentType]);
     },
     [activeChatId, isStreaming, agentProcessing, enabledAgentTypes, retryAgents],
@@ -1110,12 +1209,7 @@ export function ChatArea() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [
-    intuitiveSwipeBlocked,
-    intuitiveSwipeNavigation,
-    latestAssistantMessageForSwipes,
-    navigateLatestSwipe,
-  ]);
+  }, [intuitiveSwipeBlocked, intuitiveSwipeNavigation, latestAssistantMessageForSwipes, navigateLatestSwipe]);
 
   // Up-Arrow recall of the most recent message (user OR assistant) — runs
   // independently of swipe nav so the shortcut works with that toggle off.
@@ -1307,6 +1401,17 @@ export function ChatArea() {
   const chatModeRef = useRef(chatMode);
   chatModeRef.current = chatMode;
   const prevIsStreamingRef = useRef(false);
+  const resolveTTSCharacterId = useCallback(
+    (speaker?: string | null) => {
+      const normalizedSpeaker = normalizeTTSCharacterName(speaker);
+      if (!normalizedSpeaker) return null;
+      for (const [characterId, character] of characterMap) {
+        if (normalizeTTSCharacterName(character.name) === normalizedSpeaker) return characterId;
+      }
+      return null;
+    },
+    [characterMap],
+  );
   useEffect(() => {
     const wasStreaming = prevIsStreamingRef.current;
     prevIsStreamingRef.current = isStreaming;
@@ -1331,14 +1436,23 @@ export function ChatArea() {
     }
     if (!lastMsg?.content) return;
 
-    const fallbackSpeaker = lastMsg.characterId ? characterMap.get(lastMsg.characterId)?.name : undefined;
-    const ttsText = buildTTSMessageText(lastMsg.content, cfg, fallbackSpeaker);
-    if (!ttsText) return;
-    const ttsVoice = resolveTTSVoiceForSpeaker(cfg, fallbackSpeaker, lastMsg.characterId);
-    if (cfg.source === "elevenlabs" && !ttsVoice) return;
+    const fallbackSpeaker =
+      lastMsg.role === "narrator"
+        ? "Narrator"
+        : lastMsg.characterId
+          ? characterMap.get(lastMsg.characterId)?.name
+          : undefined;
+    const ttsRequests = buildTTSVoiceRequests(
+      lastMsg.content,
+      cfg,
+      fallbackSpeaker,
+      lastMsg.characterId,
+      resolveTTSCharacterId,
+    );
+    if (ttsRequests.length === 0) return;
 
-    void ttsService.speak(ttsText, lastMsg.id, { speaker: fallbackSpeaker, voice: ttsVoice });
-  }, [characterMap, isStreaming]);
+    void ttsService.speakSequence(withTTSVoiceRequestCacheKeys(ttsRequests, cfg, lastMsg.id), lastMsg.id);
+  }, [characterMap, isStreaming, resolveTTSCharacterId]);
 
   const newestMsgId = msgData?.pages[0]?.[msgData.pages[0].length - 1]?.id;
   const newestMsgSwipeIndex = msgData?.pages[0]?.[msgData.pages[0].length - 1]?.activeSwipeIndex;
@@ -1807,6 +1921,7 @@ export function ChatArea() {
             onRegenerate={handleRegenerate}
             onEdit={handleEdit}
             onSetActiveSwipe={handleSetActiveSwipe}
+            onToggleHiddenFromAI={handleToggleHiddenFromAI}
             onPeekPrompt={handlePeekPrompt}
             onToggleSelectMessage={handleToggleSelectMessage}
             onSwitchChat={chat?.connectedChatId ? () => setActiveChatId(chat.connectedChatId!) : undefined}
@@ -1872,7 +1987,10 @@ export function ChatArea() {
           encounterActive={encounterActive}
           spritePosition={spritePosition}
           spriteCharacterIds={spriteCharacterIds}
+          spriteDisplayModes={spriteDisplayModes}
           spriteExpressions={spriteExpressions}
+          expressionAvatarsEnabled={expressionAvatarsEnabled}
+          expressionAvatarResolver={expressionAvatarResolver}
           spritePlacements={spritePlacements}
           spriteScale={spriteScale}
           spriteOpacity={spriteOpacity}
@@ -1920,7 +2038,6 @@ export function ChatArea() {
           onCloneSceneFromHere={isSceneChat ? handleCloneSceneFromHere : undefined}
           isCloneSceneFromHereDisabled={isForking || isStreaming}
           onToggleSelectMessage={handleToggleSelectMessage}
-          onSummaryContextSizeChange={handleSummaryContextSizeChange}
           onRerunTrackers={handleRerunTrackers}
           onRerunSingleTracker={handleRerunSingleTracker}
           onStartEncounter={() => startEncounter()}

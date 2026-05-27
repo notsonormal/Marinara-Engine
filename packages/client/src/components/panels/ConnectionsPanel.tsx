@@ -57,6 +57,7 @@ const PROVIDER_COLORS: Record<string, { from: string; to: string; ring: string; 
   openai: { from: "from-emerald-400", to: "to-teal-500", ring: "ring-emerald-400/40", badge: "bg-emerald-400" },
   anthropic: { from: "from-orange-400", to: "to-amber-500", ring: "ring-orange-400/40", badge: "bg-orange-400" },
   google: { from: "from-blue-400", to: "to-indigo-500", ring: "ring-blue-400/40", badge: "bg-blue-400" },
+  google_vertex: { from: "from-cyan-400", to: "to-blue-500", ring: "ring-cyan-400/40", badge: "bg-cyan-400" },
   mistral: { from: "from-violet-400", to: "to-purple-500", ring: "ring-violet-400/40", badge: "bg-violet-400" },
   cohere: { from: "from-rose-400", to: "to-pink-500", ring: "ring-rose-400/40", badge: "bg-rose-400" },
   openrouter: { from: "from-sky-400", to: "to-cyan-500", ring: "ring-sky-400/40", badge: "bg-sky-400" },
@@ -563,10 +564,7 @@ export function ConnectionsPanel() {
   const [newFolderName, setNewFolderName] = useState("");
   const [movingConnectionId, setMovingConnectionId] = useState<string | null>(null);
 
-  const connectionsList = useMemo(
-    () => (connections as ConnectionRowData[] | undefined) ?? [],
-    [connections],
-  );
+  const connectionsList = useMemo(() => (connections as ConnectionRowData[] | undefined) ?? [], [connections]);
 
   // Sorted folder list + local order for optimistic drag-to-reorder
   const sortedFolders = useMemo(() => {
@@ -660,7 +658,7 @@ export function ConnectionsPanel() {
   };
 
   const movingConnection = movingConnectionId
-    ? connectionsList.find((c) => c.id === movingConnectionId) ?? null
+    ? (connectionsList.find((c) => c.id === movingConnectionId) ?? null)
     : null;
 
   return (
@@ -797,9 +795,7 @@ export function ConnectionsPanel() {
       )}
 
       {/* Unfiled connections */}
-      <div className="stagger-children flex flex-col gap-1">
-        {unfiledConnections.map(renderConnectionRow)}
-      </div>
+      <div className="stagger-children flex flex-col gap-1">{unfiledConnections.map(renderConnectionRow)}</div>
 
       {activeChat && (
         <p className="px-1 text-[0.625rem] text-[var(--muted-foreground)]/60">

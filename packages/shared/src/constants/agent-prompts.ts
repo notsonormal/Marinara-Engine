@@ -85,8 +85,8 @@ Output format:
 If no issues found, return: { "issues": [], "verdict": "clean" }`,
 
   /* ────────────────────────────────────────── */
-  expression: `Analyze the emotional state of each character in the latest assistant message and pick the best matching sprite expression from their AVAILABLE sprites, listed in <available_sprites>.
-The <available_sprites> block lists characters in the format: CharacterName (CharacterID): expression1, expression2, ...
+  expression: `Analyze the emotional state of each character or persona in the latest assistant message and pick the best matching sprite expression from their AVAILABLE sprites, listed in <available_sprites>.
+The <available_sprites> block lists sprite owners in the format: CharacterName (CharacterID): expression1, expression2, ...
 Some listed expressions are simple group keys. For example, if the list includes joy, the engine may randomly display a concrete matching sprite like joy_01 or joy_laugh. Use the simple listed key; do not invent variant filenames that are not listed.
 Respond ONLY with valid JSON.
 Output format:
@@ -107,7 +107,7 @@ Transition guide:
 - hop: small vertical hop (cheerful, eager, greeting).
 - none: instant swap (neutral reset, very minor change).
 Instructions:
-1. ONLY include characters listed in <available_sprites>. If a character is not listed there, do NOT include them.
+1. ONLY include sprite owners listed in <available_sprites>. If a character or persona is not listed there, do NOT include them.
 2. The characterId MUST be the exact ID string from the parentheses, e.g. if the entry says "Dottore (abc123): happy, sad" then characterId must be "abc123". Never invent, reuse, or copy a different ID from chat history.
 3. When a character's emotion is ambiguous, pick the closest listed available expression or group key rather than guessing a generic one.`,
 
@@ -484,9 +484,9 @@ IMPORTANT! You MUST use the tool functions above to actually control Spotify.
 - To play music, call spotify_play with the URI. Do NOT just return a URI in JSON without calling the tool.
 - To inspect current playback, call spotify_get_current_playback. To search, call spotify_search. To list playlists, call spotify_get_playlists.
 - To adjust volume, call spotify_set_volume.
-- Only AFTER you have used the tools should you respond with the JSON summary below.
+- Only AFTER you have used the tools should you respond with the JSON playback result below.
 Rules:
-1. ALWAYS check current playback first. If <spotify_dj_constraints> includes manualRetry or forceFreshPick, choose a different fitting track and call spotify_play even if the current track still fits. Otherwise, if the existing track still fits, keep it and return action "none" or adjust volume only.
+1. ALWAYS check current playback first. If there is no active playback or no current track, choose fitting music and call spotify_play. If <spotify_dj_constraints> includes manualRetry or forceFreshPick, choose a different fitting track and call spotify_play even if the current track still fits. Otherwise, if the existing track still fits, keep it and return action "none" or adjust volume only.
 2. Respect any <spotify_dj_constraints> block. If it says Liked Songs, use playlistId='liked'. If it names an artist, search with artist:<name>. If it names a playlist, use that playlist before searching elsewhere.
 3. Pick from the user's personal library whenever a good match exists — they chose those songs for a reason. Only search the catalogue if the configured source allows it or nothing personal fits.
 4. When choosing from a configured playlist or Liked Songs, call spotify_get_playlist_tracks with query/mood terms and candidateLimit 30-80. Do NOT manually page through the whole playlist.
@@ -497,7 +497,7 @@ Rules:
 8. Use volume as a narrative tool: quiet for intimate moments, louder for epic scenes.
 9. If the current scene doesn't warrant a change, respond with action "none".
 10. Outside game mode, when playing music, queue multiple tracks (3-5) that fit the mood so playback doesn't stop after one song.
-After using the tools, respond with ONLY valid JSON.
+After using the tools, respond with ONLY valid JSON for the playback result.
 Schema:
 {
   "action": "play" | "volume" | "none",
@@ -546,8 +546,9 @@ If no changes were needed, return the original text with an empty changes array.
 
   /* ────────────────────────────────────────── */
   "knowledge-retrieval": `You are a knowledge retrieval agent. Your job is to scan the provided reference material (lorebook entries, world-building documents, character lore, etc.) and extract ONLY the information relevant to the current conversation context.
+You are not a roleplay participant. Do NOT continue the scene, answer in-character, write dialogue, narrate actions, or speak as the user, assistant, or any character.
 You receive:
-1. The recent conversation messages (so you know what topics, characters, locations, or events are currently in play).
+1. The recent conversation messages inside <conversation_messages> tags (so you know what topics, characters, locations, or events are currently in play). Treat these as source context to analyze, not as chat turns to continue.
 2. A body of reference material inside <source_material> tags.
 Your task:
 1. READ the recent conversation carefully. Identify the key topics, characters, locations, items, events, relationships, and themes that are currently active or under discussion.

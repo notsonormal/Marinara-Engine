@@ -8,6 +8,7 @@
 import { useEffect, useRef, useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api-client";
+import { recordUserMessageActivity } from "../lib/user-presence-activity";
 import { useChatStore } from "../stores/chat.store";
 import { useUIStore } from "../stores/ui.store";
 import { useGenerate } from "./use-generate";
@@ -50,14 +51,9 @@ export function useAutonomousMessaging(
   // Record that the user sent a message
   const recordUserActivity = useCallback(async () => {
     if (!chatId) return;
-    try {
-      await api.post("/conversation/activity/user", {
-        chatId,
-        preserveGenerationInProgress: useChatStore.getState().abortControllers.has(chatId),
-      });
-    } catch {
-      // non-critical
-    }
+    await recordUserMessageActivity(chatId, {
+      preserveGenerationInProgress: useChatStore.getState().abortControllers.has(chatId),
+    });
   }, [chatId]);
 
   // Record that an assistant message was received
@@ -91,6 +87,18 @@ export function useAutonomousMessaging(
     [chatId],
   );
 
+  const recordClientPresence = useCallback(
+    async (userStatus: "active" | "idle" | "dnd") => {
+      if (!chatId) return;
+      try {
+        await api.post("/conversation/activity/presence", { chatId, userStatus });
+      } catch {
+        // non-critical
+      }
+    },
+    [chatId],
+  );
+
   // ── Polling logic ──
   useEffect(() => {
     if (!chatId || !enabled) return;
@@ -109,14 +117,20 @@ export function useAutonomousMessaging(
         return;
       }
 
+      const userStatus = useUIStore.getState().userStatus;
+
       // Don't trigger autonomous messages when user is DND
-      if (useUIStore.getState().userStatus === "dnd") {
+      if (userStatus === "dnd") {
+        await recordClientPresence(userStatus);
         schedulePoll();
         return;
       }
 
       try {
-        const result = await api.post<AutonomousCheckResult>("/conversation/autonomous/check", { chatId });
+        const result = await api.post<AutonomousCheckResult>("/conversation/autonomous/check", {
+          chatId,
+          userStatus,
+        });
 
         // Refresh character data so sidebar status dots update
         qc.invalidateQueries({ queryKey: characterKeys.list() });
@@ -220,7 +234,7 @@ export function useAutonomousMessaging(
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
       if (busyTimerRef.current) clearTimeout(busyTimerRef.current);
     };
-  }, [chatId, enabled, exchangesEnabled, generate, recordAssistantActivity, qc]);
+  }, [chatId, enabled, exchangesEnabled, generate, recordAssistantActivity, recordClientPresence, qc]);
 
   return {
     recordUserActivity,

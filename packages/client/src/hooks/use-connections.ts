@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api-client";
+import { useUIStore } from "../stores/ui.store";
 import type { ConnectionTestResult } from "@marinara-engine/shared";
 
 export const connectionKeys = {
@@ -72,14 +73,17 @@ export function useDeleteConnection() {
 
 export function useTestConnection() {
   return useMutation({
-    mutationFn: (id: string) => api.post<ConnectionTestResult>(`/connections/${id}/test`),
+    mutationFn: (id: string) =>
+      api.post<ConnectionTestResult>(`/connections/${id}/test`, { debugMode: useUIStore.getState().debugMode }),
   });
 }
 
 export function useTestMessage() {
   return useMutation({
     mutationFn: (id: string) =>
-      api.post<{ success: boolean; response: string; latencyMs: number }>(`/connections/${id}/test-message`),
+      api.post<{ success: boolean; response: string; latencyMs: number }>(`/connections/${id}/test-message`, {
+        debugMode: useUIStore.getState().debugMode,
+      }),
   });
 }
 
@@ -116,9 +120,16 @@ export function useTestImageGeneration() {
   });
 }
 
+export type RemoteConnectionModel = {
+  id: string;
+  name: string;
+  context?: number;
+  maxOutput?: number;
+};
+
 export function useFetchModels() {
   return useMutation({
-    mutationFn: (id: string) => api.get<{ models: Array<{ id: string; name: string }> }>(`/connections/${id}/models`),
+    mutationFn: (id: string) => api.get<{ models: RemoteConnectionModel[] }>(`/connections/${id}/models`),
   });
 }
 

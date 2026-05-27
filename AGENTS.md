@@ -2,6 +2,11 @@
 
 This file is a thin maintainer note for contributors using Codex. Canonical workflow, validation, and release guidance lives in `CONTRIBUTING.md`.
 
+## Agent Workflow Overlay
+
+- Follow `.github/agents/chai-workflow.md` as the repo's additive AI-agent workflow overlay for proof discipline, bugfix lanes, feature sizing, issue filing, PR gates, and risky-work claim boundaries.
+- The overlay does not replace this file, `CONTRIBUTING.md`, package instructions, or maintainer requests. Repo rules and the user's latest request still win.
+
 ## Preferred Workflow
 
 - Start with `pnpm install`.
@@ -12,7 +17,7 @@ This file is a thin maintainer note for contributors using Codex. Canonical work
 ## Repo-Specific Cautions
 
 - Keep edits non-destructive. Do not revert unrelated work in the tree.
-- Make Marinara Engine changes against `staging` first; do not target `main` directly unless the user or maintainer explicitly asks for a mainline change.
+- Make Marinara Engine changes against `staging` first; do not target `main` directly unless the user or maintainer explicitly asks for a mainline change. See `CONTRIBUTING.md § Branches`.
 - Prefer focused patches that keep code, docs, and release metadata aligned in the same change.
 - Agent-specific coordination rule: before starting issue work, check for an existing issue-linked branch, open PR, draft PR, or project board item so multiple agents do not duplicate effort. See `CONTRIBUTING.md` for the general contributor workflow.
 - Agent-specific coordination rule: when implementation effort starts for an issue, open a draft PR immediately so the project Kanban board shows the work in progress.

@@ -13,6 +13,9 @@ export type GroupChatMode = "merged" | "individual";
 /** How individual-mode group chats decide response order. */
 export type GroupResponseOrder = "sequential" | "smart" | "manual";
 
+/** Spotify source constraints used by Spotify DJ. */
+export type SpotifySourceType = "liked" | "playlist" | "artist" | "any";
+
 /** Role of a message in the conversation. */
 export type MessageRole = "user" | "assistant" | "system" | "narrator";
 
@@ -77,6 +80,41 @@ export interface WeekSummaryEntry {
   keyDetails: string[];
 }
 
+/** A chat-scoped prompt template used by manual rolling summary generation. */
+export interface ChatSummaryPromptTemplate {
+  id: string;
+  name: string;
+  prompt: string;
+}
+
+/** Rolling summary entry category. Extensible beyond rolling summaries later. */
+export type ChatSummaryEntryKind = "rolling";
+
+/** Whether a rolling summary entry was user-created, agent-created, or migrated from the legacy blob. */
+export type ChatSummaryEntryOrigin = "manual" | "automated" | "legacy";
+
+/** Source selector used to create a rolling summary entry. */
+export type ChatSummaryEntrySource = "last" | "range" | "agent";
+
+/** A single structured rolling chat summary entry. */
+export interface ChatSummaryEntry {
+  id: string;
+  kind: ChatSummaryEntryKind;
+  origin: ChatSummaryEntryOrigin;
+  title: string;
+  content: string;
+  enabled: boolean;
+  sourceMode: ChatSummaryEntrySource;
+  messageCount?: number;
+  rangeStartIndex?: number;
+  rangeEndIndex?: number;
+  messageIds?: string[];
+  promptTemplateId?: string | null;
+  tokenEstimate: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** A vectorized recall fragment created from one chat's messages. */
 export interface ChatMemoryChunk {
   id: string;
@@ -94,8 +132,16 @@ export interface ChatMemoryChunk {
 
 /** Extra metadata stored on a chat. */
 export interface ChatMetadata {
-  /** Summary text for context injection */
+  /** Compiled enabled rolling summary text for context injection. Derived from summaryEntries when present. */
   summary: string | null;
+  /** Structured rolling summary entries. Missing means legacy summary-only metadata. */
+  summaryEntries?: ChatSummaryEntry[];
+  /** Recent message count used by manual rolling summary generation and the automated summary agent. */
+  summaryContextSize?: number;
+  /** Chat-scoped manual summary prompt templates. Missing or empty uses the built-in default. */
+  summaryPromptTemplates?: ChatSummaryPromptTemplate[];
+  /** Selected manual summary prompt template ID. Null/omitted uses the built-in default. */
+  activeSummaryPromptTemplateId?: string | null;
   /** Custom tags for organisation */
   tags: string[];
   /** Whether agents are enabled for this chat */
@@ -120,8 +166,14 @@ export interface ChatMetadata {
   groupSpeakerColors?: boolean;
   /** Group individual mode response order: "sequential" or "smart" (agent-decided) */
   groupResponseOrder?: GroupResponseOrder;
+  /** When true/omitted, individual group turns append a responding-character instruction to the prompt. */
+  groupTurnPromptEnabled?: boolean;
+  /** Chat members that are temporarily excluded from group prompt/generation participation. */
+  inactiveCharacterIds?: string[];
   /** Characters with visible roleplay sprites enabled for this chat. */
   spriteCharacterIds?: string[];
+  /** Which sprite file families the roleplay Expression Engine may display. */
+  spriteDisplayModes?: Array<"expressions" | "full-body">;
   /** Preferred sidebar / default layout side for chat sprites. */
   spritePosition?: SpriteSide;
   /** Display scale for roleplay Expression Engine sprites. */
@@ -130,6 +182,8 @@ export interface ChatMetadata {
   spriteOpacity?: number;
   /** Saved freeform positions for enabled roleplay sprites. */
   spritePlacements?: Record<string, SpritePlacement>;
+  /** When true, roleplay message avatars use the per-message Expression Engine sprite when one is available. */
+  expressionAvatarsEnabled?: boolean;
   /** When true, a shared group scenario replaces individual character card scenarios */
   groupScenarioOverride?: boolean;
   /** The shared scenario text used when groupScenarioOverride is enabled */
@@ -159,6 +213,16 @@ export interface ChatMetadata {
   showInputTranslateButton?: boolean;
   /** Allow roleplay characters to create direct-message conversation chats with hidden [dm] commands. */
   roleplayDmCommandsEnabled?: boolean;
+  /** Chat-scoped Intiface Central WebSocket URL for haptic manual and auto-connect. */
+  hapticIntifaceUrl?: string | null;
+  /** Music source constraint for Spotify DJ in roleplay and visual novel chats. */
+  spotifySourceType?: SpotifySourceType;
+  /** Spotify playlist ID used when spotifySourceType is "playlist". */
+  spotifyPlaylistId?: string | null;
+  /** Human-readable playlist name cached for prompts/display. */
+  spotifyPlaylistName?: string | null;
+  /** Spotify artist name used when spotifySourceType is "artist". */
+  spotifyArtist?: string | null;
   /** Durable count of autonomous messages the user has not viewed yet. */
   autonomousUnreadCount?: number;
   /** Character IDs that contributed to the current autonomous unread state. */
@@ -175,6 +239,8 @@ export interface ChatMetadata {
   characterSchedules?: Record<string, unknown>;
   /** Week start timestamp for the current generated conversation schedules. */
   scheduleWeekStart?: string;
+  /** Chat-scoped selfie prompt-builder template. Empty/null uses the global/default prompt. */
+  selfiePrompt?: string | null;
   /** Extra positive prompt/tags appended to generated conversation selfie prompts. */
   selfiePositivePrompt?: string;
   /** Extra negative prompt/tags sent with generated conversation selfies. */
@@ -187,6 +253,8 @@ export interface ChatMetadata {
   gameSessionNumber?: number;
   /** Current session lifecycle status */
   gameSessionStatus?: import("./game.js").GameSessionStatus;
+  /** Whether the first game intro screen has been dismissed for this game chat. */
+  gameIntroPresented?: boolean;
   /** Timestamp for when the current game session was created/started */
   gameCurrentSessionStartedAt?: string;
   /** Current game state (exploration, dialogue, combat, travel_rest) */
@@ -229,10 +297,12 @@ export interface ChatMetadata {
   gameLastIllustrationTag?: string;
   /** Extra user instructions for game scene illustration prompts. */
   gameImagePromptInstructions?: string | null;
+  /** Per-game asset browser folder exclusions. Omitted/null means every asset folder is available. */
+  gameAssetSelection?: { excludedFolders?: string[] } | null;
   /** When true, Game Mode uses Spotify DJ for music instead of local music assets. */
   gameUseSpotifyMusic?: boolean;
   /** Music source constraint for Spotify DJ in Game Mode. */
-  gameSpotifySourceType?: "liked" | "playlist" | "artist" | "any";
+  gameSpotifySourceType?: SpotifySourceType;
   /** Spotify playlist ID used when gameSpotifySourceType is "playlist". */
   gameSpotifyPlaylistId?: string | null;
   /** Human-readable playlist name cached for prompts/display. */
@@ -271,6 +341,8 @@ export interface ChatMetadata {
    * Valid range: 0-50. Default: 10.
    */
   summaryTailMessages?: number;
+  /** When true or omitted, prior provider reasoning metadata is not replayed into future prompts. */
+  excludePastReasoning?: boolean;
 
   /** Any extra key-value data */
   [key: string]: unknown;
@@ -333,6 +405,8 @@ export interface MessageExtra {
    * saved with this assistant message — reused when regenerating that swipe unless refreshed.
    */
   contextInjections?: Array<{ agentType: string; agentName?: string; text: string }> | null;
+  /** Fingerprint of the compiled chat summary used when prompt caches/reasoning were stored. */
+  chatSummaryFingerprint?: string | null;
   /**
    * Hidden command-generation options needed to make swipes/regenerations replay
    * the same slash-command or guided-regenerate prompt behavior.

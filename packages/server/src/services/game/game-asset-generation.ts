@@ -22,8 +22,8 @@ import type { ImageGenerationSize } from "../image/image-generation-settings.js"
 const NPC_AVATAR_DIR = join(DATA_DIR, "avatars", "npc");
 const CHAT_BACKGROUND_DIR = join(DATA_DIR, "backgrounds");
 const CHAT_BACKGROUND_META_PATH = join(CHAT_BACKGROUND_DIR, "meta.json");
-export const DEFAULT_GAME_BACKGROUND_SIZE: ImageGenerationSize = { width: 1024, height: 576 };
-export const DEFAULT_GAME_PORTRAIT_SIZE: ImageGenerationSize = { width: 512, height: 512 };
+export const DEFAULT_GAME_BACKGROUND_SIZE: ImageGenerationSize = { width: 1280, height: 720 };
+export const DEFAULT_GAME_PORTRAIT_SIZE: ImageGenerationSize = { width: 1024, height: 1024 };
 export const GENERATED_GAME_BACKGROUND_EXTS = ["png", "jpg", "jpeg", "webp", "avif", "gif"] as const;
 const GAME_BACKGROUND_EXT_SET = new Set<string>(GENERATED_GAME_BACKGROUND_EXTS);
 const GAME_PORTRAIT_NEGATIVE_PROMPT =
@@ -189,10 +189,15 @@ export function readAvatarBase64(avatarPath: string | null | undefined): string 
 
 /** Sanitise a name into a safe filesystem slug. */
 function safeName(name: string): string {
-  return name
+  const trimmed = name.trim();
+  const slug = trimmed
     .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
+  if (slug || !trimmed) return slug;
+  return `asset-${createHash("sha256").update(trimmed).digest("hex").slice(0, 8)}`;
 }
 
 function truncateSlugByBytes(slug: string, maxBytes: number): string {
@@ -260,6 +265,7 @@ export interface NpcPortraitRequest {
   imgBaseUrl: string;
   imgApiKey: string;
   imgService?: string | null;
+  imgEndpointId?: string | null;
   imgComfyWorkflow?: string | undefined;
   imgDefaults?: ImageGenerationDefaultsProfile | null;
   debugLog?: (message: string, ...args: any[]) => void;
@@ -320,6 +326,7 @@ export async function generateNpcPortrait(req: NpcPortraitRequest): Promise<stri
         model: req.imgModel,
         width: size.width,
         height: size.height,
+        imageEndpointId: req.imgEndpointId || undefined,
         comfyWorkflow: req.imgComfyWorkflow || undefined,
         imageDefaults: req.imgDefaults ?? undefined,
       },
@@ -371,6 +378,7 @@ export interface BackgroundGenRequest {
   imgBaseUrl: string;
   imgApiKey: string;
   imgService?: string | null;
+  imgEndpointId?: string | null;
   imgComfyWorkflow?: string | undefined;
   imgDefaults?: ImageGenerationDefaultsProfile | null;
   debugLog?: (message: string, ...args: any[]) => void;
@@ -403,6 +411,7 @@ export interface SceneIllustrationGenRequest {
   imgBaseUrl: string;
   imgApiKey: string;
   imgService?: string | null;
+  imgEndpointId?: string | null;
   imgComfyWorkflow?: string | undefined;
   imgDefaults?: ImageGenerationDefaultsProfile | null;
   debugLog?: (message: string, ...args: any[]) => void;
@@ -497,6 +506,7 @@ export async function generateBackground(req: BackgroundGenRequest): Promise<str
         model: req.imgModel,
         width: size.width,
         height: size.height,
+        imageEndpointId: req.imgEndpointId || undefined,
         comfyWorkflow: req.imgComfyWorkflow || undefined,
         imageDefaults: req.imgDefaults ?? undefined,
       },
@@ -563,6 +573,7 @@ export async function generateChatBackground(req: ChatBackgroundGenRequest): Pro
         model: req.imgModel,
         width: size.width,
         height: size.height,
+        imageEndpointId: req.imgEndpointId || undefined,
         comfyWorkflow: req.imgComfyWorkflow || undefined,
         imageDefaults: req.imgDefaults ?? undefined,
       },
@@ -626,6 +637,7 @@ export async function generateSceneIllustration(req: SceneIllustrationGenRequest
         model: req.imgModel,
         width: size.width,
         height: size.height,
+        imageEndpointId: req.imgEndpointId || undefined,
         comfyWorkflow: req.imgComfyWorkflow || undefined,
         imageDefaults: req.imgDefaults ?? undefined,
         referenceImages: req.referenceImages?.length ? req.referenceImages.slice(0, 4) : undefined,

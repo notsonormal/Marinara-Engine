@@ -1,24 +1,49 @@
 // ──────────────────────────────────────────────
 // React Query: Generation (streaming + agent pipeline)
 // ──────────────────────────────────────────────
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import type { AvatarCropValue } from "../lib/utils";
 import { useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
+import { toast, type ExternalToast } from "sonner";
 import { api } from "../lib/api-client";
+import { formatAgentFailuresToast, toAgentFailure, type AgentFailure } from "../lib/agent-failures";
 import { chatBackgroundMetadataToUrl } from "../lib/backgrounds";
 import { agentKeys } from "./use-agents";
 import type { PendingCardUpdate } from "../stores/agent.store";
 import {
+  applyQuestUpdatesToPlayerStats,
   EDITABLE_CHARACTER_CARD_FIELDS,
   type CharacterCardFieldUpdate,
   type EditableCharacterCardField,
 } from "@marinara-engine/shared";
 
+type RetryAgentsOptions = {
+  lorebookKeeperBackfill?: boolean;
+  forMessageId?: string;
+  secretPlotRerollMode?: "full" | "turn_only";
+};
+
+type RetryAgentsFn = (chatId: string, agentTypes: string[], options?: RetryAgentsOptions) => Promise<void>;
+
 /** Show a persistent, copyable error toast and log to console */
-function showError(msg: string) {
+function showError(msg: string, options?: Pick<ExternalToast, "action">) {
   console.error("[Generation]", msg);
-  toast.error(msg, { duration: 15000 });
+  toast.error(msg, { duration: 15000, ...options });
+}
+
+function showAgentFailuresError(failures: AgentFailure[], onRetry?: () => void) {
+  const hasIllustratorFailure = failures.some((failure) => failure.agentType === "illustrator");
+  showError(
+    formatAgentFailuresToast(failures),
+    hasIllustratorFailure && onRetry
+      ? {
+          action: {
+            label: "Try again",
+            onClick: () => onRetry(),
+          },
+        }
+      : undefined,
+  );
 }
 
 const shownAgentWarnings = new Set<string>();
@@ -537,6 +562,7 @@ function applyGameStatePatchToStore(
  */
 export function useGenerate() {
   const qc = useQueryClient();
+  const retryAgentsRef = useRef<RetryAgentsFn | null>(null);
   // Use individual selectors to avoid re-rendering on every store change
   const setStreaming = useChatStore((s) => s.setStreaming);
   const setMariPhase = useChatStore((s) => s.setMariPhase);
@@ -557,7 +583,7 @@ export function useGenerate() {
   const setCyoaChoices = useAgentStore((s) => s.setCyoaChoices);
   const clearCyoaChoices = useAgentStore((s) => s.clearCyoaChoices);
   const enqueuePendingCardUpdate = useAgentStore((s) => s.enqueuePendingCardUpdate);
-  const setFailedAgentTypes = useAgentStore((s) => s.setFailedAgentTypes);
+  const setFailedAgentFailures = useAgentStore((s) => s.setFailedAgentFailures);
   const clearFailedAgentTypes = useAgentStore((s) => s.clearFailedAgentTypes);
   const setGameState = useGameStateStore((s) => s.setGameState);
 
@@ -698,8 +724,8 @@ export function useGenerate() {
       // Speed is controlled by the user's streamingSpeed setting (1–100).
       const transportStreaming = useUIStore.getState().enableStreaming;
       const streamingEnabled = transportStreaming;
-      const shouldDisplayRawStream =
-        getCachedChatMode(qc, params.chatId) !== "conversation" || !!params.regenerateMessageId;
+      const chatModeForGeneration = getCachedChatMode(qc, params.chatId);
+      const shouldDisplayRawStream = chatModeForGeneration !== "conversation" || !!params.regenerateMessageId;
       let fullBuffer = ""; // What the user sees (or accumulates silently when streaming is off)
       let pendingText = ""; // Tokens waiting to be typed out
       let receivedContent = false; // Whether any actual message content was received
@@ -709,6 +735,22 @@ export function useGenerate() {
       let rafId = 0;
       const persistedMessages = new Map<string, Message>();
       let gameStatePatchAnchor: { messageId: string; swipeIndex: number } | null = null;
+      const normalizeLineBreakSpacing = (text: string) =>
+        chatModeForGeneration === "roleplay" ? text.replace(/[ \t]+(\r?\n)/g, "$1") : text;
+      const appendGeneratedChunk = (chunk: string) => {
+        const normalizedChunk = normalizeLineBreakSpacing(chunk);
+        if (/^\r?\n/.test(normalizedChunk)) {
+          fullBuffer = fullBuffer.replace(/[ \t]+$/, "");
+          pendingText = pendingText.replace(/[ \t]+$/, "");
+        }
+        if (!normalizedChunk) return;
+        if (streamingEnabled && shouldDisplayRawStream) {
+          pendingText += normalizedChunk;
+          startTypewriter();
+        } else {
+          fullBuffer = normalizeLineBreakSpacing(fullBuffer + normalizedChunk);
+        }
+      };
 
       // ── Streaming think-tag filter ──
       // Models may emit <think>...</think>, <thinking>...</thinking>, or
@@ -726,38 +768,71 @@ export function useGenerate() {
       const THINK_OPEN_RE = /^(\s*)(<(think(?:ing)?)>|<\|channel>thought\b)/i;
       const THINK_OPEN_PREFIXES = ["<thinking>", "<think>", "<|channel>thought"];
 
-      // Compute charsPerTick from the user's streamingSpeed setting (1–100).
+      // Compute visible characters per second from the user's streamingSpeed setting (1–100).
       // Read per-tick so changes to the slider take effect immediately.
-      // Uses an exponential curve so each notch on the slider feels perceptibly different.
-      // speed 1   → 1 char/tick  → ~60 chars/sec   (slow typewriter effect)
-      // speed 50  → 22 chars/tick → ~1300 chars/sec (fast but visible)
-      // speed 100 → flush instantly (no typewriter)
-      const EXP_RATE = Math.log(500) / 98;
-      const getCharsPerTick = () => {
+      // speed 1   → slow read-along reveal
+      // speed 30  → deliberate typewriter pace
+      // speed 100 → flush instantly
+      const getCharsPerSecond = () => {
         const speed = useUIStore.getState().streamingSpeed;
-        return speed >= 100 ? Infinity : Math.max(1, Math.round(Math.exp(EXP_RATE * (speed - 1))));
+        if (speed >= 100) return Infinity;
+        const normalized = Math.max(0, Math.min(1, (speed - 1) / 98));
+        return 12 + Math.pow(normalized, 1.65) * 248;
       };
 
-      // Adaptive catch-up: when the queue gets very long, temporarily increase
-      // chars-per-tick to prevent the typewriter lagging far behind real completion.
-      const CATCHUP_THRESHOLD = 300;
-      const CATCHUP_MULTIPLIER = 4;
-      const TYPEWRITER_FRAME_MS = 28;
+      const TYPEWRITER_MAX_FRAME_MS = 120;
       let lastTypewriterPaintAt = 0;
+      let typewriterRemainder = 0;
 
       console.log(
-        "[Typewriter] streaming=%s, speed=%d, charsPerTick=%d",
+        "[Typewriter] streaming=%s, speed=%d, charsPerSecond=%s",
         streamingEnabled,
         useUIStore.getState().streamingSpeed,
-        getCharsPerTick(),
+        getCharsPerSecond(),
       );
 
       const flushTypewriterBuffer = () => {
         cancelAnimationFrame(rafId);
-        fullBuffer += pendingText;
+        fullBuffer = normalizeLineBreakSpacing(fullBuffer + pendingText);
         pendingText = "";
         typingActive = false;
+        typewriterRemainder = 0;
         if (streamingEnabled && shouldDisplayRawStream && fullBuffer) setStreamBuffer(fullBuffer, params.chatId);
+      };
+
+      const commonPrefixLength = (a: string, b: string) => {
+        const max = Math.min(a.length, b.length);
+        let index = 0;
+        while (index < max && a.charCodeAt(index) === b.charCodeAt(index)) index++;
+        return index;
+      };
+
+      const replaceGeneratedContentWithTypewriter = (content: string) => {
+        const nextContent = normalizeLineBreakSpacing(content);
+        cancelAnimationFrame(rafId);
+        typingActive = false;
+        typewriterRemainder = 0;
+
+        if (!streamingEnabled || !shouldDisplayRawStream) {
+          fullBuffer = nextContent;
+          pendingText = "";
+          return;
+        }
+
+        if (nextContent.startsWith(fullBuffer)) {
+          pendingText = nextContent.slice(fullBuffer.length);
+        } else {
+          const prefixLength = commonPrefixLength(fullBuffer, nextContent);
+          fullBuffer = nextContent.slice(0, prefixLength);
+          pendingText = nextContent.slice(prefixLength);
+          setStreamBuffer(fullBuffer, params.chatId);
+        }
+
+        if (pendingText) {
+          startTypewriter();
+        } else {
+          setStreamBuffer(fullBuffer, params.chatId);
+        }
       };
 
       const startTypewriter = () => {
@@ -772,17 +847,26 @@ export function useGenerate() {
             }
             return;
           }
-          if (now - lastTypewriterPaintAt < TYPEWRITER_FRAME_MS) {
+          if (!lastTypewriterPaintAt) lastTypewriterPaintAt = now;
+          const elapsedMs = Math.min(TYPEWRITER_MAX_FRAME_MS, Math.max(0, now - lastTypewriterPaintAt));
+          lastTypewriterPaintAt = now;
+
+          const charsPerSecond = getCharsPerSecond();
+          if (charsPerSecond === Infinity) {
+            fullBuffer += pendingText;
+            pendingText = "";
+            setStreamBuffer(fullBuffer, params.chatId);
             rafId = requestAnimationFrame(tick);
             return;
           }
-          lastTypewriterPaintAt = now;
-          // Read speed per-tick so the slider has immediate effect
-          const charsPerTick = getCharsPerTick();
-          // Catch-up: if the pending queue is very long, increase speed to avoid
-          // the typewriter still running long after the model finished.
-          const effective = pendingText.length > CATCHUP_THRESHOLD ? charsPerTick * CATCHUP_MULTIPLIER : charsPerTick;
-          const n = Math.min(effective, pendingText.length);
+
+          typewriterRemainder += (charsPerSecond * elapsedMs) / 1000;
+          const n = Math.min(Math.floor(typewriterRemainder), pendingText.length);
+          if (n < 1) {
+            rafId = requestAnimationFrame(tick);
+            return;
+          }
+          typewriterRemainder -= n;
           const batch = pendingText.slice(0, n);
           pendingText = pendingText.slice(n);
           fullBuffer += batch;
@@ -807,6 +891,7 @@ export function useGenerate() {
 
       try {
         const { userStatus, userActivity, debugMode, trimIncompleteModelOutput } = useUIStore.getState();
+        const userTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
 
         // Flush any pending game-state widget edits so the server sees them before committing
         const flushPatch = useGameStateStore.getState().flushPatch;
@@ -814,7 +899,15 @@ export function useGenerate() {
 
         for await (const event of api.streamEvents(
           "/generate",
-          { ...params, userStatus, userActivity, debugMode, trimIncompleteModelOutput, streaming: transportStreaming },
+          {
+            ...params,
+            userStatus,
+            userActivity,
+            userTimeZone,
+            debugMode,
+            trimIncompleteModelOutput,
+            streaming: transportStreaming,
+          },
           abortController.signal,
         )) {
           switch (event.type) {
@@ -893,13 +986,7 @@ export function useGenerate() {
 
               if (!chunk) break;
 
-              if (streamingEnabled && shouldDisplayRawStream) {
-                pendingText += chunk;
-                startTypewriter();
-              } else {
-                // Accumulate silently — don't update the UI until done
-                fullBuffer += chunk;
-              }
+              appendGeneratedChunk(chunk);
               break;
             }
 
@@ -988,13 +1075,17 @@ export function useGenerate() {
                 error: result.error,
               });
 
-              // Display as thought bubble for informational agents
-              if (result.success && result.data) {
-                const bubble = formatAgentBubble(result.agentType, result.agentName, result.data);
-                if (bubble) {
-                  addThoughtBubble(result.agentType, result.agentName, bubble);
-                }
+              const bubble = formatAgentBubble(
+                result.agentType,
+                result.agentName,
+                result.success ? result.data : { error: result.error ?? "Agent failed" },
+              );
+              if (bubble) {
+                addThoughtBubble(result.agentType, result.agentName, bubble);
+              }
 
+              // Apply successful informational agent data to dedicated stores.
+              if (result.success && result.data) {
                 // Push echo-chamber reactions to the dedicated echo store
                 if (result.agentType === "echo-chamber") {
                   const d = result.data as Record<string, unknown>;
@@ -1040,7 +1131,7 @@ export function useGenerate() {
               // Apply quest updates directly so the widget updates immediately
               if (result.success && result.agentType === "quest" && result.data) {
                 const qd = result.data as Record<string, unknown>;
-                const updates = (qd.updates as any[]) ?? [];
+                const updates = Array.isArray(qd.updates) ? qd.updates : [];
                 console.warn(`[Agent] Quest data:`, qd);
                 console.warn(`[Agent] Quest updates: ${updates.length} update(s)`, updates);
                 if (updates.length > 0) {
@@ -1054,28 +1145,11 @@ export function useGenerate() {
                     activeQuests: [],
                     status: "",
                   };
-                  const quests: any[] = [...(existing.activeQuests ?? [])];
-                  for (const u of updates) {
-                    const idx = quests.findIndex((q: any) => q.name === u.questName);
-                    if (u.action === "create" && idx === -1) {
-                      quests.push({
-                        questEntryId: u.questName,
-                        name: u.questName,
-                        currentStage: 0,
-                        objectives: u.objectives ?? [],
-                        completed: false,
-                      });
-                    } else if (idx !== -1) {
-                      if (u.action === "update" && u.objectives) quests[idx].objectives = u.objectives;
-                      else if (u.action === "complete") {
-                        quests[idx].completed = true;
-                        if (u.objectives) quests[idx].objectives = u.objectives;
-                      } else if (u.action === "fail") quests.splice(idx, 1);
-                    }
-                  }
+                  const questMerge = applyQuestUpdatesToPlayerStats(existing, updates);
+                  const quests = questMerge.quests;
                   const merged = cur
-                    ? { ...cur, playerStats: { ...existing, activeQuests: quests } }
-                    : { playerStats: { ...existing, activeQuests: quests } };
+                    ? { ...cur, playerStats: questMerge.playerStats }
+                    : { playerStats: questMerge.playerStats };
                   console.warn(`[Agent] Quest merge result — activeQuests:`, quests);
                   setGameState(merged as any);
                 } else {
@@ -1234,8 +1308,8 @@ export function useGenerate() {
                     typingActive = false;
                   }
                 }
-                fullBuffer = rw.editedText;
-                if (streamingEnabled && shouldDisplayRawStream) setStreamBuffer(rw.editedText, params.chatId);
+                fullBuffer = normalizeLineBreakSpacing(rw.editedText);
+                if (streamingEnabled && shouldDisplayRawStream) setStreamBuffer(fullBuffer, params.chatId);
               }
               break;
             }
@@ -1243,13 +1317,7 @@ export function useGenerate() {
             case "content_replace": {
               // Server stripped character commands — replace the displayed content
               const cleanContent = event.data as string;
-              if (streamingEnabled) {
-                cancelAnimationFrame(rafId);
-                pendingText = "";
-                typingActive = false;
-              }
-              fullBuffer = cleanContent;
-              if (streamingEnabled && shouldDisplayRawStream) setStreamBuffer(cleanContent, params.chatId);
+              replaceGeneratedContentWithTypewriter(cleanContent);
               break;
             }
 
@@ -1359,8 +1427,12 @@ export function useGenerate() {
             }
 
             case "agent_error": {
-              const errData = event.data as { agentType: string; error: string };
-              toast.error(errData.error);
+              const errData = event.data as { agentType: string; agentName?: string | null; error: string };
+              const failure = toAgentFailure(errData);
+              setFailedAgentFailures([failure]);
+              showAgentFailuresError([failure], () => {
+                void retryAgentsRef.current?.(params.chatId, [failure.agentType]);
+              });
               break;
             }
 
@@ -1449,6 +1521,15 @@ export function useGenerate() {
               } else if (actionData.action === "chat_created") {
                 toast(`Started ${actionData.mode} chat with ${actionData.characterName}`, { icon: "💬" });
                 qc.invalidateQueries({ queryKey: ["chats"] });
+                if (typeof actionData.chatId === "string") {
+                  qc.invalidateQueries({ queryKey: chatKeys.messages(actionData.chatId) });
+                }
+              } else if (actionData.action === "dm_posted") {
+                if (typeof actionData.chatId === "string") {
+                  qc.invalidateQueries({ queryKey: ["chats"] });
+                  qc.invalidateQueries({ queryKey: chatKeys.messages(actionData.chatId) });
+                  qc.invalidateQueries({ queryKey: lorebookKeys.active(actionData.chatId) });
+                }
               } else if (actionData.action === "data_fetched") {
                 const fetchType = (actionData.fetchType as string) ?? "data";
                 toast(`Fetched ${fetchType}: ${actionData.name}`, { icon: "📋" });
@@ -1521,12 +1602,19 @@ export function useGenerate() {
             }
 
             case "agents_retry_failed": {
-              const failedList = event.data as Array<{ agentType: string; error: string | null }>;
-              const types = failedList.map((f) => f.agentType);
-              setFailedAgentTypes(types);
-              showError(
-                `${types.length} agent${types.length > 1 ? "s" : ""} failed after retry. Use the retry button in the chat header to try again.`,
-              );
+              const failedList = event.data as Array<{
+                agentType: string;
+                agentName?: string | null;
+                error: string | null;
+              }>;
+              const failures = failedList.map(toAgentFailure);
+              setFailedAgentFailures(failures);
+              showAgentFailuresError(failures, () => {
+                void retryAgentsRef.current?.(
+                  params.chatId,
+                  failures.map((failure) => failure.agentType),
+                );
+              });
               break;
             }
           }
@@ -1544,7 +1632,9 @@ export function useGenerate() {
           });
         }
         // Final flush — ensure full content is set (only for the viewed chat)
-        if (streamingEnabled && shouldDisplayRawStream) setStreamBuffer(fullBuffer + pendingText, params.chatId);
+        if (streamingEnabled && shouldDisplayRawStream) {
+          setStreamBuffer(normalizeLineBreakSpacing(fullBuffer + pendingText), params.chatId);
+        }
       } catch (error) {
         // Flush everything instantly on error so user sees what arrived
         flushTypewriterBuffer();
@@ -1740,21 +1830,13 @@ export function useGenerate() {
       clearCyoaChoices,
       enqueuePendingCardUpdate,
       clearFailedAgentTypes,
-      setFailedAgentTypes,
+      setFailedAgentFailures,
       setGameState,
     ],
   );
 
   const retryAgents = useCallback(
-    async (
-      chatId: string,
-      agentTypes: string[],
-      options?: {
-        lorebookKeeperBackfill?: boolean;
-        forMessageId?: string;
-        secretPlotRerollMode?: "full" | "turn_only";
-      },
-    ) => {
+    async (chatId: string, agentTypes: string[], options?: RetryAgentsOptions) => {
       const isActiveChat = () => useChatStore.getState().activeChatId === chatId;
       const abortController = new AbortController();
       setProcessing(true);
@@ -1773,6 +1855,7 @@ export function useGenerate() {
         }
 
         let hasError = false;
+        const failedRetryFailures: Array<ReturnType<typeof toAgentFailure>> = [];
         for await (const event of api.streamEvents(
           "/generate/retry-agents",
           {
@@ -1844,9 +1927,14 @@ export function useGenerate() {
                   })
                   .catch((err) => console.warn("[Agent] Failed to build card update entry:", err));
               }
+              const bubble = formatAgentBubble(
+                result.agentType,
+                result.agentName,
+                result.success ? result.data : { error: result.error ?? "Agent failed" },
+              );
+              if (bubble) addThoughtBubble(result.agentType, result.agentName, bubble);
+
               if (result.success && result.data) {
-                const bubble = formatAgentBubble(result.agentType, result.agentName, result.data);
-                if (bubble) addThoughtBubble(result.agentType, result.agentName, bubble);
                 if (result.agentType === "echo-chamber") {
                   const d = result.data as Record<string, unknown>;
                   const reactions = (d.reactions as Array<{ characterName: string; reaction: string }>) ?? [];
@@ -1868,7 +1956,7 @@ export function useGenerate() {
                 // Apply quest updates directly so the widget updates immediately
                 if (result.agentType === "quest") {
                   const qd = result.data as Record<string, unknown>;
-                  const updates = (qd.updates as any[]) ?? [];
+                  const updates = Array.isArray(qd.updates) ? qd.updates : [];
                   if (updates.length > 0) {
                     const cur = useGameStateStore.getState().current;
                     const existing = cur?.playerStats ?? {
@@ -1879,45 +1967,40 @@ export function useGenerate() {
                       activeQuests: [],
                       status: "",
                     };
-                    const quests: any[] = [...(existing.activeQuests ?? [])];
-                    for (const u of updates) {
-                      const idx = quests.findIndex((q: any) => q.name === u.questName);
-                      if (u.action === "create" && idx === -1) {
-                        quests.push({
-                          questEntryId: u.questName,
-                          name: u.questName,
-                          currentStage: 0,
-                          objectives: u.objectives ?? [],
-                          completed: false,
-                        });
-                      } else if (idx !== -1) {
-                        if (u.action === "update" && u.objectives) quests[idx].objectives = u.objectives;
-                        else if (u.action === "complete") {
-                          quests[idx].completed = true;
-                          if (u.objectives) quests[idx].objectives = u.objectives;
-                        } else if (u.action === "fail") quests.splice(idx, 1);
-                      }
-                    }
+                    const questMerge = applyQuestUpdatesToPlayerStats(existing, updates);
                     const merged = cur
-                      ? { ...cur, playerStats: { ...existing, activeQuests: quests } }
-                      : { playerStats: { ...existing, activeQuests: quests } };
+                      ? { ...cur, playerStats: questMerge.playerStats }
+                      : { playerStats: questMerge.playerStats };
                     setGameState(merged as any);
                   }
                 }
               }
               if (!result.success && result.error) {
                 hasError = true;
-                showError(`${result.agentName ?? result.agentType} failed: ${result.error}`);
+                const failure = toAgentFailure(result);
+                failedRetryFailures.push(failure);
+                setFailedAgentFailures(failedRetryFailures);
+                showAgentFailuresError([failure], () => {
+                  void retryAgentsRef.current?.(chatId, [failure.agentType], options);
+                });
               }
               break;
             }
             case "agents_retry_failed": {
-              const failedList = event.data as Array<{ agentType: string; error: string | null }>;
-              const types = failedList.map((f) => f.agentType);
-              setFailedAgentTypes(types);
-              showError(
-                `${types.length} agent${types.length > 1 ? "s" : ""} failed after retry. Use the retry button in the chat header to try again.`,
-              );
+              const failedList = event.data as Array<{
+                agentType: string;
+                agentName?: string | null;
+                error: string | null;
+              }>;
+              const failures = failedList.map(toAgentFailure);
+              setFailedAgentFailures(failures);
+              showAgentFailuresError(failures, () => {
+                void retryAgentsRef.current?.(
+                  chatId,
+                  failures.map((failure) => failure.agentType),
+                  options,
+                );
+              });
               break;
             }
             case "game_state":
@@ -1941,6 +2024,16 @@ export function useGenerate() {
                 qc.invalidateQueries({ queryKey: ["messages", chatId] });
                 qc.invalidateQueries({ queryKey: ["gallery", chatId] });
               }
+              break;
+            }
+            case "agent_error": {
+              const errData = event.data as { agentType: string; agentName?: string | null; error: string };
+              hasError = true;
+              const failure = toAgentFailure(errData);
+              setFailedAgentFailures([failure]);
+              showAgentFailuresError([failure], () => {
+                void retryAgentsRef.current?.(chatId, [failure.agentType], options);
+              });
               break;
             }
             case "error": {
@@ -1982,12 +2075,14 @@ export function useGenerate() {
       clearFailedAgentTypes,
       clearThoughtBubbles,
       setCyoaChoices,
-      setFailedAgentTypes,
+      setFailedAgentFailures,
       setProcessing,
       setGameState,
       qc,
     ],
   );
+
+  retryAgentsRef.current = retryAgents;
 
   return { generate, retryAgents };
 }
@@ -2004,7 +2099,14 @@ function formatAgentBubble(agentType: string, agentName: string, data: unknown):
     case "continuity": {
       const issues = (d.issues as any[]) ?? [];
       if (!issues.length) return null;
-      return issues.map((i: any) => `${i.severity === "error" ? "🔴" : "🟡"} ${i.description}`).join("\n");
+      return issues
+        .map((i: any) => {
+          const description = typeof i.description === "string" ? i.description.trim() : "";
+          const suggestion = typeof i.suggestion === "string" ? i.suggestion.trim() : "";
+          const detail = suggestion ? `${description} Fix: ${suggestion}` : description;
+          return `${i.severity === "error" ? "🔴" : "🟡"} ${detail}`;
+        })
+        .join("\n");
     }
 
     case "prompt-reviewer": {
@@ -2072,8 +2174,14 @@ function formatAgentBubble(agentType: string, agentName: string, data: unknown):
     }
 
     case "spotify": {
+      const error = typeof d.error === "string" ? d.error.trim() : "";
+      if (error) return `🎵 Spotify DJ could not run: ${error}`;
+      if (d.parseError === true) {
+        return "🎵 Spotify DJ ran, but did not return playable track details";
+      }
       const action = d.action as string;
       const mood = (d.mood as string) ?? "";
+      const display = typeof d.display === "string" ? d.display.trim() : "";
       if (action === "none") return mood ? `🎵 Keeping current track — ${mood}` : "🎵 Keeping current track";
       if (action === "play") {
         // Support both array and singular formats
@@ -2082,7 +2190,12 @@ function formatAgentBubble(agentType: string, agentName: string, data: unknown):
           : d.trackName
             ? [d.trackName as string]
             : [];
-        if (trackNames.length === 0) return mood ? `🎵 ${mood}` : null;
+        if (trackNames.length === 0) {
+          if (display) return display;
+          const queued = typeof d.queued === "number" && Number.isFinite(d.queued) ? d.queued : 0;
+          if (queued > 1) return `🎵 Queued ${queued} Spotify tracks${mood ? `: ${mood}` : ""}`;
+          return mood ? `🎵 Spotify DJ started playback: ${mood}` : "🎵 Spotify DJ started playback";
+        }
         if (trackNames.length === 1) {
           return `🎵 ${trackNames[0]}${mood ? ` — ${mood}` : ""}`;
         }

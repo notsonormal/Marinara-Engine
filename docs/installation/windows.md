@@ -81,7 +81,7 @@ Want to use Marinara Engine from your phone, tablet, or another computer? See th
 
 When you launch Marinara Engine via the Start Menu shortcut or `start.bat` from a git checkout, the launcher automatically:
 
-1. Fetches the latest code from GitHub and fast-forwards to `origin/main`
+1. Fetches the latest code from GitHub into `origin/main`, then fast-forwards normal clones or moves installer-created release checkouts to that commit
 2. Detects whether the checkout changed
 3. Temporarily stashes tracked local changes if needed, then reapplies them
 4. Reinstalls dependencies and rebuilds when needed
@@ -93,13 +93,15 @@ This applies to both manual clones and installs created by the Windows installer
 
 Go to **Settings → Advanced → Updates** and click **Check for Updates** to see whether a new release exists. The in-app **Apply Update** button is disabled by default; to enable it, set `UPDATES_APPLY_ENABLED=true`, set `ADMIN_SECRET`, and save that same secret in **Settings → Advanced → Admin Access**. Otherwise, relaunch Marinara Engine from the shortcut or `start.bat` to let the launcher update the app.
 
+If you open Settings from an iPhone or iPad connected to this host, **Apply Update** still updates this Windows server. Remote apply also requires `UPDATES_ALLOW_REMOTE_APPLY=true`; otherwise, relaunch from the Start Menu shortcut or `start.bat` on Windows.
+
 ### Manual Update
 
 If you use a git checkout without the launcher or the in-app updater:
 
 ```bat
-git fetch origin main
-git merge --ff-only origin/main
+git fetch origin +refs/heads/main:refs/remotes/origin/main
+git merge --ff-only origin/main || git checkout --detach origin/main
 pnpm install
 pnpm build
 ```

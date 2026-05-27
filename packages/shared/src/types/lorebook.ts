@@ -31,6 +31,8 @@ export interface Lorebook {
   description: string;
   /** Top-level category this lorebook belongs to */
   category: LorebookCategory;
+  /** Optional picture displayed for this lorebook in the library UI */
+  imagePath: string | null;
   /** Default scan depth for entries that don't override */
   scanDepth: number;
   /** Max output tokens allocated to this lorebook */
@@ -38,6 +40,8 @@ export interface Lorebook {
   recursiveScanning: boolean;
   /** Maximum recursion depth for recursive scanning (default 3) */
   maxRecursionDepth: number;
+  /** When true, bulk vectorization skips every entry in this lorebook and semantic matching ignores stored vectors */
+  excludeFromVectorization: boolean;
   /** ID of the character this lorebook is linked to (character books) */
   characterId: string | null;
   /** IDs of characters this lorebook is linked to */

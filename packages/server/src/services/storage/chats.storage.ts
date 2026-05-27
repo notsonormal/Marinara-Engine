@@ -1,7 +1,7 @@
 // ──────────────────────────────────────────────
 // Storage: Chats
 // ──────────────────────────────────────────────
-import { eq, desc, and, lt, gt, inArray } from "drizzle-orm";
+import { eq, desc, and, gt, inArray, isNull } from "drizzle-orm";
 import type { DB } from "../../db/connection.js";
 import {
   chats,
@@ -83,9 +83,7 @@ function readUnreadCount(value: unknown): number {
 }
 
 function readCharacterIds(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
-    : [];
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string" && id.trim().length > 0) : [];
 }
 
 function hasConversationSchedules(value: unknown): value is CharacterSchedules {
@@ -140,8 +138,24 @@ function parseMessageCursor(before?: string): { createdAt: string; rowid: number
 }
 
 async function invalidateMemoryChunksFrom(db: DB, chatId: string, createdAt: string) {
-  await db.delete(memoryChunks).where(and(eq(memoryChunks.chatId, chatId), gt(memoryChunks.lastMessageAt, createdAt)));
-  await db.delete(memoryChunks).where(and(eq(memoryChunks.chatId, chatId), eq(memoryChunks.lastMessageAt, createdAt)));
+  await db
+    .delete(memoryChunks)
+    .where(
+      and(
+        eq(memoryChunks.chatId, chatId),
+        isNull(memoryChunks.sourceChatId),
+        gt(memoryChunks.lastMessageAt, createdAt),
+      ),
+    );
+  await db
+    .delete(memoryChunks)
+    .where(
+      and(
+        eq(memoryChunks.chatId, chatId),
+        isNull(memoryChunks.sourceChatId),
+        eq(memoryChunks.lastMessageAt, createdAt),
+      ),
+    );
 }
 
 /** Create the chat storage facade used by routes and importers. */
@@ -657,7 +671,20 @@ export function createChatsStorage(db: DB) {
      */
     async bulkSetHiddenFromAI(chatId: string, messageIds: string[], hidden: boolean): Promise<number> {
       if (messageIds.length === 0) return 0;
-      for (const id of messageIds) {
+      const uniqueIds = Array.from(new Set(messageIds));
+      const scopedRows: { id: string }[] = [];
+      const CHUNK = 500;
+      for (let i = 0; i < uniqueIds.length; i += CHUNK) {
+        const batch = uniqueIds.slice(i, i + CHUNK);
+        const batchRows = await db
+          .select({ id: messages.id })
+          .from(messages)
+          .where(and(eq(messages.chatId, chatId), inArray(messages.id, batch)));
+        scopedRows.push(...batchRows);
+      }
+      const scopedIds = Array.from(new Set(scopedRows.map((row) => row.id)));
+
+      for (const id of scopedIds) {
         await this.updateMessageExtra(id, { hiddenFromAI: hidden });
         // Mirror what the single-message /extra route does: propagate the flag
         // to all swipe rows so setActiveSwipe() cannot clobber it.
@@ -666,7 +693,7 @@ export function createChatsStorage(db: DB) {
           await this.updateSwipeExtra(id, swipe.index, { hiddenFromAI: hidden });
         }
       }
-      return messageIds.length;
+      return scopedIds.length;
     },
 
     /** Atomically append an attachment to a message's extra JSON field. */

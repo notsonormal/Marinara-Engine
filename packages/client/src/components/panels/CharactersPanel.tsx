@@ -43,10 +43,13 @@ import {
   MessageCircle,
   Star,
   Wand2,
+  Hash,
+  Minus,
 } from "lucide-react";
 import { getCharacterTitle } from "../../lib/character-display";
 import { useUIStore } from "../../stores/ui.store";
 import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
+import { estimateCharacterCardTokens, formatEstimatedTokens } from "../../lib/character-token-count";
 import { ExportFormatDialog, type ExportFormatChoice } from "../ui/ExportFormatDialog";
 
 type CharacterRow = {
@@ -59,8 +62,31 @@ type CharacterRow = {
 };
 type GroupRow = { id: string; name: string; description: string; characterIds: string; avatarPath: string | null };
 type ParsedCharacterRow = CharacterRow & { parsed: Record<string, any> };
+type ParsedGroupRow = GroupRow & { memberIds: string[]; isSynthetic?: boolean };
 
 type SortOption = "name-asc" | "name-desc" | "newest" | "oldest" | "favorites";
+const UNGROUPED_CHARACTER_GROUP_ID = "__ungrouped-characters__";
+
+function getCharacterTags(char: ParsedCharacterRow): string[] {
+  return Array.isArray(char.parsed.tags) ? (char.parsed.tags as string[]).filter(Boolean) : [];
+}
+
+function parseCharacterSearchQuery(value: string) {
+  const excludedTags: string[] = [];
+  const text = value
+    .replace(/(?:^|\s)(?:-|!)(?:tag:|#)?(?:"([^"]+)"|(\S+))/gi, (_match, quoted: string, bare: string) => {
+      const tag = (quoted ?? bare ?? "").trim();
+      if (tag) excludedTags.push(tag.toLowerCase());
+      return " ";
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    text: text.toLowerCase(),
+    excludedTags,
+  };
+}
 
 function getCharacterPreviewMetadata(char: ParsedCharacterRow): string | null {
   const parts: string[] = [];
@@ -76,7 +102,7 @@ function getCharacterPreviewMetadata(char: ParsedCharacterRow): string | null {
       : {};
   const spec = typeof cardMetadata.spec === "string" ? cardMetadata.spec.trim() : "";
   const specVersion = typeof cardMetadata.specVersion === "string" ? cardMetadata.specVersion.trim() : "";
-  const tags = Array.isArray(char.parsed.tags) ? (char.parsed.tags as string[]).filter(Boolean) : [];
+  const tags = getCharacterTags(char);
 
   if (creator) parts.push(`by ${creator}`);
   if (version) parts.push(`v${version}`);
@@ -129,7 +155,8 @@ export function CharactersPanel() {
     message: string;
     alternateGreetings: string[];
   } | null>(null);
-  const [activeTag, setActiveTag] = useState<string | null>(null);
+  const [includedTags, setIncludedTags] = useState<Set<string>>(new Set());
+  const [excludedTags, setExcludedTags] = useState<Set<string>>(new Set());
   const [tagsExpanded, setTagsExpanded] = useState(false);
   const [favFilter, setFavFilter] = useState<"all" | "favorites" | "non-favorites">("all");
   const [selectionMode, setSelectionMode] = useState(false);
@@ -166,35 +193,52 @@ export function CharactersPanel() {
 
   const filteredCharacters = useMemo(() => {
     let list = parsedCharacters;
+    const query = parseCharacterSearchQuery(search);
     // Filter by favorites
     if (favFilter === "favorites") {
       list = list.filter((c) => c.parsed.extensions?.fav);
     } else if (favFilter === "non-favorites") {
       list = list.filter((c) => !c.parsed.extensions?.fav);
     }
-    // Filter by active tag
-    if (activeTag) {
-      list = list.filter((c) => (c.parsed.tags ?? []).some((t: string) => t === activeTag));
+    // Filter by included tags (OR logic)
+    if (includedTags.size > 0) {
+      const lowerIncludedTags = new Set([...includedTags].map((t) => t.toLowerCase()));
+      list = list.filter((c) => {
+        const tags = new Set(getCharacterTags(c).map((t) => t.toLowerCase()));
+        return [...lowerIncludedTags].some((tag) => tags.has(tag));
+      });
+    }
+    const excludedTagFilters = new Set([
+      ...Array.from(excludedTags, (tag) => tag.toLowerCase()),
+      ...query.excludedTags,
+    ]);
+    if (excludedTagFilters.size > 0) {
+      list = list.filter((c) => {
+        const tags = new Set(getCharacterTags(c).map((tag) => tag.toLowerCase()));
+        for (const tag of excludedTagFilters) {
+          if (tags.has(tag)) return false;
+        }
+        return true;
+      });
     }
     // Filter by search text
-    if (search.trim()) {
-      const q = search.toLowerCase();
+    if (query.text) {
       list = list.filter(
         (c) =>
-          (c.parsed.name ?? "").toLowerCase().includes(q) ||
-          (typeof c.comment === "string" && c.comment.toLowerCase().includes(q)) ||
-          (c.parsed.description ?? "").toLowerCase().includes(q) ||
-          (c.parsed.tags ?? []).some((t: string) => t.toLowerCase().includes(q)),
+          (c.parsed.name ?? "").toLowerCase().includes(query.text) ||
+          (typeof c.comment === "string" && c.comment.toLowerCase().includes(query.text)) ||
+          (c.parsed.description ?? "").toLowerCase().includes(query.text) ||
+          getCharacterTags(c).some((t) => t.toLowerCase().includes(query.text)),
       );
     }
     return list;
-  }, [parsedCharacters, search, activeTag, favFilter]);
+  }, [parsedCharacters, search, includedTags, excludedTags, favFilter]);
 
   // Collect all unique tags across characters for the filter bar
   const allTags = useMemo(() => {
     const tagSet = new Set<string>();
     for (const c of parsedCharacters) {
-      for (const t of (c.parsed.tags ?? []) as string[]) {
+      for (const t of getCharacterTags(c)) {
         tagSet.add(t);
       }
     }
@@ -214,55 +258,174 @@ export function CharactersPanel() {
         return;
       }
       try {
-        const affected = parsedCharacters.filter((c) => ((c.parsed.tags ?? []) as string[]).includes(tag));
+        const affected = parsedCharacters.filter((c) => getCharacterTags(c).includes(tag));
         for (const c of affected) {
-          const newTags = ((c.parsed.tags ?? []) as string[]).filter((t) => t !== tag);
+          const newTags = getCharacterTags(c).filter((t) => t !== tag);
           await updateCharacter.mutateAsync({ id: c.id, data: { tags: newTags } });
         }
-        if (activeTag === tag) setActiveTag(null);
+        if (includedTags.has(tag)) {
+          setIncludedTags((prev) => {
+            const next = new Set(prev);
+            next.delete(tag);
+            return next;
+          });
+        }
+        setExcludedTags((prev) => {
+          if (!prev.has(tag)) return prev;
+          const next = new Set(prev);
+          next.delete(tag);
+          return next;
+        });
       } catch {
         toast.error("Failed to remove tag from some characters");
       }
     },
-    [parsedCharacters, updateCharacter, activeTag],
+    [parsedCharacters, updateCharacter, includedTags],
   );
+
+  const toggleIncludedTag = useCallback((tag: string) => {
+    setIncludedTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(tag)) {
+        next.delete(tag);
+      } else {
+        next.add(tag);
+      }
+      return next;
+    });
+    setExcludedTags((prev) => {
+      if (!prev.has(tag)) return prev;
+      const next = new Set(prev);
+      next.delete(tag);
+      return next;
+    });
+  }, []);
+
+  const toggleExcludedTag = useCallback((tag: string) => {
+    setIncludedTags((prev) => {
+      if (!prev.has(tag)) return prev;
+      const next = new Set(prev);
+      next.delete(tag);
+      return next;
+    });
+    setExcludedTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(tag)) {
+        next.delete(tag);
+      } else {
+        next.add(tag);
+      }
+      return next;
+    });
+  }, []);
+
+  const clearTagFilters = useCallback(() => {
+    setIncludedTags(new Set());
+    setExcludedTags(new Set());
+  }, []);
 
   const sortedCharacters = useMemo(() => {
     const list = [...filteredCharacters];
+    const hasIncludedTags = includedTags.size > 0;
+    const matchCounts = hasIncludedTags
+      ? new Map(
+          list.map((c) => {
+            const tags = new Set(getCharacterTags(c).map((t) => t.toLowerCase()));
+            return [c.id, [...includedTags].filter((tag) => tags.has(tag.toLowerCase())).length];
+          }),
+        )
+      : null;
     switch (sort) {
       case "name-asc":
-        return list.sort((a, b) => (a.parsed.name ?? "").localeCompare(b.parsed.name ?? ""));
+        return list.sort((a, b) => {
+          if (hasIncludedTags) {
+            const countDiff = (matchCounts!.get(b.id) ?? 0) - (matchCounts!.get(a.id) ?? 0);
+            if (countDiff !== 0) return countDiff;
+          }
+          return (a.parsed.name ?? "").localeCompare(b.parsed.name ?? "");
+        });
       case "name-desc":
-        return list.sort((a, b) => (b.parsed.name ?? "").localeCompare(a.parsed.name ?? ""));
+        return list.sort((a, b) => {
+          if (hasIncludedTags) {
+            const countDiff = (matchCounts!.get(b.id) ?? 0) - (matchCounts!.get(a.id) ?? 0);
+            if (countDiff !== 0) return countDiff;
+          }
+          return (b.parsed.name ?? "").localeCompare(a.parsed.name ?? "");
+        });
       case "newest":
-        return list.sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
+        return list.sort((a, b) => {
+          if (hasIncludedTags) {
+            const countDiff = (matchCounts!.get(b.id) ?? 0) - (matchCounts!.get(a.id) ?? 0);
+            if (countDiff !== 0) return countDiff;
+          }
+          return (b.createdAt ?? "").localeCompare(a.createdAt ?? "");
+        });
       case "oldest":
-        return list.sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
+        return list.sort((a, b) => {
+          if (hasIncludedTags) {
+            const countDiff = (matchCounts!.get(b.id) ?? 0) - (matchCounts!.get(a.id) ?? 0);
+            if (countDiff !== 0) return countDiff;
+          }
+          return (a.createdAt ?? "").localeCompare(b.createdAt ?? "");
+        });
       case "favorites":
         return list.sort((a, b) => {
           const aFav = a.parsed.extensions?.fav ? 1 : 0;
           const bFav = b.parsed.extensions?.fav ? 1 : 0;
           if (bFav !== aFav) return bFav - aFav;
+          if (hasIncludedTags) {
+            const countDiff = (matchCounts!.get(b.id) ?? 0) - (matchCounts!.get(a.id) ?? 0);
+            if (countDiff !== 0) return countDiff;
+          }
           return (a.parsed.name ?? "").localeCompare(b.parsed.name ?? "");
         });
       default:
+        if (hasIncludedTags) {
+          return list.sort((a, b) => {
+            const countDiff = (matchCounts!.get(b.id) ?? 0) - (matchCounts!.get(a.id) ?? 0);
+            if (countDiff !== 0) return countDiff;
+            return (a.parsed.name ?? "").localeCompare(b.parsed.name ?? "");
+          });
+        }
         return list;
     }
-  }, [filteredCharacters, sort]);
+  }, [filteredCharacters, sort, includedTags]);
 
-  const parsedGroups = useMemo(() => {
+  const parsedGroups = useMemo<ParsedGroupRow[]>(() => {
     if (!groups) return [];
-    return (groups as GroupRow[]).map((g) => ({
-      ...g,
-      memberIds: (() => {
+    const assignedIds = new Set<string>();
+    const realGroups = (groups as GroupRow[]).map((g) => {
+      const memberIds = (() => {
         try {
           return JSON.parse(g.characterIds);
         } catch {
           return [];
         }
-      })() as string[],
-    }));
-  }, [groups]);
+      })() as string[];
+      for (const id of memberIds) assignedIds.add(id);
+      return {
+        ...g,
+        memberIds,
+      };
+    });
+    const ungroupedMemberIds = parsedCharacters
+      .filter((char) => !assignedIds.has(char.id))
+      .sort((a, b) => (a.parsed.name ?? "").localeCompare(b.parsed.name ?? ""))
+      .map((char) => char.id);
+    if (ungroupedMemberIds.length === 0) return realGroups;
+    return [
+      ...realGroups,
+      {
+        id: UNGROUPED_CHARACTER_GROUP_ID,
+        name: "Ungrouped",
+        description: "Characters not assigned to any group",
+        characterIds: JSON.stringify(ungroupedMemberIds),
+        avatarPath: null,
+        memberIds: ungroupedMemberIds,
+        isSynthetic: true,
+      },
+    ];
+  }, [groups, parsedCharacters]);
 
   const toggleCharacter = (charId: string) => {
     if (!activeChat) return;
@@ -462,7 +625,7 @@ export function CharactersPanel() {
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search characters"
+            placeholder='Search characters or -tag:"tag name"'
             className="w-full rounded-xl border border-[var(--border)] bg-[var(--secondary)] py-2 pl-8 pr-3 text-xs outline-none transition-colors placeholder:text-[var(--muted-foreground)]/50 focus:border-[var(--primary)]/40 focus:ring-1 focus:ring-[var(--primary)]/20"
           />
         </div>
@@ -512,59 +675,92 @@ export function CharactersPanel() {
             onClick={() => setTagsExpanded(!tagsExpanded)}
             className={cn(
               "flex items-center gap-1.5 rounded-lg px-2 py-1 text-[0.625rem] font-medium transition-all",
-              activeTag
+              includedTags.size > 0 || excludedTags.size > 0
                 ? "bg-[var(--primary)]/15 text-[var(--primary)]"
                 : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
             )}
           >
             <Tag size="0.625rem" />
-            Tags ({allTags.length}){activeTag && <span className="ml-0.5 opacity-70">· {activeTag}</span>}
+            Tags ({allTags.length})
+            {(includedTags.size > 0 || excludedTags.size > 0) && (
+              <span className="ml-0.5 opacity-70">
+                {[
+                  ...[...includedTags].slice(0, 3),
+                  includedTags.size > 3 ? `+${includedTags.size - 3}` : null,
+                  excludedTags.size > 0 ? `-${excludedTags.size}` : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </span>
+            )}
             <ChevronDown size="0.625rem" className={cn("transition-transform", tagsExpanded && "rotate-180")} />
           </button>
           {tagsExpanded && (
             <div className="flex flex-wrap gap-1">
-              {activeTag && (
+              {(includedTags.size > 0 || excludedTags.size > 0) && (
                 <button
-                  onClick={() => setActiveTag(null)}
+                  onClick={clearTagFilters}
                   className="flex items-center gap-1 rounded-full bg-[var(--destructive)]/10 px-2 py-0.5 text-[0.625rem] font-medium text-[var(--destructive)] transition-all hover:bg-[var(--destructive)]/20"
                 >
                   <X size="0.5rem" /> Clear
                 </button>
               )}
-              {allTags.map((tag) => (
-                <div
-                  key={tag}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => setActiveTag(activeTag === tag ? null : tag)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      setActiveTag(activeTag === tag ? null : tag);
-                    }
-                  }}
-                  className={cn(
-                    "group/tag flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-all cursor-pointer",
-                    activeTag === tag
-                      ? "bg-[var(--primary)]/20 text-[var(--primary)] ring-1 ring-[var(--primary)]/30"
-                      : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
-                  )}
-                >
-                  <Tag size="0.5rem" />
-                  {tag}
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleDeleteTag(tag);
+              {allTags.map((tag) => {
+                const included = includedTags.has(tag);
+                const excluded = excludedTags.has(tag);
+                return (
+                  <div
+                    key={tag}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => toggleIncludedTag(tag)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        toggleIncludedTag(tag);
+                      }
                     }}
-                    className="ml-0.5 rounded-full p-0.5 transition-colors hover:bg-[var(--destructive)]/20 hover:text-[var(--destructive)]"
-                    title={`Delete tag "${tag}"`}
+                    className={cn(
+                      "group/tag flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-all",
+                      included
+                        ? "bg-[var(--primary)]/20 text-[var(--primary)] ring-1 ring-[var(--primary)]/30"
+                        : excluded
+                          ? "bg-[var(--destructive)]/12 text-[var(--destructive)] ring-1 ring-[var(--destructive)]/25"
+                          : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
+                    )}
                   >
-                    <X size="0.5rem" />
-                  </button>
-                </div>
-              ))}
+                    <Tag size="0.5rem" />
+                    {tag}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleExcludedTag(tag);
+                      }}
+                      className={cn(
+                        "ml-0.5 rounded-full p-0.5 transition-colors",
+                        excluded
+                          ? "bg-[var(--destructive)]/20 text-[var(--destructive)]"
+                          : "hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]",
+                      )}
+                      title={excluded ? `Stop excluding "${tag}"` : `Exclude tag "${tag}"`}
+                    >
+                      <Minus size="0.5rem" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteTag(tag);
+                      }}
+                      className="rounded-full p-0.5 transition-colors hover:bg-[var(--destructive)]/20 hover:text-[var(--destructive)]"
+                      title={`Delete tag "${tag}"`}
+                    >
+                      <X size="0.5rem" />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -731,6 +927,7 @@ export function CharactersPanel() {
               const isExpanded = expandedGroupId === group.id;
               const isEditing = editingGroupId === group.id;
               const isAssigning = assigningToGroup === group.id;
+              const isSynthetic = group.isSynthetic === true;
 
               return (
                 <div
@@ -767,57 +964,63 @@ export function CharactersPanel() {
                         </>
                       )}
                     </div>
-                    <div className="absolute right-2 top-1/2 -translate-y-1/2 flex shrink-0 items-center gap-0.5 rounded-lg bg-[var(--sidebar)] px-1 py-0.5 opacity-0 shadow-sm ring-1 ring-[var(--border)] transition-opacity group-hover:opacity-100 max-md:opacity-100">
-                      {activeChat && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            addGroupToChat(group.memberIds);
-                          }}
-                          className="rounded-lg p-1 transition-all hover:bg-[var(--accent)]"
-                          title="Add all to chat"
-                        >
-                          <UserPlus size="0.6875rem" className="text-[var(--primary)]" />
-                        </button>
-                      )}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (!isAssigning) {
-                            exitSelectionMode();
-                          }
-                          setAssigningToGroup(isAssigning ? null : group.id);
-                        }}
-                        className={cn(
-                          "rounded-lg p-1 transition-all hover:bg-[var(--accent)]",
-                          isAssigning && "bg-[var(--primary)]/15 text-[var(--primary)]",
+                    {(activeChat || !isSynthetic) && (
+                      <div className="absolute right-2 top-1/2 -translate-y-1/2 flex shrink-0 items-center gap-0.5 rounded-lg bg-[var(--sidebar)] px-1 py-0.5 opacity-0 shadow-sm ring-1 ring-[var(--border)] transition-opacity group-hover:opacity-100 max-md:opacity-100">
+                        {activeChat && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              addGroupToChat(group.memberIds);
+                            }}
+                            className="rounded-lg p-1 transition-all hover:bg-[var(--accent)]"
+                            title="Add all to chat"
+                          >
+                            <UserPlus size="0.6875rem" className="text-[var(--primary)]" />
+                          </button>
                         )}
-                        title={isAssigning ? "Done assigning" : "Add/remove members"}
-                      >
-                        <Users size="0.6875rem" />
-                      </button>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setEditingGroupId(group.id);
-                          setEditGroupName(group.name);
-                        }}
-                        className="rounded-lg p-1 transition-all hover:bg-[var(--accent)]"
-                        title="Rename group"
-                      >
-                        <Pencil size="0.6875rem" />
-                      </button>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          deleteGroup.mutate(group.id);
-                        }}
-                        className="rounded-lg p-1 transition-all hover:bg-[var(--destructive)]/15"
-                        title="Delete group"
-                      >
-                        <Trash2 size="0.6875rem" className="text-[var(--destructive)]" />
-                      </button>
-                    </div>
+                        {!isSynthetic && (
+                          <>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (!isAssigning) {
+                                  exitSelectionMode();
+                                }
+                                setAssigningToGroup(isAssigning ? null : group.id);
+                              }}
+                              className={cn(
+                                "rounded-lg p-1 transition-all hover:bg-[var(--accent)]",
+                                isAssigning && "bg-[var(--primary)]/15 text-[var(--primary)]",
+                              )}
+                              title={isAssigning ? "Done assigning" : "Add/remove members"}
+                            >
+                              <Users size="0.6875rem" />
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setEditingGroupId(group.id);
+                                setEditGroupName(group.name);
+                              }}
+                              className="rounded-lg p-1 transition-all hover:bg-[var(--accent)]"
+                              title="Rename group"
+                            >
+                              <Pencil size="0.6875rem" />
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                deleteGroup.mutate(group.id);
+                              }}
+                              className="rounded-lg p-1 transition-all hover:bg-[var(--destructive)]/15"
+                              title="Delete group"
+                            >
+                              <Trash2 size="0.6875rem" className="text-[var(--destructive)]" />
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* Expanded: show members */}
@@ -889,16 +1092,18 @@ export function CharactersPanel() {
                             >
                               <MessageCircle size="0.6875rem" />
                             </button>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                toggleGroupMember(group.id, memberId, group.memberIds);
-                              }}
-                              className="rounded p-0.5 opacity-0 transition-all hover:bg-[var(--destructive)]/15 group-hover/member:opacity-100"
-                              title="Remove from group"
-                            >
-                              <UserMinus size="0.6875rem" className="text-[var(--destructive)]" />
-                            </button>
+                            {!isSynthetic && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleGroupMember(group.id, memberId, group.memberIds);
+                                }}
+                                className="rounded p-0.5 opacity-0 transition-all hover:bg-[var(--destructive)]/15 group-hover/member:opacity-100"
+                                title="Remove from group"
+                              >
+                                <UserMinus size="0.6875rem" className="text-[var(--destructive)]" />
+                              </button>
+                            )}
                           </div>
                         );
                       })}
@@ -962,7 +1167,7 @@ export function CharactersPanel() {
         {sortedCharacters.map((char) => {
           const charName = char.parsed.name ?? "Unnamed";
           const charTitle = getCharacterTitle({ name: charName, comment: char.comment });
-          const charTags = (char.parsed.tags ?? []) as string[];
+          const charTags = getCharacterTags(char);
           const charNameColor = (char.parsed.extensions?.nameColor as string) || undefined;
           const isSelected = chatCharacterIds.includes(char.id);
           const isBulkSelected = selectedCharacterIds.has(char.id);
@@ -971,6 +1176,7 @@ export function CharactersPanel() {
           const targetGroup = assigningToGroup ? parsedGroups.find((g) => g.id === assigningToGroup) : null;
           const isInTargetGroup = targetGroup?.memberIds.includes(char.id) ?? false;
           const previewMetadata = getCharacterPreviewMetadata(char);
+          const tokenEstimate = estimateCharacterCardTokens(char.parsed);
 
           return (
             <div
@@ -1030,11 +1236,7 @@ export function CharactersPanel() {
                       src={avatarUrl}
                       alt={charName}
                       className="h-full w-full object-cover"
-                      style={getAvatarCropStyle(
-                        char.parsed.extensions?.avatarCrop as
-                          | AvatarCropValue
-                          | undefined,
-                      )}
+                      style={getAvatarCropStyle(char.parsed.extensions?.avatarCrop as AvatarCropValue | undefined)}
                     />
                   </div>
                 ) : (
@@ -1087,6 +1289,15 @@ export function CharactersPanel() {
                       : previewMetadata}
                   </div>
                 )}
+                {!assigningToGroup && (
+                  <div
+                    className="flex items-center gap-1 text-[0.625rem] text-[var(--muted-foreground)]"
+                    title="Estimated from character card text fields; actual tokenizer counts vary by model."
+                  >
+                    <Hash size="0.5625rem" />
+                    {formatEstimatedTokens(tokenEstimate)}
+                  </div>
+                )}
                 {!assigningToGroup && charTags.length > 0 && (
                   <div className="mt-0.5 flex flex-wrap gap-0.5">
                     {charTags.slice(0, 3).map((tag) => (
@@ -1094,7 +1305,7 @@ export function CharactersPanel() {
                         key={tag}
                         onClick={(e) => {
                           e.stopPropagation();
-                          setActiveTag(activeTag === tag ? null : tag);
+                          toggleIncludedTag(tag);
                         }}
                         className="cursor-pointer rounded-full bg-[var(--primary)]/8 px-1.5 py-px text-[0.5rem] font-medium text-[var(--primary)]/70 transition-all hover:bg-[var(--primary)]/15 hover:text-[var(--primary)]"
                       >

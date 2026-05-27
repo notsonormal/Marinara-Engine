@@ -311,6 +311,10 @@ async function importPersona(data: unknown, db: DB) {
       nameColor: String(d.nameColor ?? ""),
       dialogueColor: String(d.dialogueColor ?? ""),
       boxColor: String(d.boxColor ?? ""),
+      trackerCardColors:
+        typeof d.trackerCardColors === "string"
+          ? d.trackerCardColors
+          : JSON.stringify(d.trackerCardColors ?? { mode: "chat" }),
       personaStats: typeof d.personaStats === "string" ? d.personaStats : "",
       altDescriptions: stringifyJsonField(d.altDescriptions, "[]"),
       tags: stringifyJsonField(d.tags, "[]"),
@@ -363,6 +367,7 @@ async function importLorebook(data: unknown, db: DB) {
       tokenBudget: Number(lb.tokenBudget ?? 2048),
       recursiveScanning: Boolean(lb.recursiveScanning),
       maxRecursionDepth: Number(lb.maxRecursionDepth ?? 3),
+      excludeFromVectorization: Boolean(lb.excludeFromVectorization),
       characterId: typeof lb.characterId === "string" ? lb.characterId : null,
       characterIds: Array.isArray(lb.characterIds)
         ? lb.characterIds.filter((value): value is string => typeof value === "string")

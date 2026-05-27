@@ -138,9 +138,7 @@ async function readAvatarDataUrl(avatarPath: string | null | undefined): Promise
 // Read every sprite file in data/sprites/<id>/ and return it as
 // { filename, data } so import can restore the same expression set under a
 // new id.
-async function readSpritesForId(
-  id: string,
-): Promise<Array<{ filename: string; data: string }>> {
+async function readSpritesForId(id: string): Promise<Array<{ filename: string; data: string }>> {
   const dir = join(DATA_DIR, "sprites", id);
   if (!existsSync(dir)) return [];
   let entries: string[];
@@ -334,6 +332,7 @@ export async function charactersRoutes(app: FastifyInstance) {
         height,
         referenceImage: referenceImages[0],
         referenceImages: referenceImages.length > 1 ? referenceImages : undefined,
+        imageEndpointId: conn.imageEndpointId || undefined,
         comfyWorkflow: conn.comfyuiWorkflow || undefined,
         imageDefaults,
       });
@@ -400,6 +399,7 @@ export async function charactersRoutes(app: FastifyInstance) {
       versionSource,
       versionReason,
       skipVersionSnapshot,
+      mergeExtensions: false,
     });
   });
 
@@ -644,7 +644,13 @@ export async function charactersRoutes(app: FastifyInstance) {
       const filename = char.avatarPath.split("?")[0]!.split("/").pop()!;
       const avatarFile = join(DATA_DIR, "avatars", filename);
       if (existsSync(avatarFile)) {
-        pngBuffer = await readFile(avatarFile);
+        try {
+          const avatarBuffer = await readFile(avatarFile);
+          const imageInfo = isAllowedImageBuffer(avatarBuffer, extname(filename));
+          pngBuffer = imageInfo?.mimeType === "image/png" ? avatarBuffer : createMinimalPng();
+        } catch {
+          pngBuffer = createMinimalPng();
+        }
       } else {
         pngBuffer = createMinimalPng();
       }
@@ -699,6 +705,15 @@ export async function charactersRoutes(app: FastifyInstance) {
     return storage.updateAvatar(id, avatarPath);
   });
 
+  app.delete<{ Params: { id: string } }>("/:id/avatar", async (req, reply) => {
+    const { id } = req.params;
+    const char = await storage.getById(id);
+    if (!char) return reply.status(404).send({ error: "Character not found" });
+
+    const updated = await storage.updateAvatar(id, null);
+    return updated ?? reply.status(404).send({ error: "Character not found" });
+  });
+
   // ── Personas ──
 
   app.get("/personas/list", async () => {
@@ -722,6 +737,7 @@ export async function charactersRoutes(app: FastifyInstance) {
       nameColor?: string;
       dialogueColor?: string;
       boxColor?: string;
+      trackerCardColors?: string;
       avatarCrop?: string;
       createdAt?: string;
       updatedAt?: string;

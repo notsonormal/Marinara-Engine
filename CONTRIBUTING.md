@@ -25,10 +25,13 @@ Typical local setup:
 ```bash
 git clone https://github.com/Pasta-Devs/Marinara-Engine.git
 cd Marinara-Engine
+git checkout staging
 pnpm install
 pnpm build
 pnpm dev
 ```
+
+> Active development happens on `staging`, not `main`. See [Branches](#branches) below before opening a PR.
 
 Useful entry points:
 
@@ -38,6 +41,22 @@ Useful entry points:
 - `start.bat`, `start.sh`, and `start-termux.sh` run the launcher flow, including git-based auto-update and optional browser auto-open.
 
 Copy `.env.example` to `.env` when you need to change ports, HTTPS settings, or launcher behavior such as `AUTO_OPEN_BROWSER=false`.
+
+## Branches
+
+Marinara Engine uses two long-lived branches:
+
+| Branch    | Role                                                                                           |
+| --------- | ---------------------------------------------------------------------------------------------- |
+| `staging` | Active development. All feature branches, bug fixes, and documentation PRs should target this. |
+| `main`    | Release branch. Updated by maintainers as part of the release flow; do not target it directly. |
+
+Guidelines:
+
+- **Base your feature branch on `staging`**, not `main`. Run `git checkout staging && git pull` before branching.
+- **Open PRs against `staging`**. The GitHub web UI defaults to `main` (the repo's default branch); change the base to `staging` when filing the PR.
+- Do not target `main` directly unless a maintainer explicitly asks for a mainline-only change (e.g. release hotfix).
+- Update checks and installation guides continue to track `main`, since end users install from released versions.
 
 ## Repo Layout
 
@@ -121,14 +140,21 @@ All server-side logging goes through a shared [Pino](https://getpino.io/) logger
 
 1. **Open an issue first.** Before writing code, open an issue or check [the tracker](https://github.com/Pasta-Devs/Marinara-Engine/issues) so we can agree on direction, scope, and whether someone else is already on it.
 
-2. **Test it yourself.** A green `pnpm check` is the minimum. Also build the app and container, click through your change, and try the obvious edge cases (light/dark mode, mobile, empty states, error paths). If you touched UI, include before/after screenshots. CodeRabbit won't catch "the button is invisible in light mode" — only you can.
+2. **Test it yourself.** A green `pnpm check` is the minimum. Also build the app and container, click through your change, and try the obvious edge cases (light/dark mode, mobile, empty states, error paths). If you touched UI, include before/after screenshots. Upload or attach temporary PR proof screenshots to GitHub or a gist; do not commit them under `docs/pr-evidence/`. Keep committed images for intentional docs/reference assets such as README screenshots. CodeRabbit won't catch "the button is invisible in light mode" — only you can.
 
 3. **Don't trust AI-checked boxes.** If an AI agent ticked the test-plan checkboxes, treat them as your to-do list, not proof of testing. Verify each item in a real browser before submitting; untick anything you haven't personally confirmed.
 
 4. **Smaller and working beats big and broken.** We'd rather review a tight PR that works on the first try than a large one that needs multiple rounds of fixes.
 
+## AI Agent Workflow
+
+AI coding agents should use `.github/agents/chai-workflow.md` as an additive workflow overlay. It adapts the Chai Agent Workflow Pack for Marinara's branch, issue, PR, validation, and risky-work expectations.
+
+The overlay is not a substitute for this guide. When instructions conflict, follow this file, `AGENTS.md`, package-specific instructions, and maintainer requests first. The overlay is mainly a proof and coordination layer: reproduce before fixing when practical, verify the user-facing claim before saying done, keep PR/issue text exact, leave PR checkboxes unchecked for humans, and call out risky-work proof gaps honestly.
+
 ## Pull Request Expectations
 
+- Target the `staging` branch. The GitHub UI defaults to `main`; change the base before submitting. See [Branches](#branches).
 - Link the issue or feature request your PR addresses. If there isn't one yet, open one first (see [Before You Open a Pull Request](#before-you-open-a-pull-request)).
 - Keep PRs focused. Separate unrelated refactors from user-facing fixes or documentation work.
 - Explain the why clearly in the PR description. Reviewers should understand the user problem, regression, or tradeoff being addressed, not just the implementation summary.
@@ -189,8 +215,9 @@ Standard release flow:
 1. Bump the canonical version in root `package.json`.
 2. Run `pnpm version:sync -- --android-version-code <next-code>` to sync all derived version fields.
 3. Update `CHANGELOG.md`.
-4. Create and push the tag `vX.Y.Z`.
-5. Let the release workflow publish or update the GitHub Release from the matching changelog entry.
+4. Merge the release-ready `staging` change to `main`.
+5. Create and push the tag `vX.Y.Z` from the `main` commit that contains that exact version bump.
+6. Let the release workflows publish or update the GitHub Release, Windows installer, Android WebView shell APK, and GHCR container images (`X.Y.Z`, `X.Y`, `X`, `latest`, plus `X.Y.Z-lite` / `lite`) from the matching changelog entry.
 
 Release helpers now in the repo:
 

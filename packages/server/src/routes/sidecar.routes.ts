@@ -9,6 +9,7 @@ import { z } from "zod";
 import { sidecarModelService } from "../services/sidecar/sidecar-model.service.js";
 import { mlxRuntimeService } from "../services/sidecar/mlx-runtime.service.js";
 import { sidecarRuntimeService } from "../services/sidecar/sidecar-runtime.service.js";
+import { getLocalSidecarProvider, LOCAL_SIDECAR_MODEL } from "../services/llm/local-sidecar.js";
 import {
   analyzeScene,
   isInferenceAvailable,
@@ -138,6 +139,37 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
         error: error instanceof Error ? error.message : "Local sidecar test failed",
         failedRuntimeVariant: sidecarProcessService.getFailedRuntimeVariant(),
       };
+    }
+  });
+
+  const embeddingsBodySchema = z
+    .object({
+      input: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]),
+      model: z.string().trim().min(1).optional(),
+    })
+    .passthrough();
+
+  app.post("/v1/embeddings", async (req, reply) => {
+    const body = embeddingsBodySchema.parse(req.body ?? {});
+    const texts = Array.isArray(body.input) ? body.input : [body.input];
+    const model = body.model ?? LOCAL_SIDECAR_MODEL;
+
+    try {
+      const embeddings = await getLocalSidecarProvider().embed(texts, model);
+      return {
+        object: "list",
+        model,
+        data: embeddings.map((embedding, index) => ({
+          object: "embedding",
+          embedding,
+          index,
+        })),
+      };
+    } catch (error) {
+      logger.warn(error, "[sidecar] Embedding request failed");
+      return reply.status(502).send({
+        error: error instanceof Error ? error.message : "Local sidecar embedding request failed",
+      });
     }
   });
 

@@ -6,6 +6,7 @@ import { Link, Dices, Check } from "lucide-react";
 import { useConnections, useUpdateConnection } from "../../hooks/use-connections";
 import { useUpdateChat, useChat } from "../../hooks/use-chats";
 import { useChatStore } from "../../stores/chat.store";
+import { filterLanguageGenerationConnections } from "../../lib/connection-filters";
 import { cn } from "../../lib/utils";
 
 export function QuickConnectionSwitcher({ className }: { className?: string }) {
@@ -21,9 +22,9 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
   const activeConnectionId = (chat as unknown as Record<string, unknown>)?.connectionId as string | null;
   const isRandom = activeConnectionId === "random";
 
-  const sorted = ((connections ?? []) as Array<{ id: string; name: string; useForRandom?: string }>)
-    .slice()
-    .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const sorted = filterLanguageGenerationConnections(
+    (connections ?? []) as Array<{ id: string; name: string; provider?: string; useForRandom?: string }>,
+  ).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
 
   const handleSwitch = useCallback(
     (connId: string | null) => {
@@ -89,7 +90,9 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
         title="Quick Connection Switcher"
         className={cn(
           "flex h-8 w-8 items-center justify-center rounded-xl transition-all",
-          open ? "text-foreground bg-foreground/10" : "text-foreground/70 hover:bg-foreground/10 hover:text-foreground",
+          open
+            ? "bg-foreground/10 text-foreground/75"
+            : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
           className,
         )}
       >

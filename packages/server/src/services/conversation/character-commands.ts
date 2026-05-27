@@ -85,6 +85,11 @@ export interface DirectMessageCommand {
   character: string;
   /** Text the character sends in the generated conversation DM */
   message: string;
+  /** Original command text, used to strip or visible-fallback individual commands. */
+  raw?: string;
+  /** Resolved by the generation route once the target is verified as a real character card. */
+  resolvedCharacterId?: string;
+  resolvedCharacterName?: string;
 }
 
 export interface HapticCommand {
@@ -256,29 +261,37 @@ export type CharacterCommand =
   | SpotifyCommand
   | AssistantCommand;
 
+// Param block matcher: any char that isn't `"` or `]`, OR a complete
+// double-quoted string (with `\"`-style escapes). Lets a `]` inside a
+// quoted parameter value (e.g. `description="Status: [VIP]"`) sit inside
+// the command instead of terminating it early. The inner alternative
+// excludes `\\` so backslash is only consumed by the escape branch —
+// otherwise an escape-heavy value can trigger catastrophic backtracking.
+const QUOTED_PARAM_BLOCK = '(?:[^"\\]]|"(?:\\\\.|[^"\\\\])*")*';
+
 /** Regex patterns for each command type */
-const SCHEDULE_UPDATE_RE = /\[schedule_update:\s*([^\]]+)\]/gi;
+const SCHEDULE_UPDATE_RE = new RegExp(`\\[schedule_update:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
 const CROSS_POST_RE = /\[cross_post:\s*target="([^"]+)"\]/gi;
 const SELFIE_RE = /\[selfie(?::\s*(?:context="([^"]*)"|"([^"]*)"|([^\]\r\n"]+)))?\]/gi;
 const MEMORY_RE = /\[memory:\s*target="([^"]+)"\s*,\s*summary="([^"]+)"\]/gi;
-const SCENE_RE = /\[scene:\s*([^\]]+)\]/gi;
-const HAPTIC_RE = /\[haptic:\s*([^\]]+)\]/gi;
-const SPOTIFY_RE = /\[spotify:\s*([^\]]+)\]/gi;
-const DIRECT_MESSAGE_RE = /\[dm:\s*([^\]]+)\]/gi;
+const SCENE_RE = new RegExp(`\\[scene:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
+const HAPTIC_RE = new RegExp(`\\[haptic:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
+const SPOTIFY_RE = new RegExp(`\\[spotify:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
+const DIRECT_MESSAGE_RE = new RegExp(`\\[dm:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
 const INFLUENCE_RE = /<influence>([\s\S]*?)<\/influence>/gi;
 const NOTE_RE = /<note>([\s\S]*?)<\/note>/gi;
 
 // Assistant command regexes
-const CREATE_PERSONA_RE = /\[create_persona:\s*([^\]]+)\]/gi;
-const CREATE_CHARACTER_RE = /\[create_character:\s*([^\]]+)\]/gi;
-const UPDATE_CHARACTER_RE = /\[update_character:\s*([^\]]+)\]/gi;
-const UPDATE_PERSONA_RE = /\[update_persona:\s*([^\]]+)\]/gi;
-const CREATE_LOREBOOK_RE = /\[create_lorebook:\s*([^\]]+)\]/gi;
+const CREATE_PERSONA_RE = new RegExp(`\\[create_persona:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
+const CREATE_CHARACTER_RE = new RegExp(`\\[create_character:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
+const UPDATE_CHARACTER_RE = new RegExp(`\\[update_character:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
+const UPDATE_PERSONA_RE = new RegExp(`\\[update_persona:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
+const CREATE_LOREBOOK_RE = new RegExp(`\\[create_lorebook:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
 const CREATE_LOREBOOK_BLOCK_RE = /<create_lorebook>([\s\S]*?)<\/create_lorebook>/gi;
 const UPDATE_LOREBOOK_BLOCK_RE = /<update_lorebook>([\s\S]*?)<\/update_lorebook>/gi;
-const CREATE_CHAT_RE = /\[create_chat:\s*([^\]]+)\]/gi;
-const NAVIGATE_RE = /\[navigate:\s*([^\]]+)\]/gi;
-const FETCH_RE = /\[fetch:\s*([^\]]+)\]/gi;
+const CREATE_CHAT_RE = new RegExp(`\\[create_chat:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
+const NAVIGATE_RE = new RegExp(`\\[navigate:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
+const FETCH_RE = new RegExp(`\\[fetch:\\s*(${QUOTED_PARAM_BLOCK})\\]`, "gi");
 
 function decodeQuotedParamValue(value: string): string {
   return value.replace(/\\(["\\nrt])/g, (_match, escaped: string) => {
@@ -443,18 +456,45 @@ function parseUpdateLorebookBlock(raw: string): UpdateLorebookCommand | null {
       .map((entry): UpdateLorebookEntryCommand | null => {
         if (!entry || typeof entry !== "object") return null;
         const data = entry as Record<string, unknown>;
-        const entryName = typeof data.name === "string" ? data.name.trim() : "";
+        const nestedEntry = data.entry && typeof data.entry === "object" ? (data.entry as Record<string, unknown>) : {};
+        const entryName =
+          typeof data.name === "string"
+            ? data.name.trim()
+            : typeof nestedEntry.name === "string"
+              ? nestedEntry.name.trim()
+              : "";
         if (!entryName) return null;
         return {
           name: entryName,
           matchName: typeof data.matchName === "string" ? data.matchName.trim() : undefined,
-          content: typeof data.content === "string" ? data.content : undefined,
-          description: typeof data.description === "string" ? data.description : undefined,
-          keys: parseUnknownStringList(data.keys),
-          secondaryKeys: parseUnknownStringList(data.secondaryKeys),
-          tag: typeof data.tag === "string" ? data.tag : undefined,
-          constant: typeof data.constant === "boolean" ? data.constant : undefined,
-          selective: typeof data.selective === "boolean" ? data.selective : undefined,
+          content:
+            typeof data.content === "string"
+              ? data.content
+              : typeof nestedEntry.content === "string"
+                ? nestedEntry.content
+                : undefined,
+          description:
+            typeof data.description === "string"
+              ? data.description
+              : typeof nestedEntry.description === "string"
+                ? nestedEntry.description
+                : undefined,
+          keys: parseUnknownStringList(data.keys ?? nestedEntry.keys),
+          secondaryKeys: parseUnknownStringList(data.secondaryKeys ?? nestedEntry.secondaryKeys),
+          tag:
+            typeof data.tag === "string" ? data.tag : typeof nestedEntry.tag === "string" ? nestedEntry.tag : undefined,
+          constant:
+            typeof data.constant === "boolean"
+              ? data.constant
+              : typeof nestedEntry.constant === "boolean"
+                ? nestedEntry.constant
+                : undefined,
+          selective:
+            typeof data.selective === "boolean"
+              ? data.selective
+              : typeof nestedEntry.selective === "boolean"
+                ? nestedEntry.selective
+                : undefined,
         } satisfies UpdateLorebookEntryCommand;
       })
       .filter((entry): entry is UpdateLorebookEntryCommand => entry !== null);
@@ -800,7 +840,7 @@ export function parseDirectMessageCommands(content: string): {
     const message = parseQuotedParam(params, "message");
     const cleanMessage = message ? stripConversationPromptTimestamps(message.trim()) : "";
     if (character && cleanMessage) {
-      commands.push({ type: "dm", character, message: cleanMessage });
+      commands.push({ type: "dm", character, message: cleanMessage, raw: match[0] });
     }
   }
 

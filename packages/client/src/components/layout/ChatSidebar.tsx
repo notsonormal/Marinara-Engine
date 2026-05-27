@@ -25,8 +25,9 @@ import {
   ArrowUpDown,
   Tag,
   Pencil,
+  Download,
 } from "lucide-react";
-import { useChats, useCreateChat, useDeleteChat, useDeleteChatGroup } from "../../hooks/use-chats";
+import { useBulkExportChats, useChats, useCreateChat, useDeleteChat, useDeleteChatGroup } from "../../hooks/use-chats";
 import { useChatPresets, useApplyChatPreset } from "../../hooks/use-chat-presets";
 import { useConnections } from "../../hooks/use-connections";
 import {
@@ -43,10 +44,12 @@ import { showConfirmDialog } from "../../lib/app-dialogs";
 import { useUIStore, type UserStatus } from "../../stores/ui.store";
 import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
+import { toast } from "sonner";
 import type { Chat, ChatFolder, ChatMode } from "@marinara-engine/shared";
 import { Modal } from "../ui/Modal";
 import { Reorder, useDragControls } from "framer-motion";
 import { parseChatMetadata } from "../../lib/chat-display";
+import { getCurrentGameGroupRepresentative } from "../../lib/game-session-resolution";
 
 type ChatSortOption = "newest" | "oldest" | "name-asc" | "name-desc";
 
@@ -118,6 +121,7 @@ export function ChatSidebar() {
   const applyChatPreset = useApplyChatPreset();
   const deleteChat = useDeleteChat();
   const deleteChatGroup = useDeleteChatGroup();
+  const bulkExportChats = useBulkExportChats();
   const activeChatId = useChatStore((s) => s.activeChatId);
   const setActiveChatId = useChatStore((s) => s.setActiveChatId);
   const unreadCounts = useChatStore((s) => s.unreadCounts);
@@ -127,6 +131,7 @@ export function ChatSidebar() {
   const editorDirty = useUIStore((s) => s.editorDirty);
   const closeAllDetails = useUIStore((s) => s.closeAllDetails);
   const setSidebarOpen = useUIStore((s) => s.setSidebarOpen);
+  const chatModeShortcutRequest = useUIStore((s) => s.chatModeShortcutRequest);
   const setPendingNewChatMode = useChatStore((s) => s.setPendingNewChatMode);
 
   // Folder hooks
@@ -205,6 +210,15 @@ export function ChatSidebar() {
     setMultiSelectMode(false);
     setSelectedChatIds(new Set());
   }, []);
+
+  useEffect(() => {
+    if (!chatModeShortcutRequest) return;
+    setActiveTab(chatModeShortcutRequest.mode);
+    setSearchQuery("");
+    setActiveTag(null);
+    setTagsExpanded(false);
+    exitMultiSelect();
+  }, [chatModeShortcutRequest, exitMultiSelect]);
 
   // Exit multi-select when switching tabs
   useEffect(() => {
@@ -290,7 +304,10 @@ export function ChatSidebar() {
       if (chat.groupId) {
         if (seenGroups.has(chat.groupId)) continue;
         seenGroups.add(chat.groupId);
-        result.push({ chat, branchCount: totalGroupSizes.get(chat.groupId) ?? 1 });
+        result.push({
+          chat: getCurrentGameGroupRepresentative(chat, chats ?? filtered),
+          branchCount: totalGroupSizes.get(chat.groupId) ?? 1,
+        });
       } else {
         result.push({ chat, branchCount: 1 });
       }
@@ -549,6 +566,7 @@ export function ChatSidebar() {
 
   // ── Batch actions ──
   const [batchMovingFolder, setBatchMovingFolder] = useState(false);
+  const [batchExportOpen, setBatchExportOpen] = useState(false);
 
   const handleBatchDelete = useCallback(async () => {
     if (selectedChatIds.size === 0) return;
@@ -568,6 +586,24 @@ export function ChatSidebar() {
     if (activeChatId && selectedChatIds.has(activeChatId)) setActiveChatId(null);
     exitMultiSelect();
   }, [selectedChatIds, deleteChat, activeChatId, setActiveChatId, exitMultiSelect]);
+
+  const handleBatchExport = useCallback(
+    async (format: "jsonl" | "text", scope: "selected" | "all" = "selected") => {
+      if (scope === "selected" && selectedChatIds.size === 0) return;
+      try {
+        await bulkExportChats.mutateAsync({
+          chatIds: scope === "selected" ? [...selectedChatIds] : undefined,
+          format,
+          scope,
+        });
+        setBatchExportOpen(false);
+        exitMultiSelect();
+      } catch (err) {
+        toast.error(err instanceof Error ? `Export failed: ${err.message}` : "Export failed");
+      }
+    },
+    [selectedChatIds, bulkExportChats, exitMultiSelect],
+  );
 
   const handleBatchMoveToFolder = useCallback(
     (folderId: string | null) => {
@@ -781,13 +817,6 @@ export function ChatSidebar() {
           </span>
         )}
 
-        {/* Mode badge on hover */}
-        {!multiSelectMode && (
-          <span className="shrink-0 text-[0.625rem] text-[var(--muted-foreground)] opacity-0 transition-opacity group-hover:opacity-100 max-md:opacity-100">
-            {cfg.shortLabel}
-          </span>
-        )}
-
         {/* Move to folder */}
         {!multiSelectMode && modeFolders.length > 0 && (
           <button
@@ -867,6 +896,8 @@ export function ChatSidebar() {
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
+              aria-pressed={isActive}
+              data-chat-mode-tab={tab}
               className={cn(
                 "relative flex min-h-[2.125rem] flex-1 items-center justify-center gap-1.5 overflow-visible rounded-lg px-2 py-2 text-xs leading-normal font-medium transition-all",
                 isActive
@@ -1135,6 +1166,14 @@ export function ChatSidebar() {
               </button>
             )}
             <button
+              onClick={() => setBatchExportOpen(true)}
+              disabled={selectedChatIds.size === 0 || bulkExportChats.isPending}
+              className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs font-medium transition-all hover:bg-[var(--accent)] disabled:opacity-40"
+            >
+              <Download size="0.75rem" />
+              Export
+            </button>
+            <button
               onClick={handleBatchDelete}
               disabled={selectedChatIds.size === 0}
               className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[var(--destructive)]/10 px-3 py-2 text-xs font-medium text-[var(--destructive)] transition-all hover:bg-[var(--destructive)]/20 disabled:opacity-40"
@@ -1251,6 +1290,59 @@ export function ChatSidebar() {
           ))}
         </div>
       </Modal>
+
+      {/* ── Batch Export Modal ── */}
+      <Modal
+        open={batchExportOpen}
+        onClose={() => setBatchExportOpen(false)}
+        title={`Export ${selectedChatIds.size} Chat${selectedChatIds.size !== 1 ? "s" : ""}`}
+        width="max-w-xs"
+      >
+        <div className="space-y-2">
+          <p className="px-1 text-[0.625rem] font-medium uppercase tracking-wide text-[var(--muted-foreground)]/60">
+            Selected chats
+          </p>
+          <button
+            type="button"
+            onClick={() => void handleBatchExport("jsonl", "selected")}
+            disabled={bulkExportChats.isPending}
+            className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs transition-all hover:bg-[var(--accent)] disabled:opacity-40"
+          >
+            <Download size="0.75rem" className="text-[var(--muted-foreground)]" />
+            JSONL zip
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleBatchExport("text", "selected")}
+            disabled={bulkExportChats.isPending}
+            className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs transition-all hover:bg-[var(--accent)] disabled:opacity-40"
+          >
+            <Download size="0.75rem" className="text-[var(--muted-foreground)]" />
+            Text zip
+          </button>
+          <p className="px-1 pt-2 text-[0.625rem] font-medium uppercase tracking-wide text-[var(--muted-foreground)]/60">
+            Full library
+          </p>
+          <button
+            type="button"
+            onClick={() => void handleBatchExport("jsonl", "all")}
+            disabled={bulkExportChats.isPending}
+            className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs transition-all hover:bg-[var(--accent)] disabled:opacity-40"
+          >
+            <Download size="0.75rem" className="text-[var(--muted-foreground)]" />
+            All chats as JSONL zip
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleBatchExport("text", "all")}
+            disabled={bulkExportChats.isPending}
+            className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs transition-all hover:bg-[var(--accent)] disabled:opacity-40"
+          >
+            <Download size="0.75rem" className="text-[var(--muted-foreground)]" />
+            All chats as text zip
+          </button>
+        </div>
+      </Modal>
     </nav>
   );
 }
@@ -1280,7 +1372,10 @@ function FolderRow({
       {/* Folder header */}
       <div className="group relative flex items-center gap-1.5 rounded-lg px-2 py-1.5 hover:bg-[var(--sidebar-accent)]/40">
         <div
-          onPointerDown={(e) => dragControls.start(e)}
+          onPointerDown={(e) => {
+            e.preventDefault();
+            dragControls.start(e);
+          }}
           className="cursor-grab touch-none opacity-0 transition-opacity active:cursor-grabbing group-hover:opacity-100 max-md:opacity-100"
         >
           <GripVertical size="0.625rem" className="text-[var(--muted-foreground)]" />
@@ -1305,7 +1400,10 @@ function FolderRow({
         >
           <ChevronRight
             size="0.75rem"
-            className={cn("text-[var(--muted-foreground)] transition-transform shrink-0", !folder.collapsed && "rotate-90")}
+            className={cn(
+              "text-[var(--muted-foreground)] transition-transform shrink-0",
+              !folder.collapsed && "rotate-90",
+            )}
           />
           <div
             className="h-2 w-2 rounded-full flex-shrink-0 cursor-pointer"

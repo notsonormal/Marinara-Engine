@@ -11,6 +11,7 @@ import {
   useCharacter,
   useUpdateCharacter,
   useUploadAvatar,
+  useRemoveAvatar,
   useDeleteCharacter,
   useDuplicateCharacter,
   useCreatePersona,
@@ -39,6 +40,7 @@ import { showConfirmDialog } from "../../lib/app-dialogs";
 import { SpriteGenerationModal } from "../ui/SpriteGenerationModal";
 import { AvatarGenerationModal } from "../ui/AvatarGenerationModal";
 import { AvatarCropWidget } from "../ui/AvatarCropWidget";
+import { ImageUploadDropzone } from "../ui/ImageUploadDropzone";
 import {
   ArrowLeft,
   Save,
@@ -87,6 +89,8 @@ import { SpriteFrameEditor } from "../ui/SpriteFrameEditor";
 import { SpriteWandCleanupEditor } from "../ui/SpriteWandCleanupEditor";
 import { ExportFormatDialog, type ExportFormatChoice } from "../ui/ExportFormatDialog";
 import type { CharacterCardVersion, CharacterData, RPGStatsConfig } from "@marinara-engine/shared";
+import { parseTrackerCardColorConfig, serializeTrackerCardColorConfig } from "../../lib/tracker-card-colors";
+import { useQuoteFormatter } from "../../hooks/use-quote-formatter";
 
 // ── Tabs ──
 const TABS = [
@@ -144,12 +148,69 @@ function normalizeAltDescriptions(value: unknown): AltDescriptionEntry[] {
     }));
 }
 
+function appendNewTags(existingTags: string[], rawInput: string) {
+  const seen = new Set(existingTags);
+  const additions: string[] = [];
+
+  for (const tag of rawInput.split(",").map((part) => part.trim())) {
+    if (!tag || seen.has(tag)) continue;
+    seen.add(tag);
+    additions.push(tag);
+  }
+
+  return additions.length > 0 ? [...existingTags, ...additions] : existingTags;
+}
+
+const CHARACTER_QUOTE_FIELD_KEYS = new Set<string>([
+  "description",
+  "personality",
+  "scenario",
+  "first_mes",
+  "mes_example",
+  "system_prompt",
+  "post_history_instructions",
+  "creator_notes",
+]);
+
+const CHARACTER_QUOTE_EXTENSION_KEYS = new Set(["appearance", "backstory"]);
+
+function formatCharacterFieldValue<K extends keyof CharacterData>(
+  key: K,
+  value: CharacterData[K],
+  formatQuotes: (value: string) => string,
+): CharacterData[K] {
+  if (CHARACTER_QUOTE_FIELD_KEYS.has(String(key)) && typeof value === "string") {
+    return formatQuotes(value) as CharacterData[K];
+  }
+  if (key === "alternate_greetings" && Array.isArray(value)) {
+    return value.map((entry) => (typeof entry === "string" ? formatQuotes(entry) : entry)) as CharacterData[K];
+  }
+  return value;
+}
+
+function formatCharacterExtensionValue(key: string, value: unknown, formatQuotes: (value: string) => string): unknown {
+  if (CHARACTER_QUOTE_EXTENSION_KEYS.has(key) && typeof value === "string") return formatQuotes(value);
+  if (key === "altDescriptions" && Array.isArray(value)) {
+    return value.map((entry) =>
+      entry && typeof entry === "object" && "content" in entry && typeof entry.content === "string"
+        ? { ...entry, content: formatQuotes(entry.content) }
+        : entry,
+    );
+  }
+  if (key === "depth_prompt" && value && typeof value === "object" && "prompt" in value) {
+    const depthPrompt = value as { prompt?: unknown };
+    if (typeof depthPrompt.prompt === "string") return { ...value, prompt: formatQuotes(depthPrompt.prompt) };
+  }
+  return value;
+}
+
 export function CharacterEditor() {
   const characterId = useUIStore((s) => s.characterDetailId);
   const closeDetail = useUIStore((s) => s.closeCharacterDetail);
   const { data: rawCharacter, isLoading } = useCharacter(characterId);
   const updateCharacter = useUpdateCharacter();
   const uploadAvatar = useUploadAvatar();
+  const removeAvatar = useRemoveAvatar();
   const deleteCharacter = useDeleteCharacter();
   const duplicateCharacter = useDuplicateCharacter();
   const createPersona = useCreatePersona();
@@ -162,61 +223,141 @@ export function CharacterEditor() {
   const [characterComment, setCharacterComment] = useState("");
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
+  const loadedCharacterIdRef = useRef<string | null>(null);
+  const activeCharacterIdRef = useRef<string | null>(characterId);
+  const formatQuotes = useQuoteFormatter();
+  const dirtyRef = useRef(false);
+  const editRevisionRef = useRef(0);
   const setEditorDirty = useUIStore((s) => s.setEditorDirty);
+  const setDirtyState = useCallback((nextDirty: boolean) => {
+    dirtyRef.current = nextDirty;
+    setDirty(nextDirty);
+  }, []);
+  const markDirty = useCallback(() => {
+    editRevisionRef.current += 1;
+    setDirtyState(true);
+  }, [setDirtyState]);
   useEffect(() => {
+    dirtyRef.current = dirty;
     setEditorDirty(dirty);
   }, [dirty, setEditorDirty]);
   const [saving, setSaving] = useState(false);
+  const [avatarUploading, setAvatarUploading] = useState(false);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [avatarGeneratorOpen, setAvatarGeneratorOpen] = useState(false);
   const [newTag, setNewTag] = useState("");
   const [showUnsavedWarning, setShowUnsavedWarning] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const latestAvatarUploadRef = useRef<{ token: string; characterId: string } | null>(null);
+  const avatarUploadInFlightRef = useRef(false);
   const imageGenerationAvailable =
     Array.isArray(connectionsList) &&
     (connectionsList as Array<{ provider?: string }>).some((connection) => connection.provider === "image_generation");
 
-  // Parse the character when it loads
+  useEffect(() => {
+    activeCharacterIdRef.current = characterId;
+    const upload = latestAvatarUploadRef.current;
+    if (upload && upload.characterId !== characterId) {
+      latestAvatarUploadRef.current = null;
+      avatarUploadInFlightRef.current = false;
+      setAvatarUploading(false);
+    }
+  }, [characterId]);
+
+  // Parse the character when it first loads, or when switching characters.
+  // Avoid overwriting unsaved local edits when a refetch follows avatar upload.
   useEffect(() => {
     if (!rawCharacter) return;
     const char = rawCharacter as ParsedCharacter;
+    const isSwitchingCharacter = loadedCharacterIdRef.current !== char.id;
+    if (!isSwitchingCharacter && dirtyRef.current) return;
+
+    loadedCharacterIdRef.current = char.id;
+
     try {
       const parsed = typeof char.data === "string" ? JSON.parse(char.data) : char.data;
       setFormData(parsed as CharacterData);
       setCharacterComment(char.comment ?? "");
       setAvatarPreview(char.avatarPath);
+      setDirtyState(false);
     } catch {
       setFormData(null);
       setCharacterComment("");
+      setAvatarPreview(null);
+      setDirtyState(false);
     }
-  }, [rawCharacter]);
+  }, [rawCharacter, setDirtyState]);
 
-  const updateField = useCallback(<K extends keyof CharacterData>(key: K, value: CharacterData[K]) => {
-    setFormData((prev) => (prev ? { ...prev, [key]: value } : prev));
-    setDirty(true);
-  }, []);
+  const updateField = useCallback(
+    <K extends keyof CharacterData>(key: K, value: CharacterData[K]) => {
+      const nextValue = formatCharacterFieldValue(key, value, formatQuotes);
+      setFormData((prev) => (prev ? { ...prev, [key]: nextValue } : prev));
+      markDirty();
+    },
+    [formatQuotes, markDirty],
+  );
 
-  const updateExtension = useCallback((key: string, value: unknown) => {
+  const setExtensionValue = useCallback((key: string, value: unknown) => {
     setFormData((prev) => {
       if (!prev) return prev;
       return { ...prev, extensions: { ...(prev.extensions ?? {}), [key]: value } };
     });
-    setDirty(true);
+  }, []);
+
+  const updateExtension = useCallback(
+    (key: string, value: unknown) => {
+      setExtensionValue(key, formatCharacterExtensionValue(key, value, formatQuotes));
+      markDirty();
+    },
+    [formatQuotes, markDirty, setExtensionValue],
+  );
+
+  const beginAvatarUpload = useCallback(() => {
+    if (avatarUploadInFlightRef.current) return false;
+    avatarUploadInFlightRef.current = true;
+    setAvatarUploading(true);
+    return true;
+  }, []);
+
+  const isCurrentAvatarUpload = useCallback((uploadToken: string, uploadCharacterId: string) => {
+    const upload = latestAvatarUploadRef.current;
+    return (
+      upload?.token === uploadToken &&
+      upload.characterId === uploadCharacterId &&
+      activeCharacterIdRef.current === uploadCharacterId
+    );
+  }, []);
+
+  const finishAvatarUpload = useCallback((uploadToken: string, uploadCharacterId: string) => {
+    const upload = latestAvatarUploadRef.current;
+    if (upload?.token !== uploadToken || upload.characterId !== uploadCharacterId) return;
+    latestAvatarUploadRef.current = null;
+    avatarUploadInFlightRef.current = false;
+    setAvatarUploading(false);
   }, []);
 
   const handleSave = async () => {
-    if (!characterId || !formData) return;
+    if (!characterId || !formData) return false;
+    if (avatarUploadInFlightRef.current) {
+      toast.error("Wait for the current avatar upload to finish before saving.");
+      return false;
+    }
     setSaving(true);
+    const editRevisionAtSaveStart = editRevisionRef.current;
     try {
       await updateCharacter.mutateAsync({
         id: characterId,
         data: formData as unknown as Record<string, unknown>,
         comment: characterComment,
       });
-      setDirty(false);
+      if (editRevisionRef.current === editRevisionAtSaveStart) {
+        setDirtyState(false);
+      }
+      return true;
     } catch (err: any) {
       console.error("[CharacterEditor] Save failed:", err);
       toast.error(err?.message ?? "Failed to save character. Check the console for details.");
+      return false;
     } finally {
       setSaving(false);
     }
@@ -225,34 +366,156 @@ export function CharacterEditor() {
   const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !characterId) return;
+    if (saving) {
+      e.target.value = "";
+      toast.error("Wait for the current save to finish before uploading an avatar.");
+      return;
+    }
+    if (!beginAvatarUpload()) {
+      e.target.value = "";
+      toast.error("Wait for the current avatar upload to finish.");
+      return;
+    }
+
+    const uploadCharacterId = characterId;
+    const uploadToken = generateClientId();
+    latestAvatarUploadRef.current = { token: uploadToken, characterId: uploadCharacterId };
+    const fallbackAvatarPreview = avatarPreview;
+    const fallbackAvatarCrop = formData?.extensions.avatarCrop;
+    const shouldClearAvatarCrop = fallbackAvatarCrop !== undefined;
+    const fallbackDirty = dirtyRef.current;
+    const editRevisionAtUploadStart = editRevisionRef.current;
 
     const reader = new FileReader();
     reader.onload = async () => {
+      if (!isCurrentAvatarUpload(uploadToken, uploadCharacterId)) return;
       const dataUrl = reader.result as string;
       setAvatarPreview(dataUrl);
       // Clear any saved avatarCrop — the new image almost certainly has different
       // framing, so the prior normalized crop coords are meaningless and would
       // produce a stale framing on the new file.
-      updateExtension("avatarCrop", undefined);
+      if (shouldClearAvatarCrop) {
+        setExtensionValue("avatarCrop", null);
+      }
+      if (fallbackDirty || shouldClearAvatarCrop) {
+        setDirtyState(true);
+      }
       try {
-        await uploadAvatar.mutateAsync({ id: characterId, avatar: dataUrl });
+        await uploadAvatar.mutateAsync({ id: uploadCharacterId, avatar: dataUrl });
       } catch {
-        // revert on failure
+        if (!isCurrentAvatarUpload(uploadToken, uploadCharacterId)) return;
+        setAvatarPreview(fallbackAvatarPreview);
+        if (shouldClearAvatarCrop) {
+          setExtensionValue("avatarCrop", fallbackAvatarCrop);
+        }
+        if (editRevisionRef.current === editRevisionAtUploadStart) {
+          setDirtyState(fallbackDirty);
+        }
+      } finally {
+        finishAvatarUpload(uploadToken, uploadCharacterId);
       }
     };
-    reader.readAsDataURL(file);
+    reader.onerror = () => {
+      if (!isCurrentAvatarUpload(uploadToken, uploadCharacterId)) return;
+      toast.error("Failed to read avatar image.");
+      finishAvatarUpload(uploadToken, uploadCharacterId);
+    };
+    e.target.value = "";
+    try {
+      reader.readAsDataURL(file);
+    } catch {
+      toast.error("Failed to read avatar image.");
+      finishAvatarUpload(uploadToken, uploadCharacterId);
+    }
   };
 
   const handleGeneratedAvatar = useCallback(
     async (avatarDataUrl: string) => {
       if (!characterId) return;
+      if (saving) {
+        throw new Error("Wait for the current save to finish before uploading an avatar.");
+      }
+      if (!beginAvatarUpload()) {
+        throw new Error("Wait for the current avatar upload to finish.");
+      }
+      const uploadCharacterId = characterId;
+      const uploadToken = generateClientId();
+      latestAvatarUploadRef.current = { token: uploadToken, characterId: uploadCharacterId };
+      const fallbackAvatarPreview = avatarPreview;
+      const fallbackAvatarCrop = formData?.extensions.avatarCrop;
+      const shouldClearAvatarCrop = fallbackAvatarCrop !== undefined;
+      const fallbackDirty = dirtyRef.current;
+      const editRevisionAtUploadStart = editRevisionRef.current;
+
       setAvatarPreview(avatarDataUrl);
-      updateExtension("avatarCrop", undefined);
-      await uploadAvatar.mutateAsync({ id: characterId, avatar: avatarDataUrl });
-      toast.success("Character avatar generated.");
+      if (shouldClearAvatarCrop) {
+        setExtensionValue("avatarCrop", null);
+      }
+      if (fallbackDirty || shouldClearAvatarCrop) {
+        setDirtyState(true);
+      }
+      try {
+        await uploadAvatar.mutateAsync({ id: uploadCharacterId, avatar: avatarDataUrl });
+        if (isCurrentAvatarUpload(uploadToken, uploadCharacterId)) {
+          toast.success("Character avatar generated.");
+        }
+      } catch (error) {
+        if (isCurrentAvatarUpload(uploadToken, uploadCharacterId)) {
+          setAvatarPreview(fallbackAvatarPreview);
+          if (shouldClearAvatarCrop) {
+            setExtensionValue("avatarCrop", fallbackAvatarCrop);
+          }
+          if (editRevisionRef.current === editRevisionAtUploadStart) {
+            setDirtyState(fallbackDirty);
+          }
+        }
+        throw error;
+      } finally {
+        finishAvatarUpload(uploadToken, uploadCharacterId);
+      }
     },
-    [characterId, updateExtension, uploadAvatar],
+    [
+      avatarPreview,
+      beginAvatarUpload,
+      characterId,
+      finishAvatarUpload,
+      formData?.extensions.avatarCrop,
+      isCurrentAvatarUpload,
+      saving,
+      setDirtyState,
+      setExtensionValue,
+      uploadAvatar,
+    ],
   );
+
+  const handleAvatarRemove = useCallback(async () => {
+    if (!characterId || !avatarPreview) return;
+    if (saving) {
+      toast.error("Wait for the current save to finish before removing the avatar.");
+      return;
+    }
+    if (avatarUploadInFlightRef.current) {
+      toast.error("Wait for the current avatar upload to finish before removing the avatar.");
+      return;
+    }
+
+    const confirmed = await showConfirmDialog({
+      title: "Remove Avatar",
+      message: `Remove the avatar from ${formData?.name || "this character"}? This clears the character card's avatar without deleting the character.`,
+      confirmLabel: "Remove",
+      tone: "destructive",
+    });
+    if (!confirmed) return;
+
+    try {
+      await removeAvatar.mutateAsync(characterId);
+      setAvatarPreview(null);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      toast.success("Avatar removed.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to remove avatar.");
+    }
+  }, [avatarPreview, characterId, formData?.name, removeAvatar, saving]);
 
   const handleDelete = async () => {
     if (!characterId) return;
@@ -328,6 +591,9 @@ export function CharacterEditor() {
         nameColor: (formData.extensions.nameColor as string) ?? "",
         dialogueColor: (formData.extensions.dialogueColor as string) ?? "",
         boxColor: (formData.extensions.boxColor as string) ?? "",
+        trackerCardColors: serializeTrackerCardColorConfig(
+          parseTrackerCardColorConfig(formData.extensions.trackerCardColors),
+        ),
         personaStats,
         altDescriptions: "[]",
         tags: JSON.stringify(formData.tags ?? []),
@@ -363,24 +629,32 @@ export function CharacterEditor() {
   }, [avatarPreview, createPersona, formData, getAvatarDataUrl, uploadPersonaAvatar]);
 
   const handleClose = useCallback(() => {
+    if (avatarUploading) {
+      toast.error("Wait for the current avatar upload to finish.");
+      return;
+    }
     if (dirty) {
       setShowUnsavedWarning(true);
       return;
     }
     closeDetail();
-  }, [dirty, closeDetail]);
+  }, [avatarUploading, dirty, closeDetail]);
 
   const forceClose = useCallback(() => {
+    if (avatarUploading) {
+      toast.error("Wait for the current avatar upload to finish.");
+      return;
+    }
     setShowUnsavedWarning(false);
-    setDirty(false);
+    setDirtyState(false);
     closeDetail();
-  }, [closeDetail]);
+  }, [avatarUploading, closeDetail, setDirtyState]);
 
   const addTag = () => {
-    const tag = newTag.trim();
-    if (!tag || !formData) return;
-    if (formData.tags.includes(tag)) return;
-    updateField("tags", [...formData.tags, tag]);
+    if (!formData) return;
+    const nextTags = appendNewTags(formData.tags, newTag);
+    if (nextTags === formData.tags) return;
+    updateField("tags", nextTags);
     setNewTag("");
   };
 
@@ -410,6 +684,7 @@ export function CharacterEditor() {
 
   const headerActionButtonClass =
     "rounded-xl p-2 text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] max-md:rounded-lg max-md:p-1.5";
+  const saveDisabled = !dirty || saving || avatarUploading;
 
   const headerActions = (
     <>
@@ -434,6 +709,7 @@ export function CharacterEditor() {
       </button>
 
       <button
+        type="button"
         onClick={() => updateExtension("fav", !formData.extensions.fav)}
         className={cn(
           "rounded-xl p-2 transition-all max-md:rounded-lg max-md:p-1.5",
@@ -444,7 +720,12 @@ export function CharacterEditor() {
         {formData.extensions.fav ? <Star size="1rem" fill="currentColor" /> : <StarOff size="1rem" />}
       </button>
 
-      <button onClick={() => setExportDialogOpen(true)} className={headerActionButtonClass} title="Export character">
+      <button
+        type="button"
+        onClick={() => setExportDialogOpen(true)}
+        className={headerActionButtonClass}
+        title="Export character"
+      >
         <svg width="1rem" height="1rem" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
           <path
             d="M10 13V3m0 0l-4 4m4-4l4 4"
@@ -458,6 +739,7 @@ export function CharacterEditor() {
       </button>
 
       <button
+        type="button"
         onClick={handleImportAsPersona}
         disabled={createPersona.isPending || uploadPersonaAvatar.isPending}
         className="rounded-xl p-2 text-[var(--muted-foreground)] transition-all hover:bg-emerald-500/10 hover:text-emerald-400 disabled:cursor-not-allowed disabled:opacity-50 max-md:rounded-lg max-md:p-1.5"
@@ -471,6 +753,7 @@ export function CharacterEditor() {
       </button>
 
       <button
+        type="button"
         onClick={() => {
           if (!characterId) return;
           duplicateCharacter.mutate(characterId, {
@@ -486,6 +769,7 @@ export function CharacterEditor() {
       </button>
 
       <button
+        type="button"
         onClick={handleDelete}
         className="rounded-xl p-2 text-[var(--muted-foreground)] transition-all hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)] max-md:rounded-lg max-md:p-1.5"
         title="Delete character"
@@ -530,6 +814,7 @@ export function CharacterEditor() {
       <div className="flex flex-wrap items-start gap-3 border-b border-[var(--border)] bg-[var(--card)] px-4 py-3 max-md:gap-2 max-md:px-3">
         <div className="flex min-w-0 flex-1 items-center gap-3 max-md:min-w-full">
           <button
+            type="button"
             onClick={handleClose}
             className="rounded-xl p-2 transition-all hover:bg-[var(--accent)] active:scale-95 max-md:rounded-lg max-md:p-1.5"
             title="Back"
@@ -582,7 +867,7 @@ export function CharacterEditor() {
               value={characterComment}
               onChange={(e) => {
                 setCharacterComment(e.target.value);
-                setDirty(true);
+                markDirty();
               }}
               className="w-full bg-transparent text-xs text-[var(--muted-foreground)] outline-none"
               placeholder="Title / comment (e.g. 'Modern AU version')"
@@ -597,17 +882,18 @@ export function CharacterEditor() {
 
         {/* Save */}
         <button
+          type="button"
           onClick={handleSave}
-          disabled={!dirty || saving}
+          disabled={saveDisabled}
           className={cn(
             "flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-medium transition-all",
-            dirty
+            !saveDisabled
               ? "bg-gradient-to-r from-pink-400 to-purple-500 text-white shadow-md shadow-pink-500/20 hover:shadow-lg active:scale-[0.98]"
               : "bg-[var(--secondary)] text-[var(--muted-foreground)] cursor-not-allowed",
           )}
         >
           <Save size="0.8125rem" />
-          <span className="max-md:hidden">{saving ? "Saving…" : "Save"}</span>
+          <span className="max-md:hidden">{avatarUploading ? "Uploading…" : saving ? "Saving…" : "Save"}</span>
         </button>
 
         <div className="flex w-full items-center justify-end gap-1 md:hidden">{headerActions}</div>
@@ -619,23 +905,29 @@ export function CharacterEditor() {
           <AlertTriangle size="0.9375rem" className="shrink-0 text-amber-500" />
           <p className="flex-1 text-xs font-medium text-amber-500">You have unsaved changes. Close without saving?</p>
           <button
+            type="button"
             onClick={() => setShowUnsavedWarning(false)}
             className="rounded-lg px-3 py-1 text-xs font-medium text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)]"
           >
             Keep editing
           </button>
           <button
+            type="button"
             onClick={forceClose}
-            className="rounded-lg bg-amber-500/15 px-3 py-1 text-xs font-medium text-amber-500 transition-all hover:bg-amber-500/25"
+            disabled={avatarUploading}
+            className="rounded-lg bg-amber-500/15 px-3 py-1 text-xs font-medium text-amber-500 transition-all hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Discard & close
           </button>
           <button
+            type="button"
             onClick={async () => {
-              await handleSave();
-              closeDetail();
+              if (await handleSave()) {
+                closeDetail();
+              }
             }}
-            className="rounded-lg bg-gradient-to-r from-pink-400 to-purple-500 px-3 py-1 text-xs font-medium text-white shadow-sm transition-all hover:shadow-md"
+            disabled={saving || avatarUploading}
+            className="rounded-lg bg-gradient-to-r from-pink-400 to-purple-500 px-3 py-1 text-xs font-medium text-white shadow-sm transition-all hover:shadow-md disabled:cursor-not-allowed disabled:opacity-50"
           >
             Save & close
           </button>
@@ -650,6 +942,7 @@ export function CharacterEditor() {
             const Icon = tab.icon;
             return (
               <button
+                type="button"
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
                 className={cn(
@@ -682,6 +975,8 @@ export function CharacterEditor() {
                 removeTag={removeTag}
                 removeAllTags={removeAllTags}
                 avatarPreview={avatarPreview}
+                onRemoveAvatar={handleAvatarRemove}
+                removingAvatar={removeAvatar.isPending}
               />
             )}
             {activeTab === "description" && (
@@ -966,6 +1261,7 @@ function TextareaTab({
       <div className="flex items-start justify-between gap-2 mb-4">
         <SectionHeader title={title} subtitle={subtitle} />
         <button
+          type="button"
           onClick={() => setExpanded(true)}
           className="mt-0.5 shrink-0 rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
           title="Expand editor"
@@ -1005,6 +1301,8 @@ function MetadataTab({
   removeTag,
   removeAllTags,
   avatarPreview,
+  onRemoveAvatar,
+  removingAvatar,
 }: {
   characterId: string | null;
   formData: CharacterData;
@@ -1017,6 +1315,8 @@ function MetadataTab({
   removeTag: (tag: string) => void;
   removeAllTags: () => void;
   avatarPreview: string | null;
+  onRemoveAvatar: () => void;
+  removingAvatar: boolean;
 }) {
   // Read existing crop in either current or legacy shape; the widget handles both
   // and writes back the current shape on first interaction.
@@ -1033,6 +1333,8 @@ function MetadataTab({
           alt={formData.name}
           crop={savedCrop}
           onChange={(next) => updateExtension("avatarCrop", next)}
+          onRemove={onRemoveAvatar}
+          removing={removingAvatar}
         />
       )}
 
@@ -1123,6 +1425,7 @@ function MetadataTab({
               <Tag size="0.625rem" />
               {tag}
               <button
+                type="button"
                 onClick={() => removeTag(tag)}
                 className="ml-0.5 rounded-full transition-colors hover:text-[var(--destructive)]"
               >
@@ -1135,11 +1438,17 @@ function MetadataTab({
           <input
             value={newTag}
             onChange={(e) => setNewTag(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && addTag()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addTag();
+              }
+            }}
             placeholder="Add tag…"
             className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-1.5 text-xs outline-none focus:border-[var(--primary)]/40"
           />
           <button
+            type="button"
             onClick={addTag}
             className="rounded-xl bg-[var(--primary)]/15 px-3 py-1.5 text-xs font-medium text-[var(--primary)] transition-all hover:bg-[var(--primary)]/25"
           >
@@ -1445,6 +1754,7 @@ function DialogueTab({
             <HelpTooltip text="The character's opening message when a new chat starts. Good first messages set the scene and establish the character's voice." />
           </span>
           <button
+            type="button"
             onClick={() => setExpandedField("first_mes")}
             className="shrink-0 rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
             title="Expand editor"
@@ -1469,6 +1779,7 @@ function DialogueTab({
             <HelpTooltip text="Alternative first messages for variety. When starting a new chat, you can pick which greeting to use." />
           </span>
           <button
+            type="button"
             onClick={addGreeting}
             className="rounded-xl bg-[var(--primary)]/15 px-3 py-1 text-xs font-medium text-[var(--primary)] transition-all hover:bg-[var(--primary)]/25"
           >
@@ -1486,6 +1797,7 @@ function DialogueTab({
             />
             <div className="absolute right-2 top-2 flex items-center gap-0.5">
               <button
+                type="button"
                 onClick={() => setExpandedField(i)}
                 className="rounded-lg p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
                 title="Expand editor"
@@ -1493,6 +1805,7 @@ function DialogueTab({
                 <Maximize2 size="0.75rem" />
               </button>
               <button
+                type="button"
                 onClick={() => removeGreeting(i)}
                 className="rounded-lg p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--destructive)]"
               >
@@ -1511,6 +1824,7 @@ function DialogueTab({
             <HelpTooltip text="Sample conversations showing how the character talks. Helps the AI learn the character's speaking style, vocabulary, and mannerisms." />
           </span>
           <button
+            type="button"
             onClick={() => setExpandedField("mes_example")}
             className="shrink-0 rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
             title="Expand editor"
@@ -1584,9 +1898,10 @@ function AdvancedTab({
         <div className="flex items-center justify-between">
           <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--muted-foreground)]">
             System Prompt{" "}
-            <HelpTooltip text="Overrides or appends to the main system prompt when this character is active. Use this for character-specific instructions the AI must follow." />
+            <HelpTooltip text="Character-specific instructions inserted by the prompt preset's character block or wherever the preset uses {{charSysInfo}}. This does not replace the chat's main system prompt." />
           </span>
           <button
+            type="button"
             onClick={() => setExpandedField("system_prompt")}
             className="shrink-0 rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
             title="Expand editor"
@@ -1599,7 +1914,7 @@ function AdvancedTab({
           onChange={(e) => updateField("system_prompt", e.target.value)}
           rows={6}
           className="w-full resize-y rounded-xl border border-[var(--border)] bg-[var(--secondary)] p-4 text-sm outline-none placeholder:text-[var(--muted-foreground)]/40 focus:border-[var(--primary)]/40 focus:ring-1 focus:ring-[var(--primary)]/20"
-          placeholder="Override or append to the system prompt for this character…"
+          placeholder="Character-specific instructions inserted through {{charSysInfo}} or the character prompt block…"
         />
       </label>
 
@@ -1610,6 +1925,7 @@ function AdvancedTab({
             <HelpTooltip text="Text inserted after the chat history, right before the AI generates. Great for reminders like 'stay in character' or 'respond in 2 paragraphs'." />
           </span>
           <button
+            type="button"
             onClick={() => setExpandedField("post_history")}
             className="shrink-0 rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
             title="Expand editor"
@@ -1634,6 +1950,7 @@ function AdvancedTab({
             <HelpTooltip text="Injects text at a specific position in the chat history. Depth 0 = at the end, depth 4 = 4 messages back. Useful for persistent reminders." />
           </span>
           <button
+            type="button"
             onClick={() => setExpandedField("depth_prompt")}
             className="shrink-0 rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
             title="Expand editor"
@@ -1683,7 +2000,7 @@ function AdvancedTab({
         title="System Prompt"
         value={formData.system_prompt}
         onChange={(value) => updateField("system_prompt", value)}
-        placeholder="Override or append to the system prompt for this character…"
+        placeholder="Character-specific instructions inserted through {{charSysInfo}} or the character prompt block…"
       />
       <ExpandedTextarea
         open={expandedField === "post_history"}
@@ -1711,19 +2028,12 @@ function CharacterGalleryTab({ characterId, characterName }: { characterId: stri
   const { data: images, isLoading } = useCharacterGalleryImages(characterId);
   const upload = useUploadCharacterGalleryImage(characterId);
   const remove = useDeleteCharacterGalleryImage(characterId);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const [lightbox, setLightbox] = useState<CharacterGalleryImage | null>(null);
 
   const handleUpload = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const input = e.currentTarget;
-      const files = Array.from(input.files ?? []);
+    (files: File[]) => {
       if (files.length === 0) return;
-      upload.mutate(files, {
-        onSettled: () => {
-          input.value = "";
-        },
-      });
+      upload.mutate(files);
     },
     [upload],
   );
@@ -1753,16 +2063,15 @@ function CharacterGalleryTab({ characterId, characterName }: { characterId: stri
         subtitle="Keep reference art, alternate outfits, and other character images attached to this character even if chats get deleted."
       />
 
-      <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handleUpload} />
-
-      <button
-        onClick={() => fileInputRef.current?.click()}
-        disabled={upload.isPending}
-        className="flex w-full items-center justify-center gap-2 rounded-xl border-2 border-dashed border-[var(--border)] px-4 py-6 text-xs text-[var(--muted-foreground)] transition-all hover:border-[var(--primary)] hover:text-[var(--primary)] disabled:opacity-50"
-      >
-        <Upload size="1rem" />
-        {upload.isPending ? "Uploading…" : "Upload Character Images"}
-      </button>
+      <ImageUploadDropzone
+        label="Upload Character Images"
+        pending={upload.isPending}
+        pendingLabel="Uploading…"
+        dragLabel="Drop character images to upload"
+        onFilesSelected={handleUpload}
+        icon={<Upload size="1rem" />}
+        className="w-full"
+      />
 
       {isLoading ? (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
@@ -1777,7 +2086,11 @@ function CharacterGalleryTab({ characterId, characterName }: { characterId: stri
               key={image.id}
               className="group relative overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)] transition-all hover:border-[var(--primary)]/30 hover:shadow-md"
             >
-              <button className="block aspect-square w-full bg-[var(--secondary)]" onClick={() => setLightbox(image)}>
+              <button
+                type="button"
+                className="block aspect-square w-full bg-[var(--secondary)]"
+                onClick={() => setLightbox(image)}
+              >
                 <img
                   src={image.url}
                   alt={image.prompt || characterName || "Character image"}
@@ -1799,6 +2112,7 @@ function CharacterGalleryTab({ characterId, characterName }: { characterId: stri
                     <Download size="0.75rem" />
                   </a>
                   <button
+                    type="button"
                     onClick={() => void handleDelete(image)}
                     className="rounded-lg bg-red-500/35 p-1.5 text-white transition-colors hover:bg-red-500/55"
                     title="Delete"
@@ -1851,6 +2165,7 @@ function CharacterGalleryTab({ characterId, characterName }: { characterId: stri
                 <Download size="0.875rem" />
               </a>
               <button
+                type="button"
                 onClick={() => setLightbox(null)}
                 className="rounded-lg bg-black/60 p-2 text-white transition-colors hover:bg-black/80"
               >
@@ -2109,7 +2424,7 @@ function SpritesTab({
     if (
       !(await showConfirmDialog({
         title: "Clean Sprite Backgrounds",
-        message: `Run the local backgroundremover model on ${visibleSprites.length} saved ${modeLabel} sprite${visibleSprites.length === 1 ? "" : "s"} at strength ${savedCleanupStrength}? Marinara will keep a restore point in case the cleanup looks wrong.`,
+        message: `Clean backgrounds on ${visibleSprites.length} saved ${modeLabel} sprite${visibleSprites.length === 1 ? "" : "s"} at strength ${savedCleanupStrength}? Marinara will keep a restore point in case the cleanup looks wrong.`,
         confirmLabel: "Clean",
       }))
     ) {
@@ -2122,14 +2437,18 @@ function SpritesTab({
         characterId,
         expressions: visibleSprites.map((sprite) => sprite.expression),
         cleanupStrength: savedCleanupStrength,
-        engine: "backgroundremover",
+        engine: "auto",
       });
 
       if (result.processed > 0) {
         setLastCleanupBackupId(result.backupId ?? null);
-        toast.success(
-          `Cleaned ${result.processed} saved sprite${result.processed === 1 ? "" : "s"} with backgroundremover.`,
-        );
+        const engineDetails =
+          result.backgroundRemoverProcessed && result.builtinProcessed
+            ? ` with backgroundremover and built-in fallback`
+            : result.backgroundRemoverProcessed
+              ? ` with backgroundremover`
+              : ` with built-in cleanup`;
+        toast.success(`Cleaned ${result.processed} saved sprite${result.processed === 1 ? "" : "s"}${engineDetails}.`);
       }
       if (result.failed.length > 0) {
         toast.warning(`${result.failed.length} sprite${result.failed.length === 1 ? "" : "s"} could not be cleaned.`);
@@ -2213,6 +2532,7 @@ function SpritesTab({
 
       <div className="inline-flex rounded-xl bg-[var(--secondary)] p-1 ring-1 ring-[var(--border)]">
         <button
+          type="button"
           onClick={() => setCategory("expressions")}
           className={cn(
             "rounded-lg px-3 py-1.5 text-xs font-medium transition-colors",
@@ -2224,6 +2544,7 @@ function SpritesTab({
           Facial Expressions
         </button>
         <button
+          type="button"
           onClick={() => setCategory("full-body")}
           className={cn(
             "rounded-lg px-3 py-1.5 text-xs font-medium transition-colors",
@@ -2257,6 +2578,7 @@ function SpritesTab({
           </h4>
           <div className="flex flex-wrap items-center gap-2 md:justify-end">
             <button
+              type="button"
               onClick={() => setSpriteGenOpen(true)}
               disabled={spriteGenerationUnavailable}
               className="flex min-w-0 items-center justify-center gap-1.5 rounded-lg bg-purple-500/10 px-3 py-1.5 text-center text-[0.6875rem] font-medium leading-tight text-purple-400 ring-1 ring-purple-500/20 transition-all hover:bg-purple-500/20 disabled:cursor-not-allowed disabled:opacity-40 max-md:flex-1 max-md:basis-[calc(50%-0.25rem)] max-md:px-2.5"
@@ -2268,6 +2590,7 @@ function SpritesTab({
               Generate Sprite
             </button>
             <button
+              type="button"
               onClick={() => folderInputRef.current?.click()}
               disabled={!!folderProgress}
               className="flex min-w-0 items-center justify-center gap-1.5 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-center text-[0.6875rem] font-medium leading-tight text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] disabled:opacity-40 max-md:flex-1 max-md:basis-[calc(50%-0.25rem)] max-md:px-2.5"
@@ -2277,20 +2600,14 @@ function SpritesTab({
               Upload Folder
             </button>
             <button
+              type="button"
               onClick={() => void handleCleanVisibleSprites()}
-              disabled={
-                cleaningSprites ||
-                backgroundCleanupUnavailable ||
-                backgroundRemoverUnavailable ||
-                visibleSprites.length === 0
-              }
+              disabled={cleaningSprites || backgroundCleanupUnavailable || visibleSprites.length === 0}
               className="flex min-w-0 items-center justify-center gap-1.5 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-center text-[0.6875rem] font-medium leading-tight text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] disabled:opacity-40 max-md:flex-1 max-md:basis-[calc(50%-0.25rem)] max-md:px-2.5"
               title={
                 backgroundCleanupUnavailable
                   ? backgroundCleanupReason
-                  : backgroundRemoverUnavailable
-                    ? backgroundRemoverReason
-                    : "Run the local backgroundremover model on the currently visible saved sprites"
+                  : "Clean backgrounds on the currently visible saved sprites"
               }
             >
               {cleaningSprites ? <Loader2 size="0.8125rem" className="animate-spin" /> : <Eraser size="0.8125rem" />}
@@ -2298,6 +2615,7 @@ function SpritesTab({
             </button>
             <div className="relative max-md:flex-1 max-md:basis-[calc(50%-0.25rem)]">
               <button
+                type="button"
                 onClick={() => setExportMenuOpen((open) => !open)}
                 disabled={exporting || allSprites.length === 0}
                 className="flex w-full min-w-0 items-center justify-center gap-1.5 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-center text-[0.6875rem] font-medium leading-tight text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] disabled:opacity-40 max-md:px-2.5"
@@ -2309,6 +2627,7 @@ function SpritesTab({
               {exportMenuOpen && !exporting && (
                 <div className="absolute right-0 top-[calc(100%+0.35rem)] z-30 min-w-44 rounded-lg border border-[var(--border)] bg-[var(--card)] p-1 text-xs shadow-xl">
                   <button
+                    type="button"
                     onClick={() => {
                       setExportMenuOpen(false);
                       void handleExportSprites(visibleSprites, "visible");
@@ -2320,6 +2639,7 @@ function SpritesTab({
                     {category === "full-body" ? "Full-body only" : "Expressions only"}
                   </button>
                   <button
+                    type="button"
                     onClick={() => {
                       setExportMenuOpen(false);
                       void handleExportSprites(allSprites, "all");
@@ -2372,6 +2692,7 @@ function SpritesTab({
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs text-[var(--muted-foreground)]">
             <span>Last cleanup has a restore point.</span>
             <button
+              type="button"
               onClick={() => void handleRestoreLastCleanup()}
               disabled={restoringCleanup}
               className="flex items-center gap-1.5 rounded-md bg-[var(--card)] px-2.5 py-1 text-[0.6875rem] font-medium text-[var(--foreground)] ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)] disabled:opacity-40"
@@ -2413,6 +2734,7 @@ function SpritesTab({
             }}
           />
           <button
+            type="button"
             onClick={() => newExpression.trim() && startUpload(normalizeExpressionForCategory(newExpression))}
             disabled={!newExpression.trim() || uploading}
             className="flex items-center gap-1.5 rounded-xl bg-[var(--primary)] px-4 py-2 text-xs font-medium text-[var(--primary-foreground)] shadow-sm transition-all hover:shadow-md disabled:opacity-40"
@@ -2429,6 +2751,7 @@ function SpritesTab({
             <div className="flex flex-wrap gap-1">
               {suggestedExpressions.slice(0, 12).map((expr) => (
                 <button
+                  type="button"
                   key={expr}
                   onClick={() => startUpload(expr)}
                   className="rounded-lg bg-[var(--secondary)] px-2.5 py-1 text-[0.6875rem] font-medium text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
@@ -2495,6 +2818,7 @@ function SpritesTab({
                 </span>
                 <div className="flex gap-1 opacity-0 group-hover:opacity-100 max-md:opacity-100 transition-opacity">
                   <button
+                    type="button"
                     onClick={() => setFramingSprite(sprite)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
                     title="Frame"
@@ -2502,6 +2826,7 @@ function SpritesTab({
                     <Crop size="0.6875rem" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => void downloadSpriteFile(sprite)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
                     title="Download"
@@ -2509,6 +2834,7 @@ function SpritesTab({
                     <ImageDown size="0.6875rem" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => startUpload(sprite.expression)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
                     title="Replace"
@@ -2516,6 +2842,7 @@ function SpritesTab({
                     <Upload size="0.6875rem" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => setDeleteSpriteRequest(sprite)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]"
                     title="Delete"
@@ -2722,6 +3049,7 @@ function StatsTab({
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold">Attributes</h3>
               <button
+                type="button"
                 onClick={addAttribute}
                 className="flex items-center gap-1 rounded-lg bg-purple-500/15 px-2.5 py-1 text-[0.6875rem] font-medium text-purple-400 transition-colors hover:bg-purple-500/25"
               >
@@ -2749,6 +3077,7 @@ function StatsTab({
                     className="w-16 rounded-lg border border-[var(--border)] bg-[var(--input)] px-2 py-1 text-center text-xs"
                   />
                   <button
+                    type="button"
                     onClick={() => removeAttribute(i)}
                     className="rounded-lg p-1 text-[var(--muted-foreground)] transition-colors hover:bg-red-500/15 hover:text-red-400"
                   >

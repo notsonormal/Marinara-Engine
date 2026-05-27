@@ -63,6 +63,7 @@ interface ConversationViewProps {
   onRegenerate: (messageId: string) => void;
   onEdit: (messageId: string, content: string) => void;
   onSetActiveSwipe: (messageId: string, index: number) => void;
+  onToggleHiddenFromAI: (messageId: string, current: boolean) => void;
   onPeekPrompt: () => void;
   lastAssistantMessageId: string | null;
   onOpenSettings: () => void;
@@ -124,12 +125,22 @@ function hasNamePrefixFormat(msg: Message, characterMap: CharacterMap, chatChara
 }
 
 function isHiddenFromUser(message: Message) {
+  const extra = getMessageExtraRecord(message);
+  return extra.hiddenFromUser === true;
+}
+
+function getMessageExtraRecord(message: Message): Record<string, unknown> {
   try {
     const extra = typeof message.extra === "string" ? JSON.parse(message.extra) : (message.extra ?? {});
-    return extra.hiddenFromUser === true;
+    return extra && typeof extra === "object" && !Array.isArray(extra) ? (extra as Record<string, unknown>) : {};
   } catch {
-    return false;
+    return {};
   }
+}
+
+function getMessageThinking(message: Message): string | null {
+  const thinking = getMessageExtraRecord(message).thinking;
+  return typeof thinking === "string" && thinking.length > 0 ? thinking : null;
 }
 
 const LIST_LINE_RE = /^\s*(?:[-*+]|\d+\.)\s/;
@@ -315,6 +326,7 @@ export function ConversationView({
   onRegenerate,
   onEdit,
   onSetActiveSwipe,
+  onToggleHiddenFromAI,
   onPeekPrompt,
   lastAssistantMessageId,
   onOpenSettings,
@@ -569,6 +581,7 @@ export function ConversationView({
         const lines = splitAssistantContentLines(cleaned, charName);
         if (lines.length > 1) {
           const blocks = chunkAssistantMarkdownBlocks(lines);
+          const thinking = getMessageThinking(msg);
 
           blocks.forEach((block, bi) => {
             const isLast = bi === blocks.length - 1;
@@ -581,7 +594,13 @@ export function ConversationView({
                 : {
                     ...msg,
                     content,
-                    extra: { displayText: null, isGenerated: false, tokenCount: null, generationInfo: null },
+                    extra: {
+                      displayText: null,
+                      isGenerated: false,
+                      tokenCount: null,
+                      generationInfo: null,
+                      ...(bi === 0 && thinking ? { thinking } : {}),
+                    },
                   },
               isGrouped: bi === 0 ? grouped : true,
               index: messageOffset + i,
@@ -971,6 +990,7 @@ export function ConversationView({
                   onRegenerate={onRegenerate}
                   onEdit={onEdit}
                   onSetActiveSwipe={onSetActiveSwipe}
+                  onToggleHiddenFromAI={onToggleHiddenFromAI}
                   onPeekPrompt={onPeekPrompt}
                 />,
               );
@@ -1007,6 +1027,7 @@ export function ConversationView({
                 onRegenerate={onRegenerate}
                 onEdit={onEdit}
                 onSetActiveSwipe={onSetActiveSwipe}
+                onToggleHiddenFromAI={onToggleHiddenFromAI}
                 onPeekPrompt={onPeekPrompt}
                 isLastAssistantMessage={msg.id === lastAssistantMessageId}
                 characterMap={characterMap}
@@ -1138,6 +1159,7 @@ function SplitMessageGroup({
   onRegenerate,
   onEdit,
   onSetActiveSwipe,
+  onToggleHiddenFromAI,
   onPeekPrompt,
 }: {
   items: Array<{ key: string; msg: Message; isGrouped: boolean; index: number }>;
@@ -1153,6 +1175,7 @@ function SplitMessageGroup({
   onRegenerate: (id: string) => void;
   onEdit: (id: string, content: string) => void;
   onSetActiveSwipe: (id: string, index: number) => void;
+  onToggleHiddenFromAI: (id: string, current: boolean) => void;
   onPeekPrompt: () => void;
 }) {
   const [showActions, setShowActions] = useState(false);
@@ -1193,6 +1216,7 @@ function SplitMessageGroup({
           onRegenerate={onRegenerate}
           onEdit={onEdit}
           onSetActiveSwipe={onSetActiveSwipe}
+          onToggleHiddenFromAI={onToggleHiddenFromAI}
           onPeekPrompt={onPeekPrompt}
           isLastAssistantMessage={false}
           characterMap={characterMap}
@@ -1268,6 +1292,7 @@ function SplitMessageGroup({
                 onRegenerate={onRegenerate}
                 onEdit={onEdit}
                 onSetActiveSwipe={onSetActiveSwipe}
+                onToggleHiddenFromAI={onToggleHiddenFromAI}
                 onPeekPrompt={onPeekPrompt}
                 isLastAssistantMessage={false}
                 characterMap={characterMap}
@@ -1294,6 +1319,7 @@ function SplitMessageGroup({
               onRegenerate={onRegenerate}
               onEdit={onEdit}
               onSetActiveSwipe={onSetActiveSwipe}
+              onToggleHiddenFromAI={onToggleHiddenFromAI}
               onPeekPrompt={onPeekPrompt}
               onEditClick={handleStartEdit}
               isLastAssistantMessage={firstItem.msg.id === lastAssistantMessageId}
@@ -1321,6 +1347,7 @@ function SplitMessageGroup({
               onRegenerate={onRegenerate}
               onEdit={onEdit}
               onSetActiveSwipe={onSetActiveSwipe}
+              onToggleHiddenFromAI={onToggleHiddenFromAI}
               onPeekPrompt={onPeekPrompt}
               onEditClick={handleStartEdit}
               isLastAssistantMessage={msg.id === lastAssistantMessageId}

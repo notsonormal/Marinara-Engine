@@ -16,11 +16,13 @@ import {
 } from "react";
 import DOMPurify from "dompurify";
 import {
+  AlertTriangle,
   MessageCircle,
   RefreshCw,
   ScrollText,
   X,
   Package,
+  Sword,
   Copy,
   Pencil,
   Check,
@@ -55,8 +57,20 @@ import { createMessageMacroResolver, findCharacterByName } from "../../lib/chat-
 import { animateTextHtml } from "./AnimatedText";
 import { ttsService } from "../../lib/tts-service";
 import { getOrCreateCachedTTSAudioBlob } from "../../lib/tts-audio-cache";
-import { resolveTTSVoiceForSpeaker, splitTTSChunks, ttsConfigMatchesSpeaker } from "../../lib/tts-dialogue";
-import type { PartyDialogueLine, Message, TTSConfig, GameNpc, SkillCheckResult } from "@marinara-engine/shared";
+import {
+  resolveTTSNarratorVoice,
+  resolveTTSVoiceForSpeaker,
+  splitTTSChunks,
+  ttsConfigMatchesSpeaker,
+} from "../../lib/tts-dialogue";
+import {
+  formatTextQuotes,
+  type PartyDialogueLine,
+  type Message,
+  type TTSConfig,
+  type GameNpc,
+  type SkillCheckResult,
+} from "@marinara-engine/shared";
 import type { CharacterMap, PersonaInfo } from "../chat/chat-area.types";
 
 /** Build inline style for a color that may be a plain color or a CSS gradient. */
@@ -107,6 +121,8 @@ const GAME_TTS_EMOTIONS = [
 type GameTtsEmotion = (typeof GAME_TTS_EMOTIONS)[number];
 
 const GAME_TTS_EMOTION_SET = new Set<string>(GAME_TTS_EMOTIONS);
+const SIDE_VOICE_AUTOPLAY_MAX_FAILURES = 3;
+const SIDE_VOICE_AUTOPLAY_RETRY_DELAY_MS = 350;
 
 const GAME_TTS_EMOTION_ALIASES: Record<string, GameTtsEmotion> = {
   afraid: "scared",
@@ -391,6 +407,14 @@ interface GameNarrationProps {
   onOpenInventory?: () => void;
   /** Number of items in inventory (for badge) */
   inventoryCount?: number;
+  /** Ask the parent to manually start/generate combat for the current turn. */
+  onRequestCombatStart?: () => void;
+  /** Whether combat state is being prepared and the player has reached the combat beat. */
+  combatStarting?: boolean;
+  /** Whether combat state generation failed for the current combat beat. */
+  combatGenerationFailed?: boolean;
+  /** Retry combat state generation. */
+  onRetryCombatGeneration?: () => void;
   /** Open the standard delete-message flow for a backing chat message. */
   onDeleteMessage?: (messageId: string) => void;
   /** Whether the global multi-delete bar is active. */
@@ -420,6 +444,8 @@ interface GameNarrationProps {
   onNpcPortraitClick?: (npcName: string) => void;
   /** Generate or replace a tracked NPC portrait through the image provider. */
   onNpcPortraitGenerate?: (npcName: string) => void;
+  /** Notify the parent that a tracked NPC portrait URL failed to load. */
+  onNpcPortraitLoadError?: (npcName: string) => void;
   npcPortraitGenerationEnabled?: boolean;
   generatingNpcPortraitNames?: Set<string>;
   /** Pause auto-play while a blocking game overlay is open. */
@@ -461,6 +487,8 @@ interface GameNarrationProps {
   onStepForward?: () => void;
   /** Jump straight back to the present in one shot. Bound to the Return button during review. */
   onJumpToLatest?: () => void;
+  /** Set the review offset directly when an action needs to land on a specific log beat. */
+  onSetReviewOffset?: (offset: number) => void;
   /**
    * Token bumped from the parent (background-click handler) when wheel-nav is enabled
    * and the player clicks the bare scene background. GameNarration interprets it as
@@ -555,6 +583,8 @@ function buildVoiceConfigSignature(config?: TTSConfig | null): string {
     config.baseUrl,
     config.model,
     config.voice,
+    config.narratorVoiceEnabled ? "narrator-voice" : "narrator-global",
+    config.narratorVoice,
     config.voiceMode,
     JSON.stringify(config.voiceAssignments ?? []),
     config.npcDefaultVoicesEnabled ? "npc-defaults" : "npc-global",
@@ -746,7 +776,7 @@ function getGameSegmentVoiceRequest(
   if (config.dialogueOnly) return null;
   const chunks = splitTTSChunks(segment.content);
   if (chunks.length === 0) return null;
-  const voice = config.voice;
+  const voice = resolveTTSNarratorVoice(config);
   if (config.source === "elevenlabs" && !voice) return null;
   return { chunks, voice };
 }
@@ -889,6 +919,10 @@ export function GameNarration({
   skillCheckSlot,
   onOpenInventory,
   inventoryCount,
+  onRequestCombatStart,
+  combatStarting,
+  combatGenerationFailed,
+  onRetryCombatGeneration,
   onDeleteMessage,
   multiSelectMode = false,
   selectedMessageIds,
@@ -901,6 +935,7 @@ export function GameNarration({
   onReadable,
   onNpcPortraitClick,
   onNpcPortraitGenerate,
+  onNpcPortraitLoadError,
   npcPortraitGenerationEnabled = false,
   generatingNpcPortraitNames,
   autoPlayBlocked,
@@ -913,6 +948,7 @@ export function GameNarration({
   messageOffset = 0,
   onStepForward,
   onJumpToLatest,
+  onSetReviewOffset,
   nextActionToken,
   onMaxNavOffsetChange,
 }: GameNarrationProps) {
@@ -923,6 +959,7 @@ export function GameNarration({
   const [logsOpen, setLogsOpen] = useState(false);
   const messagesPerPage = useUIStore((s) => s.messagesPerPage);
   const gameDialogueDisplayMode = useUIStore((s) => s.gameDialogueDisplayMode);
+  const quoteFormat = useUIStore((s) => s.quoteFormat);
   const useStackedLogDisplay = gameDialogueDisplayMode === "stacked";
   const showLogsButton = !useStackedLogDisplay;
   const [editingContent, setEditingContent] = useState<string | null>(null);
@@ -960,7 +997,10 @@ export function GameNarration({
   const gameVoiceSequenceRef = useRef(0);
   const gameVoiceGenerationTailRef = useRef<Promise<void>>(Promise.resolve());
   const lastAutoPlayedVoiceKeyRef = useRef<string | null>(null);
-  const lastAutoPlayedSideVoiceGroupRef = useRef<string | null>(null);
+  const autoPlayedSideVoiceKeysRef = useRef<Set<string>>(new Set());
+  const sideVoiceAutoPlayFailuresRef = useRef<Map<string, number>>(new Map());
+  const sideVoiceAutoPlayRetryPendingRef = useRef<Set<string>>(new Set());
+  const sideVoiceAutoPlayRetryTimerRef = useRef<number | null>(null);
 
   // Clear edit state when the active segment changes
   useEffect(() => {
@@ -1051,7 +1091,7 @@ export function GameNarration({
       if (c.avatarUrl) setAvatarInfo(c.name, { url: c.avatarUrl, crop: c.avatarCrop });
     }
     if (personaInfo?.name && personaInfo.avatarUrl) {
-      setAvatarInfo(personaInfo.name, { url: personaInfo.avatarUrl });
+      setAvatarInfo(personaInfo.name, { url: personaInfo.avatarUrl, crop: personaInfo.avatarCrop });
     }
     if (speakerAvatarMap) {
       for (const [name, avatarInfo] of speakerAvatarMap) {
@@ -1177,6 +1217,11 @@ export function GameNarration({
   type FlatLogEntry =
     | { kind: "assistant"; messageId: string; segmentIndex: number; segment: NarrationSegment; role: Message["role"] }
     | { kind: "user"; messageId: string; segment: NarrationSegment };
+
+  const getFlatLogEntryKey = useCallback((entry: FlatLogEntry) => {
+    if (entry.kind === "assistant") return `${entry.messageId}:${entry.segmentIndex}`;
+    return `${entry.messageId}:0`;
+  }, []);
 
   const flatLogEntries = useMemo<FlatLogEntry[]>(() => {
     const out: FlatLogEntry[] = [];
@@ -1313,9 +1358,9 @@ export function GameNarration({
       };
       const resolveMacrosForText = createMessageMacroResolver(macroContext);
       const regexApplied = applyOutputRegexForSource(text, sourceMessageId, sourceRole, resolveMacrosForText);
-      return resolveMacrosForText(regexApplied);
+      return formatTextQuotes(resolveMacrosForText(regexApplied), quoteFormat);
     },
-    [applyOutputRegexForSource, macroCharacters, personaInfo, resolveMacroCharacter],
+    [applyOutputRegexForSource, macroCharacters, personaInfo, quoteFormat, resolveMacroCharacter],
   );
 
   const prepareDisplaySegment = useCallback(
@@ -1789,6 +1834,25 @@ export function GameNarration({
     [playGameVoiceKeys],
   );
 
+  const clearSideVoiceAutoPlayRetry = useCallback(() => {
+    if (sideVoiceAutoPlayRetryTimerRef.current != null) {
+      window.clearTimeout(sideVoiceAutoPlayRetryTimerRef.current);
+      sideVoiceAutoPlayRetryTimerRef.current = null;
+    }
+    sideVoiceAutoPlayRetryPendingRef.current.clear();
+  }, []);
+
+  const scheduleSideVoiceAutoPlayRetry = useCallback((key: string) => {
+    sideVoiceAutoPlayRetryPendingRef.current.add(key);
+    if (sideVoiceAutoPlayRetryTimerRef.current != null) return;
+
+    sideVoiceAutoPlayRetryTimerRef.current = window.setTimeout(() => {
+      sideVoiceAutoPlayRetryTimerRef.current = null;
+      sideVoiceAutoPlayRetryPendingRef.current.clear();
+      setGameVoiceVersion((version) => version + 1);
+    }, SIDE_VOICE_AUTOPLAY_RETRY_DELAY_MS);
+  }, []);
+
   const pauseGameVoicePlayback = useCallback(() => {
     if (!gameVoiceAudioRef.current || !gameVoicePlayingKey || gameVoicePausedKey === gameVoicePlayingKey) return;
     gameVoiceAudioRef.current.pause();
@@ -2030,6 +2094,62 @@ export function GameNarration({
         }
       : null;
   }, [active?.sourceMessageId, activeIndex, activeSegmentAnchor]);
+
+  const revealSegmentFully = useCallback(
+    (index: number) => {
+      if (segments.length === 0) return false;
+      const targetIndex = Math.max(0, Math.min(index, segments.length - 1));
+      const segment = segments[targetIndex];
+      if (!segment) return false;
+      const displayLength = effectDisplayLength(segment.content);
+      setActiveIndex(targetIndex);
+      setVisibleChars(displayLength);
+      twRef.current.pos = displayLength;
+      activeSegmentAnchorRef.current = {
+        key: narrationSegmentAnchorKey(segment),
+        index: targetIndex,
+        sourceMessageId: segment.sourceMessageId ?? null,
+      };
+      return true;
+    },
+    [segments],
+  );
+
+  const prepareLogDeleteNavigation = useCallback(
+    (deletedLogKey: string, liveSegmentIndex: number) => {
+      const deletedLogIndex = flatLogEntries.findIndex((entry) => getFlatLogEntryKey(entry) === deletedLogKey);
+
+      if (messageOffset > 0 && pastReviewEntry) {
+        const currentKey = getFlatLogEntryKey(pastReviewEntry);
+        const currentLogIndex = flatLogEntries.findIndex((entry) => getFlatLogEntryKey(entry) === currentKey);
+        // Deleting a newer entry shifts offsets. Step forward only for that case
+        // so the currently viewed beat stays selected. Deleting the selected beat
+        // itself keeps the offset, which naturally lands on the previous beat.
+        if (deletedLogIndex > currentLogIndex && currentLogIndex >= 0) {
+          onStepForward?.();
+        }
+        return;
+      }
+
+      if (messageOffset !== 0 || liveSegmentIndex < 0 || liveSegmentIndex !== activeIndex) return;
+      if (liveSegmentIndex > 0 && revealSegmentFully(liveSegmentIndex - 1)) return;
+      if (deletedLogIndex <= 0) return;
+
+      // Deleting the first visible beat of the current turn should still land on
+      // the previous chronological log beat, even when that beat is in the prior turn.
+      onSetReviewOffset?.(Math.max(0, flatLogEntries.length - deletedLogIndex - 1));
+    },
+    [
+      activeIndex,
+      flatLogEntries,
+      getFlatLogEntryKey,
+      messageOffset,
+      onSetReviewOffset,
+      onStepForward,
+      pastReviewEntry,
+      revealSegmentFully,
+    ],
+  );
 
   // Notify parent about narration completion state. While reviewing the past via
   // wheel-nav, the past message will look "complete" — but it's not the present, so
@@ -2704,12 +2824,13 @@ export function GameNarration({
     }
 
     if (activeSideVoiceKeys.length > 0) {
-      const groupKey = activeSideVoiceKeys.join("|");
       const entries = activeSideVoiceKeys.map((key) => gameVoiceCacheRef.current.get(key));
       if (entries.some((entry) => !entry || entry.status === "loading")) return true;
       if (activeSideVoiceKeys.includes(gameVoicePlayingKey ?? "")) return true;
-      const hasPlayableSideVoice = entries.some((entry) => entry?.status === "ready");
-      if (hasPlayableSideVoice && lastAutoPlayedSideVoiceGroupRef.current !== groupKey) return true;
+      const hasUnplayedSideVoice = activeSideVoiceKeys.some(
+        (key, index) => entries[index]?.status === "ready" && !autoPlayedSideVoiceKeysRef.current.has(key),
+      );
+      if (hasUnplayedSideVoice) return true;
     }
 
     return false;
@@ -2717,18 +2838,23 @@ export function GameNarration({
 
   useEffect(() => {
     lastAutoPlayedVoiceKeyRef.current = null;
-    lastAutoPlayedSideVoiceGroupRef.current = null;
+    autoPlayedSideVoiceKeysRef.current.clear();
+    sideVoiceAutoPlayFailuresRef.current.clear();
+    clearSideVoiceAutoPlayRetry();
     stopGameVoicePlayback();
-  }, [activeIndex, activeVoiceKey, stopGameVoicePlayback]);
+  }, [activeIndex, activeVoiceKey, clearSideVoiceAutoPlayRetry, stopGameVoicePlayback]);
 
   useEffect(() => {
     if (gameVoiceEnabled && !isStreaming && !scenePreparing && !directionsActive && !gameVoicePlaybackBlocked) return;
     if (isStreaming || scenePreparing || directionsActive || gameVoicePlaybackBlocked) {
       lastAutoPlayedVoiceKeyRef.current = null;
-      lastAutoPlayedSideVoiceGroupRef.current = null;
+      autoPlayedSideVoiceKeysRef.current.clear();
+      sideVoiceAutoPlayFailuresRef.current.clear();
+      clearSideVoiceAutoPlayRetry();
     }
     stopGameVoicePlayback();
   }, [
+    clearSideVoiceAutoPlayRetry,
     directionsActive,
     gameVoiceEnabled,
     gameVoicePlaybackBlocked,
@@ -2764,9 +2890,7 @@ export function GameNarration({
   useEffect(() => {
     if (!gameVoiceEnabled || activeSideVoiceKeys.length === 0) return;
     if (!doneTyping || isStreaming || scenePreparing || directionsActive || gameVoicePlaybackBlocked) return;
-
-    const sideVoiceGroupKey = activeSideVoiceKeys.join("|");
-    if (lastAutoPlayedSideVoiceGroupRef.current === sideVoiceGroupKey) return;
+    if (activeSideVoiceKeys.includes(gameVoicePlayingKey ?? "")) return;
 
     if (activeVoiceKey) {
       const parentEntry = gameVoiceCacheRef.current.get(activeVoiceKey);
@@ -2778,13 +2902,31 @@ export function GameNarration({
     }
 
     const entries = activeSideVoiceKeys.map((key) => gameVoiceCacheRef.current.get(key));
-    if (entries.some((entry) => !entry || entry.status === "loading")) return;
-
-    const playableKeys = activeSideVoiceKeys.filter((key, index) => entries[index]?.status === "ready");
+    const playableKeys = activeSideVoiceKeys.filter(
+      (key, index) =>
+        entries[index]?.status === "ready" &&
+        !autoPlayedSideVoiceKeysRef.current.has(key) &&
+        !sideVoiceAutoPlayRetryPendingRef.current.has(key) &&
+        (sideVoiceAutoPlayFailuresRef.current.get(key) ?? 0) < SIDE_VOICE_AUTOPLAY_MAX_FAILURES,
+    );
     if (playableKeys.length > 0) {
       playGameVoiceKeys(playableKeys, {
-        onStarted: () => {
-          lastAutoPlayedSideVoiceGroupRef.current = sideVoiceGroupKey;
+        onStarted: (startedKey) => {
+          autoPlayedSideVoiceKeysRef.current.add(startedKey);
+          sideVoiceAutoPlayFailuresRef.current.delete(startedKey);
+          sideVoiceAutoPlayRetryPendingRef.current.delete(startedKey);
+          setGameVoiceVersion((version) => version + 1);
+        },
+        onBlocked: (blockedKey) => {
+          const failures = (sideVoiceAutoPlayFailuresRef.current.get(blockedKey) ?? 0) + 1;
+          sideVoiceAutoPlayFailuresRef.current.set(blockedKey, failures);
+          if (failures < SIDE_VOICE_AUTOPLAY_MAX_FAILURES) {
+            scheduleSideVoiceAutoPlayRetry(blockedKey);
+            return;
+          }
+          sideVoiceAutoPlayRetryPendingRef.current.delete(blockedKey);
+          autoPlayedSideVoiceKeysRef.current.add(blockedKey);
+          setGameVoiceVersion((version) => version + 1);
         },
       });
     }
@@ -2800,12 +2942,14 @@ export function GameNarration({
     isStreaming,
     playGameVoiceKeys,
     scenePreparing,
+    scheduleSideVoiceAutoPlayRetry,
   ]);
 
   useEffect(() => {
     const pendingRequests = gameVoicePendingRef.current;
     const cachedVoices = gameVoiceCacheRef.current;
     return () => {
+      clearSideVoiceAutoPlayRetry();
       stopGameVoicePlayback();
       for (const controller of pendingRequests.values()) {
         controller.abort();
@@ -2818,12 +2962,12 @@ export function GameNarration({
       }
       cachedVoices.clear();
     };
-  }, [stopGameVoicePlayback]);
+  }, [clearSideVoiceAutoPlayRetry, stopGameVoicePlayback]);
 
   useEffect(() => {
     if (!active) return;
-    // Pause typewriter while direction effects (fades, flashes, etc.) are playing
-    if (directionsActive || scenePreparing) return;
+    // Pause typewriter while overlays/effects cover the narration so the background does not repaint behind them.
+    if (directionsActive || scenePreparing || logsOpen) return;
     const dispLen = effectDisplayLength(active.content);
 
     // Sync internal position with React state (handles restore / skip / segment change)
@@ -2853,7 +2997,7 @@ export function GameNarration({
     }, TICK_MS);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, gameInstantTextReveal, gameTextSpeed, directionsActive, scenePreparing]); // visibleChars intentionally excluded — managed internally
+  }, [active, gameInstantTextReveal, gameTextSpeed, directionsActive, scenePreparing, logsOpen]); // visibleChars intentionally excluded — managed internally
 
   const assetManifest = useGameAssetStore((s) => s.manifest);
 
@@ -3081,6 +3225,50 @@ export function GameNarration({
     "flex items-center gap-1.5 rounded-lg bg-[var(--muted)]/30 px-3 py-1.5 text-xs text-[var(--foreground)]/70 transition-colors hover:bg-[var(--muted)]/50 hover:text-[var(--foreground)] dark:bg-white/10 dark:text-white/70 dark:hover:bg-white/20 dark:hover:text-white";
   const NARRATION_META_BTN =
     "flex min-h-7 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--muted)]/20 px-2.5 py-1 text-xs text-[var(--foreground)]/75 transition-colors hover:bg-[var(--muted)]/40 dark:border-white/10 dark:bg-white/5 dark:text-white/75 dark:hover:bg-white/10";
+  const combatMetaButton = onRequestCombatStart ? (
+    <button
+      type="button"
+      onClick={combatGenerationFailed && onRetryCombatGeneration ? onRetryCombatGeneration : onRequestCombatStart}
+      disabled={combatStarting}
+      className={cn(
+        NARRATION_META_BTN,
+        "relative",
+        combatGenerationFailed
+          ? "border-rose-300/30 bg-rose-500/15 text-rose-100 hover:bg-rose-500/25"
+          : "border-amber-300/20 bg-amber-500/10 text-amber-100/90 hover:bg-amber-500/20",
+        combatStarting && "cursor-wait opacity-80",
+      )}
+      title={combatGenerationFailed ? "Retry combat generation" : "Start combat"}
+    >
+      {combatStarting ? <Loader2 size={12} className="animate-spin" /> : <Sword size={12} />}
+      <span className="hidden sm:inline">{combatGenerationFailed ? "Retry Combat" : "Combat"}</span>
+    </button>
+  ) : null;
+  const combatStatusNotice =
+    combatStarting || combatGenerationFailed ? (
+      <div
+        className={cn(
+          "mt-2 flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs",
+          combatGenerationFailed
+            ? "border-rose-300/25 bg-rose-500/10 text-rose-100"
+            : "border-amber-300/20 bg-amber-500/10 text-amber-100",
+        )}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          {combatStarting ? <Loader2 size={13} className="shrink-0 animate-spin" /> : <AlertTriangle size={13} />}
+          <span>{combatStarting ? "Combat starting, please wait..." : "Combat generation failed."}</span>
+        </span>
+        {combatGenerationFailed && onRetryCombatGeneration && (
+          <button
+            type="button"
+            onClick={onRetryCombatGeneration}
+            className="shrink-0 rounded-md bg-white/10 px-2 py-1 font-semibold text-white/85 transition-colors hover:bg-white/15 hover:text-white"
+          >
+            Retry
+          </button>
+        )}
+      </div>
+    ) : null;
 
   const handleCopyMessage = useCallback(async (key: string, text: string) => {
     const didCopy = await copyToClipboard(text);
@@ -3442,75 +3630,142 @@ export function GameNarration({
 
       <div
         data-tour="game-dialogue"
-        className="relative z-10 mx-auto flex max-h-[calc(100svh-7rem)] min-h-0 w-full max-w-4xl flex-col md:max-h-[calc(100svh-8rem)]"
+        className="relative z-10 mx-auto flex h-full max-h-[calc(100svh-7rem)] min-h-0 w-full max-w-4xl flex-col justify-end md:max-h-[calc(100svh-8rem)]"
       >
-        {useStackedLogDisplay && stackedLogEntries.length > 0 && (
-          <div
-            className="mb-2 rounded-2xl border border-[var(--border)] bg-[var(--card)]/70 p-2 shadow-[0_16px_38px_rgba(0,0,0,0.35)] backdrop-blur-md dark:border-white/10 dark:bg-black/40"
-            data-game-skip-bg-nav="true"
-          >
+        <div className="min-h-0 flex flex-1 flex-col justify-end overflow-hidden">
+          {useStackedLogDisplay && stackedLogEntries.length > 0 && (
             <div
-              ref={stackedLogRef}
-              className="flex max-h-[22svh] min-h-0 flex-col gap-1.5 overflow-y-auto pr-1 sm:max-h-[26svh] md:max-h-[32svh]"
-              onScroll={(e) => {
-                const el = e.currentTarget;
-                setStackedLogPinned(el.scrollHeight - el.scrollTop - el.clientHeight < 32);
-              }}
+              className="mb-2 rounded-2xl border border-[var(--border)] bg-[var(--card)]/70 p-2 shadow-[0_16px_38px_rgba(0,0,0,0.35)] backdrop-blur-md dark:border-white/10 dark:bg-black/40"
+              data-game-skip-bg-nav="true"
             >
-              {stackedLogEntries.map((entry) => (
-                <div key={entry.messageId} className="space-y-1.5">
-                  {entry.segments.map((seg) => renderStackedLogSegment(seg))}
-                </div>
-              ))}
+              <div
+                ref={stackedLogRef}
+                className="flex max-h-[22svh] min-h-0 flex-col gap-1.5 overflow-y-auto pr-1 sm:max-h-[26svh] md:max-h-[32svh]"
+                onScroll={(e) => {
+                  const el = e.currentTarget;
+                  setStackedLogPinned(el.scrollHeight - el.scrollTop - el.clientHeight < 32);
+                }}
+              >
+                {stackedLogEntries.map((entry) => (
+                  <div key={entry.messageId} className="space-y-1.5">
+                    {entry.segments.map((seg) => renderStackedLogSegment(seg))}
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Side remarks — small floating box shown with the dialogue they follow */}
-        {activeSideLines.length > 0 && doneTyping && (
-          <div className="relative z-20 mb-2 flex max-h-[min(16rem,38vh)] w-full flex-col space-y-1.5 overflow-x-hidden overflow-y-auto pr-1">
-            {activeSideLines.map((line, i) => {
-              const expressionAvatar =
-                line.type === "side" || line.type === "extra"
-                  ? resolveExpressionAvatar(line.character, line.expression)
-                  : null;
-              const charAvatar = expressionAvatar ?? findNamedMapValue(speakerAvatarInfos, line.character) ?? null;
-              const charColor = findNamedMapValue(speakerColors, line.character);
-              const charNameColor = findNamedMapValue(speakerNameColors, line.character);
-              return (
-                <div
-                  key={`${line.character}-side-${i}`}
-                  className="flex w-full justify-end animate-party-slide-in"
-                  style={{ animationDelay: `${i * 80}ms` }}
-                >
-                  <PartyOverlayBox line={line} avatar={charAvatar} color={charColor} nameColor={charNameColor} />
-                </div>
-              );
-            })}
-          </div>
-        )}
+          {/* Side remarks — small floating box shown with the dialogue they follow */}
+          {activeSideLines.length > 0 && doneTyping && (
+            <div
+              data-game-skip-bg-nav="true"
+              className="relative z-20 mb-2 flex max-h-[min(16rem,38vh)] w-full flex-col space-y-1.5 overflow-x-hidden overflow-y-auto pr-1"
+            >
+              {activeSideLines.map((line, i) => {
+                const expressionAvatar =
+                  line.type === "side" || line.type === "extra"
+                    ? resolveExpressionAvatar(line.character, line.expression)
+                    : null;
+                const charAvatar = expressionAvatar ?? findNamedMapValue(speakerAvatarInfos, line.character) ?? null;
+                const charColor = findNamedMapValue(speakerColors, line.character);
+                const charNameColor = findNamedMapValue(speakerNameColors, line.character);
+                const sideVoiceKey = active ? getVoiceKeyForSideLine(active, line, i) : null;
+                const voiceEntry = sideVoiceKey ? gameVoiceCacheRef.current.get(sideVoiceKey) : undefined;
+                const voicePaused = gameVoicePausedKey === sideVoiceKey;
+                const voiceActive = gameVoicePlayingKey === sideVoiceKey;
+                const voiceControl =
+                  sideVoiceKey && voiceEntry && voiceEntry.status !== "error" ? (
+                    <span
+                      className="ml-auto inline-flex items-center gap-0.5"
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onPointerUp={(event) => event.stopPropagation()}
+                      onPointerCancel={(event) => event.stopPropagation()}
+                    >
+                      <button
+                        type="button"
+                        onClick={(event) => handleGameVoiceButtonClick(event, sideVoiceKey)}
+                        disabled={voiceEntry.status === "loading"}
+                        className={cn(
+                          "inline-flex h-5 w-5 items-center justify-center rounded-full text-white/55 transition-colors hover:bg-white/10 hover:text-sky-200 disabled:cursor-wait disabled:opacity-60",
+                          voiceActive && "bg-sky-400/15 text-sky-200",
+                        )}
+                        title={
+                          voiceEntry.status === "loading"
+                            ? "Generating voice-over"
+                            : voiceActive
+                              ? voicePaused
+                                ? "Resume voice-over"
+                                : "Pause voice-over"
+                              : "Play voice-over"
+                        }
+                        aria-label={
+                          voiceEntry.status === "loading"
+                            ? "Generating voice-over"
+                            : voiceActive
+                              ? voicePaused
+                                ? "Resume voice-over"
+                                : "Pause voice-over"
+                              : "Play voice-over"
+                        }
+                      >
+                        {voiceEntry.status === "loading" ? (
+                          <Loader2 size={11} className="animate-spin" />
+                        ) : voiceActive ? (
+                          voicePaused ? (
+                            <Play size={11} />
+                          ) : (
+                            <Pause size={11} />
+                          )
+                        ) : (
+                          <Volume2 size={11} />
+                        )}
+                      </button>
+                    </span>
+                  ) : null;
+                return (
+                  <div
+                    key={`${line.character}-side-${i}`}
+                    className="flex w-full justify-end animate-party-slide-in"
+                    style={{ animationDelay: `${i * 80}ms` }}
+                  >
+                    <PartyOverlayBox
+                      line={line}
+                      avatar={charAvatar}
+                      color={charColor}
+                      nameColor={charNameColor}
+                      voiceControl={voiceControl}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
-        {/* Party turn loading indicator — only show as banner when player input isn't the active VN segment */}
-        {partyTurnPending && !scenePreparing && !active?.id?.startsWith("party-chat-input-") && (
-          <div className="mb-2 flex items-center gap-1.5 rounded-xl border border-sky-500/15 bg-sky-500/5 px-3 py-1.5 backdrop-blur-md">
-            <MessageCircle size={12} className="animate-pulse text-sky-300/70" />
-            <span className="text-[0.6875rem] text-sky-200/60">The party is reacting...</span>
-          </div>
-        )}
+          {/* Party turn loading indicator — only show as banner when player input isn't the active VN segment */}
+          {partyTurnPending && !scenePreparing && !active?.id?.startsWith("party-chat-input-") && (
+            <div className="mb-2 flex shrink-0 items-center gap-1.5 rounded-xl border border-sky-500/15 bg-sky-500/5 px-3 py-1.5 backdrop-blur-md">
+              <MessageCircle size={12} className="animate-pulse text-sky-300/70" />
+              <span className="text-[0.6875rem] text-sky-200/60">The party is reacting...</span>
+            </div>
+          )}
 
-        {/* Choice cards from GM — rendered above narration so they don't overlap */}
-        {choicesSlot}
+          {/* Choice cards from GM — rendered above narration so they don't overlap */}
+          {choicesSlot}
 
-        {/* Widget slot — mobile widget icons sit above the narration box */}
-        {widgetSlot}
+          {/* Widget slot — mobile widget icons sit above the narration box */}
+          {widgetSlot}
 
-        {/* Skill check result — shown above the narration box until dismissed */}
-        {skillCheckSlot}
+          {/* Skill check result — shown above the narration box until dismissed */}
+          {skillCheckSlot}
 
-        {/* Dice roll result — shown closest to the narration box until dismissed */}
-        {diceResultSlot}
+          {/* Dice roll result — shown closest to the narration box until dismissed */}
+          {diceResultSlot}
+        </div>
 
-        <div className="rounded-2xl border border-[var(--border)] bg-[var(--card)]/90 p-3 backdrop-blur-md shadow-[0_16px_38px_rgba(0,0,0,0.45)] dark:border-white/15 dark:bg-black/50">
+        <div
+          data-game-skip-bg-nav="true"
+          className="shrink-0 rounded-2xl border border-[var(--border)] bg-[var(--card)]/90 p-3 shadow-[0_16px_38px_rgba(0,0,0,0.45)] backdrop-blur-md dark:border-white/15 dark:bg-black/50"
+        >
           {/* Scene preparation gate: wait for effects before showing narration */}
           {scenePreparing && (
             <div className="flex items-center gap-2 py-3">
@@ -3584,6 +3839,11 @@ export function GameNarration({
                                 alt={active.speaker || ""}
                                 crop={activeAvatar.crop}
                                 className={cn(GAME_DIALOGUE_AVATAR_CLASS, "transition-colors hover:border-white/30")}
+                                onLoadError={
+                                  activeCanGeneratePortrait && active.speaker
+                                    ? () => onNpcPortraitLoadError?.(active.speaker as string)
+                                    : undefined
+                                }
                               />
                             ) : (
                               <img
@@ -3625,6 +3885,11 @@ export function GameNarration({
                           alt={active.speaker || ""}
                           crop={activeAvatar.crop}
                           className={GAME_DIALOGUE_AVATAR_CLASS}
+                          onLoadError={
+                            activeCanGeneratePortrait && active.speaker
+                              ? () => onNpcPortraitLoadError?.(active.speaker as string)
+                              : undefined
+                          }
                         />
                       ) : (
                         <img
@@ -3798,6 +4063,7 @@ export function GameNarration({
                       )}
                     </button>
                   )}
+                  {combatMetaButton}
                 </div>
                 {navControls}
               </div>
@@ -3915,6 +4181,7 @@ export function GameNarration({
                       )}
                     </button>
                   )}
+                  {combatMetaButton}
                 </div>
                 {navControls}
               </div>
@@ -3983,6 +4250,8 @@ export function GameNarration({
             </>
           )}
 
+          {!scenePreparing && combatStatusNotice}
+
           {/* Inline input — appears inside the narration box once all segments are read,
               or after the player has CONFIRMED an interrupt (not just opened the modal).
               Gating on `interruptCommitted` (not `interruptPending`) keeps the input bar
@@ -4026,7 +4295,7 @@ export function GameNarration({
       {/* Logs modal */}
       {logsOpen && showLogsButton && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80"
           data-game-skip-bg-nav="true"
           role="dialog"
           aria-modal="true"
@@ -4225,6 +4494,7 @@ export function GameNarration({
                             event.preventDefault();
                             event.stopPropagation();
                             captureLogScrollAnchor();
+                            prepareLogDeleteNavigation(`${sourceMessageId}:${sourceSegmentIndex}`, liveSegmentIndex);
                             if (canDeleteMessage && sourceMessageId) {
                               onDeleteMessage?.(sourceMessageId);
                             } else if (canDeleteThisSegment && sourceMessageId) {
@@ -4479,6 +4749,11 @@ export function GameNarration({
                                       alt={seg.speaker || ""}
                                       crop={logAvatar.crop}
                                       className="h-8 w-8 rounded-lg border border-white/10 transition-colors hover:border-white/25"
+                                      onLoadError={
+                                        canGenerateLogPortrait && seg.speaker
+                                          ? () => onNpcPortraitLoadError?.(seg.speaker as string)
+                                          : undefined
+                                      }
                                     />
                                   ) : (
                                     <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-[var(--accent)] text-[0.5rem] font-bold transition-colors hover:border-white/25">
@@ -4515,6 +4790,11 @@ export function GameNarration({
                                 alt={seg.speaker || ""}
                                 crop={logAvatar.crop}
                                 className="h-8 w-8 shrink-0 rounded-lg border border-white/10"
+                                onLoadError={
+                                  canGenerateLogPortrait && seg.speaker
+                                    ? () => onNpcPortraitLoadError?.(seg.speaker as string)
+                                    : undefined
+                                }
                               />
                             ) : (
                               <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-[var(--accent)] text-[0.5rem] font-bold">
@@ -4666,15 +4946,23 @@ function CroppedAvatar({
   alt,
   crop,
   className,
+  onLoadError,
 }: {
   src: string;
   alt: string;
   crop?: AvatarCrop | LegacyAvatarCrop | null;
   className?: string;
+  onLoadError?: () => void;
 }) {
   return (
     <div className={cn("relative overflow-hidden", className)}>
-      <img src={src} alt={alt} className="h-full w-full object-cover" style={getAvatarCropStyle(crop)} />
+      <img
+        src={src}
+        alt={alt}
+        className="h-full w-full object-cover"
+        style={getAvatarCropStyle(crop)}
+        onError={onLoadError}
+      />
     </div>
   );
 }
@@ -4684,11 +4972,13 @@ function PartyOverlayBox({
   avatar,
   color,
   nameColor,
+  voiceControl,
 }: {
   line: PartyDialogueLine;
   avatar: SpeakerAvatarInfo | null;
   color?: string;
   nameColor?: string;
+  voiceControl?: ReactNode;
 }) {
   const styleByType: Record<string, { border: string; bg: string; icon: string; labelColor: string }> = {
     side: { border: "border-white/15", bg: "bg-black/75", icon: "💬", labelColor: "text-white/85" },
@@ -4722,17 +5012,18 @@ function PartyOverlayBox({
         />
       )}
       <div className="min-w-0 flex-1">
-        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <div className="flex min-w-0 items-center gap-1.5">
           <span className="text-[0.5625rem]">{style.icon}</span>
           <span
-            className={cn("text-[0.6875rem] font-semibold", style.labelColor)}
+            className={cn("min-w-0 truncate text-[0.6875rem] font-semibold", style.labelColor)}
             style={nameColorStyle(nameColor ?? color)}
           >
             {line.character}
           </span>
           {line.type === "whisper" && line.target && (
-            <span className="text-[0.5625rem] text-white/40">→ {line.target}</span>
+            <span className="min-w-0 truncate text-[0.5625rem] text-white/40">→ {line.target}</span>
           )}
+          {voiceControl}
         </div>
         <div className="mt-0.5 min-w-0">
           <p

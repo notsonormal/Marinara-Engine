@@ -105,8 +105,8 @@ See [Professor Mari](PROFESSOR_MARI.md) for the full capabilities and safety not
 
 Marinara Engine supports a wide range of LLM and image generation providers:
 
-- **LLM:** OpenAI, Anthropic, Anthropic via Claude Pro / Max subscription (through the local Claude Agent SDK), Google, OpenRouter, NanoGPT, Mistral, Cohere, Pollinations, Together AI, NovelAI, and any custom OpenAI-compatible endpoint (Ollama, LM Studio, KoboldCpp, etc.)
-- **Image generation:** Stability AI, ComfyUI, AUTOMATIC1111 / SD Web UI, and providers that support image output through their chat API
+- **LLM:** OpenAI, Anthropic, Anthropic via Claude Pro / Max subscription (through the local Claude Agent SDK), Google Gemini, Google Vertex AI, OpenRouter, NanoGPT, Mistral, Cohere, Pollinations, Together AI, NovelAI, and any custom OpenAI-compatible endpoint (Ollama, LM Studio, KoboldCpp, etc.)
+- **Image generation:** Stability AI, ComfyUI, AUTOMATIC1111 / SD Web UI, Draw Things (Apple Silicon Macs — runs locally on Metal + Apple Neural Engine), and providers that support image output through their chat API
 
 You can configure multiple connections at once and assign different providers per chat. API keys are encrypted at rest with AES-256.
 
@@ -181,13 +181,13 @@ Other retry controls are also scoped to what they say on the button: **Retry Fai
 <summary><strong>Does Marinara Engine have Guided Generation / Swipes / Regen?</strong></summary>
 <br>
 
-Yes. Use `/narrator <direction>` when you want to steer the AI's next reply without speaking as your persona. It sends your text as hidden story direction, like `/narrator make Alex interrupt` or `/narrator move the scene toward the market`.
+Yes. Use `/guided <direction>` when you want to steer the AI's next reply without speaking as your persona. It sends your text as hidden story direction, like `/guided make Alex interrupt` or `/guided move the scene toward the market`.
 
 For swipes and regens, enable **Settings -> Advanced -> Guide swipes/regens with chat input**. Then the current chat-box draft is used as guidance when you click **Regenerate**, create a new swipe/reroll, or manually trigger a character response in a group chat.
 
-Guided `/narrator` requests and guided manual character replies use Chat reply lorebook triggers. If an older lorebook entry was attached to Continue or Autonomous only so it could steer guided replies, move that entry to Chat reply.
+Guided `/guided` requests and guided manual character replies use Chat reply lorebook triggers. If an older lorebook entry was attached to Continue or Autonomous only so it could steer guided replies, move that entry to Chat reply.
 
-If you want to post your persona message first without triggering a reply, enable **Settings -> Advanced -> Quick replies menu** and include **Post only**. The same settings submenu can include **Guide reply** for a quick `/narrator` send and **Impersonate** for generating as your persona.
+If you want to post your persona message first without triggering a reply, enable **Settings -> Advanced -> Quick replies menu** and include **Post only**. The same settings submenu can include **Guide reply** for a quick `/guided` send and **Impersonate** for generating as your persona.
 
 </details>
 
