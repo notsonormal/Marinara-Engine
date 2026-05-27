@@ -11,5 +11,7 @@ Explanations are **understanding-oriented**. They clarify a particular topic, pr
 - [How AI Image Generation works in the Engine](image_generation.md)
 - [AI Steering & Guided Generation](ai_steering.md)
 - [Asymmetric Mode Linking](mode-linking.md)
+- [History, Swipes, and Snapshots](history.md)
+- [Understanding Presets: Chat vs Prompt](presets.md)
 - *How Context token limits are calculated (Pending)*
 - *The Philosophy behind the Agent Runner (Pending)*
