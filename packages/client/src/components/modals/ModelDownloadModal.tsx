@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  AlertTriangle,
   BrainCircuit,
   Check,
   ChevronDown,
@@ -22,7 +23,13 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import type { SidecarBackend, SidecarQuantization, SidecarRuntimePreference } from "@marinara-engine/shared";
+import {
+  SIDECAR_EMBEDDING_POOLING_TYPES,
+  type SidecarBackend,
+  type SidecarEmbeddingPooling,
+  type SidecarQuantization,
+  type SidecarRuntimePreference,
+} from "@marinara-engine/shared";
 import { Modal } from "../ui/Modal.js";
 import { useSidecarStore } from "../../stores/sidecar.store.js";
 
@@ -79,6 +86,23 @@ function describeGpuLayers(gpuLayers: number): string {
   if (gpuLayers === -1) return "Auto offload";
   if (gpuLayers === 0) return "CPU only";
   return `${gpuLayers} GPU layers`;
+}
+
+function formatEmbeddingPoolingLabel(pooling: SidecarEmbeddingPooling): string {
+  switch (pooling) {
+    case "none":
+      return "None";
+    case "mean":
+      return "Mean";
+    case "cls":
+      return "CLS";
+    case "last":
+      return "Last token";
+    case "rank":
+      return "Rank";
+    default:
+      return pooling;
+  }
 }
 
 function formatCompactTokens(value: number): string {
@@ -180,8 +204,9 @@ export function ModelDownloadModal({ open, onClose }: Props) {
   const [temperatureInput, setTemperatureInput] = useState(String(config.temperature));
   const [topPInput, setTopPInput] = useState(String(config.topP));
   const [topKInput, setTopKInput] = useState(String(config.topK));
+  const [embeddingBatchSizeInput, setEmbeddingBatchSizeInput] = useState(String(config.embeddingBatchSize));
   const modalScrollRef = useRef<HTMLDivElement>(null);
-  const previousScrollLayoutRef = useRef({ isBlockingSetup: false, showRuntimeSettings: false });
+  const previousScrollLayoutRef = useRef({ showSetupProgress: false, showRuntimeSettings: false });
 
   const activeBackend = runtime.backend ?? config.backend;
   const isSystemRuntime = runtime.source === "system";
@@ -195,7 +220,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
   const hasModel = modelDownloaded;
   const activeModelName = hasModel ? modelDisplayName : null;
   const shouldAutoStart = config.useForTrackers || config.useForGameScene;
-  const isBlockingSetup = isDownloading || status === "downloading_runtime";
+  const isBlockingSetup = isDownloading || status === "downloading_runtime" || status === "downloading_model";
   const isPreparingServer =
     runtime.installed && hasModel && shouldAutoStart && !inferenceReady && status === "starting_server";
   const showSetupProgress = isBlockingSetup || isPreparingServer;
@@ -205,7 +230,14 @@ export function ModelDownloadModal({ open, onClose }: Props) {
   const quickRuntimeSummary =
     activeBackend === "mlx"
       ? `MLX runtime • ${formatCompactTokens(config.contextSize)} ctx • ${formatCompactTokens(config.maxTokens)} max`
-      : `${formatRuntimePreferenceLabel(config.runtimePreference, platform)} • ${describeGpuLayers(config.gpuLayers)} • ${formatCompactTokens(config.contextSize)} ctx • ${formatCompactTokens(config.maxTokens)} max`;
+      : [
+          formatRuntimePreferenceLabel(config.runtimePreference, platform),
+          describeGpuLayers(config.gpuLayers),
+          config.enableNativeToolCalls ? "native tools on" : "native tools off",
+          `${formatEmbeddingPoolingLabel(config.embeddingPooling)} pooling`,
+          `${formatCompactTokens(config.contextSize)} ctx`,
+          `${formatCompactTokens(config.maxTokens)} max`,
+        ].join(" • ");
 
   useEffect(() => {
     if (!open) {
@@ -244,7 +276,15 @@ export function ModelDownloadModal({ open, onClose }: Props) {
     setTemperatureInput(String(config.temperature));
     setTopPInput(String(config.topP));
     setTopKInput(String(config.topK));
-  }, [config.contextSize, config.maxTokens, config.temperature, config.topP, config.topK]);
+    setEmbeddingBatchSizeInput(String(config.embeddingBatchSize));
+  }, [
+    config.contextSize,
+    config.maxTokens,
+    config.temperature,
+    config.topP,
+    config.topK,
+    config.embeddingBatchSize,
+  ]);
 
   useEffect(() => {
     if (status === "server_error" || testMessageResult) {
@@ -292,16 +332,16 @@ export function ModelDownloadModal({ open, onClose }: Props) {
 
   useEffect(() => {
     const previous = previousScrollLayoutRef.current;
-    previousScrollLayoutRef.current = { isBlockingSetup, showRuntimeSettings };
+    previousScrollLayoutRef.current = { showSetupProgress, showRuntimeSettings };
 
     if (!open) return;
 
     const runtimeSettingsOpened = showRuntimeSettings && !previous.showRuntimeSettings;
-    const setupVisibilityChanged = isBlockingSetup !== previous.isBlockingSetup;
+    const setupVisibilityChanged = showSetupProgress !== previous.showSetupProgress;
     if (!runtimeSettingsOpened && !setupVisibilityChanged) return;
 
     modalScrollRef.current?.scrollTo({ top: 0 });
-  }, [isBlockingSetup, open, showRuntimeSettings]);
+  }, [open, showRuntimeSettings, showSetupProgress]);
 
   const handleSkip = () => {
     markPrompted();
@@ -350,6 +390,22 @@ export function ModelDownloadModal({ open, onClose }: Props) {
     }
   };
 
+  const handleNativeToolCallsToggle = () => {
+    void updateConfig({ enableNativeToolCalls: !config.enableNativeToolCalls });
+  };
+
+  const handleEmbeddingPoolingChange = (pooling: SidecarEmbeddingPooling) => {
+    void updateConfig({ embeddingPooling: pooling });
+  };
+
+  const handleApplyEmbeddingBatchSize = () => {
+    const parsed = Number.parseInt(embeddingBatchSizeInput, 10);
+    if (!Number.isFinite(parsed) || parsed < 128 || parsed > 32768) {
+      return;
+    }
+    void updateConfig({ embeddingBatchSize: parsed });
+  };
+
   const handleApplyCustomGpuLayers = () => {
     const parsed = Number.parseInt(gpuLayersInput, 10);
     if (!Number.isFinite(parsed) || parsed < 1 || parsed > 1024) {
@@ -369,10 +425,8 @@ export function ModelDownloadModal({ open, onClose }: Props) {
     if (
       !Number.isFinite(parsedContextSize) ||
       parsedContextSize < 512 ||
-      parsedContextSize > 32768 ||
       !Number.isFinite(parsedMaxTokens) ||
       parsedMaxTokens < 64 ||
-      parsedMaxTokens > 32768 ||
       !Number.isFinite(parsedTemperature) ||
       parsedTemperature < 0 ||
       parsedTemperature > 2 ||
@@ -400,13 +454,15 @@ export function ModelDownloadModal({ open, onClose }: Props) {
   const parsedTemperature = Number.parseFloat(temperatureInput);
   const parsedTopP = Number.parseFloat(topPInput);
   const parsedTopK = Number.parseInt(topKInput, 10);
+  const parsedEmbeddingBatchSize = Number.parseInt(embeddingBatchSizeInput, 10);
+  const embeddingBatchSizeValid =
+    Number.isFinite(parsedEmbeddingBatchSize) && parsedEmbeddingBatchSize >= 128 && parsedEmbeddingBatchSize <= 32768;
+  const embeddingBatchSizeDirty = embeddingBatchSizeInput !== String(config.embeddingBatchSize);
   const generationSettingsValid =
     Number.isFinite(parsedContextSize) &&
     parsedContextSize >= 512 &&
-    parsedContextSize <= 32768 &&
     Number.isFinite(parsedMaxTokens) &&
     parsedMaxTokens >= 64 &&
-    parsedMaxTokens <= 32768 &&
     Number.isFinite(parsedTemperature) &&
     parsedTemperature >= 0 &&
     parsedTemperature <= 2 &&
@@ -431,8 +487,8 @@ export function ModelDownloadModal({ open, onClose }: Props) {
     <Modal open={open} onClose={onClose} title="Local AI Model" width="max-w-2xl" contentRef={modalScrollRef}>
       <div className="flex flex-col gap-5">
         <div className="flex items-start gap-3">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-purple-500/10">
-            <BrainCircuit size="1.25rem" className="text-purple-400" />
+          <div className="mari-chrome-accent-soft-tile mari-accent-animated flex h-10 w-10 shrink-0 items-center justify-center rounded-xl">
+            <BrainCircuit size="1.25rem" />
           </div>
           <div className="text-sm text-[var(--muted-foreground)]">
             <p>
@@ -445,6 +501,19 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                 : "Set up the runtime first, then choose either a curated Gemma preset or any GGUF from HuggingFace. Runtime device selection lives inside Runtime Settings."}
             </p>
           </div>
+        </div>
+
+        <div className="rounded-xl border border-[var(--warning)]/30 bg-[var(--warning)]/10 p-3">
+          <div className="flex items-center gap-2 text-sm font-semibold text-[var(--warning)]">
+            <AlertTriangle size="0.95rem" className="shrink-0" />
+            Local Model is for helpers, not main roleplay
+          </div>
+          <p className="mt-1.5 text-xs leading-relaxed text-[var(--muted-foreground)]">
+            The bundled model is deliberately small so it can handle tracker agents, scene analysis, and lightweight
+            background chores without stealing main-model tokens. It is not intended for main chat, roleplay, Game
+            Master narration, or Professor Mari creation/editing. Use a stronger local or API language connection for
+            those.
+          </p>
         </div>
 
         {hasModel && (
@@ -471,7 +540,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
           <div className="flex items-start justify-between gap-3 max-sm:flex-col">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2 text-sm font-medium">
-                <Server size="0.95rem" className="text-purple-300" />
+                <Server size="0.95rem" className="mari-chrome-accent-icon mari-accent-animated" />
                 Runtime
               </div>
               <div className="mt-1 text-xs text-[var(--muted-foreground)]">
@@ -511,7 +580,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
               {!runtime.installed ? (
                 <button
                   onClick={() => void installRuntime()}
-                  className="flex items-center justify-center gap-2 rounded-xl bg-purple-500/15 px-4 py-2 text-sm font-medium text-purple-300 transition-colors hover:bg-purple-500/25"
+                  className="mari-chrome-accent-surface mari-accent-animated flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition-colors"
                 >
                   <Download size="0.875rem" />
                   {activeBackend === "mlx" ? "Install MLX Runtime" : "Install Runtime"}
@@ -521,7 +590,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                   {hasModel && (
                     <button
                       onClick={() => void restartRuntime()}
-                      className="flex items-center justify-center gap-2 rounded-xl bg-purple-500/15 px-4 py-2 text-sm font-medium text-purple-300 transition-colors hover:bg-purple-500/25"
+                      className="mari-chrome-accent-surface mari-accent-animated flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition-colors"
                     >
                       <Loader2 size="0.875rem" />
                       {status === "server_error"
@@ -579,7 +648,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                           onChange={(event) =>
                             handleRuntimePreferenceChange(event.target.value as SidecarRuntimePreference)
                           }
-                          className="w-full appearance-none rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 pr-10 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                          className="w-full appearance-none rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 pr-10 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
                         >
                           {runtimePreferenceOptions.map((option) => (
                             <option key={option} value={option}>
@@ -621,7 +690,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                           onChange={(event) =>
                             handleGpuLayersModeChange(event.target.value as "auto" | "cpu" | "custom")
                           }
-                          className="w-full appearance-none rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 pr-10 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                          className="w-full appearance-none rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 pr-10 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
                         >
                           <option value="auto">Auto offload</option>
                           <option value="cpu">CPU only</option>
@@ -644,7 +713,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                             }}
                             placeholder="1-1024"
                             inputMode="numeric"
-                            className="w-24 shrink-0 rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-center text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                            className="w-24 shrink-0 rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-center text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
                           />
                           <button
                             onClick={handleApplyCustomGpuLayers}
@@ -664,6 +733,115 @@ export function ModelDownloadModal({ open, onClose }: Props) {
               </div>
 
               <div className="rounded-xl border border-[var(--border)] bg-[var(--card)]/50 p-4">
+                <div className="flex items-start justify-between gap-3 max-sm:flex-col">
+                  <div>
+                    <div className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                      Native Tool Calls
+                    </div>
+                    <div className="mt-1 text-xs leading-relaxed text-[var(--muted-foreground)]/75">
+                      {activeBackend === "mlx"
+                        ? "This llama.cpp --jinja option does not apply to MLX-native sidecar runtimes."
+                        : "Starts llama-server with --jinja so OpenAI-compatible tool calls can be parsed natively. Tool-aware model templates work best; changing this restarts the local server."}
+                    </div>
+                  </div>
+                  {activeBackend === "mlx" ? (
+                    <span className="rounded-full border border-[var(--border)] px-3 py-1 text-xs text-[var(--muted-foreground)]">
+                      llama.cpp only
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={handleNativeToolCallsToggle}
+                      className="flex shrink-0 items-center gap-2 rounded-xl border border-[var(--border)] bg-[var(--card)]/70 px-3 py-2 text-sm text-[var(--foreground)] transition-colors hover:bg-[var(--card)]"
+                    >
+                      <span
+                        className={`relative h-4 w-7 rounded-full transition-colors ${
+                          config.enableNativeToolCalls ? "bg-emerald-400/70" : "bg-[var(--border)]"
+                        }`}
+                      >
+                        <span
+                          className={`absolute top-0.5 left-0.5 h-3 w-3 rounded-full bg-white shadow-sm transition-transform ${
+                            config.enableNativeToolCalls ? "translate-x-3" : ""
+                          }`}
+                        />
+                      </span>
+                      {config.enableNativeToolCalls ? "Enabled" : "Disabled"}
+                    </button>
+                  )}
+                </div>
+                {!config.enableNativeToolCalls && activeBackend !== "mlx" && (
+                  <div className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-100">
+                    Professor Mari and custom agents need this enabled before the local sidecar can execute tools.
+                  </div>
+                )}
+              </div>
+
+              {activeBackend !== "mlx" && (
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--card)]/50 p-4">
+                  <div className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                    Embedding Endpoint
+                  </div>
+                  <div className="mt-3 grid gap-3 md:grid-cols-2">
+                    <label className="flex flex-col gap-1.5">
+                      <span className="text-[0.6875rem] font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                        Pooling Type
+                      </span>
+                      <div className="relative">
+                        <select
+                          value={config.embeddingPooling}
+                          onChange={(event) =>
+                            handleEmbeddingPoolingChange(event.target.value as SidecarEmbeddingPooling)
+                          }
+                          className="w-full appearance-none rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 pr-10 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
+                        >
+                          {SIDECAR_EMBEDDING_POOLING_TYPES.map((pooling) => (
+                            <option key={pooling} value={pooling}>
+                              {formatEmbeddingPoolingLabel(pooling)}
+                            </option>
+                          ))}
+                        </select>
+                        <ChevronDown
+                          size="0.95rem"
+                          className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)]/70"
+                        />
+                      </div>
+                    </label>
+
+                    <label className="flex flex-col gap-1.5">
+                      <span className="text-[0.6875rem] font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
+                        Physical Batch Size
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <input
+                          value={embeddingBatchSizeInput}
+                          onChange={(event) => setEmbeddingBatchSizeInput(event.target.value.replace(/[^\d]/g, ""))}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              handleApplyEmbeddingBatchSize();
+                            }
+                          }}
+                          inputMode="numeric"
+                          placeholder="512"
+                          className="min-w-0 flex-1 rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
+                        />
+                        <button
+                          onClick={handleApplyEmbeddingBatchSize}
+                          disabled={!embeddingBatchSizeValid || !embeddingBatchSizeDirty}
+                          className="flex shrink-0 items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--card)]/70 px-4 py-2 text-sm text-[var(--foreground)] transition-colors hover:bg-[var(--card)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Apply
+                        </button>
+                      </div>
+                    </label>
+                  </div>
+                  <div className="mt-3 text-xs leading-relaxed text-[var(--muted-foreground)]/70">
+                    Use Mean pooling for OpenAI-compatible lorebook embeddings. Raise the physical batch size when long
+                    entries exceed llama-server's current batch limit; Gemma commonly works with 1024.
+                  </div>
+                </div>
+              )}
+
+              <div className="rounded-xl border border-[var(--border)] bg-[var(--card)]/50 p-4">
                 <div className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
                   Inference Settings
                 </div>
@@ -677,7 +855,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       onChange={(event) => setContextSizeInput(event.target.value.replace(/[^\d]/g, ""))}
                       inputMode="numeric"
                       placeholder="8192"
-                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
                     />
                   </label>
 
@@ -690,7 +868,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       onChange={(event) => setMaxTokensInput(event.target.value.replace(/[^\d]/g, ""))}
                       inputMode="numeric"
                       placeholder="4096"
-                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
                     />
                   </label>
 
@@ -703,7 +881,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       onChange={(event) => setTemperatureInput(event.target.value.replace(/[^0-9.]/g, ""))}
                       inputMode="decimal"
                       placeholder="0.3"
-                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
                     />
                   </label>
 
@@ -716,7 +894,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       onChange={(event) => setTopPInput(event.target.value.replace(/[^0-9.]/g, ""))}
                       inputMode="decimal"
                       placeholder="0.95"
-                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
                     />
                   </label>
 
@@ -729,14 +907,15 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       onChange={(event) => setTopKInput(event.target.value.replace(/[^\d]/g, ""))}
                       inputMode="numeric"
                       placeholder="64"
-                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-purple-400/50 focus:ring-1 focus:ring-purple-400/20"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--card)]/80 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)] focus:ring-1 focus:ring-[var(--marinara-chat-chrome-focus-ring)]"
                     />
                   </label>
                 </div>
                 <div className="mt-3 flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-stretch">
                   <div className="text-xs text-[var(--muted-foreground)]/70">
                     Max response tokens caps how much the local runtime can generate. If it is too large relative to the
-                    context window, Marinara has to trim more of the prompt to make room.
+                    context window, Marinara has to trim more of the prompt to make room. Marinara does not impose an
+                    upper limit here; the selected model and your hardware still decide what can actually run.
                   </div>
                   <button
                     onClick={handleApplyGenerationSettings}
@@ -900,13 +1079,13 @@ export function ModelDownloadModal({ open, onClose }: Props) {
         </div>
 
         {showSetupProgress && (
-          <div className="rounded-xl border border-purple-400/25 bg-purple-500/5 p-4">
+          <div className="rounded-xl border border-[var(--marinara-chat-chrome-button-border-active)] bg-[var(--marinara-chat-chrome-highlight-bg)] p-4">
             <div className="flex items-start gap-3">
-              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-purple-500/15">
-                <Loader2 size="1rem" className="animate-spin text-purple-300" />
+              <div className="mari-chrome-accent-soft-tile mari-accent-animated mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full">
+                <Loader2 size="1rem" className="animate-spin" />
               </div>
               <div className="flex-1">
-                <div className="text-sm font-medium text-purple-200">{setupLabel}</div>
+                <div className="mari-chrome-text-strong text-sm font-medium">{setupLabel}</div>
                 <div className="mt-1 text-xs text-[var(--muted-foreground)]/80">{setupDescription}</div>
               </div>
             </div>
@@ -922,7 +1101,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                 </div>
                 <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--border)]">
                   <div
-                    className="h-full rounded-full bg-purple-400 transition-all duration-300"
+                    className="mari-chrome-accent-progress mari-accent-animated h-full rounded-full transition-all duration-300"
                     style={{ width: `${progressPercent}%` }}
                   />
                 </div>
@@ -933,13 +1112,13 @@ export function ModelDownloadModal({ open, onClose }: Props) {
               </div>
             ) : (
               <div className="mt-4 h-2 w-full overflow-hidden rounded-full bg-[var(--border)]">
-                <div className="h-full w-1/3 animate-pulse rounded-full bg-purple-400/80" />
+                <div className="mari-chrome-accent-progress mari-accent-animated h-full w-1/3 animate-pulse rounded-full" />
               </div>
             )}
           </div>
         )}
 
-        {!isBlockingSetup && (
+        {!showSetupProgress && (
           <>
             <div className="flex flex-col gap-2">
               <span className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
@@ -950,7 +1129,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                   key={`${model.backend}-${model.quantization}`}
                   className={`flex cursor-pointer items-center gap-3 rounded-xl border p-3 transition-colors ${
                     selectedQuant === model.quantization
-                      ? "border-purple-400/50 bg-purple-500/5"
+                      ? "border-[var(--marinara-chat-chrome-button-border-active)] bg-[var(--marinara-chat-chrome-highlight-bg)]"
                       : "border-[var(--border)] hover:bg-[var(--secondary)]/50"
                   }`}
                 >
@@ -965,7 +1144,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                   <div
                     className={`h-4 w-4 shrink-0 rounded-full border-2 transition-colors ${
                       selectedQuant === model.quantization
-                        ? "border-purple-400 bg-purple-400"
+                        ? "border-[var(--marinara-chat-chrome-button-border-active)] bg-[var(--marinara-chat-chrome-accent)]"
                         : "border-[var(--border)]"
                     }`}
                   >
@@ -988,7 +1167,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                     </div>
                   </div>
                   {model.quantization === "q8_0" && (
-                    <span className="rounded-full bg-purple-500/15 px-2 py-0.5 text-[0.625rem] font-medium text-purple-300">
+                    <span className="mari-chrome-accent-surface mari-accent-animated rounded-full px-2 py-0.5 text-[0.625rem] font-medium">
                       Recommended
                     </span>
                   )}
@@ -997,7 +1176,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
               <button
                 onClick={handleCuratedDownload}
                 disabled={!selectedPreset}
-                className="mt-1 flex items-center justify-center gap-2 rounded-xl bg-purple-500/15 px-4 py-2.5 text-sm font-medium text-purple-300 transition-colors hover:bg-purple-500/25 disabled:opacity-50"
+                className="mari-chrome-accent-surface mari-accent-animated mt-1 flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition-colors disabled:opacity-50"
               >
                 <Zap size="0.875rem" />
                 {hasModel ? "Switch to Curated Preset" : "Use Curated Preset"}
@@ -1025,7 +1204,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                       }
                     }}
                     placeholder="owner/repo"
-                    className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-2 text-sm outline-none transition-colors focus:border-purple-400/50"
+                    className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-2 text-sm outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)]"
                   />
                   <button
                     onClick={() => void handleListModels()}
@@ -1063,7 +1242,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
                     <select
                       value={selectedCustomPath}
                       onChange={(event) => setSelectedCustomPath(event.target.value)}
-                      className="rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-2 text-sm outline-none transition-colors focus:border-purple-400/50"
+                      className="rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-2 text-sm outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)]"
                     >
                       {customModels.map((entry) => (
                         <option key={entry.path} value={entry.path}>
@@ -1106,7 +1285,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
         )}
 
         <div className="flex items-center gap-2">
-          {isBlockingSetup ? (
+          {showSetupProgress ? (
             <button
               onClick={handleCancelSetup}
               className="flex w-full items-center justify-center gap-2 rounded-xl border border-[var(--border)] px-4 py-2.5 text-sm text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)]"
@@ -1125,7 +1304,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
               <button
                 onClick={handleDone}
                 disabled={!canFinish}
-                className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-purple-500/15 px-4 py-2.5 text-sm font-medium text-purple-300 transition-colors hover:bg-purple-500/25 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-purple-500/15"
+                className="mari-chrome-accent-surface mari-accent-animated flex flex-1 items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Done
               </button>
@@ -1133,7 +1312,7 @@ export function ModelDownloadModal({ open, onClose }: Props) {
           )}
         </div>
 
-        {!hasModel && !isBlockingSetup && (
+        {!hasModel && !showSetupProgress && (
           <div className="rounded-xl border border-[var(--border)] bg-[var(--card)]/50 p-3">
             <span className="text-xs font-medium uppercase tracking-wider text-[var(--muted-foreground)]/60">
               What the local model handles

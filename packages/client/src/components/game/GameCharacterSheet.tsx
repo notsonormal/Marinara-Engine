@@ -19,6 +19,14 @@ import {
   Zap,
 } from "lucide-react";
 import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
+import { DraftNumberInput } from "../ui/DraftNumberInput";
+import { NEUTRAL_SURFACE_VARIABLES } from "../ui/neutral-surface-styles";
+import {
+  createDefaultRpgStatPools,
+  normalizeRpgStatPools,
+  syncRpgHpFromPools,
+  type RPGStatPool,
+} from "@marinara-engine/shared";
 
 export interface GameCharacterSheetGameCard {
   shortDescription: string;
@@ -30,6 +38,7 @@ export interface GameCharacterSheetGameCard {
   rpgStats?: {
     attributes: Array<{ name: string; value: number }>;
     hp: { value: number; max: number };
+    pools?: RPGStatPool[];
   };
 }
 
@@ -63,6 +72,7 @@ interface GameCardDraft {
   weaknesses: string[];
   extraEntries: Array<{ key: string; value: string }>;
   rpgStatsEnabled: boolean;
+  pools: RPGStatPool[];
   attributes: Array<{ name: string; value: number }>;
   hpValue: number;
   hpMax: number;
@@ -79,6 +89,16 @@ const DEFAULT_ATTRIBUTES = [
   { name: "CHA", value: 10 },
 ];
 
+function createNewRpgPool(existing: readonly RPGStatPool[]): RPGStatPool {
+  const used = new Set(existing.map((pool) => pool.name.trim().toLowerCase()).filter(Boolean));
+  let index = existing.length + 1;
+  let name = `Pool ${index}`;
+  while (used.has(name.toLowerCase())) {
+    name = `Pool ${++index}`;
+  }
+  return { name, value: 100, max: 100, color: "#a78bfa" };
+}
+
 // Mirrors server's attributeModifier in skill-check.service.ts: floor((score - 10) / 2).
 function formatAttributeModifier(score: number): string {
   const mod = Math.floor((score - 10) / 2);
@@ -87,9 +107,9 @@ function formatAttributeModifier(score: number): string {
 
 const FIELD_LABEL_CLASS = "text-[0.6875rem] font-semibold uppercase tracking-wider text-[var(--muted-foreground)]";
 const TEXT_INPUT_CLASS =
-  "w-full rounded-lg border border-[var(--border)] bg-[var(--secondary)]/60 px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--primary)]/40";
+  "w-full rounded-lg border border-[var(--marinara-chat-chrome-input-border)] bg-[var(--marinara-chat-chrome-input-bg)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)]";
 const NUMBER_INPUT_CLASS =
-  "w-full rounded-lg border border-[var(--border)] bg-[var(--secondary)]/60 px-2.5 py-1.5 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--primary)]/40";
+  "w-full rounded-lg border border-transparent bg-[var(--marinara-chat-chrome-input-bg)] px-2.5 py-1.5 text-sm text-[var(--foreground)] outline-none transition-colors focus:border-[var(--marinara-chat-chrome-input-border-focus)]";
 
 function normalizeTextValue(value: unknown) {
   if (typeof value === "string") return value;
@@ -154,6 +174,13 @@ function createDraft(gameCard?: GameCharacterSheetGameCard): GameCardDraft {
     rawRpgStats?.hp && typeof rawRpgStats.hp === "object" && !Array.isArray(rawRpgStats.hp)
       ? (rawRpgStats.hp as Record<string, unknown>)
       : undefined;
+  const pools = rawRpgStats
+    ? normalizeRpgStatPools(rawRpgStats as unknown as GameCharacterSheetGameCard["rpgStats"])
+    : createDefaultRpgStatPools();
+  const hp = syncRpgHpFromPools(pools, {
+    value: normalizeNumberValue(rawHp?.value, 100),
+    max: Math.max(1, normalizeNumberValue(rawHp?.max, 100)),
+  });
 
   return {
     shortDescription: normalizeTextValue(rawGameCard?.shortDescription).trim(),
@@ -163,9 +190,10 @@ function createDraft(gameCard?: GameCharacterSheetGameCard): GameCardDraft {
     weaknesses: normalizeDraftListSource(rawGameCard?.weaknesses),
     extraEntries: normalizeDraftExtraEntries(rawGameCard?.extra),
     rpgStatsEnabled: !!rawRpgStats,
+    pools,
     attributes: normalizeDraftAttributes(rawRpgStats?.attributes),
-    hpValue: normalizeNumberValue(rawHp?.value, 100),
-    hpMax: Math.max(1, normalizeNumberValue(rawHp?.max, 100)),
+    hpValue: hp.value,
+    hpMax: hp.max,
   };
 }
 
@@ -199,13 +227,17 @@ function normalizeDraft(draft: GameCardDraft): GameCharacterSheetGameCard | unde
     .filter((attr) => attr.name);
 
   const rpgStats = draft.rpgStatsEnabled
-    ? {
-        attributes,
-        hp: {
-          value: Math.max(0, draft.hpValue),
-          max: Math.max(1, draft.hpMax),
-        },
-      }
+    ? (() => {
+        const pools = normalizeRpgStatPools({
+          hp: { value: Math.max(0, draft.hpValue), max: Math.max(1, draft.hpMax) },
+          pools: draft.pools,
+        });
+        return {
+          attributes,
+          hp: syncRpgHpFromPools(pools, { value: Math.max(0, draft.hpValue), max: Math.max(1, draft.hpMax) }),
+          pools,
+        };
+      })()
     : undefined;
 
   const hasContent =
@@ -278,11 +310,9 @@ export function GameCharacterSheet({
     previewGameCard?.rpgStats &&
     Array.isArray(previewGameCard.rpgStats.attributes) &&
     previewGameCard.rpgStats.attributes.length > 0;
-  const hasRpgHp =
-    previewGameCard?.rpgStats?.hp &&
-    (Number.isFinite(Number(previewGameCard.rpgStats.hp.value)) ||
-      Number.isFinite(Number(previewGameCard.rpgStats.hp.max)));
-  const hasRpgStats = Boolean(hasRpgAttributes || hasRpgHp);
+  const previewRpgPools = previewGameCard?.rpgStats ? normalizeRpgStatPools(previewGameCard.rpgStats) : [];
+  const hasRpgPools = previewRpgPools.length > 0;
+  const hasRpgStats = Boolean(hasRpgAttributes || hasRpgPools);
   const hasPersistentSheetData = hasGameData(previewGameCard) || hasRpgStats;
   const hasAnyData =
     hasPersistentSheetData ||
@@ -359,6 +389,27 @@ export function GameCharacterSheet({
     });
   };
 
+  const updatePool = (index: number, patch: Partial<RPGStatPool>) => {
+    setDraft((prev) => {
+      const pools = prev.pools.map((pool, poolIndex) => (poolIndex === index ? { ...pool, ...patch } : pool));
+      const hp = syncRpgHpFromPools(pools, { value: prev.hpValue, max: prev.hpMax });
+      return { ...prev, pools, hpValue: hp.value, hpMax: hp.max };
+    });
+  };
+
+  const addPool = () => {
+    setDraft((prev) => ({ ...prev, pools: [...prev.pools, createNewRpgPool(prev.pools)] }));
+  };
+
+  const removePool = (index: number) => {
+    setDraft((prev) => {
+      const pools = prev.pools.filter((_, poolIndex) => poolIndex !== index);
+      const nextPools = pools.length > 0 ? pools : createDefaultRpgStatPools();
+      const hp = syncRpgHpFromPools(nextPools, { value: prev.hpValue, max: prev.hpMax });
+      return { ...prev, pools: nextPools, hpValue: hp.value, hpMax: hp.max };
+    });
+  };
+
   const handleCancelEdit = () => {
     setDraft(createDraft(card.gameCard));
     setIsEditing(false);
@@ -385,11 +436,14 @@ export function GameCharacterSheet({
   return (
     <div
       data-game-skip-bg-nav="true"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-[max(env(safe-area-inset-top),0.75rem)] backdrop-blur-sm sm:p-4"
       onClick={onClose}
     >
       <div
-        className="relative mx-4 flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-2xl"
+        className={cn(
+          NEUTRAL_SURFACE_VARIABLES,
+          "marinara-chat-popover relative flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-panel-bg)] shadow-2xl supports-[height:100dvh]:max-h-[85dvh]",
+        )}
         onClick={(e) => e.stopPropagation()}
       >
         {(onSave || onRegenerate) && (
@@ -399,14 +453,14 @@ export function GameCharacterSheet({
                 <button
                   onClick={handleCancelEdit}
                   disabled={isSaving}
-                  className="inline-flex h-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--card)]/90 px-2.5 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)] disabled:opacity-60 sm:h-auto sm:px-3 sm:py-1.5"
+                  className="inline-flex h-8 items-center justify-center rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-button-bg)] px-2.5 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)] disabled:opacity-60 sm:h-auto sm:px-3 sm:py-1.5"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={() => void handleSave()}
                   disabled={isSaving}
-                  className="inline-flex h-8 min-w-8 items-center justify-center gap-1.5 rounded-lg bg-[var(--primary)] px-2 text-xs font-semibold text-[var(--primary-foreground)] transition-opacity hover:opacity-90 disabled:opacity-60 sm:h-auto sm:min-w-0 sm:px-3 sm:py-1.5"
+                  className="inline-flex h-8 min-w-8 items-center justify-center gap-1.5 rounded-lg bg-[var(--marinara-chat-chrome-highlight-bg)] px-2 text-xs font-semibold text-[var(--foreground)] ring-1 ring-[var(--marinara-chat-chrome-panel-border)] transition-colors hover:bg-[var(--marinara-chat-chrome-button-bg-hover)] disabled:opacity-60 sm:h-auto sm:min-w-0 sm:px-3 sm:py-1.5"
                   title={isSaving ? "Saving..." : "Save Sheet"}
                   aria-label={isSaving ? "Saving sheet" : "Save sheet"}
                 >
@@ -420,7 +474,7 @@ export function GameCharacterSheet({
                   <button
                     onClick={() => void handleRegenerate()}
                     disabled={isRegenerating || isSaving}
-                    className="inline-flex h-8 min-w-8 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)]/90 px-2 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)] disabled:cursor-wait disabled:opacity-60 sm:h-auto sm:min-w-0 sm:px-3 sm:py-1.5"
+                    className="inline-flex h-8 min-w-8 items-center justify-center gap-1.5 rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-button-bg)] px-2 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)] disabled:cursor-wait disabled:opacity-60 sm:h-auto sm:min-w-0 sm:px-3 sm:py-1.5"
                     title="Regenerate this sheet from character and current game context"
                     aria-label="Regenerate sheet"
                   >
@@ -432,7 +486,7 @@ export function GameCharacterSheet({
                   <button
                     onClick={() => setIsEditing(true)}
                     disabled={isRegenerating}
-                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--card)]/90 p-0 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)] disabled:opacity-60 sm:h-auto sm:w-auto sm:min-w-0 sm:gap-1.5 sm:px-3 sm:py-1.5"
+                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-button-bg)] p-0 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)] disabled:opacity-60 sm:h-auto sm:w-auto sm:min-w-0 sm:gap-1.5 sm:px-3 sm:py-1.5"
                     title="Edit Sheet"
                     aria-label="Edit sheet"
                   >
@@ -447,17 +501,17 @@ export function GameCharacterSheet({
 
         <button
           onClick={onClose}
-          className="absolute right-3 top-3 z-10 flex h-7 w-7 items-center justify-center rounded-lg p-0 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)] sm:h-auto sm:w-auto sm:p-1.5"
+          className="absolute right-3 top-3 z-10 flex h-7 w-7 items-center justify-center rounded-lg p-0 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)] sm:h-auto sm:w-auto sm:p-1.5"
           aria-label="Close character sheet"
           title="Close character sheet"
         >
           <X className="h-4 w-4 sm:h-[18px] sm:w-[18px]" />
         </button>
 
-        <div className="relative border-b border-[var(--border)] bg-[var(--secondary)]/50 px-4 py-4 sm:px-5">
+        <div className="relative border-b border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-highlight-bg)] px-4 py-4 sm:px-5">
           <div className="flex items-center gap-3 sm:gap-4">
             {card.avatarUrl ? (
-              <span className="relative block h-16 w-16 shrink-0 overflow-hidden rounded-xl border-2 border-[var(--border)] shadow-xl sm:h-20 sm:w-20">
+              <span className="relative block h-16 w-16 shrink-0 overflow-hidden rounded-xl border-2 border-[var(--marinara-chat-chrome-panel-border)] shadow-xl sm:h-20 sm:w-20">
                 <img
                   src={card.avatarUrl}
                   alt={card.title}
@@ -466,7 +520,7 @@ export function GameCharacterSheet({
                 />
               </span>
             ) : (
-              <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-xl border-2 border-[var(--border)] bg-[var(--secondary)] text-xl font-bold text-[var(--muted-foreground)] sm:h-20 sm:w-20 sm:text-2xl">
+              <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-xl border-2 border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-highlight-bg)] text-xl font-bold text-[var(--muted-foreground)] sm:h-20 sm:w-20 sm:text-2xl">
                 {card.title[0]}
               </div>
             )}
@@ -478,7 +532,7 @@ export function GameCharacterSheet({
                 {card.title}
               </h2>
               {previewGameCard?.class && (
-                <p className="text-xs font-medium text-[var(--primary)]">{previewGameCard.class}</p>
+                <p className="text-xs font-medium text-[var(--muted-foreground)]">{previewGameCard.class}</p>
               )}
               {previewGameCard?.shortDescription && !previewGameCard.class && (
                 <p className="text-xs text-[var(--muted-foreground)]">{previewGameCard.shortDescription}</p>
@@ -488,8 +542,10 @@ export function GameCharacterSheet({
               )}
               {card.mood && (
                 <div className="mt-1.5 flex items-center gap-1.5">
-                  <Heart size={11} className="text-rose-400/70" />
-                  <span className="text-[0.6875rem] italic text-rose-400/70">{card.mood}</span>
+                  <Heart size={11} className="text-[var(--marinara-chat-chrome-panel-muted)]" />
+                  <span className="text-[0.6875rem] italic text-[var(--marinara-chat-chrome-panel-muted)]">
+                    {card.mood}
+                  </span>
                 </div>
               )}
               {card.status && (
@@ -497,9 +553,9 @@ export function GameCharacterSheet({
               )}
             </div>
             {card.level != null && (
-              <div className="mr-16 flex items-center gap-1 rounded border border-[var(--primary)]/20 bg-[var(--primary)]/10 px-1.5 py-0.5 sm:mr-0">
-                <span className="text-[0.4375rem] uppercase tracking-wider text-[var(--primary)]/60">LVL</span>
-                <span className="text-xs font-bold leading-none text-[var(--primary)]">{card.level}</span>
+              <div className="mr-16 flex items-center gap-1 rounded border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-input-bg)] px-1.5 py-0.5 sm:mr-0">
+                <span className="text-[0.4375rem] uppercase tracking-wider text-[var(--muted-foreground)]">LVL</span>
+                <span className="text-xs font-bold leading-none text-[var(--foreground)]">{card.level}</span>
               </div>
             )}
           </div>
@@ -513,7 +569,7 @@ export function GameCharacterSheet({
         <div className="flex-1 overflow-y-auto">
           {isEditing && (
             <>
-              <div className="border-b border-[var(--border)] px-5 py-4">
+              <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
                 <SectionHeader
                   icon={<Pencil size={12} />}
                   title="Sheet Details"
@@ -543,7 +599,7 @@ export function GameCharacterSheet({
                 </div>
               </div>
 
-              <div className="border-b border-[var(--border)] px-5 py-4">
+              <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
                 <div className="mb-2.5 flex items-center justify-between gap-3">
                   <SectionHeader
                     icon={<Shield size={12} />}
@@ -555,37 +611,68 @@ export function GameCharacterSheet({
                       type="checkbox"
                       checked={draft.rpgStatsEnabled}
                       onChange={(e) => setDraft((prev) => ({ ...prev, rpgStatsEnabled: e.target.checked }))}
-                      className="h-4 w-4 rounded accent-[var(--primary)]"
+                      className="h-4 w-4 rounded accent-[var(--foreground)]"
                     />
                     Enable
                   </label>
                 </div>
                 {draft.rpgStatsEnabled ? (
                   <div className="space-y-3">
-                    <div className="grid grid-cols-2 gap-3">
-                      <label className="block space-y-1.5">
-                        <span className={FIELD_LABEL_CLASS}>Current HP</span>
-                        <input
-                          type="number"
-                          value={draft.hpValue}
-                          onChange={(e) =>
-                            setDraft((prev) => ({ ...prev, hpValue: parseInt(e.target.value, 10) || 0 }))
-                          }
-                          className={NUMBER_INPUT_CLASS}
-                        />
-                      </label>
-                      <label className="block space-y-1.5">
-                        <span className={FIELD_LABEL_CLASS}>Max HP</span>
-                        <input
-                          type="number"
-                          value={draft.hpMax}
-                          min={1}
-                          onChange={(e) =>
-                            setDraft((prev) => ({ ...prev, hpMax: Math.max(1, parseInt(e.target.value, 10) || 1) }))
-                          }
-                          className={NUMBER_INPUT_CLASS}
-                        />
-                      </label>
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className={FIELD_LABEL_CLASS}>Pools</span>
+                        <button
+                          onClick={addPool}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[var(--marinara-chat-chrome-panel-border)] px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)]"
+                        >
+                          <Plus size={13} />
+                          Add Pool
+                        </button>
+                      </div>
+                      {draft.pools.map((pool, index) => (
+                        <div
+                          key={`${pool.name}-${index}`}
+                          className="grid grid-cols-[2rem_minmax(0,1fr)_5rem_5rem_auto] gap-2 max-sm:grid-cols-1"
+                        >
+                          <input
+                            type="color"
+                            value={pool.color}
+                            onChange={(e) => updatePool(index, { color: e.target.value })}
+                            className="h-9 w-8 rounded border border-[var(--marinara-chat-chrome-panel-border)] bg-transparent p-0.5 max-sm:w-full"
+                            aria-label={`${pool.name || "Pool"} color`}
+                          />
+                          <input
+                            type="text"
+                            value={pool.name}
+                            onChange={(e) => updatePool(index, { name: e.target.value })}
+                            placeholder="HP"
+                            className={TEXT_INPUT_CLASS}
+                          />
+                          <DraftNumberInput
+                            value={pool.value}
+                            onCommit={(value) => updatePool(index, { value: Math.max(0, value) })}
+                            min={0}
+                            selectOnFocus
+                            ariaLabel={`${pool.name || "Pool"} value`}
+                            className={NUMBER_INPUT_CLASS}
+                          />
+                          <DraftNumberInput
+                            value={pool.max}
+                            min={1}
+                            onCommit={(value) => updatePool(index, { max: Math.max(1, value) })}
+                            selectOnFocus
+                            ariaLabel={`${pool.name || "Pool"} max`}
+                            className={NUMBER_INPUT_CLASS}
+                          />
+                          <button
+                            onClick={() => removePool(index)}
+                            className="inline-flex items-center justify-center rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-red-400 max-sm:h-9"
+                            title="Remove pool"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      ))}
                     </div>
                     <div className="space-y-2">
                       {draft.attributes.map((attr, index) => (
@@ -597,15 +684,15 @@ export function GameCharacterSheet({
                             placeholder="STR"
                             className={TEXT_INPUT_CLASS}
                           />
-                          <input
-                            type="number"
+                          <DraftNumberInput
                             value={attr.value}
-                            onChange={(e) => updateAttribute(index, "value", parseInt(e.target.value, 10) || 0)}
+                            onCommit={(value) => updateAttribute(index, "value", value)}
+                            selectOnFocus
                             className={NUMBER_INPUT_CLASS}
                           />
                           <button
                             onClick={() => removeAttribute(index)}
-                            className="inline-flex items-center justify-center rounded-lg border border-[var(--border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-red-400"
+                            className="inline-flex items-center justify-center rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-red-400"
                             title="Remove attribute"
                           >
                             <Trash2 size={13} />
@@ -614,7 +701,7 @@ export function GameCharacterSheet({
                       ))}
                       <button
                         onClick={addAttribute}
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[var(--border)] px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[var(--marinara-chat-chrome-panel-border)] px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)]"
                       >
                         <Plus size={13} />
                         Add Attribute
@@ -628,7 +715,7 @@ export function GameCharacterSheet({
                 )}
               </div>
 
-              <div className="border-b border-[var(--border)] px-5 py-4">
+              <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
                 <div className="mb-2.5 flex items-center justify-between gap-3">
                   <SectionHeader
                     icon={<Zap size={12} />}
@@ -637,7 +724,7 @@ export function GameCharacterSheet({
                   />
                   <button
                     onClick={() => addListItem("abilities")}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[var(--border)] px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[var(--marinara-chat-chrome-panel-border)] px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)]"
                   >
                     <Plus size={13} />
                     Add
@@ -655,7 +742,7 @@ export function GameCharacterSheet({
                       />
                       <button
                         onClick={() => removeListItem("abilities", index)}
-                        className="inline-flex items-center justify-center rounded-lg border border-[var(--border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-red-400"
+                        className="inline-flex items-center justify-center rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-red-400"
                         title="Remove ability"
                       >
                         <Trash2 size={13} />
@@ -665,7 +752,7 @@ export function GameCharacterSheet({
                 </div>
               </div>
 
-              <div className="border-b border-[var(--border)] px-5 py-4">
+              <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
                 <div className="grid gap-4 md:grid-cols-2">
                   <div>
                     <div className="mb-2.5 flex items-center justify-between gap-3">
@@ -676,7 +763,7 @@ export function GameCharacterSheet({
                       />
                       <button
                         onClick={() => addListItem("strengths")}
-                        className="inline-flex items-center gap-1 rounded-lg border border-dashed border-[var(--border)] px-2 py-1 text-[0.6875rem] text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
+                        className="inline-flex items-center gap-1 rounded-lg border border-dashed border-[var(--marinara-chat-chrome-panel-border)] px-2 py-1 text-[0.6875rem] text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)]"
                       >
                         <Plus size={12} />
                         Add
@@ -694,7 +781,7 @@ export function GameCharacterSheet({
                           />
                           <button
                             onClick={() => removeListItem("strengths", index)}
-                            className="inline-flex items-center justify-center rounded-lg border border-[var(--border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-red-400"
+                            className="inline-flex items-center justify-center rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-red-400"
                             title="Remove strength"
                           >
                             <Trash2 size={13} />
@@ -712,7 +799,7 @@ export function GameCharacterSheet({
                       />
                       <button
                         onClick={() => addListItem("weaknesses")}
-                        className="inline-flex items-center gap-1 rounded-lg border border-dashed border-[var(--border)] px-2 py-1 text-[0.6875rem] text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
+                        className="inline-flex items-center gap-1 rounded-lg border border-dashed border-[var(--marinara-chat-chrome-panel-border)] px-2 py-1 text-[0.6875rem] text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)]"
                       >
                         <Plus size={12} />
                         Add
@@ -730,7 +817,7 @@ export function GameCharacterSheet({
                           />
                           <button
                             onClick={() => removeListItem("weaknesses", index)}
-                            className="inline-flex items-center justify-center rounded-lg border border-[var(--border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-red-400"
+                            className="inline-flex items-center justify-center rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-red-400"
                             title="Remove weakness"
                           >
                             <Trash2 size={13} />
@@ -742,7 +829,7 @@ export function GameCharacterSheet({
                 </div>
               </div>
 
-              <div className="border-b border-[var(--border)] px-5 py-4">
+              <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
                 <div className="mb-2.5 flex items-center justify-between gap-3">
                   <SectionHeader
                     icon={<Info size={12} />}
@@ -751,7 +838,7 @@ export function GameCharacterSheet({
                   />
                   <button
                     onClick={addExtraEntry}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[var(--border)] px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[var(--marinara-chat-chrome-panel-border)] px-3 py-1.5 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--foreground)]"
                   >
                     <Plus size={13} />
                     Add Detail
@@ -782,7 +869,7 @@ export function GameCharacterSheet({
                       />
                       <button
                         onClick={() => removeExtraEntry(index)}
-                        className="inline-flex items-center justify-center rounded-lg border border-[var(--border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-red-400 max-sm:h-10"
+                        className="inline-flex items-center justify-center rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] px-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-red-400 max-sm:h-10"
                         title="Remove detail"
                       >
                         <Trash2 size={13} />
@@ -795,7 +882,7 @@ export function GameCharacterSheet({
           )}
 
           {!isEditing && hasRpgStats && previewGameCard?.rpgStats && (
-            <div className="border-b border-[var(--border)] px-5 py-4">
+            <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
               <SectionHeader
                 icon={<Shield size={12} />}
                 title="Attributes"
@@ -806,7 +893,7 @@ export function GameCharacterSheet({
                   {previewGameCard.rpgStats.attributes.map((attr) => (
                     <div
                       key={attr.name}
-                      className="flex flex-col items-center rounded-lg border border-[var(--border)] bg-[var(--secondary)]/50 px-2 py-1.5"
+                      className="flex flex-col items-center rounded-lg border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-highlight-bg)] px-2 py-1.5"
                     >
                       <span className="text-[0.5625rem] font-bold uppercase tracking-widest text-[var(--muted-foreground)]">
                         {attr.name}
@@ -819,35 +906,38 @@ export function GameCharacterSheet({
                   ))}
                 </div>
               )}
-              {hasRpgHp &&
-                (() => {
-                  const hpMax = Math.max(1, Number(previewGameCard.rpgStats.hp.max) || 1);
-                  const hpValue = Math.max(0, Math.min(hpMax, Number(previewGameCard.rpgStats.hp.value) || 0));
-                  return (
-                    <div>
-                      <div className="mb-0.5 flex items-center justify-between text-xs">
-                        <span className="font-medium text-[var(--foreground)]/80">HP</span>
-                        <span className="font-mono text-[var(--muted-foreground)]">
-                          {hpValue}/{hpMax}
-                        </span>
+              {hasRpgPools && (
+                <div className="space-y-2">
+                  {previewRpgPools.map((pool) => {
+                    const poolMax = Math.max(1, Number(pool.max) || 1);
+                    const poolValue = Math.max(0, Math.min(poolMax, Number(pool.value) || 0));
+                    return (
+                      <div key={pool.name}>
+                        <div className="mb-0.5 flex items-center justify-between text-xs">
+                          <span className="font-medium text-[var(--foreground)]/80">{pool.name}</span>
+                          <span className="font-mono text-[var(--muted-foreground)]">
+                            {poolValue}/{poolMax}
+                          </span>
+                        </div>
+                        <div className="h-2.5 overflow-hidden rounded-full bg-[var(--marinara-chat-chrome-highlight-bg)] ring-1 ring-[var(--marinara-chat-chrome-panel-border)]">
+                          <div
+                            className="h-full rounded-full transition-all"
+                            style={{
+                              width: `${(poolValue / poolMax) * 100}%`,
+                              background: pool.color,
+                            }}
+                          />
+                        </div>
                       </div>
-                      <div className="h-2.5 overflow-hidden rounded-full bg-[var(--secondary)] ring-1 ring-[var(--border)]">
-                        <div
-                          className="h-full rounded-full transition-all"
-                          style={{
-                            width: `${(hpValue / hpMax) * 100}%`,
-                            background: "#ef4444",
-                          }}
-                        />
-                      </div>
-                    </div>
-                  );
-                })()}
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
           {card.stats && card.stats.length > 0 && (
-            <div className="border-b border-[var(--border)] px-5 py-4">
+            <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
               <SectionHeader icon={<Shield size={12} />} title="Stats" className="text-[var(--muted-foreground)]" />
               <div className="space-y-2">
                 {card.stats.map((stat) => {
@@ -862,12 +952,12 @@ export function GameCharacterSheet({
                           {value}/{max}
                         </span>
                       </div>
-                      <div className="h-2 overflow-hidden rounded-full bg-[var(--secondary)] ring-1 ring-[var(--border)]">
+                      <div className="h-2 overflow-hidden rounded-full bg-[var(--marinara-chat-chrome-highlight-bg)] ring-1 ring-[var(--marinara-chat-chrome-panel-border)]">
                         <div
                           className="h-full rounded-full transition-all"
                           style={{
                             width: `${width}%`,
-                            background: stat.color || "var(--primary)",
+                            background: stat.color || "var(--foreground)",
                           }}
                         />
                       </div>
@@ -879,13 +969,13 @@ export function GameCharacterSheet({
           )}
 
           {!isEditing && previewGameCard && previewGameCard.abilities.length > 0 && (
-            <div className="border-b border-[var(--border)] px-5 py-4">
+            <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
               <SectionHeader icon={<Zap size={12} />} title="Abilities" className="text-[var(--muted-foreground)]" />
               <div className="space-y-1">
                 {previewGameCard.abilities.map((ability, index) => (
                   <div
                     key={`${ability}-${index}`}
-                    className="rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs text-[var(--foreground)]/80"
+                    className="rounded-lg bg-[var(--marinara-chat-chrome-highlight-bg)] px-2.5 py-1.5 text-xs text-[var(--foreground)]/80"
                   >
                     {ability}
                   </div>
@@ -897,7 +987,7 @@ export function GameCharacterSheet({
           {!isEditing &&
             previewGameCard &&
             (previewGameCard.strengths.length > 0 || previewGameCard.weaknesses.length > 0) && (
-              <div className="border-b border-[var(--border)] px-5 py-4">
+              <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
                 <div className="grid grid-cols-2 gap-3">
                   {previewGameCard.strengths.length > 0 && (
                     <div>
@@ -932,7 +1022,7 @@ export function GameCharacterSheet({
             )}
 
           {!isEditing && previewGameCard && Object.keys(previewGameCard.extra).length > 0 && (
-            <div className="border-b border-[var(--border)] px-5 py-4">
+            <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
               <SectionHeader icon={<Info size={12} />} title="Details" className="text-[var(--muted-foreground)]" />
               <div className="space-y-1.5 text-xs">
                 {Object.entries(previewGameCard.extra).map(([key, value]) => (
@@ -948,20 +1038,20 @@ export function GameCharacterSheet({
           )}
 
           {card.inventory && card.inventory.length > 0 && (
-            <div className="border-b border-[var(--border)] px-5 py-4">
+            <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
               <SectionHeader icon={<Swords size={12} />} title="Inventory" className="text-[var(--muted-foreground)]" />
               <div className="space-y-1">
                 {card.inventory.map((item) => (
                   <div
                     key={`${item.name}-${item.location ?? "bag"}`}
-                    className="flex items-center justify-between rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs"
+                    className="flex items-center justify-between rounded-lg bg-[var(--marinara-chat-chrome-highlight-bg)] px-2.5 py-1.5 text-xs"
                   >
                     <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
                       <span className="min-w-0 whitespace-normal break-words text-[var(--foreground)]/80 [overflow-wrap:anywhere]">
                         {item.name}
                       </span>
                       {item.location && (
-                        <span className="rounded bg-[var(--primary)]/10 px-1.5 py-0.5 text-[0.5625rem] text-[var(--muted-foreground)]">
+                        <span className="rounded bg-[var(--foreground)]/10 px-1.5 py-0.5 text-[0.5625rem] text-[var(--muted-foreground)]">
                           {item.location}
                         </span>
                       )}
@@ -976,7 +1066,7 @@ export function GameCharacterSheet({
           )}
 
           {card.customFields && Object.keys(card.customFields).length > 0 && (
-            <div className="border-b border-[var(--border)] px-5 py-4">
+            <div className="border-b border-[var(--marinara-chat-chrome-panel-border)] px-5 py-4">
               <SectionHeader icon={<Sparkles size={12} />} title="Traits" className="text-[var(--muted-foreground)]" />
               <div className="space-y-1.5 text-xs">
                 {Object.entries(card.customFields).map(([key, value]) => (

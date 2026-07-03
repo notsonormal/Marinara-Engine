@@ -10,6 +10,7 @@ const VALID_ORIGINS = new Set<ChatSummaryEntryOrigin>(["manual", "automated", "l
 const VALID_SOURCES = new Set<ChatSummaryEntrySource>(["last", "range", "agent"]);
 
 export const COMPILED_CHAT_SUMMARY_MAX_BYTES = 64 * 1024;
+export const MAX_AUTOMATED_CHAT_SUMMARY_ENTRIES = 200;
 
 export type ChatSummaryEntryInput = Partial<ChatSummaryEntry> & {
   content: string;
@@ -182,6 +183,8 @@ export function normalizeChatSummaryEntry(
   if (rangeEndIndex !== undefined) base.rangeEndIndex = rangeEndIndex;
   const messageIds = normalizeMessageIds(value.messageIds);
   if (messageIds) base.messageIds = messageIds;
+  const hiddenMessageIds = normalizeMessageIds(value.hiddenMessageIds);
+  if (hiddenMessageIds) base.hiddenMessageIds = hiddenMessageIds;
   if (typeof value.promptTemplateId === "string") {
     base.promptTemplateId = value.promptTemplateId.trim() || null;
   } else if (value.promptTemplateId === null) {
@@ -223,6 +226,36 @@ export function sortChatSummaryEntries(entries: ChatSummaryEntry[]): ChatSummary
       return a.index - b.index;
     })
     .map(({ entry }) => entry);
+}
+
+function pruneAutomatedChatSummaryEntries(entries: ChatSummaryEntry[]): ChatSummaryEntry[] {
+  let prunableAutomatedCount = 0;
+  for (const entry of entries) {
+    if (
+      entry.origin === "automated" &&
+      entry.enabled &&
+      !(entry.hiddenMessageIds && entry.hiddenMessageIds.length > 0)
+    ) {
+      prunableAutomatedCount += 1;
+    }
+  }
+  let removable = prunableAutomatedCount - MAX_AUTOMATED_CHAT_SUMMARY_ENTRIES;
+  if (removable <= 0) return entries;
+
+  const pruned: ChatSummaryEntry[] = [];
+  for (const entry of entries) {
+    if (
+      removable > 0 &&
+      entry.origin === "automated" &&
+      entry.enabled &&
+      !(entry.hiddenMessageIds && entry.hiddenMessageIds.length > 0)
+    ) {
+      removable -= 1;
+      continue;
+    }
+    pruned.push(entry);
+  }
+  return pruned;
 }
 
 export function normalizeChatSummaryEntries(
@@ -272,7 +305,7 @@ export function appendChatSummaryEntryToMetadata(
     legacySummary: typeof metadata.summary === "string" ? metadata.summary : null,
   });
   const entry = createChatSummaryEntry(input, options);
-  const nextEntries = sortChatSummaryEntries([...entries, entry]);
+  const nextEntries = pruneAutomatedChatSummaryEntries(sortChatSummaryEntries([...entries, entry]));
   return {
     entry,
     entries: nextEntries,

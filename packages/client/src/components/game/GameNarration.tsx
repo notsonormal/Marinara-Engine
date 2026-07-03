@@ -35,12 +35,15 @@ import {
   Loader2,
   Wand2,
   RotateCcw,
+  GitBranch,
 } from "lucide-react";
 import { cn, copyToClipboard, getAvatarCropStyle, type AvatarCrop, type LegacyAvatarCrop } from "../../lib/utils";
+import { useRenderTimer } from "../../lib/perf-diagnostics";
 import { findNamedMapValue } from "../../lib/game-character-name-match";
 import type { GameSegmentEdit } from "../../lib/game-segment-edits";
 import { parseGmTags, stripGmTagsKeepReadables } from "../../lib/game-tag-parser";
 import { audioManager } from "../../lib/game-audio";
+import { normalizeSpriteExpressionKey, resolveSpriteExpression } from "../../lib/sprite-expression-match";
 import {
   DIALOGUE_QUOTE_CAPTURE_GROUP_PATTERN_SOURCE,
   HTML_SAFE_DIALOGUE_QUOTE_PATTERN_SOURCE,
@@ -53,6 +56,8 @@ import { useApplyRegex } from "../../hooks/use-apply-regex";
 import { useGameAssetStore } from "../../stores/game-asset.store";
 import { useGameModeStore } from "../../stores/game-mode.store";
 import { useUIStore } from "../../stores/ui.store";
+import { useChatStore } from "../../stores/chat.store";
+import { parseChatMetadata } from "../../lib/chat-display";
 import { createMessageMacroResolver, findCharacterByName } from "../../lib/chat-macros";
 import { animateTextHtml } from "./AnimatedText";
 import { ttsService } from "../../lib/tts-service";
@@ -65,6 +70,7 @@ import {
 } from "../../lib/tts-dialogue";
 import {
   formatTextQuotes,
+  normalizeTextForMatch,
   type PartyDialogueLine,
   type Message,
   type TTSConfig,
@@ -89,14 +95,6 @@ function nameColorStyle(color?: string): CSSProperties | undefined {
     };
   }
   return { color };
-}
-
-function normalizeSpriteExpressionKey(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/^full_/, "")
-    .replace(/[_\s-]+/g, "_");
 }
 
 const GAME_TTS_EMOTIONS = [
@@ -235,7 +233,7 @@ function formatTokenEstimate(tokens: number): string {
   return tokens.toLocaleString();
 }
 
-interface NarrationSegment {
+export interface NarrationSegment {
   id: string;
   type: "narration" | "dialogue" | "readable" | "system";
   speaker?: string;
@@ -274,6 +272,13 @@ type GameSegmentVoiceEntry =
   | { status: "loading"; speaker?: string; tone?: string; voice?: string; chunks: string[] }
   | { status: "ready"; speaker?: string; tone?: string; voice?: string; chunks: string[]; urls: string[] }
   | { status: "error"; speaker?: string; tone?: string; voice?: string; chunks: string[] };
+
+const GAME_VOICE_CACHE_MAX_ENTRIES = 80;
+
+function revokeGameVoiceEntry(entry: GameSegmentVoiceEntry | undefined): void {
+  if (entry?.status !== "ready") return;
+  for (const url of entry.urls) URL.revokeObjectURL(url);
+}
 
 interface GameSegmentVoiceRequest {
   speaker?: string;
@@ -417,6 +422,8 @@ interface GameNarrationProps {
   onRetryCombatGeneration?: () => void;
   /** Open the standard delete-message flow for a backing chat message. */
   onDeleteMessage?: (messageId: string) => void;
+  /** Create a chat branch ending at a game log message or the current decision beat. */
+  onBranchMessage?: (messageId: string) => void;
   /** Whether the global multi-delete bar is active. */
   multiSelectMode?: boolean;
   /** Chat message ids selected for global multi-delete. */
@@ -666,23 +673,44 @@ function waitForGameTTSRetry(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function waitForGameTTSBlob(promise: Promise<Blob>, signal: AbortSignal): Promise<Blob> {
+  if (signal.aborted) return Promise.reject(new DOMException("TTS request aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("TTS request aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (blob) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(blob);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function generateGameVoiceJobBlob(job: GameVoiceAudioJob, controller: AbortController): Promise<Blob> {
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= GAME_TTS_CHUNK_ATTEMPTS; attempt += 1) {
     if (controller.signal.aborted) throw new DOMException("TTS request aborted", "AbortError");
     try {
-      return await getOrCreateCachedTTSAudioBlob(
+      const sharedPromise = getOrCreateCachedTTSAudioBlob(
         job.cacheKey,
         () =>
           ttsService.generateAudio(job.chunk, {
             speaker: job.speaker,
             tone: job.tone,
             voice: job.voice,
-            signal: controller.signal,
           }),
         [job.textCacheKey],
       );
+      return await waitForGameTTSBlob(sharedPromise, controller.signal);
     } catch (err) {
       if (controller.signal.aborted || (err instanceof Error && err.name === "AbortError")) throw err;
       lastError = err;
@@ -698,8 +726,8 @@ async function generateGameVoiceJobBlob(job: GameVoiceAudioJob, controller: Abor
 function findNpcVoiceHint(speaker: string | null | undefined, gameNpcs: GameNpc[]) {
   const speakerName = speaker?.trim();
   if (!speakerName) return null;
-  const normalizedSpeaker = speakerName.toLowerCase();
-  const npc = gameNpcs.find((candidate) => candidate.name.trim().toLowerCase() === normalizedSpeaker);
+  const normalizedSpeaker = normalizeTextForMatch(speakerName);
+  const npc = gameNpcs.find((candidate) => normalizeTextForMatch(candidate.name) === normalizedSpeaker);
   if (!npc) return { name: speakerName };
   return { name: npc.name, description: npc.description, gender: npc.gender, pronouns: npc.pronouns, notes: npc.notes };
 }
@@ -709,7 +737,7 @@ type GameSegmentVoiceOptions = {
 };
 
 function normalizeGameVoiceSpeakerName(value: string | null | undefined): string {
-  return value?.trim().toLowerCase().replace(/\s+/g, " ") ?? "";
+  return normalizeTextForMatch(value);
 }
 
 function getGameVoicePlayerSpeakerNames(personaName: string | undefined): Set<string> {
@@ -924,6 +952,7 @@ export function GameNarration({
   combatGenerationFailed,
   onRetryCombatGeneration,
   onDeleteMessage,
+  onBranchMessage,
   multiSelectMode = false,
   selectedMessageIds,
   onDeleteSegment,
@@ -952,8 +981,13 @@ export function GameNarration({
   nextActionToken,
   onMaxNavOffsetChange,
 }: GameNarrationProps) {
+  useRenderTimer("game-narration"); // [#3104 diagnostic]
   const { translations, translating } = useTranslate();
   const { applyToAIOutput } = useApplyRegex();
+  // Parse the chat metadata in a memo (not the store selector) so streaming ticks
+  // don't re-parse the whole metadata object on every update.
+  const activeChatMetadata = useChatStore((s) => s.activeChat?.metadata);
+  const scopedRegexMode = useMemo(() => parseChatMetadata(activeChatMetadata).scopedRegexMode, [activeChatMetadata]);
   const [activeIndex, setActiveIndex] = useState(0);
   const [visibleChars, setVisibleChars] = useState(0);
   const [logsOpen, setLogsOpen] = useState(false);
@@ -978,9 +1012,12 @@ export function GameNarration({
   const logScrollContainerRef = useRef<HTMLDivElement | null>(null);
   const pendingLogScrollAnchorRef = useRef<{ key: string; offsetTop: number; scrollTop: number } | null>(null);
   const pendingLogScrollTopRef = useRef<number | null>(null);
+  const stackedLogShellRef = useRef<HTMLDivElement | null>(null);
   const stackedLogRef = useRef<HTMLDivElement | null>(null);
   const activeSegmentScrollRef = useRef<HTMLDivElement | null>(null);
   const [stackedLogPinned, setStackedLogPinned] = useState(true);
+  const [stackedLogHeldHeight, setStackedLogHeldHeight] = useState<number | null>(null);
+  const stackedLogHeightHoldTimerRef = useRef<number | null>(null);
   const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
   const copyResetTimerRef = useRef<number | null>(null);
   const [mobilePortraitActionsSpeaker, setMobilePortraitActionsSpeaker] = useState<string | null>(null);
@@ -994,9 +1031,26 @@ export function GameNarration({
   const gameVoiceCacheRef = useRef<Map<string, GameSegmentVoiceEntry>>(new Map());
   const gameVoicePendingRef = useRef<Map<string, AbortController>>(new Map());
   const gameVoiceAudioRef = useRef<HTMLAudioElement | null>(null);
+  // Every voice <audio> currently created/playing. gameVoiceAudioRef only tracks
+  // the single most-recent element, so when two playback attempts interleave the
+  // earlier element is dropped from the ref and never paused — it plays to the end
+  // while new clips stack on top (issue #2647 overlap). This set lets
+  // stopGameVoicePlayback tear down ALL live elements, guaranteeing at most one
+  // voice clip is ever audible.
+  const gameVoiceActiveAudiosRef = useRef<Set<HTMLAudioElement>>(new Set());
   const gameVoiceSequenceRef = useRef(0);
   const gameVoiceGenerationTailRef = useRef<Promise<void>>(Promise.resolve());
   const lastAutoPlayedVoiceKeyRef = useRef<string | null>(null);
+  // Keys for which an auto-play attempt has been launched but not yet confirmed
+  // started. The committed dedup refs (lastAutoPlayedVoiceKeyRef /
+  // autoPlayedSideVoiceKeysRef) are only written in the async onStarted callback,
+  // so without these synchronous in-flight markers a gameVoiceVersion bump (fired
+  // as each clip finishes generating) re-runs the auto-play effects before the
+  // current clip reports playing and relaunches it — restarting the same line on
+  // a loop. onStarted clears in-flight after committing dedup; onBlocked clears it
+  // so the autoplay-blocked retry path still works. See issue #2647.
+  const autoPlayInFlightVoiceKeyRef = useRef<string | null>(null);
+  const autoPlayInFlightSideVoiceKeysRef = useRef<Set<string>>(new Set());
   const autoPlayedSideVoiceKeysRef = useRef<Set<string>>(new Set());
   const sideVoiceAutoPlayFailuresRef = useRef<Map<string, number>>(new Map());
   const sideVoiceAutoPlayRetryPendingRef = useRef<Set<string>>(new Set());
@@ -1034,16 +1088,16 @@ export function GameNarration({
     const byName = new Map<string, string>();
     for (const [, c] of activeCharacterEntries) {
       const color = c.dialogueColor || c.nameColor;
-      if (color) byName.set(c.name.toLowerCase(), color);
+      if (color) byName.set(normalizeTextForMatch(c.name), color);
     }
     if (speakerAvatarMap) {
       for (const [name, info] of speakerAvatarMap) {
         const color = info.dialogueColor || info.nameColor;
-        if (color) byName.set(name.toLowerCase(), color);
+        if (color) byName.set(normalizeTextForMatch(name), color);
       }
     }
     if (personaInfo?.name && (personaInfo.dialogueColor || personaInfo.nameColor)) {
-      byName.set(personaInfo.name.toLowerCase(), personaInfo.dialogueColor || personaInfo.nameColor || "");
+      byName.set(normalizeTextForMatch(personaInfo.name), personaInfo.dialogueColor || personaInfo.nameColor || "");
     }
     return byName;
   }, [activeCharacterEntries, personaInfo, speakerAvatarMap]);
@@ -1053,16 +1107,16 @@ export function GameNarration({
     const byName = new Map<string, string>();
     for (const [, c] of activeCharacterEntries) {
       const color = c.nameColor || c.dialogueColor;
-      if (color) byName.set(c.name.toLowerCase(), color);
+      if (color) byName.set(normalizeTextForMatch(c.name), color);
     }
     if (speakerAvatarMap) {
       for (const [name, info] of speakerAvatarMap) {
         const color = info.nameColor || info.dialogueColor;
-        if (color) byName.set(name.toLowerCase(), color);
+        if (color) byName.set(normalizeTextForMatch(name), color);
       }
     }
     if (personaInfo?.name && (personaInfo.nameColor || personaInfo.dialogueColor)) {
-      byName.set(personaInfo.name.toLowerCase(), personaInfo.nameColor || personaInfo.dialogueColor || "");
+      byName.set(normalizeTextForMatch(personaInfo.name), personaInfo.nameColor || personaInfo.dialogueColor || "");
     }
     return byName;
   }, [activeCharacterEntries, personaInfo, speakerAvatarMap]);
@@ -1077,10 +1131,17 @@ export function GameNarration({
     return byId;
   }, [messages]);
 
+  // Per-message speaker, so scoped regex can match a segment's character in exclusive mode.
+  const messageCharacterById = useMemo(() => {
+    const byId = new Map<string, string | null>();
+    for (const m of messages) byId.set(m.id, m.characterId ?? null);
+    return byId;
+  }, [messages]);
+
   const speakerAvatarInfos = useMemo(() => {
     const byName = new Map<string, SpeakerAvatarInfo>();
     const setAvatarInfo = (name: string, avatarInfo: SpeakerAvatarInfo) => {
-      const key = name.toLowerCase();
+      const key = normalizeTextForMatch(name);
       const existing = byName.get(key) ?? findNamedMapValue(byName, name);
       byName.set(key, {
         url: avatarInfo.url || existing?.url || "",
@@ -1108,16 +1169,16 @@ export function GameNarration({
   }, [activeCharacterEntries, personaInfo, speakerAvatarMap, gameNpcs]);
 
   const uploadableNpcNames = useMemo(
-    () => new Set(gameNpcs.map((npc) => npc.name.trim().toLowerCase()).filter(Boolean)),
+    () => new Set(gameNpcs.map((npc) => normalizeTextForMatch(npc.name)).filter(Boolean)),
     [gameNpcs],
   );
 
   const nonNpcSpeakerNames = useMemo(() => {
     const names = new Set(["you", "player", "narrator", "gm", "game master", "system", "assistant", "story"]);
     for (const [, character] of activeCharacterEntries) {
-      if (character.name.trim()) names.add(character.name.trim().toLowerCase());
+      if (character.name.trim()) names.add(normalizeTextForMatch(character.name));
     }
-    if (personaInfo?.name?.trim()) names.add(personaInfo.name.trim().toLowerCase());
+    if (personaInfo?.name?.trim()) names.add(normalizeTextForMatch(personaInfo.name));
     return names;
   }, [activeCharacterEntries, personaInfo]);
 
@@ -1126,7 +1187,7 @@ export function GameNarration({
   const canUploadNpcPortrait = useCallback(
     (speaker?: string | null) => {
       const speakerName = speaker?.trim();
-      const normalizedSpeaker = speakerName?.toLowerCase();
+      const normalizedSpeaker = normalizeTextForMatch(speakerName);
       if (!speakerName || !normalizedSpeaker || !onNpcPortraitClick) return false;
       if (uploadableNpcNames.has(normalizedSpeaker)) return true;
       if (nonNpcSpeakerNames.has(normalizedSpeaker)) return false;
@@ -1145,7 +1206,7 @@ export function GameNarration({
     (speaker?: string | null) => {
       if (!speaker || !onNpcPortraitClick) return;
       const speakerName = speaker.trim();
-      const normalizedSpeaker = speakerName.toLowerCase();
+      const normalizedSpeaker = normalizeTextForMatch(speakerName);
       if (!uploadableNpcNames.has(normalizedSpeaker) && !/^\p{Lu}/u.test(speakerName)) return;
       onNpcPortraitClick(speaker);
     },
@@ -1173,7 +1234,7 @@ export function GameNarration({
       if (!speaker) return;
 
       if (isMobileGameViewport() && canGenerateNpcPortrait(speaker)) {
-        const normalizedSpeaker = speaker.trim().toLowerCase();
+        const normalizedSpeaker = normalizeTextForMatch(speaker);
         setMobilePortraitActionsSpeaker((current) => (current === normalizedSpeaker ? null : normalizedSpeaker));
         return;
       }
@@ -1185,7 +1246,7 @@ export function GameNarration({
 
   const isMobilePortraitActionsVisible = useCallback(
     (speaker?: string | null) => {
-      const normalizedSpeaker = speaker?.trim().toLowerCase();
+      const normalizedSpeaker = normalizeTextForMatch(speaker);
       return !!normalizedSpeaker && mobilePortraitActionsSpeaker === normalizedSpeaker;
     },
     [mobilePortraitActionsSpeaker],
@@ -1193,7 +1254,7 @@ export function GameNarration({
 
   const isNpcPortraitGenerating = useCallback(
     (speaker?: string | null) => {
-      const normalized = speaker?.trim().toLowerCase();
+      const normalized = normalizeTextForMatch(speaker);
       return !!normalized && !!generatingNpcPortraitNames?.has(normalized);
     },
     [generatingNpcPortraitNames],
@@ -1338,9 +1399,11 @@ export function GameNarration({
       return applyToAIOutput(text, {
         depth: sourceMessageId ? messageDepthById.get(sourceMessageId) : undefined,
         resolveMacros: resolveMacrosForText,
+        scopedMode: scopedRegexMode,
+        characterId: sourceMessageId ? messageCharacterById.get(sourceMessageId) : undefined,
       });
     },
-    [applyToAIOutput, messageDepthById],
+    [applyToAIOutput, messageDepthById, messageCharacterById, scopedRegexMode],
   );
 
   const prepareSegmentText = useCallback(
@@ -1356,7 +1419,8 @@ export function GameNarration({
         primaryCharacter: resolveMacroCharacter(speaker),
         characters: macroCharacters,
       };
-      const resolveMacrosForText = createMessageMacroResolver(macroContext);
+      const macroRandomSeed = `${sourceMessageId ?? "game-segment"}:${text}`;
+      const resolveMacrosForText = createMessageMacroResolver(macroContext, { randomSeed: macroRandomSeed });
       const regexApplied = applyOutputRegexForSource(text, sourceMessageId, sourceRole, resolveMacrosForText);
       return formatTextQuotes(resolveMacrosForText(regexApplied), quoteFormat);
     },
@@ -1608,6 +1672,16 @@ export function GameNarration({
     sourceMessagesById,
   ]);
 
+  // Fast O(1) segment-id → index lookup, rebuilt only when `segments` changes.
+  // The per-segment log renderers below previously each called
+  // `segments.findIndex(...)`, making stacked-log rendering O(n²) in segment
+  // count — the root of the #3104 game-mode freeze on long chats.
+  const segmentIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    segments.forEach((segment, index) => map.set(segment.id, index));
+    return map;
+  }, [segments]);
+
   // Clamp activeIndex when segments shrink (e.g. new party chat clears old dialogue)
   useEffect(() => {
     if (segments.length > 0 && activeIndex >= segments.length) {
@@ -1726,6 +1800,34 @@ export function GameNarration({
   const normalizedGameVoiceVolume = Math.max(0, Math.min(1, gameVoiceVolume));
   const gameVoicePlaybackBlocked = voicePlaybackBlocked ?? autoPlayBlocked;
 
+  const cacheGameVoiceEntry = useCallback(
+    (key: string, entry: GameSegmentVoiceEntry) => {
+      const cache = gameVoiceCacheRef.current;
+      revokeGameVoiceEntry(cache.get(key));
+      cache.delete(key);
+      cache.set(key, entry);
+
+      const protectedKeys = new Set(
+        [gameVoicePlayingKey, gameVoicePausedKey].filter((value): value is string => !!value),
+      );
+      let guard = 0;
+      while (cache.size > GAME_VOICE_CACHE_MAX_ENTRIES && guard < cache.size) {
+        const oldestKey = cache.keys().next().value;
+        if (!oldestKey) break;
+        const oldestEntry = cache.get(oldestKey);
+        if (protectedKeys.has(oldestKey) && oldestEntry) {
+          cache.delete(oldestKey);
+          cache.set(oldestKey, oldestEntry);
+          guard += 1;
+          continue;
+        }
+        cache.delete(oldestKey);
+        revokeGameVoiceEntry(oldestEntry);
+      }
+    },
+    [gameVoicePausedKey, gameVoicePlayingKey],
+  );
+
   const queueLogScrollTopRestore = useCallback(() => {
     const scrollTop = logScrollContainerRef.current?.scrollTop;
     if (scrollTop != null) {
@@ -1736,14 +1838,16 @@ export function GameNarration({
   const stopGameVoicePlayback = useCallback(() => {
     gameVoiceSequenceRef.current += 1;
     queueLogScrollTopRestore();
-    const audio = gameVoiceAudioRef.current;
-    if (audio) {
+    // Tear down every live voice element, not just the current ref — interleaved
+    // playback attempts can orphan earlier elements off the single ref (#2647).
+    for (const audio of gameVoiceActiveAudiosRef.current) {
       audio.pause();
       audio.onended = null;
       audio.onerror = null;
       audio.onplaying = null;
-      gameVoiceAudioRef.current = null;
     }
+    gameVoiceActiveAudiosRef.current.clear();
+    gameVoiceAudioRef.current = null;
     setGameVoicePlayingKey(null);
     setGameVoicePausedKey(null);
   }, [queueLogScrollTopRestore]);
@@ -1796,6 +1900,7 @@ export function GameNarration({
         audio.preload = "auto";
         audioManager.setMediaElementVolume(audio, normalizedGameVoiceVolume);
         audio.muted = normalizedGameVoiceVolume <= 0;
+        gameVoiceActiveAudiosRef.current.add(audio);
         gameVoiceAudioRef.current = audio;
 
         let started = false;
@@ -1805,6 +1910,7 @@ export function GameNarration({
           options?.onStarted?.(key);
         };
         const markFailed = () => {
+          gameVoiceActiveAudiosRef.current.delete(audio);
           if (gameVoiceSequenceRef.current !== sequence || gameVoiceAudioRef.current !== audio) return;
           queueLogScrollTopRestore();
           setGameVoicePlayingKey(null);
@@ -1815,12 +1921,29 @@ export function GameNarration({
 
         audio.onplaying = markStarted;
         audio.onended = () => {
+          gameVoiceActiveAudiosRef.current.delete(audio);
           if (gameVoiceSequenceRef.current !== sequence || gameVoiceAudioRef.current !== audio) return;
           urlIndex += 1;
           playNext();
         };
         audio.onerror = markFailed;
-        void audio.play().then(markStarted).catch(markFailed);
+        void audio
+          .play()
+          .then(markStarted)
+          .catch(() => {
+            // Browsers can reject the play() promise (typically AbortError) when a
+            // rapid re-trigger "interrupts" it, even though playback actually
+            // started and continues. Dropping such a still-playing clip from the
+            // tracking set would orphan it so stopGameVoicePlayback() can never
+            // pause it — the clips stack and overlap (#2647). Only treat the
+            // rejection as a real failure when the element is genuinely not
+            // playing; otherwise treat it as a normal start.
+            if (!audio.paused && !audio.ended) {
+              markStarted();
+              return;
+            }
+            markFailed();
+          });
       };
 
       playNext();
@@ -2522,6 +2645,39 @@ export function GameNarration({
     if (useStackedLogDisplay) setStackedLogPinned(true);
   }, [useStackedLogDisplay]);
 
+  const holdStackedLogHeightForDelete = useCallback(() => {
+    const shell = stackedLogShellRef.current;
+    if (!shell) return;
+
+    const measuredHeight = Math.ceil(shell.getBoundingClientRect().height);
+    if (measuredHeight <= 0) return;
+
+    setStackedLogHeldHeight(measuredHeight);
+    if (stackedLogHeightHoldTimerRef.current !== null) {
+      window.clearTimeout(stackedLogHeightHoldTimerRef.current);
+    }
+
+    const scrollEl = stackedLogRef.current;
+    const scrollTop = scrollEl?.scrollTop ?? null;
+    window.requestAnimationFrame(() => {
+      if (scrollTop == null || !scrollEl) return;
+      scrollEl.scrollTop = Math.min(scrollTop, scrollEl.scrollHeight);
+    });
+
+    stackedLogHeightHoldTimerRef.current = window.setTimeout(() => {
+      stackedLogHeightHoldTimerRef.current = null;
+      setStackedLogHeldHeight(null);
+    }, 320);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (stackedLogHeightHoldTimerRef.current !== null) {
+        window.clearTimeout(stackedLogHeightHoldTimerRef.current);
+      }
+    };
+  }, []);
+
   useEffect(() => {
     if (!useStackedLogDisplay || !stackedLogPinned) return;
     const el = stackedLogRef.current;
@@ -2543,7 +2699,12 @@ export function GameNarration({
         ? null
         : (() => {
             const avatar = findNamedMapValue(speakerAvatarInfos, active.speaker);
-            return avatar ? { name: active.speaker, avatarUrl: avatar.url, expression: active.sprite } : null;
+            if (avatar) return { name: active.speaker, avatarUrl: avatar.url, expression: active.sprite };
+            const sprites = spriteMap ? findNamedMapValue(spriteMap, active.speaker) : null;
+            const expressionSprites = sprites?.filter((sprite) => !sprite.expression.toLowerCase().startsWith("full_"));
+            if (!expressionSprites?.length) return null;
+            const sprite = resolveSpriteExpression(expressionSprites, active.sprite ?? "neutral");
+            return sprite ? { name: active.speaker, avatarUrl: sprite.url, expression: active.sprite } : null;
           })();
 
     // Composite key catches legitimate expression/avatar changes, not just name
@@ -2551,7 +2712,7 @@ export function GameNarration({
     if (nextKey === lastReportedSpeakerRef.current) return;
     lastReportedSpeakerRef.current = nextKey;
     onActiveSpeakerChange(next);
-  }, [active, speakerAvatarInfos, onActiveSpeakerChange]);
+  }, [active, speakerAvatarInfos, spriteMap, onActiveSpeakerChange]);
 
   // How many segments are prepended before the actual GM narration segments
   const playerSegmentOffset = latestUserMessage?.content && latestAssistant ? 1 : 0;
@@ -2707,7 +2868,7 @@ export function GameNarration({
 
       const controller = new AbortController();
       gameVoicePendingRef.current.set(key, controller);
-      gameVoiceCacheRef.current.set(key, {
+      cacheGameVoiceEntry(key, {
         status: "loading",
         chunks: audioJobs.map((job) => job.chunk),
         speaker: audioJobs[0]?.speaker,
@@ -2758,7 +2919,7 @@ export function GameNarration({
           if (controller.signal.aborted) return;
           const urls = blobs.map((blob) => URL.createObjectURL(blob));
           if (!failed && urls.length === audioJobs.length) {
-            gameVoiceCacheRef.current.set(key, {
+            cacheGameVoiceEntry(key, {
               status: "ready",
               chunks: audioJobs.map((job) => job.chunk),
               speaker: audioJobs[0]?.speaker,
@@ -2768,7 +2929,7 @@ export function GameNarration({
             });
           } else {
             for (const url of urls) URL.revokeObjectURL(url);
-            gameVoiceCacheRef.current.set(key, {
+            cacheGameVoiceEntry(key, {
               status: "error",
               chunks: audioJobs.map((job) => job.chunk),
               speaker: audioJobs[0]?.speaker,
@@ -2788,6 +2949,7 @@ export function GameNarration({
     gameVoiceGenerationTailRef.current = gameVoiceGenerationTailRef.current.catch(() => undefined).then(runPlans);
     void gameVoiceGenerationTailRef.current;
   }, [
+    cacheGameVoiceEntry,
     gameNpcs,
     gameVoiceConfigSignature,
     gameVoiceEnabled,
@@ -2838,6 +3000,8 @@ export function GameNarration({
 
   useEffect(() => {
     lastAutoPlayedVoiceKeyRef.current = null;
+    autoPlayInFlightVoiceKeyRef.current = null;
+    autoPlayInFlightSideVoiceKeysRef.current.clear();
     autoPlayedSideVoiceKeysRef.current.clear();
     sideVoiceAutoPlayFailuresRef.current.clear();
     clearSideVoiceAutoPlayRetry();
@@ -2848,6 +3012,8 @@ export function GameNarration({
     if (gameVoiceEnabled && !isStreaming && !scenePreparing && !directionsActive && !gameVoicePlaybackBlocked) return;
     if (isStreaming || scenePreparing || directionsActive || gameVoicePlaybackBlocked) {
       lastAutoPlayedVoiceKeyRef.current = null;
+      autoPlayInFlightVoiceKeyRef.current = null;
+      autoPlayInFlightSideVoiceKeysRef.current.clear();
       autoPlayedSideVoiceKeysRef.current.clear();
       sideVoiceAutoPlayFailuresRef.current.clear();
       clearSideVoiceAutoPlayRetry();
@@ -2867,12 +3033,23 @@ export function GameNarration({
     if (!gameVoiceEnabled || !activeVoiceKey) return;
     if (isStreaming || scenePreparing || directionsActive || gameVoicePlaybackBlocked) return;
     if (lastAutoPlayedVoiceKeyRef.current === activeVoiceKey) return;
+    // A launch is already pending for this key; don't relaunch on version churn.
+    if (autoPlayInFlightVoiceKeyRef.current === activeVoiceKey) return;
     const entry = gameVoiceCacheRef.current.get(activeVoiceKey);
     if (!entry || entry.status !== "ready") return;
+    autoPlayInFlightVoiceKeyRef.current = activeVoiceKey;
     playGameVoiceKey(activeVoiceKey, {
       onStarted: (startedKey) => {
         if (startedKey === activeVoiceKey) {
           lastAutoPlayedVoiceKeyRef.current = activeVoiceKey;
+        }
+        if (autoPlayInFlightVoiceKeyRef.current === startedKey) {
+          autoPlayInFlightVoiceKeyRef.current = null;
+        }
+      },
+      onBlocked: (blockedKey) => {
+        if (autoPlayInFlightVoiceKeyRef.current === blockedKey) {
+          autoPlayInFlightVoiceKeyRef.current = null;
         }
       },
     });
@@ -2906,18 +3083,22 @@ export function GameNarration({
       (key, index) =>
         entries[index]?.status === "ready" &&
         !autoPlayedSideVoiceKeysRef.current.has(key) &&
+        !autoPlayInFlightSideVoiceKeysRef.current.has(key) &&
         !sideVoiceAutoPlayRetryPendingRef.current.has(key) &&
         (sideVoiceAutoPlayFailuresRef.current.get(key) ?? 0) < SIDE_VOICE_AUTOPLAY_MAX_FAILURES,
     );
     if (playableKeys.length > 0) {
+      for (const key of playableKeys) autoPlayInFlightSideVoiceKeysRef.current.add(key);
       playGameVoiceKeys(playableKeys, {
         onStarted: (startedKey) => {
+          autoPlayInFlightSideVoiceKeysRef.current.delete(startedKey);
           autoPlayedSideVoiceKeysRef.current.add(startedKey);
           sideVoiceAutoPlayFailuresRef.current.delete(startedKey);
           sideVoiceAutoPlayRetryPendingRef.current.delete(startedKey);
           setGameVoiceVersion((version) => version + 1);
         },
         onBlocked: (blockedKey) => {
+          autoPlayInFlightSideVoiceKeysRef.current.delete(blockedKey);
           const failures = (sideVoiceAutoPlayFailuresRef.current.get(blockedKey) ?? 0) + 1;
           sideVoiceAutoPlayFailuresRef.current.set(blockedKey, failures);
           if (failures < SIDE_VOICE_AUTOPLAY_MAX_FAILURES) {
@@ -3198,16 +3379,8 @@ export function GameNarration({
       const expressionSprites = sprites.filter((s) => !s.expression.toLowerCase().startsWith("full_"));
       if (!expressionSprites.length) return null;
 
-      const exact = expressionSprites.find((s) => normalizeSpriteExpressionKey(s.expression) === exprKey);
-      if (exact) return { url: exact.url };
-
-      const partial = expressionSprites.find((s) => {
-        const spriteKey = normalizeSpriteExpressionKey(s.expression);
-        return spriteKey.includes(exprKey) || exprKey.includes(spriteKey);
-      });
-      if (partial) return { url: partial.url };
-
-      return { url: expressionSprites[0]!.url };
+      const match = resolveSpriteExpression(expressionSprites, exprKey);
+      return match ? { url: match.url } : null;
     },
     [spriteMap],
   );
@@ -3225,6 +3398,10 @@ export function GameNarration({
     "flex items-center gap-1.5 rounded-lg bg-[var(--muted)]/30 px-3 py-1.5 text-xs text-[var(--foreground)]/70 transition-colors hover:bg-[var(--muted)]/50 hover:text-[var(--foreground)] dark:bg-white/10 dark:text-white/70 dark:hover:bg-white/20 dark:hover:text-white";
   const NARRATION_META_BTN =
     "flex min-h-7 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--muted)]/20 px-2.5 py-1 text-xs text-[var(--foreground)]/75 transition-colors hover:bg-[var(--muted)]/40 dark:border-white/10 dark:bg-white/5 dark:text-white/75 dark:hover:bg-white/10";
+  const NARRATION_COUNT_BADGE =
+    "absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--foreground)] px-0.5 text-[0.55rem] font-bold text-[var(--background)] ring-1 ring-[var(--background)]/20 dark:bg-white/90 dark:text-black dark:ring-black/20";
+  const ACTIVE_SEGMENT_ACTION_BTN =
+    "inline-flex items-center justify-center rounded p-1 text-[var(--muted-foreground)]/40 transition-colors hover:bg-[var(--muted)]/30 hover:text-[var(--muted-foreground)] dark:text-white/20 dark:hover:bg-white/10 dark:hover:text-white/60";
   const combatMetaButton = onRequestCombatStart ? (
     <button
       type="button"
@@ -3234,7 +3411,7 @@ export function GameNarration({
         NARRATION_META_BTN,
         "relative",
         combatGenerationFailed
-          ? "border-rose-300/30 bg-rose-500/15 text-rose-100 hover:bg-rose-500/25"
+          ? "border-[var(--destructive)]/30 bg-[var(--destructive)]/15 text-[var(--destructive)] hover:bg-[var(--destructive)]/25"
           : "border-amber-300/20 bg-amber-500/10 text-amber-100/90 hover:bg-amber-500/20",
         combatStarting && "cursor-wait opacity-80",
       )}
@@ -3250,7 +3427,7 @@ export function GameNarration({
         className={cn(
           "mt-2 flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs",
           combatGenerationFailed
-            ? "border-rose-300/25 bg-rose-500/10 text-rose-100"
+            ? "border-[var(--destructive)]/25 bg-[var(--destructive)]/10 text-[var(--destructive)]"
             : "border-amber-300/20 bg-amber-500/10 text-amber-100",
         )}
       >
@@ -3372,6 +3549,21 @@ export function GameNarration({
   // While reviewing the past (messageOffset > 0), interrupt controls are hidden and
   // the Next button is forced visible so the player can see and press "Return".
   const reviewingPast = messageOffset > 0;
+  const playerInputAvailable =
+    !scenePreparing &&
+    !reviewingPast &&
+    (narrationComplete || interruptCommitted) &&
+    !isStreaming &&
+    !partyTurnPending &&
+    !!inputSlot;
+  const activeSourceRole = activeSourceMessage?.role ?? active?.sourceRole ?? null;
+  const activeCanBranchAtInput = !!(
+    playerInputAvailable &&
+    onBranchMessage &&
+    editingContent === null &&
+    activeSourceMessageId &&
+    (activeSourceRole === "assistant" || activeSourceRole === "narrator")
+  );
   const showInterruptControls = !reviewingPast && !narrationComplete && !partyTurnPending && !!onInterruptRequest;
   const showNav = reviewingPast || (!narrationComplete && !isStreaming && !interruptPending);
   const navControls =
@@ -3436,7 +3628,286 @@ export function GameNarration({
       </div>
     );
 
-  const renderStackedLogSegment = (seg: NarrationSegment) => {
+  const handleBranchActiveBeat = useCallback(
+    (event: ReactMouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!activeCanBranchAtInput || !activeSourceMessageId) return;
+      onBranchMessage?.(activeSourceMessageId);
+    },
+    [activeCanBranchAtInput, activeSourceMessageId, onBranchMessage],
+  );
+
+  const handleSaveActiveSegmentEdit = useCallback(() => {
+    if (editingContent?.trim() && onEditSegment) {
+      const editInfo = segmentEditInfoRef.current[activeIndex];
+      if (editInfo) onEditSegment(editInfo.messageId, editInfo.segmentIndex, { content: editingContent.trim() });
+    }
+    setEditingContent(null);
+  }, [activeIndex, editingContent, onEditSegment]);
+
+  const activeBranchButton = activeCanBranchAtInput ? (
+    <button
+      type="button"
+      onClick={handleBranchActiveBeat}
+      className={cn(ACTIVE_SEGMENT_ACTION_BTN, "text-[var(--primary)]/80 hover:text-[var(--primary)]")}
+      title="Branch before this decision"
+      aria-label="Branch before this decision"
+    >
+      <GitBranch size={11} />
+    </button>
+  ) : null;
+  const activeCopyButton =
+    editingContent === null && activeCopyKey ? (
+      <button
+        type="button"
+        onClick={() => {
+          void handleCopyMessage(activeCopyKey, activeCopyText);
+        }}
+        className={ACTIVE_SEGMENT_ACTION_BTN}
+        title="Copy"
+        aria-label="Copy"
+      >
+        {copiedMessageKey === activeCopyKey ? <Check size={11} /> : <Copy size={11} />}
+      </button>
+    ) : null;
+  const activeEditButton =
+    activeCanEditSegment && editingContent === null ? (
+      <button
+        type="button"
+        onClick={() => setEditingContent(active?.content ?? "")}
+        className={cn(ACTIVE_SEGMENT_ACTION_BTN, "hidden md:inline-flex")}
+        title="Edit"
+      >
+        <Pencil size={11} />
+      </button>
+    ) : null;
+  const activeSaveButton =
+    editingContent !== null ? (
+      <button
+        type="button"
+        onClick={handleSaveActiveSegmentEdit}
+        className="inline-flex items-center justify-center rounded bg-emerald-500/20 p-1 text-emerald-300 transition-colors hover:bg-emerald-500/30"
+        title="Save"
+      >
+        <Check size={11} />
+      </button>
+    ) : null;
+  const activeSegmentActionButtons =
+    activeSaveButton || activeBranchButton || activeCopyButton || activeEditButton ? (
+      <div
+        onPointerDown={(event) => event.stopPropagation()}
+        onPointerUp={(event) => event.stopPropagation()}
+        className="absolute right-1.5 top-1.5 z-10 flex items-center gap-0.5"
+      >
+        {activeSaveButton ?? (
+          <>
+            {activeBranchButton}
+            {activeCopyButton}
+            {activeEditButton}
+          </>
+        )}
+      </div>
+    ) : null;
+
+  const renderStackedLogSegment = (seg: NarrationSegment, entryMessageId: string) => {
+    const sourceMessageId = seg.sourceMessageId ?? entryMessageId;
+    const hasSourceSegmentIndex = seg.sourceSegmentIndex != null;
+    const sourceSegmentIndex = seg.sourceSegmentIndex ?? 0;
+    const sourceMessageRole = sourceMessageId ? (sourceMessagesById.get(sourceMessageId)?.role ?? null) : null;
+    const sourceRole = seg.sourceRole ?? sourceMessageRole;
+    const isUserAuthoredSource = sourceRole === "user" || sourceMessageRole === "user";
+    const liveSegmentIndex = segmentIndexById.get(seg.id) ?? -1;
+    const canEditMessage = !!onEditMessage && !!sourceMessageId && isUserAuthoredSource;
+    const canEditSegment =
+      !!onEditSegment &&
+      !!sourceMessageId &&
+      hasSourceSegmentIndex &&
+      sourceRole !== "user" &&
+      sourceRole !== "system" &&
+      sourceMessageId !== "party-chat";
+    const canEdit = canEditMessage || canEditSegment;
+    const canDeleteMessage =
+      !!onDeleteMessage && !!sourceMessageId && (isUserAuthoredSource || sourceRole === "system");
+    const canBranchMessage = !!onBranchMessage && !!sourceMessageId && isUserAuthoredSource;
+    const canDeleteThisSegment =
+      !!onDeleteSegment &&
+      !!sourceMessageId &&
+      hasSourceSegmentIndex &&
+      sourceRole !== "user" &&
+      sourceRole !== "system" &&
+      sourceMessageId !== "party-chat";
+    const isEditingThis = editingLogSeg?.messageId === sourceMessageId && editingLogSeg?.segIndex === sourceSegmentIndex;
+    const showDeleteButton = canDeleteMessage || canDeleteThisSegment;
+    const copyKey =
+      sourceMessageId && hasSourceSegmentIndex
+        ? `log:${sourceMessageId}:${sourceSegmentIndex}`
+        : sourceMessageId
+          ? `log:${sourceMessageId}`
+          : null;
+    const copyText = seg.readableContent ?? stripGmTagsKeepReadables(seg.content);
+    const stackedActionButtonClass =
+      "rounded p-1 text-[var(--foreground)]/45 opacity-100 transition-all hover:bg-[var(--muted)]/35 hover:text-[var(--foreground)]/70 md:text-[var(--foreground)]/25 md:opacity-0 md:group-hover/logseg:opacity-100 dark:text-white/45 dark:hover:bg-white/10 dark:hover:text-white/70 dark:md:text-white/25";
+    const copyButton = copyKey ? (
+      <button
+        type="button"
+        onPointerDown={stopLogActionPointerDown}
+        onClick={(event) => handleLogCopyButtonClick(event, copyKey, copyText)}
+        className={stackedActionButtonClass}
+        title="Copy"
+      >
+        {copiedMessageKey === copyKey ? <Check size={11} /> : <Copy size={11} />}
+      </button>
+    ) : null;
+    const branchButton = canBranchMessage ? (
+      <button
+        type="button"
+        onPointerDown={stopLogActionPointerDown}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onBranchMessage?.(sourceMessageId);
+        }}
+        className={stackedActionButtonClass}
+        title="Branch from here"
+        aria-label="Branch from here"
+      >
+        <GitBranch size={11} />
+      </button>
+    ) : null;
+    const deleteButton = showDeleteButton ? (
+      <button
+        type="button"
+        onPointerDown={stopLogActionPointerDown}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          holdStackedLogHeightForDelete();
+          prepareLogDeleteNavigation(`${sourceMessageId}:${sourceSegmentIndex}`, liveSegmentIndex);
+          if (canDeleteMessage && sourceMessageId) {
+            onDeleteMessage?.(sourceMessageId);
+          } else if (canDeleteThisSegment && sourceMessageId) {
+            onDeleteSegment?.(sourceMessageId, sourceSegmentIndex);
+          }
+        }}
+        className={cn(stackedActionButtonClass, "hover:bg-red-500/20 hover:text-red-400")}
+        title={canDeleteThisSegment ? "Delete segment" : "Delete message"}
+      >
+        <Trash2 size={11} />
+      </button>
+    ) : null;
+    const editButtons = canEdit ? (
+      <>
+        {!isEditingThis && (
+          <button
+            type="button"
+            onPointerDown={stopLogActionPointerDown}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (!sourceMessageId) return;
+              const initialContent = seg.type === "readable" ? (seg.readableContent ?? seg.content) : seg.content;
+              const initialSpeaker = canEditSegment && seg.type === "dialogue" ? (seg.speaker ?? "") : undefined;
+              logEditDraftRef.current = {
+                content: initialContent,
+                speaker: initialSpeaker,
+              };
+              setEditingLogSeg({
+                messageId: sourceMessageId,
+                segIndex: sourceSegmentIndex,
+                content: initialContent,
+                speaker: initialSpeaker,
+                segmentType: seg.type,
+                readableType: seg.readableType,
+              });
+            }}
+            className={stackedActionButtonClass}
+            title="Edit"
+          >
+            <Pencil size={11} />
+          </button>
+        )}
+        {isEditingThis && (
+          <button
+            type="button"
+            onPointerDown={stopLogActionPointerDown}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              commitLogEdit({
+                sourceMessageId,
+                sourceSegmentIndex,
+                canEditMessage,
+                canEditSegment,
+                fallbackSpeaker: seg.speaker,
+              });
+            }}
+            className="rounded bg-emerald-500/20 p-1 text-emerald-300 transition-colors hover:bg-emerald-500/30"
+            title="Save"
+          >
+            <Check size={11} />
+          </button>
+        )}
+      </>
+    ) : null;
+    const actionButtons =
+      deleteButton || branchButton || copyButton || editButtons ? (
+        <div
+          onPointerDown={stopLogActionPointerDown}
+          onClick={(event) => event.stopPropagation()}
+          className="absolute right-1.5 top-1.5 z-10 flex items-center gap-0.5"
+        >
+          {branchButton}
+          {deleteButton}
+          {copyButton}
+          {editButtons}
+        </div>
+      ) : null;
+    const editSpeakerInput =
+      isEditingThis && seg.type === "dialogue" && canEditSegment ? (
+        <input
+          key={`${sourceMessageId}:${sourceSegmentIndex}:speaker`}
+          className="mb-1 w-full rounded border border-[var(--border)] bg-[var(--background)]/55 px-2 py-1 text-[0.7rem] font-semibold text-[var(--foreground)] outline-none focus:border-[var(--primary)]/45 dark:border-white/10 dark:bg-black/40 dark:text-white/90 dark:focus:border-white/30"
+          defaultValue={editingLogSeg?.speaker ?? ""}
+          placeholder="Speaker name"
+          onChange={(e) => {
+            logEditDraftRef.current = {
+              ...logEditDraftRef.current,
+              speaker: e.target.value,
+            };
+          }}
+        />
+      ) : null;
+    const editTextarea = isEditingThis ? (
+      <textarea
+        key={`${sourceMessageId}:${sourceSegmentIndex}:content`}
+        ref={logEditTextareaRef}
+        className="mt-1 w-full rounded border border-[var(--border)] bg-[var(--background)]/55 px-2 py-1 text-xs text-[var(--foreground)] outline-none focus:border-[var(--primary)]/45 dark:border-white/10 dark:bg-black/40 dark:text-white/90 dark:focus:border-white/30"
+        style={narrationFontStyle}
+        defaultValue={editingLogSeg.content}
+        rows={3}
+        autoFocus
+        onChange={(e) => {
+          logEditDraftRef.current = {
+            ...logEditDraftRef.current,
+            content: e.target.value,
+          };
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") setEditingLogSeg(null);
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            e.preventDefault();
+            commitLogEdit({
+              sourceMessageId,
+              sourceSegmentIndex,
+              canEditMessage,
+              canEditSegment,
+              fallbackSpeaker: seg.speaker,
+            });
+          }
+        }}
+      />
+    ) : null;
     const partyBadge =
       seg.partyType && seg.partyType !== "main" ? (
         <span
@@ -3445,7 +3916,8 @@ export function GameNarration({
             seg.partyType === "side" && "bg-sky-500/15 text-sky-200/70",
             seg.partyType === "extra" && "bg-sky-500/15 text-sky-200/70",
             seg.partyType === "thought" && "bg-purple-500/15 text-purple-200/70",
-            seg.partyType === "whisper" && "bg-rose-500/15 text-rose-200/70",
+            seg.partyType === "whisper" &&
+              "bg-[var(--marinara-chat-chrome-highlight-bg)] text-[var(--marinara-chat-chrome-panel-text)]",
           )}
         >
           {PARTY_TYPE_ICONS[seg.partyType] ?? ""} {seg.partyType}
@@ -3520,11 +3992,14 @@ export function GameNarration({
 
     if (seg.type === "dialogue") {
       const logAvatar = seg.speaker ? findNamedMapValue(speakerAvatarInfos, seg.speaker) : null;
+      const canUploadLogPortrait = canUploadNpcPortrait(seg.speaker);
+      const canGenerateLogPortrait = canGenerateNpcPortrait(seg.speaker);
+      const logPortraitGenerating = isNpcPortraitGenerating(seg.speaker);
       return (
         <div
           key={seg.id}
           className={cn(
-            "flex gap-2 rounded-lg border px-2.5 py-2",
+            "group/logseg relative flex gap-2 rounded-lg border px-2.5 py-2 pr-20",
             seg.partyType === "thought"
               ? "border-purple-400/10 bg-purple-950/15"
               : seg.partyType === "whisper"
@@ -3534,12 +4009,64 @@ export function GameNarration({
                   : "border-[var(--border)] bg-[var(--muted)]/20 dark:border-white/5 dark:bg-black/20",
           )}
         >
-          {logAvatar ? (
+          {actionButtons}
+          {canUploadLogPortrait ? (
+            <div className="group/log-avatar relative shrink-0">
+              <button
+                type="button"
+                onClick={(event) => handleNpcPortraitAvatarClick(event, seg.speaker)}
+                className="rounded-lg transition-transform hover:scale-[1.02] focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/25 dark:focus:ring-white/20"
+                title="Upload or replace NPC portrait"
+              >
+                {logAvatar ? (
+                  <CroppedAvatar
+                    src={logAvatar.url}
+                    alt={seg.speaker || ""}
+                    crop={logAvatar.crop}
+                    className="h-7 w-7 rounded-lg border border-[var(--border)] transition-colors hover:border-[var(--primary)]/35 dark:border-white/10 dark:hover:border-white/25"
+                    onLoadError={
+                      canGenerateLogPortrait && seg.speaker
+                        ? () => onNpcPortraitLoadError?.(seg.speaker as string)
+                        : undefined
+                    }
+                  />
+                ) : (
+                  <div className="flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--accent)] text-[0.5rem] font-bold transition-colors hover:border-[var(--primary)]/35 dark:border-white/10 dark:hover:border-white/25">
+                    {(seg.speaker || "?")[0]}
+                  </div>
+                )}
+              </button>
+              {canGenerateLogPortrait && (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    triggerNpcPortraitGenerate(seg.speaker);
+                  }}
+                  disabled={logPortraitGenerating}
+                  className={cn(
+                    "absolute -right-1 -top-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-black/75 text-[var(--primary)] opacity-0 ring-1 ring-white/15 transition-opacity disabled:cursor-wait md:group-hover/log-avatar:opacity-100",
+                    (logPortraitGenerating || isMobilePortraitActionsVisible(seg.speaker)) && "max-md:opacity-100",
+                  )}
+                  title="Generate NPC portrait"
+                >
+                  {logPortraitGenerating ? (
+                    <Loader2 size="0.6rem" className="animate-spin" />
+                  ) : (
+                    <Wand2 size="0.6rem" />
+                  )}
+                </button>
+              )}
+            </div>
+          ) : logAvatar ? (
             <CroppedAvatar
               src={logAvatar.url}
               alt={seg.speaker || ""}
               crop={logAvatar.crop}
               className="h-7 w-7 shrink-0 rounded-lg border border-[var(--border)] dark:border-white/10"
+              onLoadError={
+                canGenerateLogPortrait && seg.speaker ? () => onNpcPortraitLoadError?.(seg.speaker as string) : undefined
+              }
             />
           ) : (
             <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--accent)] text-[0.5rem] font-bold dark:border-white/10">
@@ -3561,14 +4088,21 @@ export function GameNarration({
               {partyBadge}
               {voiceButton}
             </div>
-            <div
-              className={cn(
-                "mt-0.5 text-xs leading-relaxed text-[var(--foreground)]/80 dark:text-white/80",
-                seg.partyType === "thought" ? "italic opacity-80" : "font-semibold",
-              )}
-              style={seg.color ? { ...narrationFontStyle, color: seg.color } : narrationFontStyle}
-              dangerouslySetInnerHTML={{ __html: animateTextHtml(formatNarration(seg.content, false)) }}
-            />
+            {isEditingThis ? (
+              <>
+                {editSpeakerInput}
+                {editTextarea}
+              </>
+            ) : (
+              <div
+                className={cn(
+                  "mt-0.5 text-xs leading-relaxed text-[var(--foreground)]/80 dark:text-white/80",
+                  seg.partyType === "thought" ? "italic opacity-80" : "font-semibold",
+                )}
+                style={seg.color ? { ...narrationFontStyle, color: seg.color } : narrationFontStyle}
+                dangerouslySetInnerHTML={{ __html: animateTextHtml(formatNarration(seg.content, false)) }}
+              />
+            )}
           </div>
         </div>
       );
@@ -3576,30 +4110,46 @@ export function GameNarration({
 
     if (seg.type === "system") {
       return (
-        <div key={seg.id} className="rounded-lg border border-cyan-400/15 bg-cyan-950/15 px-2.5 py-2 text-cyan-50/80">
+        <div
+          key={seg.id}
+          className="group/logseg relative rounded-lg border border-cyan-400/15 bg-cyan-950/15 px-2.5 py-2 pr-20 text-cyan-50/80"
+        >
+          {actionButtons}
           <div className="mb-1 text-[0.6rem] font-semibold uppercase tracking-wide text-cyan-200/80">System</div>
-          <div
-            className="whitespace-pre-wrap break-words text-xs leading-relaxed"
-            style={narrationFontStyle}
-            dangerouslySetInnerHTML={{ __html: animateTextHtml(formatNarration(seg.content, false)) }}
-          />
+          {isEditingThis ? (
+            editTextarea
+          ) : (
+            <div
+              className="whitespace-pre-wrap break-words text-xs leading-relaxed"
+              style={narrationFontStyle}
+              dangerouslySetInnerHTML={{ __html: animateTextHtml(formatNarration(seg.content, false)) }}
+            />
+          )}
         </div>
       );
     }
 
     if (seg.type === "readable") {
       return (
-        <div key={seg.id} className="rounded-lg border border-amber-400/15 bg-amber-950/15 px-2.5 py-2">
+        <div
+          key={seg.id}
+          className="group/logseg relative rounded-lg border border-amber-400/15 bg-amber-950/15 px-2.5 py-2 pr-20"
+        >
+          {actionButtons}
           <div className="mb-1 text-[0.6rem] font-semibold uppercase tracking-wide text-amber-300/80">
             {seg.readableType === "book" ? "Book" : "Note"}
           </div>
-          <div
-            className="text-xs italic leading-relaxed text-amber-200/70"
-            style={narrationFontStyle}
-            dangerouslySetInnerHTML={{
-              __html: animateTextHtml(formatNarration(seg.readableContent ?? seg.content, false)),
-            }}
-          />
+          {isEditingThis ? (
+            editTextarea
+          ) : (
+            <div
+              className="text-xs italic leading-relaxed text-amber-200/70"
+              style={narrationFontStyle}
+              dangerouslySetInnerHTML={{
+                __html: animateTextHtml(formatNarration(seg.readableContent ?? seg.content, false)),
+              }}
+            />
+          )}
         </div>
       );
     }
@@ -3607,19 +4157,24 @@ export function GameNarration({
     return (
       <div
         key={seg.id}
-        className="rounded-lg border border-[var(--border)] bg-[var(--muted)]/20 px-2.5 py-2 dark:border-white/5 dark:bg-black/20"
+        className="group/logseg relative rounded-lg border border-[var(--border)] bg-[var(--muted)]/20 px-2.5 py-2 pr-20 dark:border-white/5 dark:bg-black/20"
       >
+        {actionButtons}
         <div className="mb-1 flex items-center">
           <span className="text-[0.6rem] font-semibold uppercase tracking-wide text-[var(--foreground)]/75 dark:text-white/80">
             Narration
           </span>
           {voiceButton}
         </div>
-        <div
-          className="text-xs leading-relaxed text-[var(--foreground)]/80 dark:text-white/80"
-          style={narrationStyle}
-          dangerouslySetInnerHTML={{ __html: animateTextHtml(formatNarration(seg.content, false)) }}
-        />
+        {isEditingThis ? (
+          editTextarea
+        ) : (
+          <div
+            className="text-xs leading-relaxed text-[var(--foreground)]/80 dark:text-white/80"
+            style={narrationStyle}
+            dangerouslySetInnerHTML={{ __html: animateTextHtml(formatNarration(seg.content, false)) }}
+          />
+        )}
       </div>
     );
   };
@@ -3633,14 +4188,16 @@ export function GameNarration({
         className="relative z-10 mx-auto flex h-full max-h-[calc(100svh-7rem)] min-h-0 w-full max-w-4xl flex-col justify-end md:max-h-[calc(100svh-8rem)]"
       >
         <div className="min-h-0 flex flex-1 flex-col justify-end overflow-hidden">
-          {useStackedLogDisplay && stackedLogEntries.length > 0 && (
+          {useStackedLogDisplay && (stackedLogEntries.length > 0 || stackedLogHeldHeight !== null) && (
             <div
-              className="mb-2 rounded-2xl border border-[var(--border)] bg-[var(--card)]/70 p-2 shadow-[0_16px_38px_rgba(0,0,0,0.35)] backdrop-blur-md dark:border-white/10 dark:bg-black/40"
+              ref={stackedLogShellRef}
+              className="mb-2 rounded-2xl border border-[var(--border)] bg-[var(--card)]/70 p-2 shadow-[0_16px_38px_rgba(0,0,0,0.35)] backdrop-blur-md [overflow-anchor:none] dark:border-white/10 dark:bg-black/40"
+              style={stackedLogHeldHeight !== null ? { minHeight: `${stackedLogHeldHeight}px` } : undefined}
               data-game-skip-bg-nav="true"
             >
               <div
                 ref={stackedLogRef}
-                className="flex max-h-[22svh] min-h-0 flex-col gap-1.5 overflow-y-auto pr-1 sm:max-h-[26svh] md:max-h-[32svh]"
+                className="flex max-h-[22svh] min-h-0 flex-col gap-1.5 overflow-y-auto pr-1 [overflow-anchor:none] sm:max-h-[26svh] md:max-h-[32svh]"
                 onScroll={(e) => {
                   const el = e.currentTarget;
                   setStackedLogPinned(el.scrollHeight - el.scrollTop - el.clientHeight < 32);
@@ -3648,7 +4205,7 @@ export function GameNarration({
               >
                 {stackedLogEntries.map((entry) => (
                   <div key={entry.messageId} className="space-y-1.5">
-                    {entry.segments.map((seg) => renderStackedLogSegment(seg))}
+                    {entry.segments.map((seg) => renderStackedLogSegment(seg, entry.messageId))}
                   </div>
                 ))}
               </div>
@@ -3920,7 +4477,8 @@ export function GameNarration({
                               className={cn(
                                 "rounded-full px-1.5 py-0.5 text-[0.5rem] font-semibold uppercase tracking-wide",
                                 active.partyType === "thought" && "bg-purple-500/15 text-purple-200/70",
-                                active.partyType === "whisper" && "bg-rose-500/15 text-rose-200/70",
+                                active.partyType === "whisper" &&
+                                  "bg-[var(--marinara-chat-chrome-highlight-bg)] text-[var(--marinara-chat-chrome-panel-text)]",
                               )}
                             >
                               {PARTY_TYPE_ICONS[active.partyType] ?? ""} {active.partyType}
@@ -3942,6 +4500,7 @@ export function GameNarration({
                               : active.partyType === "whisper"
                                 ? "border-rose-400/10 bg-rose-950/20"
                                 : "border-[var(--border)] bg-[var(--muted)]/20 dark:border-white/10 dark:bg-black/35",
+                            activeSegmentActionButtons && "pr-16",
                           )}
                         >
                           {editingContent !== null ? (
@@ -3980,49 +4539,7 @@ export function GameNarration({
                             />
                           )}
                         </div>
-                        {/* Edit button */}
-                        {activeCanEditSegment && (
-                          <button
-                            type="button"
-                            onClick={() => setEditingContent(active.content)}
-                            className="absolute right-1.5 top-1.5 hidden rounded p-1 text-[var(--muted-foreground)]/40 transition-colors hover:bg-[var(--muted)]/30 hover:text-[var(--muted-foreground)] md:block dark:text-white/20 dark:hover:bg-white/10 dark:hover:text-white/60"
-                            title="Edit"
-                          >
-                            <Pencil size={11} />
-                          </button>
-                        )}
-                        {editingContent !== null && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (editingContent.trim() && onEditSegment) {
-                                const ei = segmentEditInfoRef.current[activeIndex];
-                                if (ei)
-                                  onEditSegment(ei.messageId, ei.segmentIndex, { content: editingContent.trim() });
-                              }
-                              setEditingContent(null);
-                            }}
-                            className="absolute right-1.5 top-1.5 rounded bg-emerald-500/20 p-1 text-emerald-300 transition-colors hover:bg-emerald-500/30"
-                            title="Save"
-                          >
-                            <Check size={11} />
-                          </button>
-                        )}
-                        {editingContent === null && activeCopyKey && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              void handleCopyMessage(activeCopyKey, activeCopyText);
-                            }}
-                            className={cn(
-                              "absolute top-1.5 hidden rounded p-1 text-[var(--muted-foreground)]/40 transition-colors hover:bg-[var(--muted)]/30 hover:text-[var(--muted-foreground)] md:block dark:text-white/20 dark:hover:bg-white/10 dark:hover:text-white/60",
-                              activeCanEditSegment ? "right-7" : "right-1.5",
-                            )}
-                            title="Copy"
-                          >
-                            {copiedMessageKey === activeCopyKey ? <Check size={11} /> : <Copy size={11} />}
-                          </button>
-                        )}
+                        {activeSegmentActionButtons}
                       </div>
                     </div>
                   </div>
@@ -4056,11 +4573,7 @@ export function GameNarration({
                     <button onClick={onOpenInventory} className={cn("relative", NARRATION_META_BTN)}>
                       <Package size={12} />
                       <span className="hidden sm:inline">Inventory</span>
-                      {(inventoryCount ?? 0) > 0 && (
-                        <span className="absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-0.5 text-[0.55rem] font-bold text-black">
-                          {inventoryCount}
-                        </span>
-                      )}
+                      {(inventoryCount ?? 0) > 0 && <span className={NARRATION_COUNT_BADGE}>{inventoryCount}</span>}
                     </button>
                   )}
                   {combatMetaButton}
@@ -4083,7 +4596,10 @@ export function GameNarration({
                 ref={activeSegmentScrollRef}
                 onPointerDown={(event) => handleMobileSegmentPointerDown(event, active)}
                 onPointerUp={(event) => handleMobileSegmentTapToEdit(event, active)}
-                className="relative game-narration-prose max-h-40 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--muted)]/20 px-3 py-2.5 sm:max-h-48 dark:border-white/10 dark:bg-black/35"
+                className={cn(
+                  "relative game-narration-prose max-h-40 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--muted)]/20 px-3 py-2.5 sm:max-h-48 dark:border-white/10 dark:bg-black/35",
+                  activeSegmentActionButtons && "pr-16",
+                )}
               >
                 {editingContent !== null ? (
                   <textarea
@@ -4111,48 +4627,7 @@ export function GameNarration({
                     }}
                   />
                 )}
-                {/* Edit button */}
-                {activeCanEditSegment && (
-                  <button
-                    type="button"
-                    onClick={() => setEditingContent(active.content)}
-                    className="absolute right-1.5 top-1.5 hidden rounded p-1 text-[var(--muted-foreground)]/40 transition-colors hover:bg-[var(--muted)]/30 hover:text-[var(--muted-foreground)] md:block dark:text-white/20 dark:hover:bg-white/10 dark:hover:text-white/60"
-                    title="Edit"
-                  >
-                    <Pencil size={11} />
-                  </button>
-                )}
-                {editingContent !== null && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (editingContent.trim() && onEditSegment) {
-                        const ei = segmentEditInfoRef.current[activeIndex];
-                        if (ei) onEditSegment(ei.messageId, ei.segmentIndex, { content: editingContent.trim() });
-                      }
-                      setEditingContent(null);
-                    }}
-                    className="absolute right-1.5 top-1.5 rounded bg-emerald-500/20 p-1 text-emerald-300 transition-colors hover:bg-emerald-500/30"
-                    title="Save"
-                  >
-                    <Check size={11} />
-                  </button>
-                )}
-                {editingContent === null && activeCopyKey && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      void handleCopyMessage(activeCopyKey, activeCopyText);
-                    }}
-                    className={cn(
-                      "absolute top-1.5 hidden rounded p-1 text-[var(--muted-foreground)]/40 transition-colors hover:bg-[var(--muted)]/30 hover:text-[var(--muted-foreground)] md:block dark:text-white/20 dark:hover:bg-white/10 dark:hover:text-white/60",
-                      activeCanEditSegment ? "right-7" : "right-1.5",
-                    )}
-                    title="Copy"
-                  >
-                    {copiedMessageKey === activeCopyKey ? <Check size={11} /> : <Copy size={11} />}
-                  </button>
-                )}
+                {activeSegmentActionButtons}
               </div>
 
               {doneTyping &&
@@ -4174,11 +4649,7 @@ export function GameNarration({
                     <button onClick={onOpenInventory} className={cn("relative", NARRATION_META_BTN)}>
                       <Package size={12} />
                       <span className="hidden sm:inline">Inventory</span>
-                      {(inventoryCount ?? 0) > 0 && (
-                        <span className="absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-0.5 text-[0.55rem] font-bold text-black">
-                          {inventoryCount}
-                        </span>
-                      )}
+                      {(inventoryCount ?? 0) > 0 && <span className={NARRATION_COUNT_BADGE}>{inventoryCount}</span>}
                     </button>
                   )}
                   {combatMetaButton}
@@ -4199,7 +4670,10 @@ export function GameNarration({
 
               <div
                 ref={activeSegmentScrollRef}
-                className="relative game-narration-prose max-h-40 overflow-y-auto rounded-xl border border-amber-400/20 bg-amber-950/20 px-3 py-2.5 sm:max-h-48"
+                className={cn(
+                  "relative game-narration-prose max-h-40 overflow-y-auto rounded-xl border border-amber-400/20 bg-amber-950/20 px-3 py-2.5 sm:max-h-48",
+                  activeCopyKey && "pr-9",
+                )}
               >
                 <div
                   className={cn(
@@ -4221,8 +4695,9 @@ export function GameNarration({
                     onClick={() => {
                       void handleCopyMessage(activeCopyKey, activeCopyText);
                     }}
-                    className="absolute right-1.5 top-1.5 hidden rounded p-1 text-amber-200/45 transition-colors hover:bg-amber-100/10 hover:text-amber-100/70 md:block"
+                    className="absolute right-1.5 top-1.5 rounded p-1 text-amber-200/45 transition-colors hover:bg-amber-100/10 hover:text-amber-100/70"
                     title="Copy"
+                    aria-label="Copy"
                   >
                     {copiedMessageKey === activeCopyKey ? <Check size={11} /> : <Copy size={11} />}
                   </button>
@@ -4258,12 +4733,7 @@ export function GameNarration({
               from showing in the background while the confirmation modal is still open.
               While reviewing the past via wheel-nav, the input is hidden — the player is
               looking at history, not typing. */}
-          {!scenePreparing &&
-            !reviewingPast &&
-            (narrationComplete || interruptCommitted) &&
-            !isStreaming &&
-            !partyTurnPending &&
-            inputSlot && <div className="mt-2">{inputSlot}</div>}
+          {playerInputAvailable && <div className="mt-2">{inputSlot}</div>}
 
           {/* Also show input when no narration at all (start of scene) */}
           {!scenePreparing && !active && !isStreaming && !sceneAnalysisFailed && inputSlot && (
@@ -4401,11 +4871,13 @@ export function GameNarration({
                       const sourceMessageId = seg.sourceMessageId ?? entry.messageId;
                       const hasSourceSegmentIndex = seg.sourceSegmentIndex != null;
                       const sourceSegmentIndex = seg.sourceSegmentIndex ?? 0;
-                      const sourceRole =
-                        seg.sourceRole ??
-                        (sourceMessageId ? (sourceMessagesById.get(sourceMessageId)?.role ?? null) : null);
+                      const sourceMessageRole = sourceMessageId
+                        ? (sourceMessagesById.get(sourceMessageId)?.role ?? null)
+                        : null;
+                      const sourceRole = seg.sourceRole ?? sourceMessageRole;
+                      const isUserAuthoredSource = sourceRole === "user" || sourceMessageRole === "user";
                       const isActiveSeg = active?.id === seg.id;
-                      const liveSegmentIndex = segments.findIndex((s) => s.id === seg.id);
+                      const liveSegmentIndex = segmentIndexById.get(seg.id) ?? -1;
                       const canJumpToSeg =
                         !!latestAssistant &&
                         sourceMessageId === latestAssistant.id &&
@@ -4441,7 +4913,7 @@ export function GameNarration({
                       const jumpRowClasses = canJumpToSeg
                         ? "cursor-pointer hover:ring-1 hover:ring-white/15 focus:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
                         : "";
-                      const canEditMessage = !!onEditMessage && !!sourceMessageId && sourceRole === "user";
+                      const canEditMessage = !!onEditMessage && !!sourceMessageId && isUserAuthoredSource;
                       const canEditSegment =
                         !!onEditSegment &&
                         !!sourceMessageId &&
@@ -4451,7 +4923,8 @@ export function GameNarration({
                         sourceMessageId !== "party-chat";
                       const canEdit = canEditMessage || canEditSegment;
                       const canDeleteMessage =
-                        !!onDeleteMessage && !!sourceMessageId && (sourceRole === "user" || sourceRole === "system");
+                        !!onDeleteMessage && !!sourceMessageId && (isUserAuthoredSource || sourceRole === "system");
+                      const canBranchMessage = !!onBranchMessage && !!sourceMessageId && isUserAuthoredSource;
                       const canDeleteThisSegment =
                         !!onDeleteSegment &&
                         !!sourceMessageId &&
@@ -4486,6 +4959,23 @@ export function GameNarration({
                           {copiedMessageKey === copyKey ? <Check size={11} /> : <Copy size={11} />}
                         </button>
                       ) : null;
+                      const branchButton = canBranchMessage ? (
+                        <button
+                          type="button"
+                          onPointerDown={stopLogActionPointerDown}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            onBranchMessage?.(sourceMessageId);
+                            setLogsOpen(false);
+                          }}
+                          className="rounded p-1 text-white/45 opacity-100 transition-all hover:bg-white/10 hover:text-white/60 md:text-white/20 md:opacity-0 md:group-hover/logseg:opacity-100"
+                          title="Branch from here"
+                          aria-label="Branch from here"
+                        >
+                          <GitBranch size={11} />
+                        </button>
+                      ) : null;
                       const deleteButton = showDeleteButton ? (
                         <button
                           type="button"
@@ -4516,7 +5006,8 @@ export function GameNarration({
                               seg.partyType === "side" && "bg-sky-500/15 text-sky-200/70",
                               seg.partyType === "extra" && "bg-sky-500/15 text-sky-200/70",
                               seg.partyType === "thought" && "bg-purple-500/15 text-purple-200/70",
-                              seg.partyType === "whisper" && "bg-rose-500/15 text-rose-200/70",
+                              seg.partyType === "whisper" &&
+                                "bg-[var(--marinara-chat-chrome-highlight-bg)] text-[var(--marinara-chat-chrome-panel-text)]",
                             )}
                           >
                             {PARTY_TYPE_ICONS[seg.partyType] ?? ""} {seg.partyType}
@@ -4651,12 +5142,13 @@ export function GameNarration({
                       );
 
                       const actionButtons =
-                        deleteButton || copyButton || editButtons ? (
+                        deleteButton || branchButton || copyButton || editButtons ? (
                           <div
                             onPointerDown={stopLogActionPointerDown}
                             onClick={(event) => event.stopPropagation()}
                             className="absolute right-1.5 top-1.5 z-10 flex items-center gap-0.5"
                           >
+                            {branchButton}
                             {deleteButton}
                             {copyButton}
                             {editButtons}
@@ -4984,7 +5476,12 @@ function PartyOverlayBox({
     side: { border: "border-white/15", bg: "bg-black/75", icon: "💬", labelColor: "text-white/85" },
     extra: { border: "border-white/15", bg: "bg-black/75", icon: "💬", labelColor: "text-white/85" },
     thought: { border: "border-purple-400/20", bg: "bg-purple-950/70", icon: "💭", labelColor: "text-purple-200/80" },
-    whisper: { border: "border-rose-400/20", bg: "bg-rose-950/70", icon: "🤫", labelColor: "text-rose-200/80" },
+    whisper: {
+      border: "border-[var(--marinara-chat-chrome-button-border)]",
+      bg: "bg-[var(--marinara-chat-chrome-panel-bg)]",
+      icon: "🤫",
+      labelColor: "text-[var(--marinara-chat-chrome-panel-text)]",
+    },
   };
   const style = styleByType[line.type] ?? styleByType.side!;
 
@@ -5075,9 +5572,9 @@ const EXPRESSION_REACTIONS: Record<string, { symbol: string; color: string; effe
   mischievous: { symbol: "😈", color: "text-purple-300", effect: "pop" },
 
   // Affection
-  flirty: { symbol: "💗", color: "text-pink-400", effect: "heart" },
-  tender: { symbol: "💕", color: "text-pink-300", effect: "heart" },
-  loving: { symbol: "💕", color: "text-pink-300", effect: "heart" },
+  flirty: { symbol: "💗", color: "text-[var(--marinara-chat-chrome-panel-text)]", effect: "heart" },
+  tender: { symbol: "💕", color: "text-[var(--marinara-chat-chrome-panel-text)]", effect: "heart" },
+  loving: { symbol: "💕", color: "text-[var(--marinara-chat-chrome-panel-text)]", effect: "heart" },
 
   // Sadness
   sad: { symbol: "💧", color: "text-blue-300", effect: "tear" },
@@ -5271,7 +5768,10 @@ function buildTruncationLines(rawContent: string): TruncationLine[] {
   });
 }
 
-function parseNarrationSegments(message: NarrationMessage, speakerColors: Map<string, string>): NarrationSegment[] {
+export function parseNarrationSegments(
+  message: NarrationMessage,
+  speakerColors: Map<string, string>,
+): NarrationSegment[] {
   // Use stripGmTagsKeepReadables so [Note:] and [Book:] stay inline for position-aware display.
   // Extract them first as placeholders so multi-line readables don't break line-based parsing.
   const withReadables = stripGmTagsKeepReadables(message.content || "");
@@ -5680,7 +6180,7 @@ export function formatNarration(content: string, boldDialogue = true): string {
       const modifier = attrs.modifier ? `${attrs.stat || "modifier"} ${formatSignedNumber(attrs.modifier)}` : "";
       const turns = attrs.turns || attrs.duration ? `${attrs.turns || attrs.duration} turns` : "";
       return commandBadge(
-        "bg-rose-500/15 text-rose-200 ring-1 ring-rose-400/20",
+        "bg-[var(--destructive)]/15 text-[var(--destructive)] ring-1 ring-[var(--destructive)]/20",
         "✦ Status",
         [attrs.effect || attrs.name || "Effect", attrs.target ? `on ${attrs.target}` : "", turns, modifier]
           .filter(Boolean)
@@ -5720,7 +6220,7 @@ export function formatNarration(content: string, boldDialogue = true): string {
     .replace(/\[reputation:\s*([^\]]+)\]/gi, (_match, rawAttrs: string) => {
       const attrs = parseCommandAttributes(rawAttrs);
       return commandBadge(
-        "bg-fuchsia-500/15 text-fuchsia-200 ring-1 ring-fuchsia-400/20",
+        "bg-[var(--marinara-chat-chrome-highlight-bg)] text-[var(--marinara-chat-chrome-panel-text)] ring-1 ring-[var(--marinara-chat-chrome-button-border)]",
         "◆ Reputation",
         [attrs.npc, attrs.action].filter(Boolean).join(": "),
       );

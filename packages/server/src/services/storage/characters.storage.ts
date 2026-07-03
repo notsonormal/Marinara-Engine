@@ -1,12 +1,20 @@
 // ──────────────────────────────────────────────
 // Storage: Characters, Personas & Groups
 // ──────────────────────────────────────────────
-import { and, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, like, ne, or } from "drizzle-orm";
 import type { DB } from "../../db/connection.js";
-import { characters, characterCardVersions, personas, characterGroups, personaGroups } from "../../db/schema/index.js";
+import {
+  characters,
+  characterCardVersions,
+  personas,
+  personaCardVersions,
+  characterGroups,
+  personaGroups,
+} from "../../db/schema/index.js";
 import { newId, now } from "../../utils/id-generator.js";
-import type { CharacterData } from "@marinara-engine/shared";
+import { PROFESSOR_MARI_ID, type CharacterData, type PersonaCardSnapshot } from "@marinara-engine/shared";
 import { normalizeTimestampOverrides, type TimestampOverrides } from "../import/import-timestamps.js";
+import { toPaginatedList } from "../../utils/list-pagination.js";
 
 function resolveTimestamps(overrides?: TimestampOverrides | null) {
   const normalized = normalizeTimestampOverrides(overrides);
@@ -21,7 +29,15 @@ function parseCharacterData(data: string): CharacterData {
   return JSON.parse(data) as CharacterData;
 }
 
+function parsePersonaSnapshot(data: string): PersonaCardSnapshot {
+  return JSON.parse(data) as PersonaCardSnapshot;
+}
+
 function characterDataChanged(current: CharacterData, next: CharacterData) {
+  return JSON.stringify(current) !== JSON.stringify(next);
+}
+
+function personaSnapshotChanged(current: PersonaCardSnapshot, next: PersonaCardSnapshot) {
   return JSON.stringify(current) !== JSON.stringify(next);
 }
 
@@ -51,12 +67,168 @@ function mergeCharacterData(
   };
 }
 
+type PersonaRow = typeof personas.$inferSelect;
+type CharacterListPageOptions = {
+  includeBuiltIn?: boolean;
+  limit: number;
+  offset: number;
+  search?: string;
+  sort?: string;
+};
+type PersonaListPageOptions = {
+  limit: number;
+  offset: number;
+  search?: string;
+  sort?: string;
+};
+
+function likePattern(value: string | undefined) {
+  const trimmed = value?.trim();
+  return trimmed ? `%${trimmed}%` : "";
+}
+
+function characterOrder(sort: string | undefined) {
+  switch (sort) {
+    case "oldest":
+      return [asc(characters.createdAt), asc(characters.id)];
+    case "newest":
+      return [desc(characters.createdAt), asc(characters.id)];
+    default:
+      return [desc(characters.updatedAt), asc(characters.id)];
+  }
+}
+
+function personaOrder(sort: string | undefined) {
+  switch (sort) {
+    case "name-desc":
+      return [desc(personas.name), asc(personas.id)];
+    case "newest":
+      return [desc(personas.createdAt), asc(personas.id)];
+    case "oldest":
+      return [asc(personas.createdAt), asc(personas.id)];
+    case "name-asc":
+    default:
+      return [asc(personas.name), asc(personas.id)];
+  }
+}
+
+function getCharacterSummaryFromRow(row: typeof characters.$inferSelect) {
+  try {
+    const parsed = parseCharacterData(row.data);
+    const extensions =
+      parsed.extensions && typeof parsed.extensions === "object"
+        ? (parsed.extensions as Record<string, unknown>)
+        : {};
+    return {
+      id: row.id,
+      name: typeof parsed.name === "string" && parsed.name.trim() ? parsed.name.trim() : "Unknown",
+      avatarUrl: row.avatarPath ?? null,
+      avatarCrop: extensions.avatarCrop ?? null,
+      conversationStatus:
+        typeof extensions.conversationStatus === "string" ? extensions.conversationStatus : undefined,
+    };
+  } catch {
+    return {
+      id: row.id,
+      name: "Unknown",
+      avatarUrl: row.avatarPath ?? null,
+      avatarCrop: null,
+      conversationStatus: undefined,
+    };
+  }
+}
+
+function buildPersonaSnapshot(persona: PersonaRow): PersonaCardSnapshot {
+  return {
+    name: persona.name ?? "",
+    creator: persona.creator ?? "",
+    personaVersion: persona.personaVersion?.trim() ? persona.personaVersion : "1.0",
+    creatorNotes: persona.creatorNotes ?? "",
+    description: persona.description ?? "",
+    personality: persona.personality ?? "",
+    scenario: persona.scenario ?? "",
+    backstory: persona.backstory ?? "",
+    appearance: persona.appearance ?? "",
+    avatarCrop: persona.avatarCrop ?? "",
+    nameColor: persona.nameColor ?? "",
+    dialogueColor: persona.dialogueColor ?? "",
+    boxColor: persona.boxColor ?? "",
+    trackerCardColors: persona.trackerCardColors ?? '{"mode":"chat"}',
+    personaStats: persona.personaStats ?? "",
+    tags: persona.tags ?? "[]",
+    savedStatusOptions: persona.savedStatusOptions ?? "[]",
+  };
+}
+
+function mergePersonaSnapshot(
+  current: PersonaCardSnapshot,
+  updates: Partial<PersonaCardSnapshot>,
+): PersonaCardSnapshot {
+  return {
+    ...current,
+    ...updates,
+    personaVersion: updates.personaVersion !== undefined ? updates.personaVersion : current.personaVersion,
+  };
+}
+
+function normalizePersonaSnapshot(data: PersonaCardSnapshot): PersonaCardSnapshot {
+  return {
+    name: data.name ?? "",
+    creator: data.creator ?? "",
+    personaVersion: data.personaVersion?.trim() ? data.personaVersion : "1.0",
+    creatorNotes: data.creatorNotes ?? "",
+    description: data.description ?? "",
+    personality: data.personality ?? "",
+    scenario: data.scenario ?? "",
+    backstory: data.backstory ?? "",
+    appearance: data.appearance ?? "",
+    avatarCrop: data.avatarCrop ?? "",
+    nameColor: data.nameColor ?? "",
+    dialogueColor: data.dialogueColor ?? "",
+    boxColor: data.boxColor ?? "",
+    trackerCardColors: data.trackerCardColors ?? '{"mode":"chat"}',
+    personaStats: data.personaStats ?? "",
+    tags: data.tags ?? "[]",
+    savedStatusOptions: data.savedStatusOptions ?? "[]",
+  };
+}
+
 export function createCharactersStorage(db: DB) {
   return {
     // ── Characters ──
 
     async list() {
       return db.select().from(characters).orderBy(desc(characters.updatedAt));
+    },
+
+    async listPage(options: CharacterListPageOptions) {
+      const clauses = [];
+      if (!options.includeBuiltIn) clauses.push(ne(characters.id, PROFESSOR_MARI_ID));
+      const pattern = likePattern(options.search);
+      if (pattern) clauses.push(or(like(characters.data, pattern), like(characters.comment, pattern)));
+      const whereClause = clauses.length > 0 ? and(...clauses) : undefined;
+      const rows = await (whereClause
+        ? db
+            .select()
+            .from(characters)
+            .where(whereClause)
+            .orderBy(...characterOrder(options.sort))
+            .limit(options.limit + 1)
+            .offset(options.offset)
+        : db
+            .select()
+            .from(characters)
+            .orderBy(...characterOrder(options.sort))
+            .limit(options.limit + 1)
+            .offset(options.offset));
+      return toPaginatedList(rows, options.limit, options.offset);
+    },
+
+    async listSummariesByIds(ids: string[]) {
+      const uniqueIds = Array.from(new Set(ids.filter((id) => id.trim().length > 0)));
+      if (uniqueIds.length === 0) return [];
+      const rows = await db.select().from(characters).where(inArray(characters.id, uniqueIds));
+      return rows.map(getCharacterSummaryFromRow);
     },
 
     async getById(id: string) {
@@ -222,7 +394,26 @@ export function createCharactersStorage(db: DB) {
     },
 
     async remove(id: string) {
-      await db.delete(characters).where(eq(characters.id, id));
+      await db.transaction(async (tx) => {
+        await tx.delete(characters).where(eq(characters.id, id));
+        const groups = await tx.select().from(characterGroups);
+        for (const group of groups) {
+          let memberIds: string[];
+          try {
+            memberIds = typeof group.characterIds === "string" ? (JSON.parse(group.characterIds) as string[]) : [];
+          } catch {
+            continue;
+          }
+          if (!Array.isArray(memberIds) || !memberIds.includes(id)) continue;
+          await tx
+            .update(characterGroups)
+            .set({
+              characterIds: JSON.stringify(memberIds.filter((characterId) => characterId !== id)),
+              updatedAt: now(),
+            })
+            .where(eq(characterGroups.id, group.id));
+        }
+      });
     },
 
     async duplicateCharacter(id: string) {
@@ -250,9 +441,90 @@ export function createCharactersStorage(db: DB) {
       return db.select().from(personas).orderBy(desc(personas.updatedAt));
     },
 
+    async listPersonasPage(options: PersonaListPageOptions) {
+      const pattern = likePattern(options.search);
+      const whereClause = pattern
+        ? or(
+            like(personas.name, pattern),
+            like(personas.comment, pattern),
+            like(personas.creator, pattern),
+            like(personas.description, pattern),
+            like(personas.personality, pattern),
+            like(personas.scenario, pattern),
+            like(personas.backstory, pattern),
+            like(personas.appearance, pattern),
+            like(personas.tags, pattern),
+          )
+        : undefined;
+      const rows = await (whereClause
+        ? db
+            .select()
+            .from(personas)
+            .where(whereClause)
+            .orderBy(...personaOrder(options.sort))
+            .limit(options.limit + 1)
+            .offset(options.offset)
+        : db
+            .select()
+            .from(personas)
+            .orderBy(...personaOrder(options.sort))
+            .limit(options.limit + 1)
+            .offset(options.offset));
+      return toPaginatedList(rows, options.limit, options.offset);
+    },
+
     async getPersona(id: string) {
       const rows = await db.select().from(personas).where(eq(personas.id, id));
       return rows[0] ?? null;
+    },
+
+    async listPersonaVersions(personaId: string) {
+      const rows = await db
+        .select()
+        .from(personaCardVersions)
+        .where(eq(personaCardVersions.personaId, personaId))
+        .orderBy(desc(personaCardVersions.createdAt));
+
+      return rows.map((row) => ({
+        ...row,
+        data: parsePersonaSnapshot(row.data),
+      }));
+    },
+
+    async getPersonaVersionById(personaId: string, versionId: string) {
+      const rows = await db
+        .select()
+        .from(personaCardVersions)
+        .where(and(eq(personaCardVersions.personaId, personaId), eq(personaCardVersions.id, versionId)));
+      const row = rows[0];
+      if (!row) return null;
+      return {
+        ...row,
+        data: parsePersonaSnapshot(row.data),
+      };
+    },
+
+    async createPersonaVersionSnapshot(
+      personaId: string,
+      options?: { source?: string; reason?: string; createdAt?: string | null },
+    ) {
+      const existing = await this.getPersona(personaId);
+      if (!existing) return null;
+      const currentData = buildPersonaSnapshot(existing);
+      const timestamp = options?.createdAt ?? now();
+      const id = newId();
+      await db.insert(personaCardVersions).values({
+        id,
+        personaId,
+        data: JSON.stringify(currentData),
+        comment: existing.comment ?? "",
+        avatarPath: existing.avatarPath ?? null,
+        version: currentData.personaVersion ?? "",
+        source: options?.source ?? "manual",
+        reason: options?.reason ?? "",
+        createdAt: timestamp,
+      });
+      return this.getPersonaVersionById(personaId, id);
     },
 
     async createPersona(
@@ -261,6 +533,9 @@ export function createCharactersStorage(db: DB) {
       avatarPath?: string,
       extra?: {
         comment?: string;
+        creator?: string;
+        personaVersion?: string;
+        creatorNotes?: string;
         personality?: string;
         scenario?: string;
         backstory?: string;
@@ -270,7 +545,6 @@ export function createCharactersStorage(db: DB) {
         boxColor?: string;
         trackerCardColors?: string;
         personaStats?: string;
-        altDescriptions?: string;
         tags?: string;
         savedStatusOptions?: string;
         avatarCrop?: string;
@@ -283,6 +557,9 @@ export function createCharactersStorage(db: DB) {
         id,
         name,
         comment: extra?.comment ?? "",
+        creator: extra?.creator ?? "",
+        personaVersion: extra?.personaVersion?.trim() ? extra.personaVersion : "1.0",
+        creatorNotes: extra?.creatorNotes ?? "",
         description,
         personality: extra?.personality ?? "",
         scenario: extra?.scenario ?? "",
@@ -296,7 +573,6 @@ export function createCharactersStorage(db: DB) {
         boxColor: extra?.boxColor ?? "",
         trackerCardColors: extra?.trackerCardColors ?? '{"mode":"chat"}',
         personaStats: extra?.personaStats ?? "",
-        altDescriptions: extra?.altDescriptions ?? "[]",
         tags: extra?.tags ?? "[]",
         savedStatusOptions: extra?.savedStatusOptions ?? "[]",
         createdAt: timestamp.createdAt,
@@ -306,14 +582,33 @@ export function createCharactersStorage(db: DB) {
     },
 
     async setActivePersona(id: string) {
-      // Deactivate all
-      await db.update(personas).set({ isActive: "false" });
-      // Activate the one
-      await db.update(personas).set({ isActive: "true", updatedAt: now() }).where(eq(personas.id, id));
+      return db.transaction(async (tx) => {
+        const existing = await tx.select({ id: personas.id }).from(personas).where(eq(personas.id, id));
+        if (!existing[0]) return false;
+        await tx.update(personas).set({ isActive: "false" });
+        await tx.update(personas).set({ isActive: "true", updatedAt: now() }).where(eq(personas.id, id));
+        return true;
+      });
     },
 
     async removePersona(id: string) {
-      await db.delete(personas).where(eq(personas.id, id));
+      await db.transaction(async (tx) => {
+        await tx.delete(personas).where(eq(personas.id, id));
+        const groups = await tx.select().from(personaGroups);
+        for (const group of groups) {
+          let memberIds: string[];
+          try {
+            memberIds = JSON.parse(group.personaIds) as string[];
+          } catch {
+            continue;
+          }
+          if (!Array.isArray(memberIds) || !memberIds.includes(id)) continue;
+          await tx
+            .update(personaGroups)
+            .set({ personaIds: JSON.stringify(memberIds.filter((personaId) => personaId !== id)), updatedAt: now() })
+            .where(eq(personaGroups.id, group.id));
+        }
+      });
     },
 
     async duplicatePersona(id: string) {
@@ -325,6 +620,9 @@ export function createCharactersStorage(db: DB) {
         id: newPId,
         name: `${source.name || "Persona"} (Copy)`,
         comment: source.comment ?? "",
+        creator: source.creator ?? "",
+        personaVersion: source.personaVersion?.trim() ? source.personaVersion : "1.0",
+        creatorNotes: source.creatorNotes ?? "",
         description: source.description ?? "",
         personality: source.personality ?? "",
         scenario: source.scenario ?? "",
@@ -338,7 +636,6 @@ export function createCharactersStorage(db: DB) {
         boxColor: source.boxColor ?? "",
         trackerCardColors: source.trackerCardColors ?? '{"mode":"chat"}',
         personaStats: source.personaStats ?? "",
-        altDescriptions: source.altDescriptions ?? "[]",
         tags: source.tags ?? "[]",
         savedStatusOptions: source.savedStatusOptions ?? "[]",
         createdAt: timestamp,
@@ -352,26 +649,71 @@ export function createCharactersStorage(db: DB) {
       updates: {
         name?: string;
         comment?: string;
+        creator?: string;
+        personaVersion?: string;
+        creatorNotes?: string;
         description?: string;
         personality?: string;
         scenario?: string;
         backstory?: string;
         appearance?: string;
-        avatarPath?: string;
+        avatarPath?: string | null;
         avatarCrop?: string;
         nameColor?: string;
         dialogueColor?: string;
         boxColor?: string;
         trackerCardColors?: string;
         personaStats?: string;
-        altDescriptions?: string;
         tags?: string;
         savedStatusOptions?: string;
       },
+      options?: {
+        versionSource?: string | null;
+        versionReason?: string | null;
+        skipVersionSnapshot?: boolean;
+      },
     ) {
+      const existing = await this.getPersona(id);
+      if (!existing) return null;
+      const currentData = buildPersonaSnapshot(existing);
+      const nextData = mergePersonaSnapshot(currentData, {
+        ...(updates.name !== undefined && { name: updates.name }),
+        ...(updates.creator !== undefined && { creator: updates.creator }),
+        ...(updates.personaVersion !== undefined && { personaVersion: updates.personaVersion }),
+        ...(updates.creatorNotes !== undefined && { creatorNotes: updates.creatorNotes }),
+        ...(updates.description !== undefined && { description: updates.description }),
+        ...(updates.personality !== undefined && { personality: updates.personality }),
+        ...(updates.scenario !== undefined && { scenario: updates.scenario }),
+        ...(updates.backstory !== undefined && { backstory: updates.backstory }),
+        ...(updates.appearance !== undefined && { appearance: updates.appearance }),
+        ...(updates.avatarCrop !== undefined && { avatarCrop: updates.avatarCrop }),
+        ...(updates.nameColor !== undefined && { nameColor: updates.nameColor }),
+        ...(updates.dialogueColor !== undefined && { dialogueColor: updates.dialogueColor }),
+        ...(updates.boxColor !== undefined && { boxColor: updates.boxColor }),
+        ...(updates.trackerCardColors !== undefined && { trackerCardColors: updates.trackerCardColors }),
+        ...(updates.personaStats !== undefined && { personaStats: updates.personaStats }),
+        ...(updates.tags !== undefined && { tags: updates.tags }),
+        ...(updates.savedStatusOptions !== undefined && { savedStatusOptions: updates.savedStatusOptions }),
+      });
+      const nextComment = updates.comment !== undefined ? updates.comment : (existing.comment ?? "");
+      const nextAvatarPath = updates.avatarPath !== undefined ? updates.avatarPath : existing.avatarPath;
+      const shouldSnapshot =
+        !options?.skipVersionSnapshot &&
+        (personaSnapshotChanged(currentData, nextData) ||
+          nextComment !== (existing.comment ?? "") ||
+          nextAvatarPath !== existing.avatarPath);
+      if (shouldSnapshot) {
+        await this.createPersonaVersionSnapshot(id, {
+          source: options?.versionSource ?? "manual",
+          reason: options?.versionReason ?? "",
+        });
+      }
       const sets: Record<string, unknown> = { updatedAt: now() };
       if (updates.name !== undefined) sets.name = updates.name;
       if (updates.comment !== undefined) sets.comment = updates.comment;
+      if (updates.creator !== undefined) sets.creator = updates.creator;
+      if (updates.personaVersion !== undefined) sets.personaVersion = updates.personaVersion;
+      if (updates.creatorNotes !== undefined) sets.creatorNotes = updates.creatorNotes;
       if (updates.description !== undefined) sets.description = updates.description;
       if (updates.personality !== undefined) sets.personality = updates.personality;
       if (updates.scenario !== undefined) sets.scenario = updates.scenario;
@@ -384,11 +726,53 @@ export function createCharactersStorage(db: DB) {
       if (updates.boxColor !== undefined) sets.boxColor = updates.boxColor;
       if (updates.trackerCardColors !== undefined) sets.trackerCardColors = updates.trackerCardColors;
       if (updates.personaStats !== undefined) sets.personaStats = updates.personaStats;
-      if (updates.altDescriptions !== undefined) sets.altDescriptions = updates.altDescriptions;
       if (updates.tags !== undefined) sets.tags = updates.tags;
       if (updates.savedStatusOptions !== undefined) sets.savedStatusOptions = updates.savedStatusOptions;
       await db.update(personas).set(sets).where(eq(personas.id, id));
       return this.getPersona(id);
+    },
+
+    async restorePersonaVersion(personaId: string, versionId: string) {
+      const version = await this.getPersonaVersionById(personaId, versionId);
+      if (!version) return null;
+      const existing = await this.getPersona(personaId);
+      if (!existing) return null;
+      const data = normalizePersonaSnapshot(version.data);
+      await db
+        .update(personas)
+        .set({
+          name: data.name,
+          comment: version.comment ?? "",
+          creator: data.creator,
+          personaVersion: data.personaVersion,
+          creatorNotes: data.creatorNotes,
+          description: data.description,
+          personality: data.personality,
+          scenario: data.scenario,
+          backstory: data.backstory,
+          appearance: data.appearance,
+          avatarPath: version.avatarPath ?? null,
+          avatarCrop: data.avatarCrop,
+          nameColor: data.nameColor,
+          dialogueColor: data.dialogueColor,
+          boxColor: data.boxColor,
+          trackerCardColors: data.trackerCardColors,
+          personaStats: data.personaStats,
+          tags: data.tags,
+          savedStatusOptions: data.savedStatusOptions,
+          updatedAt: now(),
+        })
+        .where(eq(personas.id, personaId));
+      return this.getPersona(personaId);
+    },
+
+    async deletePersonaVersion(personaId: string, versionId: string) {
+      const version = await this.getPersonaVersionById(personaId, versionId);
+      if (!version) return false;
+      await db
+        .delete(personaCardVersions)
+        .where(and(eq(personaCardVersions.personaId, personaId), eq(personaCardVersions.id, versionId)));
+      return true;
     },
 
     // ── Character Groups ──
@@ -418,7 +802,7 @@ export function createCharactersStorage(db: DB) {
 
     async updateGroup(
       id: string,
-      updates: { name?: string; description?: string; characterIds?: string[]; avatarPath?: string },
+      updates: { name?: string; description?: string; characterIds?: string[]; avatarPath?: string | null },
     ) {
       const existing = await this.getGroupById(id);
       if (!existing) return null;

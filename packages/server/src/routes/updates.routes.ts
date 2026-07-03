@@ -25,9 +25,32 @@ const GITHUB_API_BASE = `https://api.github.com/repos/${GITHUB_REPO}`;
 const GITHUB_TAGS_API = `${GITHUB_API_BASE}/git/matching-refs/tags/v`;
 const GITHUB_RELEASE_BY_TAG_API = (tag: string) => `${GITHUB_API_BASE}/releases/tags/${tag}`;
 const UPDATE_REMOTE = "origin";
-const UPDATE_BRANCH = "main";
-const UPDATE_REF = `${UPDATE_REMOTE}/${UPDATE_BRANCH}`;
-const UPDATE_FETCH_REF = `+refs/heads/${UPDATE_BRANCH}:refs/remotes/${UPDATE_REMOTE}/${UPDATE_BRANCH}`;
+type UpdateChannel = "stable" | "staging";
+type UpdateChannelInfo = {
+  id: UpdateChannel;
+  label: string;
+  branch: "main" | "staging";
+  targetRef: string;
+  fetchRef: string;
+  warning?: string;
+};
+const UPDATE_CHANNELS: Record<UpdateChannel, UpdateChannelInfo> = {
+  stable: {
+    id: "stable",
+    label: "Latest Stable",
+    branch: "main",
+    targetRef: `${UPDATE_REMOTE}/main`,
+    fetchRef: `+refs/heads/main:refs/remotes/${UPDATE_REMOTE}/main`,
+  },
+  staging: {
+    id: "staging",
+    label: "Staging/UAT",
+    branch: "staging",
+    targetRef: `${UPDATE_REMOTE}/staging`,
+    fetchRef: `+refs/heads/staging:refs/remotes/${UPDATE_REMOTE}/staging`,
+    warning: "Staging builds are pre-release tester builds. Back up your app data before applying them.",
+  },
+};
 const DEFAULT_PNPM_VERSION = "10.33.2";
 const DOCKER_IMAGE = "ghcr.io/pasta-devs/marinara-engine";
 const MANUAL_GIT_UPDATE_COMMAND =
@@ -35,7 +58,7 @@ const MANUAL_GIT_UPDATE_COMMAND =
 const DOCKER_UPDATE_COMMAND = "docker compose pull && docker compose up -d";
 const ANDROID_APK_NOTICE =
   "> [!IMPORTANT]\n" +
-  "> **Android APK notice:** The APK is not a standalone Marinara Engine app yet. It is a WebView shell for the local Marinara server, so Termux must be installed and `./start-termux.sh` must be running on the same Android device before you open the APK.";
+  "> **Android APK notice:** The APK is a Termux bootstrap + WebView shell, not a native Android server build. It opens an already-running local Marinara server, and on first launch it can download Termux from F-Droid, hand it to Android's installer, and start Marinara through Termux after Android permission prompts.";
 
 // ── Cached release info (15-min TTL) ──
 let cachedRelease: {
@@ -48,8 +71,7 @@ let cacheTimestamp = 0;
 const CACHE_TTL_MS = 15 * 60_000;
 
 // ── Cached commit-level check (5-min TTL) ──
-let cachedCommitsBehind: number | null = null;
-let commitCheckTimestamp = 0;
+const cachedCommitsBehindByChannel = new Map<UpdateChannel, { commitsBehind: number | null; timestamp: number }>();
 const COMMIT_CHECK_TTL_MS = 5 * 60_000;
 
 type InstallType = "git" | "docker" | "standalone";
@@ -106,25 +128,71 @@ function getGitLauncherCommand(platform: ServerPlatform) {
   }
 }
 
-function getManualUpdateCommand(installType: InstallType, platform: ServerPlatform) {
+async function gitCommandSucceeds(root: string, args: string[]): Promise<boolean> {
+  try {
+    await execFileAsync("git", args, { cwd: root, timeout: 5_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function isDetachedStagingCheckout(root: string): Promise<boolean> {
+  const isOnStagingHistory = await gitCommandSucceeds(root, [
+    "merge-base",
+    "--is-ancestor",
+    "HEAD",
+    UPDATE_CHANNELS.staging.targetRef,
+  ]);
+  if (!isOnStagingHistory) return false;
+  const isOnStableHistory = await gitCommandSucceeds(root, [
+    "merge-base",
+    "--is-ancestor",
+    "HEAD",
+    UPDATE_CHANNELS.stable.targetRef,
+  ]);
+  return !isOnStableHistory;
+}
+
+async function getUpdateChannelForCheckout(root: string, branch: string | null | undefined) {
+  if (branch === UPDATE_CHANNELS.staging.branch) return UPDATE_CHANNELS.staging;
+  if (!branch && (await isDetachedStagingCheckout(root))) return UPDATE_CHANNELS.staging;
+  return UPDATE_CHANNELS.stable;
+}
+
+function getManualGitApplyCommand(channel = UPDATE_CHANNELS.stable) {
+  const checkoutCommand =
+    channel.id === "staging"
+      ? `git show-ref --verify --quiet refs/heads/${channel.branch} && (git checkout ${channel.branch} && git merge --ff-only ${channel.targetRef}) || git checkout -b ${channel.branch} ${channel.targetRef}`
+      : `(git merge --ff-only ${channel.targetRef} || git checkout --detach ${channel.targetRef})`;
+  return `git fetch ${UPDATE_REMOTE} ${channel.fetchRef} && ${checkoutCommand} && pnpm install --frozen-lockfile && pnpm --filter @marinara-engine/shared build && pnpm --filter @marinara-engine/server --filter @marinara-engine/client --parallel run build`;
+}
+
+function getManualUpdateCommand(installType: InstallType, platform: ServerPlatform, channel = UPDATE_CHANNELS.stable) {
   if (installType === "docker") return DOCKER_UPDATE_COMMAND;
+  if (installType === "git" && channel.id === "staging") {
+    return getManualGitApplyCommand(channel);
+  }
   if (installType === "git") return getGitLauncherCommand(platform);
   return null;
 }
 
-function getManualUpdateHint(installType: InstallType, platform: ServerPlatform) {
+function getManualUpdateHint(installType: InstallType, platform: ServerPlatform, channel = UPDATE_CHANNELS.stable) {
   if (installType === "docker") {
     return "Pull the published container image and restart the container. Versioned tags are published from vX.Y.Z release tags.";
   }
+  if (installType === "git" && channel.id === "staging") {
+    return "Staging is a tester branch. Make a profile backup first, then apply from the browser or run the command below from the repo checkout.";
+  }
   if (installType === "git") {
     const launcher = getGitLauncherCommand(platform);
-    return `Relaunch Marinara with ${launcher} to let the platform launcher fetch origin/main, install dependencies, rebuild, and start the new version.`;
+    return `Relaunch Marinara with ${launcher} to let the platform launcher fetch the current checkout's update branch, install dependencies, rebuild, and start the new version.`;
   }
   return "Download the release asset or update the host install manually, then restart Marinara.";
 }
 
-async function fetchUpdateRef(root: string) {
-  await execFileAsync("git", ["fetch", UPDATE_REMOTE, UPDATE_FETCH_REF, "--quiet"], {
+async function fetchUpdateRef(root: string, channel = UPDATE_CHANNELS.stable) {
+  await execFileAsync("git", ["fetch", UPDATE_REMOTE, channel.fetchRef, "--quiet"], {
     cwd: root,
     timeout: 15_000,
   });
@@ -160,6 +228,26 @@ async function getCurrentBranch(root: string): Promise<string | null> {
   }
 }
 
+async function checkoutOrCreateUpdateBranch(root: string, channel: UpdateChannelInfo): Promise<void> {
+  const branchRef = `refs/heads/${channel.branch}`;
+  const branchExists = await gitCommandSucceeds(root, ["show-ref", "--verify", "--quiet", branchRef]);
+  if (branchExists) {
+    await execFileAsync("git", ["checkout", channel.branch], {
+      cwd: root,
+      timeout: 60_000,
+    });
+    await execFileAsync("git", ["merge", "--ff-only", channel.targetRef], {
+      cwd: root,
+      timeout: 60_000,
+    });
+    return;
+  }
+  await execFileAsync("git", ["checkout", "-b", channel.branch, channel.targetRef], {
+    cwd: root,
+    timeout: 60_000,
+  });
+}
+
 async function hasTrackedChanges(root: string): Promise<boolean> {
   try {
     const { stdout } = await execFileAsync("git", ["status", "--short", "--untracked-files=no"], {
@@ -172,14 +260,14 @@ async function hasTrackedChanges(root: string): Promise<boolean> {
   }
 }
 
-/** Check how many commits behind origin/main the local HEAD is. Returns 0 if up to date, null on error. */
-async function getCommitsBehind(): Promise<number | null> {
+/** Check how many commits behind the selected update channel the local HEAD is. Returns 0 if up to date, null on error. */
+async function getCommitsBehind(channel = UPDATE_CHANNELS.stable): Promise<number | null> {
   if (!isGitInstall()) return null;
   const root = getMonorepoRoot();
   try {
     // Fetch the tracked auto-update target (no checkout).
-    await fetchUpdateRef(root);
-    const { stdout } = await execFileAsync("git", ["rev-list", "--count", `HEAD..${UPDATE_REF}`], {
+    await fetchUpdateRef(root, channel);
+    const { stdout } = await execFileAsync("git", ["rev-list", "--count", `HEAD..${channel.targetRef}`], {
       cwd: root,
       timeout: 5_000,
     });
@@ -381,12 +469,33 @@ async function resolveLatestReleaseFromGitHub(signal: AbortSignal) {
 
 type ApplyUpdateBody = {
   confirm?: boolean;
+  channel?: UpdateChannel;
   currentVersion?: string;
   currentBuild?: string | null;
   currentCommit?: string | null;
   targetRef?: string;
   targetCommit?: string;
 };
+
+async function resolveUpdateChannel(
+  root: string,
+  value: unknown,
+  currentBranch?: string | null,
+): Promise<UpdateChannelInfo> {
+  if (value === "staging") return UPDATE_CHANNELS.staging;
+  if (value === "stable") return UPDATE_CHANNELS.stable;
+  return getUpdateChannelForCheckout(root, currentBranch);
+}
+
+function serializeUpdateChannels() {
+  return Object.values(UPDATE_CHANNELS).map((channel) => ({
+    id: channel.id,
+    label: channel.label,
+    branch: channel.branch,
+    targetRef: channel.targetRef,
+    warning: channel.warning ?? null,
+  }));
+}
 
 function buildReleasePayload(release: NonNullable<typeof cachedRelease>) {
   const releaseTag = `v${release.latestVersion}`;
@@ -399,15 +508,15 @@ function buildReleasePayload(release: NonNullable<typeof cachedRelease>) {
   };
 }
 
-function getApplyAvailability(installType: InstallType, platform: ServerPlatform) {
+function getApplyAvailability(installType: InstallType, platform: ServerPlatform, channel = UPDATE_CHANNELS.stable) {
   const enabled = isUpdatesApplyEnabled();
   if (installType === "docker") {
     return {
       applyAvailable: false,
       updatesApplyEnabled: enabled,
       applyUnavailableReason: "container-install" as ApplyUnavailableReason,
-      manualUpdateCommand: getManualUpdateCommand(installType, platform),
-      manualUpdateHint: getManualUpdateHint(installType, platform),
+      manualUpdateCommand: getManualUpdateCommand(installType, platform, channel),
+      manualUpdateHint: getManualUpdateHint(installType, platform, channel),
     };
   }
   if (installType !== "git") {
@@ -415,8 +524,8 @@ function getApplyAvailability(installType: InstallType, platform: ServerPlatform
       applyAvailable: false,
       updatesApplyEnabled: enabled,
       applyUnavailableReason: "unsupported-install" as ApplyUnavailableReason,
-      manualUpdateCommand: getManualUpdateCommand(installType, platform),
-      manualUpdateHint: getManualUpdateHint(installType, platform),
+      manualUpdateCommand: getManualUpdateCommand(installType, platform, channel),
+      manualUpdateHint: getManualUpdateHint(installType, platform, channel),
     };
   }
   if (!enabled) {
@@ -424,8 +533,8 @@ function getApplyAvailability(installType: InstallType, platform: ServerPlatform
       applyAvailable: false,
       updatesApplyEnabled: false,
       applyUnavailableReason: "disabled" as ApplyUnavailableReason,
-      manualUpdateCommand: getManualUpdateCommand(installType, platform),
-      manualUpdateHint: getManualUpdateHint(installType, platform),
+      manualUpdateCommand: getManualUpdateCommand(installType, platform, channel),
+      manualUpdateHint: getManualUpdateHint(installType, platform, channel),
     };
   }
   return {
@@ -442,7 +551,7 @@ export async function updatesRoutes(app: FastifyInstance) {
   // GET /api/updates/check
   // Fetches the newest stable Git tag from GitHub, then hydrates it
   // with matching release metadata when that release exists.
-  // For git installs, also checks if the local commit is behind origin/main.
+  // For git installs, also checks if the local commit is behind the selected update channel.
   app.get("/check", async (req, reply) => {
     const now = Date.now();
     const currentCommit = getBuildCommit();
@@ -451,17 +560,24 @@ export async function updatesRoutes(app: FastifyInstance) {
     const installType = getInstallType(gitInstall);
     const serverPlatform = getServerPlatform();
     const clientPlatform = getClientPlatform(req.headers["user-agent"]);
-    const applyAvailability = getApplyAvailability(installType, serverPlatform);
+    const root = getMonorepoRoot();
+    const currentBranch = gitInstall ? await getCurrentBranch(root) : null;
+    const channel = await resolveUpdateChannel(
+      root,
+      (req.query as { channel?: unknown } | undefined)?.channel,
+      currentBranch,
+    );
+    const applyAvailability = getApplyAvailability(installType, serverPlatform, channel);
 
     // Check commits behind for git installs
     let commitsBehind: number | null = null;
     if (gitInstall) {
-      if (cachedCommitsBehind !== null && now - commitCheckTimestamp < COMMIT_CHECK_TTL_MS) {
-        commitsBehind = cachedCommitsBehind;
+      const cached = cachedCommitsBehindByChannel.get(channel.id);
+      if (cached && now - cached.timestamp < COMMIT_CHECK_TTL_MS) {
+        commitsBehind = cached.commitsBehind;
       } else {
-        commitsBehind = await getCommitsBehind();
-        cachedCommitsBehind = commitsBehind;
-        commitCheckTimestamp = now;
+        commitsBehind = await getCommitsBehind(channel);
+        cachedCommitsBehindByChannel.set(channel.id, { commitsBehind, timestamp: now });
       }
     }
 
@@ -472,16 +588,20 @@ export async function updatesRoutes(app: FastifyInstance) {
         currentVersion: APP_VERSION,
         currentCommit,
         currentBuild,
+        channel: channel.id,
+        channelLabel: channel.label,
+        currentBranch,
+        channels: serializeUpdateChannels(),
         ...buildReleasePayload(cachedRelease),
-        updateAvailable: versionUpdate || (commitsBehind != null && commitsBehind > 0),
-        versionUpdate,
+        updateAvailable: (channel.id === "stable" && versionUpdate) || (commitsBehind != null && commitsBehind > 0),
+        versionUpdate: channel.id === "stable" ? versionUpdate : false,
         commitsBehind: commitsBehind ?? 0,
         installType,
         serverPlatform,
         clientPlatform,
         ...applyAvailability,
-        targetRef: UPDATE_REF,
-        targetCommit: gitInstall ? await resolveGitRef(getMonorepoRoot(), UPDATE_REF) : null,
+        targetRef: channel.targetRef,
+        targetCommit: gitInstall ? await resolveGitRef(root, channel.targetRef) : null,
       };
     }
 
@@ -500,16 +620,20 @@ export async function updatesRoutes(app: FastifyInstance) {
         currentVersion: APP_VERSION,
         currentCommit,
         currentBuild,
+        channel: channel.id,
+        channelLabel: channel.label,
+        currentBranch,
+        channels: serializeUpdateChannels(),
         ...buildReleasePayload(cachedRelease),
-        updateAvailable: versionUpdate || (commitsBehind != null && commitsBehind > 0),
-        versionUpdate,
+        updateAvailable: (channel.id === "stable" && versionUpdate) || (commitsBehind != null && commitsBehind > 0),
+        versionUpdate: channel.id === "stable" ? versionUpdate : false,
         commitsBehind: commitsBehind ?? 0,
         installType,
         serverPlatform,
         clientPlatform,
         ...applyAvailability,
-        targetRef: UPDATE_REF,
-        targetCommit: gitInstall ? await resolveGitRef(getMonorepoRoot(), UPDATE_REF) : null,
+        targetRef: channel.targetRef,
+        targetCommit: gitInstall ? await resolveGitRef(root, channel.targetRef) : null,
       };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -518,6 +642,10 @@ export async function updatesRoutes(app: FastifyInstance) {
         currentVersion: APP_VERSION,
         currentCommit,
         currentBuild,
+        channel: channel.id,
+        channelLabel: channel.label,
+        currentBranch,
+        channels: serializeUpdateChannels(),
         updateAvailable: commitsBehind != null && commitsBehind > 0,
         commitsBehind: commitsBehind ?? 0,
         installType,
@@ -530,14 +658,17 @@ export async function updatesRoutes(app: FastifyInstance) {
 
   // ── Apply update (git installs only) ──
   // POST /api/updates/apply
-  // Fast-forwards to origin/main, installs, rebuilds, then signals the process to restart.
+  // Fast-forwards to the selected update channel, installs, rebuilds, then signals the process to restart.
   app.post<{ Body: ApplyUpdateBody }>("/apply", async (req, reply) => {
     const gitInstall = isGitInstall();
     const installType = getInstallType(gitInstall);
     const serverPlatform = getServerPlatform();
+    const root = getMonorepoRoot();
+    const currentBranch = gitInstall ? await getCurrentBranch(root) : null;
+    const channel = await resolveUpdateChannel(root, req.body?.channel, currentBranch);
 
     if (!gitInstall) {
-      const manualUpdateCommand = getManualUpdateCommand(installType, serverPlatform);
+      const manualUpdateCommand = getManualUpdateCommand(installType, serverPlatform, channel);
       return reply.status(400).send({
         error: "Auto-update apply is unavailable for this install type",
         message:
@@ -548,19 +679,19 @@ export async function updatesRoutes(app: FastifyInstance) {
         serverPlatform,
         applyUnavailableReason: installType === "docker" ? "container-install" : "unsupported-install",
         manualUpdateCommand,
-        manualUpdateHint: getManualUpdateHint(installType, serverPlatform),
+        manualUpdateHint: getManualUpdateHint(installType, serverPlatform, channel),
       });
     }
 
     if (!isUpdatesApplyEnabled()) {
       return reply.status(403).send({
         error: "Auto-update apply is disabled for this install",
-        message: `Update manually with: ${getGitLauncherCommand(serverPlatform)}. Advanced git installs can enable server-side update application with UPDATES_APPLY_ENABLED=true.`,
+        message: `Update manually with: ${getManualUpdateCommand("git", serverPlatform, channel) ?? getGitLauncherCommand(serverPlatform)}. Advanced git installs can enable server-side update application with UPDATES_APPLY_ENABLED=true.`,
         installType: "git",
         serverPlatform,
         applyUnavailableReason: "disabled",
-        manualUpdateCommand: getManualUpdateCommand("git", serverPlatform),
-        manualUpdateHint: getManualUpdateHint("git", serverPlatform),
+        manualUpdateCommand: getManualUpdateCommand("git", serverPlatform, channel),
+        manualUpdateHint: getManualUpdateHint("git", serverPlatform, channel),
       });
     }
 
@@ -572,8 +703,6 @@ export async function updatesRoutes(app: FastifyInstance) {
     ) {
       return;
     }
-
-    const root = getMonorepoRoot();
 
     try {
       const body = req.body ?? {};
@@ -587,20 +716,19 @@ export async function updatesRoutes(app: FastifyInstance) {
       if (buildCommit && body.currentCommit && body.currentCommit !== buildCommit) {
         return reply.status(409).send({ error: "Current commit confirmation does not match the running server" });
       }
-      if (body.targetRef && body.targetRef !== UPDATE_REF) {
-        return reply.status(400).send({ error: `Update target ref must be ${UPDATE_REF}` });
+      if (body.targetRef && body.targetRef !== channel.targetRef) {
+        return reply.status(400).send({ error: `Update target ref must be ${channel.targetRef}` });
       }
 
-      const currentBranch = await getCurrentBranch(root);
       const oldHead = await resolveGitRef(root, "HEAD");
       if (!oldHead) {
         throw new Error("Could not read the current git commit.");
       }
 
-      await fetchUpdateRef(root);
-      const targetHead = await resolveGitRef(root, UPDATE_REF);
+      await fetchUpdateRef(root, channel);
+      const targetHead = await resolveGitRef(root, channel.targetRef);
       if (!targetHead) {
-        throw new Error(`Could not resolve ${UPDATE_REF}.`);
+        throw new Error(`Could not resolve ${channel.targetRef}.`);
       }
       if (!body.targetCommit || body.targetCommit !== targetHead) {
         return reply.status(409).send({
@@ -623,14 +751,24 @@ export async function updatesRoutes(app: FastifyInstance) {
         /* clean tree — nothing to stash */
       }
 
-      // Step 1: move to the latest origin/main commit.
+      // Step 1: move to the latest selected channel commit.
       // Installer-created release checkouts are shallow detached HEADs, so
       // they cannot reliably merge a remote-tracking branch. A detached
       // checkout is expected there; normal main-branch clones still fast-forward.
-      if (oldHead !== targetHead) {
+      const shouldAttachStagingBranch = channel.id === "staging" && currentBranch !== channel.branch;
+      if (oldHead !== targetHead || shouldAttachStagingBranch) {
         try {
-          if (currentBranch) {
-            await execFileAsync("git", ["merge", "--ff-only", UPDATE_REF], {
+          if (channel.id === "staging") {
+            if (currentBranch === channel.branch) {
+              await execFileAsync("git", ["merge", "--ff-only", channel.targetRef], {
+                cwd: root,
+                timeout: 60_000,
+              });
+            } else {
+              await checkoutOrCreateUpdateBranch(root, channel);
+            }
+          } else if (currentBranch === channel.branch) {
+            await execFileAsync("git", ["merge", "--ff-only", channel.targetRef], {
               cwd: root,
               timeout: 60_000,
             });
@@ -645,7 +783,7 @@ export async function updatesRoutes(app: FastifyInstance) {
             await execFileAsync("git", ["stash", "pop", "-q"], { cwd: root, timeout: 10_000 }).catch(() => {});
           const branchLabel = currentBranch ? ` branch "${currentBranch}"` : " current checkout";
           const message = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
-          throw new Error(`Could not update the${branchLabel} to ${UPDATE_REF}: ${message}`);
+          throw new Error(`Could not update the${branchLabel} to ${channel.targetRef}: ${message}`);
         }
       }
 
@@ -659,12 +797,12 @@ export async function updatesRoutes(app: FastifyInstance) {
         throw new Error("Could not read the updated git commit.");
       }
       if (newHead !== targetHead) {
-        throw new Error(`Update target mismatch: expected ${UPDATE_REF} at ${targetHead}, got ${newHead}.`);
+        throw new Error(`Update target mismatch: expected ${channel.targetRef} at ${targetHead}, got ${newHead}.`);
       }
 
       const alreadyUpToDate = oldHead === targetHead;
 
-      // If HEAD already matches origin/main, check if the source actually differs
+      // If HEAD already matches the target channel, check if the source actually differs
       // from the running build (e.g. previous update pulled code but failed to build,
       // or the running dist is from a stale commit).
       if (alreadyUpToDate) {
@@ -698,11 +836,28 @@ export async function updatesRoutes(app: FastifyInstance) {
         message: "Update applied successfully. Please relaunch the app to use the new version.",
       };
 
-      // Give Fastify time to flush the response, then exit
+      // Give Fastify time to flush the response and clear the file-backed
+      // store's write-back debounce window (SAVE_DEBOUNCE_MS = 750ms), then
+      // shut down GRACEFULLY so pending dirty tables reach disk before exit.
       setTimeout(() => {
-        logger.info("[Update] Shutting down after update...");
-        process.exit(0);
-      }, 500);
+        void (async () => {
+          try {
+            // Mirror index.ts shutdown() (and the onClose hook in app.ts):
+            // app.close() runs Fastify onClose -> closeDB() -> fileStore.close()
+            // -> flush(true), plus stops the sidecar. A bare process.exit(0)
+            // bypasses onClose/beforeExit and silently drops debounced writes.
+            await app.close();
+            logger.info("[Update] Shutting down after update...");
+            process.exit(0);
+          } catch (err) {
+            // Flush/close failed: log it (process is being torn down for a
+            // user-initiated relaunch, so still exit 0 rather than signal a
+            // crash to any supervisor).
+            logger.error(err, "[Update] Graceful shutdown failed; exiting anyway");
+            process.exit(0);
+          }
+        })();
+      }, 1_000);
 
       return result;
     } catch (err: unknown) {
@@ -710,7 +865,7 @@ export async function updatesRoutes(app: FastifyInstance) {
       const pnpmVersion = getPinnedPnpmVersion(root);
       return reply.status(500).send({
         error: `Update failed: ${message}`,
-        hint: `You can try running the update manually: git fetch ${UPDATE_REMOTE} +refs/heads/${UPDATE_BRANCH}:refs/remotes/${UPDATE_REMOTE}/${UPDATE_BRANCH} && (git merge --ff-only ${UPDATE_REF} || git checkout --detach ${UPDATE_REF}) && pnpm install --frozen-lockfile && pnpm --filter @marinara-engine/shared build && pnpm --filter @marinara-engine/server --filter @marinara-engine/client --parallel run build. If pnpm is unavailable, run npm install -g pnpm@${pnpmVersion} first.`,
+        hint: `You can try running the update manually: ${getManualGitApplyCommand(channel)}. If pnpm is unavailable, run npm install -g pnpm@${pnpmVersion} first.`,
       });
     }
   });

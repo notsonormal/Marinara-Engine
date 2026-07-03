@@ -14,6 +14,7 @@ import {
   Loader2,
   FileText,
   WandSparkles,
+  Swords,
 } from "lucide-react";
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
@@ -34,23 +35,32 @@ import {
 import { createInputMacroResolverForChat, isPromptPreviewMacro } from "../../lib/chat-macros";
 import { parseChatMetadata } from "../../lib/chat-display";
 import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
+import { applyTextareaQuoteFormat } from "../../lib/textarea-quotes";
 import { translateDraftText } from "../../lib/draft-translation";
 import { prepareImageAttachment } from "../../lib/chat-attachment-images";
+import { CARD_ASSET_INSERT_EVENT, type CardAssetInsertDetail } from "../../lib/card-asset-links";
+import { requestChatScrollToBottom } from "../../lib/chat-scroll-events";
 import { EmojiPicker } from "../ui/EmojiPicker";
 import { SpeechToTextButton } from "../ui/SpeechToTextButton";
 import { QuickConnectionSwitcher } from "./QuickConnectionSwitcher";
 import { QuickPersonaSwitcher } from "./QuickPersonaSwitcher";
 import { QuickSwitcherMobile } from "./QuickSwitcherMobile";
-import { MariThinkingIndicator } from "./MariThinkingIndicator";
-import { MariCapabilityNotice } from "./MariCapabilityNotice";
 import { SlashCommandFeedback } from "./SlashCommandFeedback";
 import { QuickReplyMenu, type QuickReplyAction } from "./QuickReplyMenu";
+import { getChatInputShellClass } from "./chat-input-styles";
 
 interface Attachment {
   type: string; // MIME type
   data: string; // base64 data URL
   name: string;
 }
+
+const EMPTY_RESPONSE_QUEUE: string[] = [];
+
+type NarrativeDirectorMode = "natural" | "random";
+
+const ROLEPLAY_AGENT_ACTION_BUTTON_CLASS =
+  "flex items-center gap-1.5 rounded-lg px-3 py-1 text-xs transition-all disabled:cursor-not-allowed disabled:opacity-50";
 
 const TEXT_ATTACHMENT_EXTENSIONS = new Set([
   "csv",
@@ -64,6 +74,7 @@ const TEXT_ATTACHMENT_EXTENSIONS = new Set([
   "yaml",
   "yml",
 ]);
+const PDF_ATTACHMENT_MIME_TYPE = "application/pdf";
 
 function getFileExtension(fileName: string): string {
   const match = fileName.toLowerCase().match(/\.([a-z0-9]+)$/);
@@ -71,8 +82,9 @@ function getFileExtension(fileName: string): string {
 }
 
 function inferAttachmentType(file: File): string {
-  if (file.type) return file.type;
   const extension = getFileExtension(file.name);
+  if (extension === "pdf") return PDF_ATTACHMENT_MIME_TYPE;
+  if (file.type) return file.type;
   if (extension === "json" || extension === "jsonl") return "application/json";
   if (extension === "csv") return "text/csv";
   if (extension === "md" || extension === "markdown") return "text/markdown";
@@ -86,6 +98,7 @@ function isSupportedChatAttachment(file: File): boolean {
   if (file.type.startsWith("image/")) return true;
   if (file.type.startsWith("text/")) return true;
   const type = inferAttachmentType(file);
+  if (type === PDF_ATTACHMENT_MIME_TYPE) return true;
   if (
     type === "application/json" ||
     type === "application/xml" ||
@@ -95,6 +108,36 @@ function isSupportedChatAttachment(file: File): boolean {
     return true;
   }
   return TEXT_ATTACHMENT_EXTENSIONS.has(getFileExtension(file.name));
+}
+
+function getChatInputTextareaMaxHeightPx() {
+  if (typeof window === "undefined") return 200;
+  const isMobile = window.matchMedia("(max-width: 767px)").matches;
+  if (!isMobile) return 200;
+  const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+  return Math.max(56, Math.min(128, Math.floor(viewportHeight * 0.24)));
+}
+
+function resizeChatInputTextarea(el: HTMLTextAreaElement) {
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, getChatInputTextareaMaxHeightPx())}px`;
+}
+
+function useIsMobileComposerViewport() {
+  const [isMobileViewport, setIsMobileViewport] = useState(() =>
+    typeof window === "undefined" ? false : window.matchMedia("(max-width: 767px)").matches,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia("(max-width: 767px)");
+    const update = () => setIsMobileViewport(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  return isMobileViewport;
 }
 
 function readFileAsDataUrl(file: Blob): Promise<string> {
@@ -108,6 +151,8 @@ function readFileAsDataUrl(file: Blob): Promise<string> {
 
 interface ChatInputProps {
   mode?: "conversation" | "roleplay";
+  mobileHistoryCollapsed?: boolean;
+  onMobileHistoryCollapsedChange?: (collapsed: boolean) => void;
   characterNames?: string[];
   groupResponseOrder?: string;
   chatCharacters?: Array<{
@@ -122,15 +167,23 @@ interface ChatInputProps {
     options?: { immediate?: boolean },
   ) => void | Promise<void>;
   onPeekPrompt?: () => void;
+  combatAgentEnabled?: boolean;
+  onStartEncounter?: () => void;
+  interactionsLocked?: boolean;
 }
 
 export const ChatInput = memo(function ChatInput({
   mode = "conversation",
+  mobileHistoryCollapsed = false,
+  onMobileHistoryCollapsedChange,
   characterNames = [],
   groupResponseOrder,
   chatCharacters,
   onExpressionChange,
   onPeekPrompt,
+  combatAgentEnabled,
+  onStartEncounter,
+  interactionsLocked = false,
 }: ChatInputProps) {
   const [hasInput, setHasInput] = useState(false);
   const [completions, setCompletions] = useState<SlashCommand[]>([]);
@@ -140,6 +193,8 @@ export const ChatInput = memo(function ChatInput({
   const [pendingAttachmentReadsByChat, setPendingAttachmentReadsByChat] = useState<Record<string, number>>({});
   const [isTranslatingDraft, setIsTranslatingDraft] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
+  const isMobileComposerViewport = useIsMobileComposerViewport();
+  const [pushStoryArmed, setPushStoryArmed] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [charPickerOpen, setCharPickerOpen] = useState(false);
   const charPickerBtnRef = useRef<HTMLButtonElement>(null);
@@ -147,6 +202,7 @@ export const ChatInput = memo(function ChatInput({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const emojiButtonRef = useRef<HTMLButtonElement>(null);
   const inputBarRef = useRef<HTMLDivElement>(null);
+  const focusAfterMobileRestoreRef = useRef(false);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const attachmentsRef = useRef<Attachment[]>([]);
   const pendingAttachmentDraftsRef = useRef<Map<string, Attachment[]>>(new Map());
@@ -154,10 +210,15 @@ export const ChatInput = memo(function ChatInput({
   const streamingChatId = useChatStore((s) => s.streamingChatId);
   const isStreamingGlobal = useChatStore((s) => s.isStreaming);
   const isStreaming = isStreamingGlobal && streamingChatId === activeChatId;
+  const isInputBusy = isStreaming || interactionsLocked;
+  const responseQueue = useChatStore((s) =>
+    activeChatId ? (s.responseQueues.get(activeChatId) ?? EMPTY_RESPONSE_QUEUE) : EMPTY_RESPONSE_QUEUE,
+  );
   const setInputDraft = useChatStore((s) => s.setInputDraft);
   const clearInputDraft = useChatStore((s) => s.clearInputDraft);
   const setCurrentInput = useChatStore((s) => s.setCurrentInput);
-  const currentInput = useChatStore((s) => s.currentInput);
+  const removeFromResponseQueue = useChatStore((s) => s.removeFromResponseQueue);
+  const clearResponseQueue = useChatStore((s) => s.clearResponseQueue);
   const activeChat = useChatStore((s) => s.activeChat);
   const chatMetadata = useMemo(() => parseChatMetadata(activeChat?.metadata), [activeChat?.metadata]);
   const inactiveCharacterIds = useMemo(
@@ -177,6 +238,18 @@ export const ChatInput = memo(function ChatInput({
     () => (activeChatCharacters ? activeChatCharacters.map((character) => character.name) : characterNames),
     [activeChatCharacters, characterNames],
   );
+  const inputPlaceholder = useMemo(() => {
+    if (!activeChatId) return "Select a chat first";
+    if (isMobileComposerViewport) return mode === "roleplay" ? "Write… /cmds" : "Message… /cmds";
+    if (mode === "roleplay") return "Write your response, / for commands";
+    if (activeCharacterNames.length > 1) return `Message @${activeCharacterNames.join(", @")}, / for commands`;
+    if (activeCharacterNames.length === 1) return `Message @${activeCharacterNames[0]}, / for commands`;
+    return "Type here, / for commands.";
+  }, [activeCharacterNames, activeChatId, isMobileComposerViewport, mode]);
+  const queuedResponseOrder = useMemo(
+    () => new Map(responseQueue.map((characterId, index) => [characterId, index + 1])),
+    [responseQueue],
+  );
   const { generate } = useGenerate();
   const { applyToUserInput } = useApplyRegex();
   const enterToSend = useUIStore((s) => s.enterToSendRP);
@@ -193,6 +266,40 @@ export const ChatInput = memo(function ChatInput({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const resizeRafRef = useRef<number>(0);
   const qc = useQueryClient();
+  const shouldShowMobileCollapsedComposer =
+    isMobileComposerViewport &&
+    mobileHistoryCollapsed &&
+    !hasInput &&
+    attachments.length === 0 &&
+    !isInputBusy &&
+    !emojiOpen &&
+    !charPickerOpen;
+  const activeAgentIds = useMemo(
+    () =>
+      Array.isArray(chatMetadata.activeAgentIds)
+        ? chatMetadata.activeAgentIds.filter((id): id is string => typeof id === "string")
+        : [],
+    [chatMetadata.activeAgentIds],
+  );
+  const narrativeDirectorActive =
+    mode === "roleplay" && chatMetadata.enableAgents === true && activeAgentIds.includes("director");
+  const combatActionActive =
+    mode === "roleplay" && combatAgentEnabled === true && typeof onStartEncounter === "function";
+  const showRoleplayAgentActions = narrativeDirectorActive || combatActionActive;
+  const narrativeDirectorMode: NarrativeDirectorMode =
+    chatMetadata.narrativeDirectorMode === "random" ? "random" : "natural";
+  const consumeNarrativeDirectorMode = useCallback((): NarrativeDirectorMode | undefined => {
+    if (!pushStoryArmed || !narrativeDirectorActive) return undefined;
+    setPushStoryArmed(false);
+    return narrativeDirectorMode;
+  }, [narrativeDirectorActive, narrativeDirectorMode, pushStoryArmed]);
+  const generateWithNarrativeDirector = useCallback(
+    (params: Parameters<typeof generate>[0]) => {
+      const directorMode = consumeNarrativeDirectorMode();
+      return generate(directorMode ? { ...params, narrativeDirectorMode: directorMode } : params);
+    },
+    [consumeNarrativeDirectorMode, generate],
+  );
 
   const syncInputState = useCallback(
     (value: string) => {
@@ -206,6 +313,36 @@ export const ChatInput = memo(function ChatInput({
     attachmentsRef.current = next;
     setAttachments(next);
   }, []);
+
+  const insertTextAtCursor = useCallback(
+    (text: string) => {
+      const el = textareaRef.current;
+      if (!el || !activeChatId) return;
+      const start = el.selectionStart ?? el.value.length;
+      const end = el.selectionEnd ?? start;
+      const nextValue = `${el.value.slice(0, start)}${text}${el.value.slice(end)}`;
+      const cursor = start + text.length;
+      el.value = nextValue;
+      el.selectionStart = el.selectionEnd = cursor;
+      resizeChatInputTextarea(el);
+      syncInputState(nextValue);
+      setInputDraft(activeChatId, nextValue);
+      el.focus();
+    },
+    [activeChatId, setInputDraft, syncInputState],
+  );
+
+  useEffect(() => {
+    const handleCardAssetInsert = (event: Event) => {
+      const detail = (event as CustomEvent<CardAssetInsertDetail>).detail;
+      if (!detail?.markdown) return;
+      if (detail.chatId && detail.chatId !== activeChatId) return;
+      insertTextAtCursor(detail.markdown);
+    };
+
+    window.addEventListener(CARD_ASSET_INSERT_EVENT, handleCardAssetInsert);
+    return () => window.removeEventListener(CARD_ASSET_INSERT_EVENT, handleCardAssetInsert);
+  }, [activeChatId, insertTextAtCursor]);
 
   const updateAttachments = useCallback((updater: (current: Attachment[]) => Attachment[]) => {
     setAttachments((current) => {
@@ -271,8 +408,7 @@ export const ChatInput = memo(function ChatInput({
       textareaRef.current.value = draft;
       syncInputState(draft);
       // Resize textarea to fit content
-      textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 200) + "px";
+      resizeChatInputTextarea(textareaRef.current);
       const restoredAttachments = pendingAttachmentDraftsRef.current.get(activeChatId) ?? [];
       replaceAttachments(restoredAttachments);
       pendingAttachmentDraftsRef.current.delete(activeChatId);
@@ -337,17 +473,33 @@ export const ChatInput = memo(function ChatInput({
     });
   }, [activeChatId, qc]);
   const messagesData = qc.getQueryData<InfiniteData<Message[]>>(chatKeys.messages(activeChatId ?? ""));
-  const lastMessageRole = useMemo(() => {
+  const lastMessage = useMemo(() => {
     const firstPage = messagesData?.pages?.[0];
-    return firstPage?.[firstPage.length - 1]?.role ?? null;
+    return firstPage?.[firstPage.length - 1] ?? null;
   }, [messagesData]);
+  const latestAssistantMessage = useMemo(() => {
+    for (const page of messagesData?.pages ?? []) {
+      for (let i = page.length - 1; i >= 0; i--) {
+        const message = page[i];
+        if (message?.role === "assistant") return message;
+      }
+    }
+    return null;
+  }, [messagesData]);
+  const lastMessageRole = lastMessage?.role ?? null;
 
-  const canRetry = !isStreaming && lastMessageRole === "user";
-  const canContinue = !isStreaming && mode === "roleplay" && lastMessageRole === "assistant";
+  const canRetry = !isInputBusy && lastMessageRole === "user";
+  const canContinue =
+    !isInputBusy && mode === "roleplay" && groupResponseOrder !== "manual" && lastMessageRole === "assistant";
   const pendingAttachmentReads = activeChatId ? (pendingAttachmentReadsByChat[activeChatId] ?? 0) : 0;
   const isReadingAttachments = pendingAttachmentReads > 0;
   const hasPendingAttachments = isReadingAttachments || attachments.length > 0;
   const requiresManualGuideTarget = groupResponseOrder === "manual" && activeCharacterNames.length > 1;
+  const inputBusyReason = isStreaming
+    ? "Wait for the current stream to finish."
+    : interactionsLocked
+      ? "Wait for agents to finish."
+      : null;
 
   const removeAttachment = (idx: number) => {
     updateAttachments((prev) => prev.filter((_, i) => i !== idx));
@@ -365,7 +517,7 @@ export const ChatInput = memo(function ChatInput({
         }
         if (!isSupportedChatAttachment(file)) {
           toast.error(
-            `${file.name || "That file"} is not supported in chat. Attach images or text files like JSON, TXT, Markdown, or CSV.`,
+            `${file.name || "That file"} is not supported in chat. Attach images, PDFs, or text files like JSON, TXT, Markdown, or CSV.`,
           );
           return false;
         }
@@ -458,20 +610,50 @@ export const ChatInput = memo(function ChatInput({
     return {
       chatId: activeChatId,
       mode,
-      generate,
+      generate: generateWithNarrativeDirector,
       createMessage: (data) => createMessage.mutate(data),
       invalidate: () => qc.invalidateQueries({ queryKey: chatKeys.all }),
       characterNames: activeCharacterNames,
       characters: activeChatCharacters,
+      latestAssistantMessageId: latestAssistantMessage?.id ?? null,
+      lastMessageRole,
       setSpriteExpression: onExpressionChange
         ? (characterId, expression) => onExpressionChange(characterId, expression, { immediate: true })
         : undefined,
     };
-  }, [activeChatId, mode, generate, createMessage, activeCharacterNames, activeChatCharacters, onExpressionChange, qc]);
+  }, [
+    activeChatId,
+    mode,
+    generateWithNarrativeDirector,
+    createMessage,
+    activeCharacterNames,
+    activeChatCharacters,
+    latestAssistantMessage,
+    lastMessageRole,
+    onExpressionChange,
+    qc,
+  ]);
+
+  const handleTogglePushStory = useCallback(() => {
+    if (!narrativeDirectorActive || isInputBusy) return;
+    setPushStoryArmed((current) => {
+      const next = !current;
+      if (next) {
+        toast.success(
+          `The next time a character responds, they will push the story forward ${
+            narrativeDirectorMode === "random" ? "randomly" : "naturally"
+          }!`,
+        );
+      } else {
+        toast.info("Push Story disarmed.");
+      }
+      return next;
+    });
+  }, [isInputBusy, narrativeDirectorActive, narrativeDirectorMode]);
 
   const handleSend = useCallback(async () => {
     const raw = getValue();
-    if (!activeChatId || isStreaming) return;
+    if (!activeChatId || isInputBusy) return;
     if (isReadingAttachments) {
       toast.info("Still reading attached files. Send will be ready in a moment.");
       return;
@@ -486,13 +668,32 @@ export const ChatInput = memo(function ChatInput({
     if (!hasText && !hasFiles) {
       // Manual mode: no auto-retry/continue — use the character picker instead
       if (groupResponseOrder === "manual") return;
+      const queuedCharacterId = groupResponseOrder === "smart" ? responseQueue[0] : null;
+      if (queuedCharacterId) {
+        removeFromResponseQueue(activeChatId, queuedCharacterId);
+        try {
+          await generateWithNarrativeDirector({
+            chatId: activeChatId,
+            connectionId: null,
+            forCharacterId: queuedCharacterId,
+          });
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : "Generation failed";
+          toast.error(msg);
+        }
+        return;
+      }
       const cached = qc.getQueryData<InfiniteData<Message[]>>(chatKeys.messages(activeChatId));
       const firstPage = cached?.pages?.[0];
       const lastMsg = firstPage?.[firstPage.length - 1];
-      if (lastMsg && (lastMsg.role === "user" || (lastMsg.role === "assistant" && mode === "roleplay"))) {
-        // Retry (last msg is user) or Continue (last msg is assistant, roleplay mode)
+      if (lastMsg?.role === "user" || (mode === "roleplay" && lastMsg?.role === "assistant")) {
+        // User-tail retries and assistant-tail empty sends both create a new reply.
+        // Appending onto the previous assistant message remains explicit via /continue.
         try {
-          await generate({ chatId: activeChatId, connectionId: null });
+          await generateWithNarrativeDirector({
+            chatId: activeChatId,
+            connectionId: null,
+          });
         } catch (error) {
           const msg = error instanceof Error ? error.message : "Generation failed";
           toast.error(msg);
@@ -578,10 +779,13 @@ export const ChatInput = memo(function ChatInput({
     const cachedCharacters = qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list());
     const cachedPersonas = qc.getQueryData<Array<Record<string, unknown>>>(characterKeys.personas);
     const resolveInputMacros = createInputMacroResolverForChat(chat, cachedCharacters, cachedPersonas, normalized);
-    let message = applyToUserInput(normalized, { resolveMacros: resolveInputMacros });
+    const chatMeta = parseChatMetadata(chat?.metadata);
+    let message = applyToUserInput(normalized, {
+      resolveMacros: resolveInputMacros,
+      scopedMode: chatMeta.scopedRegexMode,
+    });
 
     // Input translation: translate user's message before sending
-    const chatMeta = parseChatMetadata(chat?.metadata);
     if (chatMeta.translateInput && message.trim()) {
       try {
         const { translateText } = await import("../../lib/translate-text");
@@ -594,6 +798,33 @@ export const ChatInput = memo(function ChatInput({
 
     message = resolveInputMacros(message);
 
+    const submittingChatId = activeChatId;
+    const submittedDraft = textareaRef.current?.value ?? "";
+    const submittedHeight = textareaRef.current?.style.height ?? "auto";
+    const submittedAttachments = attachments;
+    const submittedCompletions = completions;
+    const restoreSubmittedDraft = () => {
+      const activeChatIdAfterFailure = useChatStore.getState().activeChatId;
+      const currentValue = textareaRef.current?.value ?? "";
+      const canRestoreVisibleDraft = activeChatIdAfterFailure === submittingChatId && currentValue.length === 0;
+      if (canRestoreVisibleDraft && textareaRef.current) {
+        textareaRef.current.value = submittedDraft;
+        textareaRef.current.style.height = submittedHeight;
+        syncInputState(submittedDraft);
+        setCompletions(submittedCompletions);
+      }
+      if (submittedAttachments.length > 0) {
+        if (activeChatIdAfterFailure === submittingChatId && canRestoreVisibleDraft) {
+          updateAttachments((current) => (current.length === 0 ? submittedAttachments : current));
+        } else {
+          pendingAttachmentDraftsRef.current.set(submittingChatId, submittedAttachments);
+        }
+      }
+      if (submittedDraft && (canRestoreVisibleDraft || activeChatIdAfterFailure !== submittingChatId)) {
+        setInputDraft(submittingChatId, submittedDraft);
+      }
+    };
+
     if (textareaRef.current) {
       textareaRef.current.value = "";
       textareaRef.current.style.height = "auto";
@@ -603,6 +834,7 @@ export const ChatInput = memo(function ChatInput({
     const pendingAttachments = attachments.map((a) => ({ type: a.type, data: a.data, filename: a.name, name: a.name }));
     replaceAttachments([]);
     clearInputDraft(activeChatId);
+    clearResponseQueue(activeChatId);
 
     // Manual mode: only create the user message, no auto-generation
     if (groupResponseOrder === "manual") {
@@ -612,6 +844,7 @@ export const ChatInput = memo(function ChatInput({
           content: message,
           characterId: null,
         });
+        requestChatScrollToBottom({ chatId: activeChatId, behavior: "auto" });
         if (pendingAttachments.length) {
           await updateMessageExtra.mutateAsync({
             messageId: created.id,
@@ -619,6 +852,7 @@ export const ChatInput = memo(function ChatInput({
           });
         }
       } catch (error) {
+        restoreSubmittedDraft();
         const msg = error instanceof Error ? error.message : "Failed to send message";
         toast.error(msg);
       }
@@ -626,29 +860,36 @@ export const ChatInput = memo(function ChatInput({
     }
 
     try {
-      await generate({
+      const succeeded = await generateWithNarrativeDirector({
         chatId: activeChatId,
         connectionId: null,
         userMessage: message,
         ...(pendingAttachments.length ? { attachments: pendingAttachments } : {}),
       });
+      if (succeeded === false) {
+        restoreSubmittedDraft();
+      }
     } catch (error) {
+      restoreSubmittedDraft();
       const msg = error instanceof Error ? error.message : "Generation failed";
       toast.error(msg);
       console.error("Send failed:", error);
     }
   }, [
     activeChatId,
-    isStreaming,
-    generate,
+    mode,
+    isInputBusy,
+    generateWithNarrativeDirector,
     applyToUserInput,
     buildContext,
     qc,
     clearInputDraft,
     attachments,
     isReadingAttachments,
-    mode,
     groupResponseOrder,
+    responseQueue,
+    removeFromResponseQueue,
+    clearResponseQueue,
     createMessage,
     updateMessageExtra,
     syncInputState,
@@ -724,7 +965,7 @@ export const ChatInput = memo(function ChatInput({
   );
 
   const handleImpersonateQuickButton = useCallback(async () => {
-    if (!activeChatId || isStreaming) return;
+    if (!activeChatId || isInputBusy) return;
     if (hasPendingAttachments) {
       toast.info("Clear or send attachments before using quick impersonate.");
       return;
@@ -732,10 +973,10 @@ export const ChatInput = memo(function ChatInput({
     const text = textareaRef.current?.value?.trim() ?? "";
     if (!text) return;
     await runQuickSlashCommand(`/impersonate ${text}`, "Impersonate failed");
-  }, [activeChatId, isStreaming, hasPendingAttachments, runQuickSlashCommand]);
+  }, [activeChatId, isInputBusy, hasPendingAttachments, runQuickSlashCommand]);
 
   const handlePostOnlyButton = useCallback(async () => {
-    if (!activeChatId || isStreaming) return;
+    if (!activeChatId || isInputBusy) return;
     const submittingChatId = activeChatId;
     if (isReadingAttachments) {
       toast.info("Still reading attached files. Post will be ready in a moment.");
@@ -756,9 +997,12 @@ export const ChatInput = memo(function ChatInput({
     const cachedCharacters = qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list());
     const cachedPersonas = qc.getQueryData<Array<Record<string, unknown>>>(characterKeys.personas);
     const resolveInputMacros = createInputMacroResolverForChat(chat, cachedCharacters, cachedPersonas, normalized);
-    let message = applyToUserInput(normalized, { resolveMacros: resolveInputMacros });
-
     const chatMeta = parseChatMetadata(chat?.metadata);
+    let message = applyToUserInput(normalized, {
+      resolveMacros: resolveInputMacros,
+      scopedMode: chatMeta.scopedRegexMode,
+    });
+
     if (chatMeta.translateInput && message.trim()) {
       try {
         const { translateText } = await import("../../lib/translate-text");
@@ -789,6 +1033,7 @@ export const ChatInput = memo(function ChatInput({
     setCompletions([]);
     replaceAttachments([]);
     clearInputDraft(submittingChatId);
+    clearResponseQueue(submittingChatId);
 
     let createdMessageId: string | null = null;
     try {
@@ -837,7 +1082,7 @@ export const ChatInput = memo(function ChatInput({
     }
   }, [
     activeChatId,
-    isStreaming,
+    isInputBusy,
     isReadingAttachments,
     attachments,
     completions,
@@ -851,11 +1096,12 @@ export const ChatInput = memo(function ChatInput({
     createMessage,
     deleteMessage,
     updateMessageExtra,
+    clearResponseQueue,
     quoteFormat,
   ]);
 
   const handleGuidedGenerationButton = useCallback(async () => {
-    if (!activeChatId || isStreaming) return;
+    if (!activeChatId || isInputBusy) return;
     if (requiresManualGuideTarget) {
       toast.info("Choose a character from the reply picker to guide a specific reply.");
       return;
@@ -867,20 +1113,20 @@ export const ChatInput = memo(function ChatInput({
     const text = textareaRef.current?.value?.trim() ?? "";
     if (!text) return;
     await runQuickSlashCommand(`/guided ${text}`, "Guided generation failed");
-  }, [activeChatId, isStreaming, requiresManualGuideTarget, hasPendingAttachments, runQuickSlashCommand]);
+  }, [activeChatId, isInputBusy, requiresManualGuideTarget, hasPendingAttachments, runQuickSlashCommand]);
 
   const quickReplyActions = useMemo<QuickReplyAction[]>(() => {
     const actions: QuickReplyAction[] = [];
     const getPostOnlyDisabledReason = () => {
       if (!activeChatId) return "Select or create a chat first.";
-      if (isStreaming) return "Wait for the current stream to finish.";
+      if (inputBusyReason) return inputBusyReason;
       if (isReadingAttachments) return "Still reading attached files.";
       if (!hasInput && attachments.length === 0) return "Type a draft first.";
       return undefined;
     };
     const getGuideDisabledReason = () => {
       if (!activeChatId) return "Select or create a chat first.";
-      if (isStreaming) return "Wait for the current stream to finish.";
+      if (inputBusyReason) return inputBusyReason;
       if (requiresManualGuideTarget) return "Choose a character from the reply picker.";
       if (hasPendingAttachments) return "Clear or post attachments first.";
       if (!hasInput) return "Type a direction first.";
@@ -888,7 +1134,7 @@ export const ChatInput = memo(function ChatInput({
     };
     const getImpersonateDisabledReason = () => {
       if (!activeChatId) return "Select or create a chat first.";
-      if (isStreaming) return "Wait for the current stream to finish.";
+      if (inputBusyReason) return inputBusyReason;
       if (hasPendingAttachments) return "Clear or post attachments first.";
       if (!hasInput) return "Type a direction first.";
       return undefined;
@@ -899,7 +1145,7 @@ export const ChatInput = memo(function ChatInput({
         label: "Post only",
         description: "Add your message without a reply",
         icon: <FileText size="0.875rem" />,
-        disabled: !activeChatId || isStreaming || isReadingAttachments || (!hasInput && attachments.length === 0),
+        disabled: !activeChatId || isInputBusy || isReadingAttachments || (!hasInput && attachments.length === 0),
         disabledReason: getPostOnlyDisabledReason(),
         onSelect: handlePostOnlyButton,
       });
@@ -910,7 +1156,7 @@ export const ChatInput = memo(function ChatInput({
         label: "Guide reply",
         description: "Send as /guided direction",
         icon: <WandSparkles size="0.875rem" />,
-        disabled: !activeChatId || isStreaming || requiresManualGuideTarget || !hasInput || hasPendingAttachments,
+        disabled: !activeChatId || isInputBusy || requiresManualGuideTarget || !hasInput || hasPendingAttachments,
         disabledReason: getGuideDisabledReason(),
         onSelect: handleGuidedGenerationButton,
       });
@@ -921,7 +1167,7 @@ export const ChatInput = memo(function ChatInput({
         label: "Impersonate",
         description: "Generate as your persona",
         icon: <UserCheck size="0.875rem" />,
-        disabled: !activeChatId || isStreaming || !hasInput || hasPendingAttachments,
+        disabled: !activeChatId || isInputBusy || !hasInput || hasPendingAttachments,
         disabledReason: getImpersonateDisabledReason(),
         onSelect: handleImpersonateQuickButton,
       });
@@ -929,7 +1175,8 @@ export const ChatInput = memo(function ChatInput({
     return actions;
   }, [
     activeChatId,
-    isStreaming,
+    isInputBusy,
+    inputBusyReason,
     isReadingAttachments,
     hasInput,
     attachments.length,
@@ -983,13 +1230,7 @@ export const ChatInput = memo(function ChatInput({
   const handleInput = () => {
     const el = textareaRef.current;
     if (!el) return;
-    const raw = el.value;
-    const fixed = formatTextQuotes(raw, quoteFormat);
-    if (raw !== fixed) {
-      const pos = el.selectionStart;
-      el.value = fixed;
-      el.setSelectionRange(pos, pos);
-    }
+    const fixed = applyTextareaQuoteFormat(el, quoteFormat);
     const nowHasInput = fixed.trim().length > 0;
     setHasInput((prev) => (prev === nowHasInput ? prev : nowHasInput));
 
@@ -1013,8 +1254,7 @@ export const ChatInput = memo(function ChatInput({
     if (resizeRafRef.current) cancelAnimationFrame(resizeRafRef.current);
     resizeRafRef.current = requestAnimationFrame(() => {
       if (!el) return;
-      el.style.height = "auto";
-      el.style.height = Math.min(el.scrollHeight, 200) + "px";
+      resizeChatInputTextarea(el);
     });
 
     // Slash command autocomplete
@@ -1053,17 +1293,21 @@ export const ChatInput = memo(function ChatInput({
   // Character picker: trigger a response from a specific character (manual mode)
   const handleCharacterResponse = useCallback(
     async (characterId: string) => {
-      if (!activeChatId || isStreaming) return;
+      if (!activeChatId || isInputBusy) return;
       setCharPickerOpen(false);
       setCharPickerPos(null);
+      if (responseQueue.includes(characterId)) {
+        removeFromResponseQueue(activeChatId, characterId);
+      }
+      const guideText = getValue();
       try {
-        await generate(
+        await generateWithNarrativeDirector(
           guideGenerations && hasInput
             ? {
                 chatId: activeChatId,
                 connectionId: null,
                 forCharacterId: characterId,
-                generationGuide: buildGuidedGenerationInstructionMessage(currentInput),
+                generationGuide: buildGuidedGenerationInstructionMessage(guideText),
                 generationGuideSource: "guide",
               }
             : { chatId: activeChatId, connectionId: null, forCharacterId: characterId },
@@ -1073,7 +1317,15 @@ export const ChatInput = memo(function ChatInput({
         toast.error(msg);
       }
     },
-    [activeChatId, isStreaming, generate, hasInput, currentInput, guideGenerations],
+    [
+      activeChatId,
+      isInputBusy,
+      generateWithNarrativeDirector,
+      hasInput,
+      guideGenerations,
+      responseQueue,
+      removeFromResponseQueue,
+    ],
   );
 
   // Close character picker on outside click
@@ -1126,8 +1378,7 @@ export const ChatInput = memo(function ChatInput({
       if (!translated || !textareaRef.current) return;
       const formatted = formatTextQuotes(translated, quoteFormat);
       textareaRef.current.value = formatted;
-      textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 200) + "px";
+      resizeChatInputTextarea(textareaRef.current);
       syncInputState(formatted);
       setInputDraft(activeChatId, formatted);
       textareaRef.current.focus();
@@ -1151,14 +1402,60 @@ export const ChatInput = memo(function ChatInput({
 
       el.value = nextValue;
       el.setSelectionRange(nextCursor, nextCursor);
-      el.style.height = "auto";
-      el.style.height = Math.min(el.scrollHeight, 200) + "px";
+      resizeChatInputTextarea(el);
       syncInputState(nextValue);
       if (activeChatId) setInputDraft(activeChatId, nextValue);
       el.focus();
     },
     [activeChatId, quoteFormat, setInputDraft, syncInputState],
   );
+
+  const ensureInputVisible = useCallback(() => {
+    if (typeof window === "undefined" || !window.matchMedia("(max-width: 767px)").matches) return;
+    const scroll = () => {
+      const inputBar = inputBarRef.current;
+      const viewport = window.visualViewport;
+      if (!inputBar || !viewport) return;
+      const rect = inputBar.getBoundingClientRect();
+      const viewportTop = viewport.offsetTop;
+      const viewportBottom = viewportTop + viewport.height;
+      if (rect.top >= viewportTop + 8 && rect.bottom <= viewportBottom - 8) return;
+      inputBar.scrollIntoView({ block: "nearest", inline: "nearest" });
+    };
+    requestAnimationFrame(scroll);
+  }, []);
+
+  useEffect(() => {
+    if (mobileHistoryCollapsed || !focusAfterMobileRestoreRef.current) return;
+    focusAfterMobileRestoreRef.current = false;
+    const focus = () => {
+      textareaRef.current?.focus({ preventScroll: true });
+      ensureInputVisible();
+    };
+    requestAnimationFrame(focus);
+    window.setTimeout(focus, 120);
+  }, [ensureInputVisible, mobileHistoryCollapsed]);
+
+  if (shouldShowMobileCollapsedComposer) {
+    return (
+      <div className="mari-chat-input chat-input-container px-3 pb-3 md:hidden">
+        <button
+          type="button"
+          onClick={() => {
+            focusAfterMobileRestoreRef.current = true;
+            onMobileHistoryCollapsedChange?.(false);
+          }}
+          className={cn(
+            getChatInputShellClass({ dragging: false, hasContent: false, layout: "roleplay" }),
+            "min-h-10 w-full justify-start text-left text-sm text-foreground/55",
+          )}
+          aria-label="Show message input"
+        >
+          <span className="truncate">{mode === "roleplay" ? "Write… /cmds" : "Message… /cmds"}</span>
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="mari-chat-input chat-input-container px-3 pb-3">
@@ -1184,7 +1481,7 @@ export const ChatInput = memo(function ChatInput({
                   : "text-foreground/70 hover:bg-foreground/5",
               )}
             >
-              <span className="shrink-0 whitespace-nowrap font-mono font-semibold text-blue-400">/{cmd.name}</span>
+              <span className="shrink-0 whitespace-nowrap font-mono font-semibold text-foreground/80">/{cmd.name}</span>
               <span className="min-w-0 flex-1 text-xs leading-snug opacity-60 [overflow-wrap:anywhere]">
                 {cmd.description}
               </span>
@@ -1196,18 +1493,66 @@ export const ChatInput = memo(function ChatInput({
       {/* Feedback toast */}
       {feedback && <SlashCommandFeedback feedback={feedback} onDismiss={() => setFeedback(null)} className="mb-2" />}
 
+      {showRoleplayAgentActions && (
+        <div className="flex flex-wrap justify-center gap-2 py-1">
+          {narrativeDirectorActive && (
+            <button
+              type="button"
+              onClick={handleTogglePushStory}
+              disabled={isInputBusy}
+              aria-pressed={pushStoryArmed}
+              className={cn(
+                ROLEPLAY_AGENT_ACTION_BUTTON_CLASS,
+                pushStoryArmed
+                  ? "bg-foreground/10 text-foreground ring-1 ring-foreground/25"
+                  : "text-foreground/50 hover:bg-foreground/10 hover:text-foreground/80",
+              )}
+              title={
+                narrativeDirectorMode === "random"
+                  ? "Arm a random Narrative Director event for the next response"
+                  : "Arm a natural Narrative Director push for the next response"
+              }
+            >
+              <WandSparkles size="0.875rem" />
+              <span>Push Story</span>
+            </button>
+          )}
+          {combatActionActive && (
+            <button
+              type="button"
+              onClick={() => onStartEncounter?.()}
+              disabled={isInputBusy}
+              className={cn(
+                ROLEPLAY_AGENT_ACTION_BUTTON_CLASS,
+                "text-foreground/50 hover:bg-foreground/10 hover:text-foreground/80 disabled:hover:bg-transparent disabled:hover:text-foreground/50",
+              )}
+              title="Start Combat Encounter"
+            >
+              <Swords size="0.875rem" />
+              <span>Encounter</span>
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Attachment previews */}
       {(attachments.length > 0 || isReadingAttachments) && (
         <div className="mb-2 flex flex-wrap gap-2">
           {attachments.map((att, i) => (
             <div
               key={i}
-              className="group relative flex items-center gap-1.5 rounded-lg bg-foreground/10 px-2 py-1 text-xs text-foreground/70"
+              className="group relative flex items-center gap-1.5 rounded-lg bg-foreground/10 px-2 py-1 text-xs text-foreground/70 ring-1 ring-foreground/10"
             >
               {att.type.startsWith("image/") ? (
                 <img src={att.data} alt={att.name} className="h-8 w-8 rounded object-cover" />
               ) : (
-                <FileText size="1rem" className="shrink-0 text-foreground/50" />
+                <FileText
+                  size="1rem"
+                  className={cn(
+                    "shrink-0",
+                    att.type === PDF_ATTACHMENT_MIME_TYPE ? "text-[var(--primary)]" : "text-foreground/50",
+                  )}
+                />
               )}
               <span className="max-w-[7.5rem] truncate">{att.name}</span>
               <button
@@ -1219,7 +1564,7 @@ export const ChatInput = memo(function ChatInput({
             </div>
           ))}
           {isReadingAttachments && (
-            <div className="flex items-center gap-1.5 rounded-lg bg-foreground/10 px-2 py-1 text-xs text-foreground/60">
+            <div className="flex items-center gap-1.5 rounded-lg bg-foreground/10 px-2 py-1 text-xs text-foreground/60 ring-1 ring-foreground/10">
               <Loader2 size="0.875rem" className="animate-spin" />
               Reading file...
             </div>
@@ -1227,42 +1572,34 @@ export const ChatInput = memo(function ChatInput({
         </div>
       )}
 
-      {/* Mari capability + thinking indicators */}
-      <MariCapabilityNotice />
-      <MariThinkingIndicator />
-
       {/* Main input container */}
       <div
         ref={inputBarRef}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
-        className={cn(
-          "mari-chat-input-box relative flex items-center gap-1 rounded-2xl border-2 px-2 py-1.5 transition-all duration-200 sm:gap-2 sm:px-4 sm:py-2.5",
-          "bg-[var(--card)]",
-          isDragging
-            ? "border-blue-400/50 bg-blue-500/10 shadow-lg shadow-blue-500/10"
-            : hasInput || attachments.length
-              ? "border-blue-400/30 shadow-md shadow-blue-500/5"
-              : "border-foreground/25",
-        )}
+        className={getChatInputShellClass({
+          dragging: isDragging,
+          hasContent: hasInput || attachments.length > 0,
+          layout: "roleplay",
+        })}
       >
         {/* Attachment button */}
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/*,.txt,.md,.markdown,.json,.jsonl,.csv,.log,.xml,.yaml,.yml"
+          accept="image/*,application/pdf,.pdf,.txt,.md,.markdown,.json,.jsonl,.csv,.log,.xml,.yaml,.yml"
           multiple
           className="hidden"
           onChange={handleFileUpload}
         />
         <button
           onClick={() => fileInputRef.current?.click()}
-          disabled={!activeChatId}
+          disabled={!activeChatId || isInputBusy}
           className={cn(
-            "flex h-11 w-11 items-center justify-center rounded-xl transition-all active:scale-90 disabled:cursor-not-allowed disabled:text-foreground/25 disabled:opacity-50 sm:h-8 sm:w-8",
+            "flex h-9 w-9 items-center justify-center rounded-xl transition-all active:scale-90 disabled:cursor-not-allowed disabled:text-foreground/25 disabled:opacity-50 sm:h-8 sm:w-8",
             attachments.length
-              ? "bg-foreground/10 text-foreground/75"
+              ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20"
               : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
           )}
           title="Attach files"
@@ -1283,18 +1620,9 @@ export const ChatInput = memo(function ChatInput({
           onChange={handleInput}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
-          placeholder={
-            activeChatId
-              ? mode === "roleplay"
-                ? "Write your response, / for commands"
-                : activeCharacterNames.length > 0
-                  ? activeCharacterNames.length > 1
-                    ? `Message @${activeCharacterNames.join(", @")}, / for commands`
-                    : `Message @${activeCharacterNames[0]}, / for commands`
-                  : "Type here, / for commands."
-              : "Select a chat first"
-          }
-          disabled={!activeChatId}
+          onFocus={ensureInputVisible}
+          placeholder={inputPlaceholder}
+          disabled={!activeChatId || isInputBusy}
           rows={1}
           spellCheck
           autoCorrect="on"
@@ -1302,17 +1630,18 @@ export const ChatInput = memo(function ChatInput({
         />
 
         {/* Emoji picker */}
-        <div className="relative hidden sm:block">
+        <div className="relative hidden shrink-0 sm:block">
           <button
             ref={emojiButtonRef}
             onClick={() => setEmojiOpen((v) => !v)}
             className={cn(
-              "flex h-8 w-8 items-center justify-center rounded-full transition-colors",
+              "flex h-8 w-8 items-center justify-center rounded-full transition-colors active:scale-90",
               emojiOpen
-                ? "bg-foreground/10 text-foreground/75"
+                ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20"
                 : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
             )}
             title="Emoji"
+            aria-label="Emoji"
           >
             <Smile size="1.125rem" />
           </button>
@@ -1335,7 +1664,7 @@ export const ChatInput = memo(function ChatInput({
               guideGenerations && hasInput
                 ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20 hover:bg-foreground/15"
                 : charPickerOpen
-                  ? "bg-foreground/10 text-foreground/75"
+                  ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20"
                   : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
             )}
             title={guideGenerations && hasInput ? "Trigger character response (guided)" : "Trigger character response"}
@@ -1348,10 +1677,10 @@ export const ChatInput = memo(function ChatInput({
           <button
             type="button"
             onClick={() => void handleTranslateDraft()}
-            disabled={!activeChatId || !hasInput || isStreaming || isTranslatingDraft}
+            disabled={!activeChatId || !hasInput || isInputBusy || isTranslatingDraft}
             className={cn(
               "flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all duration-200 sm:h-8 sm:w-8",
-              hasInput && !isStreaming && !isTranslatingDraft
+              hasInput && !isInputBusy && !isTranslatingDraft
                 ? "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70 active:scale-90"
                 : "text-foreground/25",
             )}
@@ -1363,7 +1692,7 @@ export const ChatInput = memo(function ChatInput({
 
         {speechToTextEnabled && (
           <SpeechToTextButton
-            disabled={!activeChatId}
+            disabled={!activeChatId || isInputBusy}
             onTranscript={handleSpeechTranscript}
             className="rounded-full"
             iconSize={16}
@@ -1373,29 +1702,32 @@ export const ChatInput = memo(function ChatInput({
         {showQuickRepliesMenu && quickReplyActions.length > 0 && (
           <QuickReplyMenu
             actions={quickReplyActions}
-            disabled={!activeChatId || isReadingAttachments || (!hasInput && attachments.length === 0)}
+            disabled={!activeChatId || isInputBusy || isReadingAttachments}
           />
         )}
 
         {/* Send / Stop button */}
 
         <button
-          onClick={isStreaming ? () => useChatStore.getState().stopGeneration() : handleSend}
+          onClick={isStreaming ? () => useChatStore.getState().stopGeneration(activeChatId ?? undefined) : handleSend}
           disabled={
-            (!isStreaming && isReadingAttachments) ||
+            (!isStreaming && (isInputBusy || isReadingAttachments)) ||
             (!hasInput && !attachments.length && !isStreaming && !canRetry && !canContinue) ||
             !activeChatId
           }
           className={cn(
-            "mari-chat-send-btn flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all duration-200 sm:h-8 sm:w-8",
-            isStreaming
-              ? "text-foreground/75 hover:text-foreground/90"
-              : (hasInput || attachments.length || canRetry || canContinue) && activeChatId && !isReadingAttachments
-                ? "text-foreground/75 hover:text-foreground/90 active:scale-90"
+            "mari-chat-send-btn flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-all duration-200 sm:h-8 sm:w-8",
+            isInputBusy
+              ? "text-foreground/75 hover:bg-foreground/10 hover:text-foreground/90"
+              : (hasInput || attachments.length || canRetry || canContinue) &&
+                  activeChatId &&
+                  !isInputBusy &&
+                  !isReadingAttachments
+                ? "text-foreground/75 hover:bg-foreground/10 hover:text-foreground/90 active:scale-90"
                 : "text-foreground/20",
           )}
         >
-          {isStreaming ? (
+          {isInputBusy ? (
             <StopCircle size="1rem" />
           ) : (
             <Send size="0.9375rem" className={cn(hasInput && "translate-x-[1px]")} />
@@ -1409,38 +1741,46 @@ export const ChatInput = memo(function ChatInput({
         createPortal(
           <div
             ref={charPickerMenuRef}
-            className="fixed z-[9999] flex min-w-[220px] max-w-[280px] max-h-[320px] flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)] shadow-2xl"
+            className="fixed z-[9999] flex min-w-[220px] max-w-[280px] max-h-[320px] flex-col overflow-hidden rounded-xl border border-foreground/10 bg-[var(--card)] shadow-2xl"
             style={
               charPickerPos ? { left: charPickerPos.left, top: charPickerPos.top } : { visibility: "hidden" as const }
             }
           >
-            <div className="flex items-center justify-center border-b border-[var(--border)] px-3 py-2 text-[0.6875rem] font-semibold">
+            <div className="flex items-center justify-center border-b border-foreground/10 px-3 py-2 text-[0.6875rem] font-semibold">
               Trigger Response
             </div>
             <div className="overflow-y-auto p-1">
-              {activeChatCharacters!.map((char) => (
-                <button
-                  key={char.id}
-                  onClick={() => handleCharacterResponse(char.id)}
-                  className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-all hover:bg-[var(--accent)]"
-                >
-                  {char.avatarUrl ? (
-                    <span className="relative h-7 w-7 shrink-0 overflow-hidden rounded-full">
-                      <img
-                        src={char.avatarUrl}
-                        alt={char.name}
-                        className="h-full w-full object-cover"
-                        style={getAvatarCropStyle(char.avatarCrop)}
-                      />
-                    </span>
-                  ) : (
-                    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--secondary)] text-[0.6875rem] font-semibold text-[var(--muted-foreground)]">
-                      {(char.name || "?")[0].toUpperCase()}
-                    </div>
-                  )}
-                  <span className="truncate text-xs">{char.name}</span>
-                </button>
-              ))}
+              {activeChatCharacters!.map((char) => {
+                const queuedOrder = queuedResponseOrder.get(char.id);
+                return (
+                  <button
+                    key={char.id}
+                    onClick={() => handleCharacterResponse(char.id)}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-all hover:bg-foreground/10"
+                  >
+                    {char.avatarUrl ? (
+                      <span className="relative h-7 w-7 shrink-0 overflow-hidden rounded-full">
+                        <img
+                          src={char.avatarUrl}
+                          alt={char.name}
+                          className="h-full w-full object-cover"
+                          style={getAvatarCropStyle(char.avatarCrop)}
+                        />
+                      </span>
+                    ) : (
+                      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-foreground/10 text-[0.6875rem] font-semibold text-foreground/45">
+                        {(char.name || "?")[0].toUpperCase()}
+                      </div>
+                    )}
+                    <span className="min-w-0 flex-1 truncate text-xs">{char.name}</span>
+                    {queuedOrder && (
+                      <span className="flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full border border-foreground/15 bg-foreground/10 px-1 text-[0.625rem] font-semibold text-foreground/70">
+                        {queuedOrder}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
             </div>
           </div>,
           document.body,

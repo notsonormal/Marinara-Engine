@@ -1,4 +1,4 @@
-import type { LorebookEntry } from "@marinara-engine/shared";
+import { LIMITS, type Lorebook, type LorebookEntry } from "@marinara-engine/shared";
 import type { DB } from "../../db/connection.js";
 import { logger } from "../../lib/logger.js";
 import { localEmbed } from "../local-embedder.js";
@@ -18,6 +18,17 @@ export interface LorebookEmbeddingWarmupResult {
 export interface SemanticLorebookMatch {
   entry: LorebookEntry;
   similarity: number;
+}
+
+export function selectLorebookVectorQueryText(messages: Array<{ content: string }>, depth: number): string {
+  const selectedMessages = depth > 0 ? messages.slice(-depth) : messages;
+  return selectedMessages.map((message) => message.content).join("\n").trim();
+}
+
+function normalizeLorebookVectorQueryDepth(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return LIMITS.LOREBOOK_VECTOR_QUERY_DEPTH_DEFAULT;
+  return Math.max(0, Math.min(LIMITS.LOREBOOK_VECTOR_QUERY_DEPTH_MAX, Math.trunc(parsed)));
 }
 
 function normalizedParts(parts: Array<[string, unknown]>): string[] {
@@ -68,10 +79,21 @@ function normalizePositiveInteger(value: unknown, fallback: number): number {
   return Math.max(1, Math.trunc(numeric));
 }
 
+function getExistingEmbeddingDimension(entries: LorebookEntry[]): number | null {
+  for (const entry of entries) {
+    if (entry.excludeFromVectorization) continue;
+    if (entry.embedding && entry.embedding.length > 0) {
+      return entry.embedding.length;
+    }
+  }
+  return null;
+}
+
 async function embedLorebookTexts(texts: string[], options: LorebookEmbeddingOptions): Promise<number[][]> {
   return embedMemoryRecallTexts(texts, {
     localEmbedder: options.localEmbedder ?? localEmbed,
     embeddingSource: options.embeddingSource,
+    signal: options.signal,
   });
 }
 
@@ -82,13 +104,24 @@ export async function warmLorebookEntryEmbeddings(
 ): Promise<LorebookEmbeddingWarmupResult> {
   const batchSize = normalizePositiveInteger(options.batchSize, DEFAULT_WARMUP_BATCH_SIZE);
   const candidates = entries
-    .filter((entry) => entry.enabled && (!entry.embedding || entry.embedding.length === 0))
+    .filter((entry) => entry.enabled && !entry.excludeFromVectorization && (!entry.embedding || entry.embedding.length === 0))
     .slice(0, batchSize);
   if (candidates.length === 0) return { attempted: 0, embedded: 0 };
 
   const texts = candidates.map(buildLorebookEntryEmbeddingText);
   const embeddings = await embedLorebookTexts(texts, options);
   if (embeddings.length === 0) return { attempted: candidates.length, embedded: 0 };
+
+  const embeddingDimension = embeddings.find((embedding) => embedding.length > 0)?.length ?? null;
+  const existingDimension = getExistingEmbeddingDimension(entries);
+  if (embeddingDimension && existingDimension && embeddingDimension !== existingDimension) {
+    logger.warn(
+      "[lorebook-embeddings] Skipping warmup because embedding dimension changed from %d to %d. Refresh lorebook embeddings before mixing embedding models.",
+      existingDimension,
+      embeddingDimension,
+    );
+    return { attempted: candidates.length, embedded: 0 };
+  }
 
   const storage = createLorebooksStorage(db);
   let embedded = 0;
@@ -141,4 +174,60 @@ export async function semanticShortlistLorebookEntries(
     .sort((a, b) => b.similarity - a.similarity)
     .slice(0, topK);
   return matches.length > 0 ? matches : null;
+}
+
+export async function buildLorebookSemanticEmbeddingsById({
+  lorebooks,
+  entries,
+  scanMessages,
+  embeddingSource,
+  signal,
+}: {
+  lorebooks: Lorebook[];
+  entries: LorebookEntry[];
+  scanMessages: Array<{ content: string }>;
+  embeddingSource: MemoryRecallEmbeddingOptions["embeddingSource"];
+  signal?: AbortSignal;
+}): Promise<{ defaultEmbedding: number[] | null; embeddingsByLorebookId?: Map<string, number[] | null> }> {
+  const lorebookIdsWithVectors = new Set(
+    entries
+      .filter(
+        (entry) => !entry.excludeFromVectorization && Array.isArray(entry.embedding) && entry.embedding.length > 0,
+      )
+      .map((entry) => entry.lorebookId),
+  );
+  if (lorebookIdsWithVectors.size === 0) return { defaultEmbedding: null };
+
+  const vectorLorebooks = lorebooks.filter(
+    (lorebook) => !lorebook.excludeFromVectorization && lorebookIdsWithVectors.has(lorebook.id),
+  );
+  if (vectorLorebooks.length === 0) return { defaultEmbedding: null };
+
+  const depths = Array.from(new Set(vectorLorebooks.map((lorebook) => normalizeLorebookVectorQueryDepth(lorebook.vectorQueryDepth))));
+  const embeddingsByDepth = new Map<number, number[] | null>();
+  for (const depth of depths) {
+    const queryText = selectLorebookVectorQueryText(scanMessages, depth);
+    if (!queryText) {
+      embeddingsByDepth.set(depth, null);
+      continue;
+    }
+    const embeddings = await embedMemoryRecallTexts([queryText], { embeddingSource, signal });
+    embeddingsByDepth.set(depth, embeddings[0] ?? null);
+  }
+
+  const embeddingsByLorebookId = new Map<string, number[] | null>();
+  for (const lorebook of vectorLorebooks) {
+    embeddingsByLorebookId.set(
+      lorebook.id,
+      embeddingsByDepth.get(normalizeLorebookVectorQueryDepth(lorebook.vectorQueryDepth)) ?? null,
+    );
+  }
+
+  return {
+    defaultEmbedding:
+      embeddingsByDepth.get(LIMITS.LOREBOOK_VECTOR_QUERY_DEPTH_DEFAULT) ??
+      Array.from(embeddingsByDepth.values()).find((embedding) => embedding && embedding.length > 0) ??
+      null,
+    embeddingsByLorebookId,
+  };
 }

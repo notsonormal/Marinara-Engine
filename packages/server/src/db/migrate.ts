@@ -19,6 +19,7 @@ const CREATE_TABLES: string[] = [
     prompt_preset_id TEXT,
     connection_id TEXT,
     metadata TEXT NOT NULL DEFAULT '{}',
+    last_message_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
@@ -64,6 +65,9 @@ const CREATE_TABLES: string[] = [
     id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL,
     comment TEXT NOT NULL DEFAULT '',
+    creator TEXT NOT NULL DEFAULT '',
+    persona_version TEXT NOT NULL DEFAULT '1.0',
+    creator_notes TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
     personality TEXT NOT NULL DEFAULT '',
     scenario TEXT NOT NULL DEFAULT '',
@@ -77,11 +81,21 @@ const CREATE_TABLES: string[] = [
     box_color TEXT NOT NULL DEFAULT '',
     tracker_card_colors TEXT NOT NULL DEFAULT '{"mode":"chat"}',
     persona_stats TEXT NOT NULL DEFAULT '',
-    alt_descriptions TEXT NOT NULL DEFAULT '[]',
     tags TEXT NOT NULL DEFAULT '[]',
     saved_status_options TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS persona_card_versions (
+    id TEXT PRIMARY KEY NOT NULL,
+    persona_id TEXT NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+    data TEXT NOT NULL,
+    comment TEXT NOT NULL DEFAULT '',
+    avatar_path TEXT,
+    version TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'manual',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS character_groups (
     id TEXT PRIMARY KEY NOT NULL,
@@ -108,14 +122,19 @@ const CREATE_TABLES: string[] = [
     image_path TEXT,
     scan_depth INTEGER NOT NULL DEFAULT 2,
     token_budget INTEGER NOT NULL DEFAULT 2048,
+    entry_limit INTEGER NOT NULL DEFAULT 100,
     recursive_scanning TEXT NOT NULL DEFAULT 'false',
     max_recursion_depth INTEGER NOT NULL DEFAULT 3,
-    exclude_from_vectorization TEXT NOT NULL DEFAULT 'false',
+    exclude_from_vectorization TEXT NOT NULL DEFAULT 'true',
+    vector_query_depth INTEGER NOT NULL DEFAULT 10,
+    vector_score_threshold REAL NOT NULL DEFAULT 0.3,
+    vector_max_results INTEGER NOT NULL DEFAULT 10,
     character_id TEXT,
     persona_id TEXT,
     chat_id TEXT,
     is_global TEXT NOT NULL DEFAULT 'false',
     enabled TEXT NOT NULL DEFAULT 'true',
+    scope TEXT NOT NULL DEFAULT '{"mode":"all","chatIds":[]}',
     tags TEXT NOT NULL DEFAULT '[]',
     generated_by TEXT,
     source_agent_id TEXT,
@@ -187,7 +206,9 @@ const CREATE_TABLES: string[] = [
     dynamic_state TEXT NOT NULL DEFAULT '{}',
     activation_conditions TEXT NOT NULL DEFAULT '[]',
     schedule TEXT,
-    prevent_recursion TEXT NOT NULL DEFAULT 'false',
+    prevent_recursion TEXT NOT NULL DEFAULT 'true',
+    exclude_recursion TEXT NOT NULL DEFAULT 'false',
+    delay_until_recursion TEXT NOT NULL DEFAULT 'false',
     exclude_from_vectorization TEXT NOT NULL DEFAULT 'false',
     embedding TEXT,
     created_at TEXT NOT NULL,
@@ -197,6 +218,8 @@ const CREATE_TABLES: string[] = [
     id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
+    conversation_prompt TEXT NOT NULL DEFAULT '',
+    game_prompt TEXT NOT NULL DEFAULT '',
     section_order TEXT NOT NULL DEFAULT '[]',
     group_order TEXT NOT NULL DEFAULT '[]',
     variable_groups TEXT NOT NULL DEFAULT '[]',
@@ -245,6 +268,8 @@ const CREATE_TABLES: string[] = [
     multi_select TEXT NOT NULL DEFAULT 'false',
     separator TEXT NOT NULL DEFAULT ', ',
     random_pick TEXT NOT NULL DEFAULT 'false',
+    display_mode TEXT NOT NULL DEFAULT 'auto',
+    option_sort TEXT NOT NULL DEFAULT 'manual',
     sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
   )`,
@@ -255,11 +280,14 @@ const CREATE_TABLES: string[] = [
     base_url TEXT NOT NULL DEFAULT '',
     api_key_encrypted TEXT NOT NULL DEFAULT '',
     model TEXT NOT NULL DEFAULT '',
+    image_path TEXT,
     max_context INTEGER NOT NULL DEFAULT 128000,
     max_parallel_jobs INTEGER NOT NULL DEFAULT 1,
+    treat_as_local_endpoint TEXT NOT NULL DEFAULT 'false',
     is_default TEXT NOT NULL DEFAULT 'false',
     use_for_random TEXT NOT NULL DEFAULT 'false',
     enable_caching TEXT NOT NULL DEFAULT 'false',
+    anthropic_extended_cache_ttl TEXT NOT NULL DEFAULT 'false',
     caching_at_depth INTEGER NOT NULL DEFAULT 5,
     prompt_preset_id TEXT,
     created_at TEXT NOT NULL,
@@ -282,6 +310,7 @@ const CREATE_TABLES: string[] = [
     phase TEXT NOT NULL,
     enabled TEXT NOT NULL DEFAULT 'true',
     connection_id TEXT,
+    image_path TEXT,
     prompt_template TEXT NOT NULL DEFAULT '',
     settings TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
@@ -317,7 +346,9 @@ const CREATE_TABLES: string[] = [
     webhook_url TEXT,
     static_result TEXT,
     script_body TEXT,
+    include_hidden_context TEXT NOT NULL DEFAULT 'false',
     enabled TEXT NOT NULL DEFAULT 'true',
+    sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
@@ -335,6 +366,18 @@ const CREATE_TABLES: string[] = [
     recent_events TEXT NOT NULL DEFAULT '[]',
     player_stats TEXT,
     persona_stats TEXT,
+    field_locks TEXT,
+    committed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS game_engine_state (
+    id TEXT PRIMARY KEY NOT NULL,
+    chat_id TEXT NOT NULL,
+    message_id TEXT NOT NULL DEFAULT '',
+    swipe_index INTEGER NOT NULL DEFAULT 0,
+    game_type TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL,
     committed INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
   )`,
@@ -362,6 +405,8 @@ const CREATE_TABLES: string[] = [
     placement TEXT NOT NULL DEFAULT '["ai_output"]',
     flags TEXT NOT NULL DEFAULT 'gi',
     prompt_only TEXT NOT NULL DEFAULT 'false',
+    apply_mode TEXT,
+    target_character_ids TEXT NOT NULL DEFAULT '[]',
     "order" INTEGER NOT NULL DEFAULT 0,
     min_depth INTEGER,
     max_depth INTEGER,
@@ -388,6 +433,39 @@ const CREATE_TABLES: string[] = [
     model TEXT NOT NULL DEFAULT '',
     width INTEGER,
     height INTEGER,
+    custom_kind TEXT,
+    custom_name TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS persona_images (
+    id TEXT PRIMARY KEY NOT NULL,
+    persona_id TEXT NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    prompt TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    width INTEGER,
+    height INTEGER,
+    custom_kind TEXT,
+    custom_name TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS gallery_folders (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS global_images (
+    id TEXT PRIMARY KEY NOT NULL,
+    folder_id TEXT REFERENCES gallery_folders(id) ON DELETE SET NULL,
+    file_path TEXT NOT NULL,
+    prompt TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    width INTEGER,
+    height INTEGER,
+    custom_kind TEXT,
+    custom_name TEXT,
     created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS ooc_influences (
@@ -451,12 +529,19 @@ const CREATE_TABLES: string[] = [
     value TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS achievement_unlocks (
+    id TEXT PRIMARY KEY NOT NULL,
+    unlocked_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS installed_extensions (
     id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
+    runtime TEXT NOT NULL DEFAULT 'client',
     css TEXT,
     js TEXT,
+    server_js TEXT,
     enabled TEXT NOT NULL DEFAULT 'true',
     installed_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -489,8 +574,33 @@ interface ColumnMigration {
 
 const COLUMN_MIGRATIONS: ColumnMigration[] = [
   {
+    table: "prompt_presets",
+    column: "conversation_prompt",
+    definition: "TEXT NOT NULL DEFAULT ''",
+  },
+  {
+    table: "prompt_presets",
+    column: "game_prompt",
+    definition: "TEXT NOT NULL DEFAULT ''",
+  },
+  {
+    table: "api_connections",
+    column: "image_path",
+    definition: "TEXT",
+  },
+  {
+    table: "agent_configs",
+    column: "image_path",
+    definition: "TEXT",
+  },
+  {
     table: "api_connections",
     column: "enable_caching",
+    definition: "TEXT NOT NULL DEFAULT 'false'",
+  },
+  {
+    table: "api_connections",
+    column: "anthropic_extended_cache_ttl",
     definition: "TEXT NOT NULL DEFAULT 'false'",
   },
   {
@@ -519,14 +629,39 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     definition: "TEXT",
   },
   {
+    table: "game_state_snapshots",
+    column: "field_locks",
+    definition: "TEXT",
+  },
+  {
     table: "lorebooks",
     column: "max_recursion_depth",
     definition: "INTEGER NOT NULL DEFAULT 3",
   },
   {
     table: "lorebooks",
+    column: "entry_limit",
+    definition: "INTEGER NOT NULL DEFAULT 100",
+  },
+  {
+    table: "lorebooks",
     column: "exclude_from_vectorization",
-    definition: "TEXT NOT NULL DEFAULT 'false'",
+    definition: "TEXT NOT NULL DEFAULT 'true'",
+  },
+  {
+    table: "lorebooks",
+    column: "vector_query_depth",
+    definition: "INTEGER NOT NULL DEFAULT 10",
+  },
+  {
+    table: "lorebooks",
+    column: "vector_score_threshold",
+    definition: "REAL NOT NULL DEFAULT 0.3",
+  },
+  {
+    table: "lorebooks",
+    column: "vector_max_results",
+    definition: "INTEGER NOT NULL DEFAULT 10",
   },
   {
     table: "lorebooks",
@@ -536,12 +671,17 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
   {
     table: "lorebook_entries",
     column: "prevent_recursion",
+    definition: "TEXT NOT NULL DEFAULT 'true'",
+  },
+  {
+    table: "lorebook_entries",
+    column: "exclude_recursion",
     definition: "TEXT NOT NULL DEFAULT 'false'",
   },
   {
-    table: "personas",
-    column: "alt_descriptions",
-    definition: "TEXT NOT NULL DEFAULT '[]'",
+    table: "lorebook_entries",
+    column: "delay_until_recursion",
+    definition: "TEXT NOT NULL DEFAULT 'false'",
   },
   {
     table: "lorebook_entries",
@@ -566,6 +706,21 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
   {
     table: "personas",
     column: "comment",
+    definition: "TEXT NOT NULL DEFAULT ''",
+  },
+  {
+    table: "personas",
+    column: "creator",
+    definition: "TEXT NOT NULL DEFAULT ''",
+  },
+  {
+    table: "personas",
+    column: "persona_version",
+    definition: "TEXT NOT NULL DEFAULT '1.0'",
+  },
+  {
+    table: "personas",
+    column: "creator_notes",
     definition: "TEXT NOT NULL DEFAULT ''",
   },
   {
@@ -594,6 +749,11 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     definition: "INTEGER NOT NULL DEFAULT 0",
   },
   {
+    table: "chats",
+    column: "last_message_at",
+    definition: "TEXT",
+  },
+  {
     table: "api_connections",
     column: "openrouter_provider",
     definition: "TEXT",
@@ -601,6 +761,16 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
   {
     table: "api_connections",
     column: "image_generation_source",
+    definition: "TEXT",
+  },
+  {
+    table: "regex_scripts",
+    column: "target_character_ids",
+    definition: "TEXT NOT NULL DEFAULT '[]'",
+  },
+  {
+    table: "regex_scripts",
+    column: "apply_mode",
     definition: "TEXT",
   },
   {
@@ -649,6 +819,11 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     definition: "TEXT",
   },
   {
+    table: "lorebooks",
+    column: "scope",
+    definition: 'TEXT NOT NULL DEFAULT \'{"mode":"all","chatIds":[]}\'',
+  },
+  {
     table: "api_connections",
     column: "default_parameters",
     definition: "TEXT",
@@ -667,6 +842,11 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     table: "api_connections",
     column: "max_parallel_jobs",
     definition: "INTEGER NOT NULL DEFAULT 1",
+  },
+  {
+    table: "api_connections",
+    column: "treat_as_local_endpoint",
+    definition: "TEXT NOT NULL DEFAULT 'false'",
   },
   {
     table: "lorebook_entries",
@@ -753,6 +933,66 @@ const COLUMN_MIGRATIONS: ColumnMigration[] = [
     column: "source_chat_id",
     definition: "TEXT",
   },
+  {
+    table: "character_images",
+    column: "custom_kind",
+    definition: "TEXT",
+  },
+  {
+    table: "character_images",
+    column: "custom_name",
+    definition: "TEXT",
+  },
+  {
+    table: "persona_images",
+    column: "custom_kind",
+    definition: "TEXT",
+  },
+  {
+    table: "persona_images",
+    column: "custom_name",
+    definition: "TEXT",
+  },
+  {
+    table: "global_images",
+    column: "custom_kind",
+    definition: "TEXT",
+  },
+  {
+    table: "global_images",
+    column: "custom_name",
+    definition: "TEXT",
+  },
+  {
+    table: "custom_tools",
+    column: "include_hidden_context",
+    definition: "TEXT NOT NULL DEFAULT 'false'",
+  },
+  {
+    table: "custom_tools",
+    column: "sort_order",
+    definition: "INTEGER NOT NULL DEFAULT 0",
+  },
+  {
+    table: "choice_blocks",
+    column: "display_mode",
+    definition: "TEXT NOT NULL DEFAULT 'auto'",
+  },
+  {
+    table: "choice_blocks",
+    column: "option_sort",
+    definition: "TEXT NOT NULL DEFAULT 'manual'",
+  },
+  {
+    table: "installed_extensions",
+    column: "runtime",
+    definition: "TEXT NOT NULL DEFAULT 'client'",
+  },
+  {
+    table: "installed_extensions",
+    column: "server_js",
+    definition: "TEXT",
+  },
 ];
 
 /**
@@ -774,12 +1014,49 @@ export async function runMigrations(db: DB) {
     }
   }
 
+  const customToolOrderRows = await db.all<{ id: string; sort_order: number | null }>(
+    sql.raw(`SELECT id, sort_order FROM custom_tools ORDER BY sort_order ASC, updated_at DESC, id ASC`),
+  );
+  if (
+    customToolOrderRows.length > 1 &&
+    customToolOrderRows.every((row) => Number(row.sort_order ?? 0) === 0)
+  ) {
+    for (const [index, row] of customToolOrderRows.entries()) {
+      await db.run(sql`UPDATE custom_tools SET sort_order = ${(index + 1) * 10} WHERE id = ${row.id}`);
+    }
+  }
+
+  await db.run(
+    sql.raw(`
+      UPDATE chats
+      SET last_message_at = (
+        SELECT MAX(messages.created_at)
+        FROM messages
+        WHERE messages.chat_id = chats.id
+      )
+      WHERE (last_message_at IS NULL OR last_message_at = '')
+      AND EXISTS (
+        SELECT 1
+        FROM messages
+        WHERE messages.chat_id = chats.id
+      )
+    `),
+  );
+
   // 3. Create indexes if they don't exist
+  await db.run(sql.raw(`CREATE INDEX IF NOT EXISTS idx_chats_last_message_at ON chats(last_message_at DESC)`));
+  await db.run(sql.raw(`CREATE INDEX IF NOT EXISTS idx_messages_chat_created_at ON messages(chat_id, created_at DESC)`));
   await db.run(
     sql.raw(`CREATE INDEX IF NOT EXISTS idx_game_state_chat_id ON game_state_snapshots(chat_id, created_at DESC)`),
   );
   await db.run(
     sql.raw(`CREATE INDEX IF NOT EXISTS idx_game_state_message ON game_state_snapshots(message_id, swipe_index)`),
+  );
+  await db.run(
+    sql.raw(`CREATE INDEX IF NOT EXISTS idx_game_engine_state_chat ON game_engine_state(chat_id, created_at DESC)`),
+  );
+  await db.run(
+    sql.raw(`CREATE INDEX IF NOT EXISTS idx_game_engine_state_message ON game_engine_state(message_id, swipe_index)`),
   );
   await db.run(
     sql.raw(`CREATE INDEX IF NOT EXISTS idx_lorebook_character_links_book ON lorebook_character_links(lorebook_id)`),
@@ -873,6 +1150,18 @@ export async function runMigrations(db: DB) {
       `CREATE INDEX IF NOT EXISTS idx_character_card_versions ON character_card_versions(character_id, created_at DESC)`,
     ),
   );
+  await db.run(
+    sql.raw(
+      `CREATE INDEX IF NOT EXISTS idx_persona_card_versions ON persona_card_versions(persona_id, created_at DESC)`,
+    ),
+  );
   await db.run(sql.raw(`CREATE INDEX IF NOT EXISTS idx_custom_themes_active ON custom_themes(is_active)`));
   await db.run(sql.raw(`CREATE INDEX IF NOT EXISTS idx_chat_presets_mode_active ON chat_presets(mode, is_active)`));
+  await db.run(
+    sql.raw(`CREATE INDEX IF NOT EXISTS idx_persona_images_persona ON persona_images(persona_id, created_at DESC)`),
+  );
+  await db.run(
+    sql.raw(`CREATE INDEX IF NOT EXISTS idx_global_images_folder ON global_images(folder_id, created_at DESC)`),
+  );
+  await db.run(sql.raw(`CREATE INDEX IF NOT EXISTS idx_global_images_created ON global_images(created_at DESC)`));
 }

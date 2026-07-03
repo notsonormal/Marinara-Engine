@@ -5,6 +5,7 @@
 // persona, and per-chat choice selections.
 // ──────────────────────────────────────────────
 import type { DB } from "../../db/connection.js";
+import { logger } from "../../lib/logger.js";
 import type {
   ChatMLMessage,
   PromptPreset,
@@ -17,8 +18,9 @@ import type {
   MacroContext,
   ResolveMacroOptions,
 } from "@marinara-engine/shared";
-import { resolveMacros } from "@marinara-engine/shared";
+import { DEFAULT_GENERATION_PARAMS, generationParametersSchema, resolveMacros } from "@marinara-engine/shared";
 import { wrapContent, wrapGroup } from "./format-engine.js";
+import { sanitizePromptLeaf } from "./prompt-escaping.js";
 import { expandMarker, type MarkerContext } from "./marker-expander.js";
 import { mergeAdjacentMessages, squashLeadingSystemMessages } from "./merger.js";
 import { injectAtDepth } from "../lorebook/prompt-injector.js";
@@ -26,6 +28,7 @@ import type { LorebookScanResult } from "../lorebook/index.js";
 import {
   buildPromptMacroContext,
   collectCharacterDepthPromptEntries,
+  collectCharacterPostHistoryEntries,
   resolveMacrosWithVariableSnapshot,
 } from "./macro-context.js";
 
@@ -162,6 +165,8 @@ export interface AssemblerInput {
   disableLorebooks?: boolean;
   /** Pre-computed embedding of chat context for semantic lorebook matching. */
   chatEmbedding?: number[] | null;
+  /** Per-lorebook pre-computed embeddings for semantic lorebook matching. */
+  semanticEmbeddingsByLorebookId?: ReadonlyMap<string, number[] | null>;
   /** Per-chat ephemeral state overrides for lorebook entries (from chat metadata). */
   entryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
   /** Per-chat sticky/cooldown/delay timing state for lorebook entries. */
@@ -178,6 +183,14 @@ export interface AssemblerInput {
   groupScenarioOverrideText?: string | null;
   /** Per-generation agent data keyed by agent type. Used when an agent section must consume fresh output. */
   runtimeAgentData?: Record<string, string | RuntimeAgentData>;
+  /** Current generation type label for {{lastGenerationType}}. */
+  lastGenerationType?: string;
+  /** Human-readable idle duration for {{idle_duration}}. */
+  idleDuration?: string;
+  /** IANA timezone used by date/time macros. */
+  timeZone?: string;
+  /** Skip regular preset instructions that would conflict with user impersonation. */
+  impersonate?: boolean;
   /** Preserve character-scoped macros for a later known-speaker finalization pass. */
   deferCharacterMacros?: boolean;
 }
@@ -202,13 +215,39 @@ export interface AssemblerOutput {
   runtimeAgentTypesUsed?: string[];
 }
 
+function parsePresetParameters(raw: string): GenerationParameters {
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    // Malformed legacy rows should not leave generation parameters undefined.
+  }
+  const merged =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? { ...DEFAULT_GENERATION_PARAMS, ...(parsed as Partial<GenerationParameters>) }
+      : { ...DEFAULT_GENERATION_PARAMS };
+  const result = generationParametersSchema.safeParse(merged);
+  if (result.success) return result.data;
+
+  const out: GenerationParameters = { ...DEFAULT_GENERATION_PARAMS };
+  const source = merged as Record<string, unknown>;
+  for (const key of Object.keys(generationParametersSchema.shape) as Array<keyof GenerationParameters>) {
+    const fieldSchema = generationParametersSchema.shape[key];
+    const field = fieldSchema.safeParse(source[key]);
+    if (field.success) {
+      (out as Record<keyof GenerationParameters, unknown>)[key] = field.data;
+    }
+  }
+  return out;
+}
+
 // ═══════════════════════════════════════════════
 //  Main Assembler
 // ═══════════════════════════════════════════════
 
 export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOutput> {
   const wrapFormat = (input.preset.wrapFormat || "xml") as WrapFormat;
-  const parameters = JSON.parse(input.preset.parameters) as GenerationParameters;
+  const parameters = parsePresetParameters(input.preset.parameters);
   const sectionOrder = JSON.parse(input.preset.sectionOrder) as string[];
   const groupOrder = JSON.parse(input.preset.groupOrder) as string[];
   const variableValues = JSON.parse(input.preset.variableValues) as Record<string, string>;
@@ -267,6 +306,9 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     groupScenarioOverrideText: input.groupScenarioOverrideText,
     lastInput: [...input.chatMessages].reverse().find((message) => message.role === "user")?.content,
     chatId: input.chatId,
+    lastGenerationType: input.lastGenerationType,
+    idleDuration: input.idleDuration,
+    timeZone: input.timeZone,
   });
 
   // Resolve macros inside variable values themselves (e.g. {{user}} in a choice value)
@@ -295,6 +337,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     excludedLorebookSourceAgentIds: input.excludedLorebookSourceAgentIds ?? [],
     disableLorebooks: input.disableLorebooks === true,
     chatEmbedding: input.chatEmbedding ?? null,
+    semanticEmbeddingsByLorebookId: input.semanticEmbeddingsByLorebookId,
     entryStateOverrides: input.entryStateOverrides,
     entryTimingStates: input.entryTimingStates,
     lorebookTokenBudget: input.lorebookTokenBudget,
@@ -303,6 +346,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     previewOnly: input.previewOnly === true,
     resolveLorebookContent: (value) => resolveMacrosWithVariableSnapshot(value, macroCtx, deferNameMacroOptions),
     groupScenarioOverrideText: input.groupScenarioOverrideText ?? null,
+    macroCtx,
   };
 
   // ── Phase 1: Resolve sections in preset order ──
@@ -317,6 +361,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     const section = sectionMap.get(sectionId);
     if (!section) continue;
     if (section.enabled !== "true") continue;
+    if (input.impersonate === true && section.isMarker !== "true") continue;
 
     // Check if group is enabled
     if (section.groupId) {
@@ -334,18 +379,24 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
       }
     }
 
-    const resolved = await resolveSection(section, {
-      macroCtx,
-      markerCtx,
-      macroOptions: deferAllMacroOptions,
-      wrapFormat,
-      runtimeAgentData: input.runtimeAgentData ?? {},
-      runtimeAgentTypesUsed,
-    });
+    let resolved: ResolvedSection | null;
+    try {
+      resolved = await resolveSection(section, {
+        macroCtx,
+        markerCtx,
+        macroOptions: deferAllMacroOptions,
+        wrapFormat,
+        runtimeAgentData: input.runtimeAgentData ?? {},
+        runtimeAgentTypesUsed,
+      });
+    } catch (err) {
+      logger.warn(err, "[prompt] Skipping section %s after marker expansion failed", section.id);
+      continue;
+    }
 
     if (!resolved) continue;
 
-    if (section.injectionPosition === "depth" && section.injectionDepth > 0) {
+    if (!resolved.isChatHistory && section.injectionPosition === "depth" && section.injectionDepth >= 0) {
       depthSections.push(resolved);
     } else {
       orderedSections.push(resolved);
@@ -363,17 +414,16 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     const section = orderedSections[i]!;
     if (processedSections.has(section.id)) continue;
 
-    if (section.groupId) {
+    if (section.groupId && !section.isChatHistory) {
       // Collect all consecutive sections in the same group
       const groupSections: ResolvedSection[] = [section];
       processedSections.add(section.id);
 
       for (let j = i + 1; j < orderedSections.length; j++) {
         const next = orderedSections[j]!;
-        if (next.groupId === section.groupId) {
-          groupSections.push(next);
-          processedSections.add(next.id);
-        }
+        if (next.isChatHistory || next.groupId !== section.groupId) break;
+        groupSections.push(next);
+        processedSections.add(next.id);
       }
 
       // Get group info for wrapping
@@ -394,26 +444,6 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
         chatHistoryEndIdx = messages.length;
       } else {
         messages.push(...section.messages.map((message) => ({ ...message, contextKind: "prompt" as const })));
-      }
-    }
-  }
-
-  // ── Phase 2b: Fallback chat summary injection ──
-  // If the preset has no chat_summary marker but a summary exists, append it
-  // to the bottom of the first system message so it's always included.
-  if (!hasChatSummaryMarker && markerCtx.chatSummary) {
-    const wrapped = wrapContent(markerCtx.chatSummary, "Chat Summary", wrapFormat);
-    if (wrapped) {
-      const firstSystemIdx = messages.findIndex((m) => m.role === "system");
-      if (firstSystemIdx >= 0) {
-        messages[firstSystemIdx] = {
-          ...messages[firstSystemIdx]!,
-          content: `${messages[firstSystemIdx]!.content}\n\n${wrapped}`,
-          contextKind: "prompt",
-        };
-      } else {
-        // No system message at all — prepend one
-        messages.unshift({ role: "system", content: wrapped, contextKind: "prompt" });
       }
     }
   }
@@ -453,6 +483,16 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     allDepthEntries.push(characterDepthEntries);
   }
 
+  const characterPostHistoryEntries = await collectCharacterPostHistoryEntries(
+    input.db,
+    input.characterIds,
+    macroCtx,
+    wrapFormat,
+  );
+  if (characterPostHistoryEntries.length > 0) {
+    allDepthEntries.push(characterPostHistoryEntries);
+  }
+
   const combinedDepthEntries = allDepthEntries.flat();
   if (combinedDepthEntries.length > 0) {
     const historyBounds = findHistoryBounds(finalMessages);
@@ -465,13 +505,20 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
   }
 
   // ── Phase 6: Strict role formatting ──
-  // Forces proper role ordering: system first, then alternating user/assistant.
-  // Sections after chat history are forced to user role.
+  // Keeps explicit section roles while folding system blocks to the front and
+  // merging adjacent same-role messages.
   if (parameters.strictRoleFormatting) {
-    finalMessages = enforceStrictRoles(finalMessages, chatHistoryEndIdx);
+    finalMessages = enforceStrictRoles(finalMessages);
   }
 
-  // ── Phase 7: Single user message mode ──
+  // ── Phase 7: Fallback chat summary injection ──
+  // A chat_summary marker owns placement when present. Without one, enabled
+  // summaries belong at the end of the system prompt block, before history.
+  if (!hasChatSummaryMarker) {
+    finalMessages = appendFallbackChatSummaryToSystemPrompt(finalMessages, markerCtx.chatSummary, wrapFormat, macroCtx);
+  }
+
+  // ── Phase 8: Single user message mode ──
   // Collapses entire prompt into one user message.
   if (parameters.singleUserMessage) {
     const combined = finalMessages
@@ -544,10 +591,14 @@ async function resolveSection(
   let runtimeAgentText = "";
   let runtimeAgentStartToken: string | undefined;
   let runtimeAgentEndToken: string | undefined;
+  let wrapperName = section.name;
 
   // Handle marker sections
   if (section.isMarker === "true" && section.markerConfig) {
     const markerConfig = JSON.parse(section.markerConfig) as MarkerConfig;
+    if (markerConfig.type === "chat_summary") {
+      wrapperName = "Chat Summary";
+    }
     const runtimeAgentType =
       markerConfig.type === "agent_data" && markerConfig.agentType ? markerConfig.agentType : null;
     const runtimeAgentData = runtimeAgentType !== null ? ctx.runtimeAgentData[runtimeAgentType] : undefined;
@@ -559,7 +610,7 @@ async function resolveSection(
             startToken: runtimeAgentData?.startToken,
             endToken: runtimeAgentData?.endToken,
           };
-    runtimeAgentText = normalizedRuntimeAgentData.text;
+    runtimeAgentText = sanitizePromptLeaf(normalizedRuntimeAgentData.text, ctx.wrapFormat);
     runtimeAgentStartToken = normalizedRuntimeAgentData.startToken;
     runtimeAgentEndToken = normalizedRuntimeAgentData.endToken;
     const hasRuntimeAgentData =
@@ -574,10 +625,7 @@ async function resolveSection(
         id: section.id,
         groupId: section.groupId,
         role,
-        messages: expanded.messages.map((message) => ({
-          ...message,
-          content: resolveMacros(message.content, ctx.macroCtx),
-        })),
+        messages: expanded.messages,
         depth: section.injectionDepth,
         isChatHistory: true,
       };
@@ -599,6 +647,11 @@ async function resolveSection(
       // Other markers return content to be wrapped
       content = expanded.content;
       contentMacrosResolved =
+        markerConfig.type === "character" ||
+        markerConfig.type === "persona" ||
+        markerConfig.type === "chat_summary" ||
+        markerConfig.type === "dialogue_examples" ||
+        markerConfig.type === "agent_data" ||
         markerConfig.type === "world_info_before" ||
         markerConfig.type === "world_info_after" ||
         markerConfig.type === "lorebook";
@@ -620,7 +673,7 @@ async function resolveSection(
   );
 
   // Auto-wrap in the preset's format
-  const wrapped = wrapContent(content, section.name, ctx.wrapFormat);
+  const wrapped = wrapContent(content, wrapperName, ctx.wrapFormat);
   const messageContent = shouldWrapRuntimeAgentSection
     ? `${runtimeAgentStartToken}${wrapped || content}${runtimeAgentEndToken}`
     : wrapped || content;
@@ -697,10 +750,9 @@ function buildGroupMessages(
 
 /**
  * Enforce strict role formatting:
- * 1. Leading system messages stay as system.
- * 2. Sections after chat_history are forced to user role.
- * 3. Ensures alternating user/assistant after the system block.
- *    Adjacent same-role messages are merged.
+ * 1. System messages are kept as system and merged into the leading system block.
+ * 2. User/assistant sections keep their configured role.
+ * 3. Adjacent same-role user/assistant messages are merged instead of coercing roles.
  */
 function findHistoryBounds(messages: ChatMLMessage[]): { start: number; end: number } | null {
   let start = -1;
@@ -714,61 +766,88 @@ function findHistoryBounds(messages: ChatMLMessage[]): { start: number; end: num
   return start >= 0 ? { start, end } : null;
 }
 
-function enforceStrictRoles(messages: ChatMLMessage[], chatHistoryEndIdx: number): ChatMLMessage[] {
-  if (messages.length === 0) return messages;
-  const resolvedChatHistoryEndIdx = findHistoryBounds(messages)?.end ?? chatHistoryEndIdx;
+function appendFallbackChatSummaryToSystemPrompt(
+  messages: ChatMLMessage[],
+  chatSummary: string | null,
+  wrapFormat: WrapFormat,
+  macroCtx: MacroContext,
+): ChatMLMessage[] {
+  const summary = sanitizePromptLeaf(resolveMacros(chatSummary ?? "", macroCtx), wrapFormat).trim();
+  if (!summary) return messages;
 
-  // Step 1: Force post-chat-history non-user/assistant messages to user
-  if (resolvedChatHistoryEndIdx > 0) {
-    messages = messages.map((m, i) => {
-      if (i >= resolvedChatHistoryEndIdx && m.role === "system") {
-        return { ...m, role: "user" as const };
-      }
-      return m;
-    });
+  const wrapped = wrapContent(summary, "Chat Summary", wrapFormat).trim();
+  if (!wrapped) return messages;
+
+  const next = messages.map((message) => ({ ...message }));
+  let lastLeadingSystemIdx = -1;
+  for (let i = 0; i < next.length; i++) {
+    const message = next[i]!;
+    if (message.role !== "system" || message.contextKind === "history") break;
+    lastLeadingSystemIdx = i;
   }
 
-  // Step 2: Collect leading system block
+  if (lastLeadingSystemIdx >= 0) {
+    const target = next[lastLeadingSystemIdx]!;
+    next[lastLeadingSystemIdx] = {
+      ...target,
+      content: `${target.content}\n\n${wrapped}`,
+      contextKind: target.contextKind ?? "prompt",
+    };
+    return next;
+  }
+
+  return [{ role: "system", content: wrapped, contextKind: "prompt" }, ...next];
+}
+
+function enforceStrictRoles(messages: ChatMLMessage[]): ChatMLMessage[] {
+  if (messages.length === 0) return messages;
+
+  const mergeInto = (target: ChatMLMessage, source: ChatMLMessage) => {
+    target.content += "\n\n" + source.content;
+    if (target.contextKind !== source.contextKind) {
+      delete target.contextKind;
+    }
+    if (source.images?.length) {
+      target.images = [...(target.images ?? []), ...source.images];
+    }
+    if (source.files?.length) {
+      target.files = [...(target.files ?? []), ...source.files];
+    }
+    if (source.providerMetadata) {
+      target.providerMetadata = source.providerMetadata;
+    }
+  };
+
+  // Step 1: Collect leading system block.
   const result: ChatMLMessage[] = [];
   let idx = 0;
-  const systemParts: string[] = [];
   while (idx < messages.length && messages[idx]!.role === "system") {
-    systemParts.push(messages[idx]!.content);
+    const msg = messages[idx]!;
+    const leadingSystem = result[0];
+    if (leadingSystem?.role === "system") {
+      mergeInto(leadingSystem, msg);
+    } else {
+      result.push({ ...msg });
+    }
     idx++;
   }
-  if (systemParts.length > 0) {
-    result.push({ role: "system", content: systemParts.join("\n\n") });
-  }
 
-  // Step 3: The rest must alternate user/assistant.
-  // First non-system should be user.
-  let expectedRole: "user" | "assistant" = "user";
   for (; idx < messages.length; idx++) {
     const msg = messages[idx]!;
-    const effectiveRole = msg.role === "system" ? "user" : msg.role;
 
-    if (effectiveRole === expectedRole) {
-      result.push({ ...msg, role: effectiveRole });
-      expectedRole = effectiveRole === "user" ? "assistant" : "user";
-    } else {
-      // Wrong role — merge into the previous message of the same role, or
-      // if this would break alternation, force it to the expected role.
+    if (msg.role === "system") {
       const prev = result[result.length - 1];
-      const sameCharacter = (prev?.characterId ?? null) === (msg.characterId ?? null);
-      if (prev && prev.role === effectiveRole && sameCharacter) {
-        // Merge into previous (same role back-to-back)
-        prev.content += "\n\n" + msg.content;
-        if (prev.contextKind !== msg.contextKind) {
-          delete prev.contextKind;
-        }
-        if (msg.images?.length) {
-          prev.images = [...(prev.images ?? []), ...msg.images];
-        }
-      } else {
-        // Force to expected role to maintain alternation
-        result.push({ ...msg, role: expectedRole });
-        expectedRole = expectedRole === "user" ? "assistant" : "user";
-      }
+      if (prev?.role === "system") mergeInto(prev, msg);
+      else result.push({ ...msg });
+      continue;
+    }
+
+    const prev = result[result.length - 1];
+    const sameCharacter = (prev?.characterId ?? null) === (msg.characterId ?? null);
+    if (prev && prev.role === msg.role && sameCharacter) {
+      mergeInto(prev, msg);
+    } else {
+      result.push({ ...msg });
     }
   }
 

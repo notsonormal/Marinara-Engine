@@ -1,10 +1,9 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   Check,
   ChevronDown,
   Code2,
-  MessageCircle,
   Pencil,
   RefreshCw,
   Sparkles,
@@ -22,10 +21,6 @@ import {
 import { ContextInjectionPanel } from "../agents/ContextInjectionPanel";
 import { ContinuityIssueChecklist } from "../agents/ContinuityIssueChecklist";
 
-const SecretPlotPanel = lazy(async () =>
-  import("../agents/SecretPlotPanel").then((m) => ({ default: m.SecretPlotPanel })),
-);
-
 interface ThoughtBubble {
   agentId: string;
   agentName: string;
@@ -33,7 +28,7 @@ interface ThoughtBubble {
   timestamp: number;
 }
 
-type AgentsMenuTab = "activity" | "injections" | "secret";
+type AgentsMenuTab = "activity" | "injections";
 
 interface RoleplayHUDActionsMenuProps {
   chatId: string;
@@ -47,10 +42,6 @@ interface RoleplayHUDActionsMenuProps {
   customAgentRunsLoading: boolean;
   agentConfigs?: AgentConfigRow[];
   enabledAgentTypes?: Set<string>;
-  showEcho: boolean;
-  echoChamberOpen: boolean;
-  toggleEchoChamber: () => void;
-  echoMessageCount: number;
   clearGameState: () => void;
   onRetriggerTrackers?: () => void;
   onRetryFailedAgents?: () => void;
@@ -58,7 +49,6 @@ interface RoleplayHUDActionsMenuProps {
   failedAgentFailures?: AgentFailure[];
   onClose: () => void;
   showInjectionsTab?: boolean;
-  showSecretPlotTab?: boolean;
 }
 
 export function RoleplayHUDActionsMenu({
@@ -73,10 +63,6 @@ export function RoleplayHUDActionsMenu({
   customAgentRunsLoading,
   agentConfigs,
   enabledAgentTypes,
-  showEcho,
-  echoChamberOpen,
-  toggleEchoChamber,
-  echoMessageCount,
   clearGameState,
   onRetriggerTrackers,
   onRetryFailedAgents,
@@ -84,11 +70,23 @@ export function RoleplayHUDActionsMenu({
   failedAgentFailures,
   onClose,
   showInjectionsTab,
-  showSecretPlotTab,
 }: RoleplayHUDActionsMenuProps) {
   const [tab, setTab] = useState<AgentsMenuTab>("activity");
   const uniqueAgentCount = new Set(thoughtBubbles.map((bubble) => bubble.agentId)).size;
-  const hasCustomRuns = customAgentRuns.length > 0;
+  const latestActiveCustomRuns = useMemo(
+    () => getLatestActiveCustomRuns(customAgentRuns, agentConfigs ?? [], enabledAgentTypes),
+    [customAgentRuns, agentConfigs, enabledAgentTypes],
+  );
+  const latestHistoricalCustomRuns = useMemo(() => getLatestCustomRuns(customAgentRuns), [customAgentRuns]);
+  const showHistoricalCustomRuns =
+    latestActiveCustomRuns.length === 0 && thoughtBubbles.length === 0 && !isAgentProcessing;
+  const customActivityRuns =
+    latestActiveCustomRuns.length > 0
+      ? latestActiveCustomRuns
+      : showHistoricalCustomRuns
+        ? latestHistoricalCustomRuns
+        : [];
+  const hasCustomRuns = customActivityRuns.length > 0;
   const injectableCustomRuns = useMemo(
     () => getLatestInjectableCustomRuns(customAgentRuns, agentConfigs ?? [], enabledAgentTypes),
     [customAgentRuns, agentConfigs, enabledAgentTypes],
@@ -105,14 +103,12 @@ export function RoleplayHUDActionsMenu({
   const tabs = [
     { id: "activity" as const, label: "Activity" },
     ...(showInjectionsTab ? [{ id: "injections" as const, label: "Injections" }] : []),
-    ...(showSecretPlotTab ? [{ id: "secret" as const, label: "Secret plot" }] : []),
   ] as const;
   const currentTabIndex = tabs.findIndex((t) => t.id === tab);
   const safeTabIndex = currentTabIndex >= 0 ? currentTabIndex : 0;
   const currentTab = tabs[safeTabIndex] ?? tabs[0];
   const activeTab = currentTab.id;
   const showTrackerActions = activeTab === "activity";
-  const showRetryFailedAction = !!(onRetryFailedAgents && failedAgentTypes && failedAgentTypes.length > 0);
   const displayedFailures = useMemo(
     () =>
       failedAgentFailures && failedAgentFailures.length > 0
@@ -120,17 +116,16 @@ export function RoleplayHUDActionsMenu({
         : (failedAgentTypes ?? []).map((agentType) => toAgentFailure({ agentType })),
     [failedAgentFailures, failedAgentTypes],
   );
-  const showFooterActions = showEcho || showTrackerActions || showRetryFailedAction;
+  const failureCount = displayedFailures.length;
+  const showRetryFailedAction = !!onRetryFailedAgents && failureCount > 0;
+  const showFooterActions = showTrackerActions || showRetryFailedAction;
 
   useEffect(() => {
     if (!showInjectionsTab && tab === "injections") {
       setTab("activity");
       return;
     }
-    if (!showSecretPlotTab && tab === "secret") {
-      setTab("activity");
-    }
-  }, [showInjectionsTab, showSecretPlotTab, tab]);
+  }, [showInjectionsTab, tab]);
 
   return (
     <>
@@ -144,14 +139,10 @@ export function RoleplayHUDActionsMenu({
                   key={item.id}
                   type="button"
                   onClick={() => setTab(item.id)}
-                  title={
-                    item.id === "secret"
-                      ? "Values here are stored in agent memory - the same source used when injecting arc and directions before each reply."
-                      : undefined
-                  }
+                  title={undefined}
                   className={
                     active
-                      ? "min-h-6 min-w-0 flex-1 rounded-md bg-[var(--primary)]/15 px-1.5 py-0.5 text-center text-[0.5625rem] font-semibold text-[var(--primary)] ring-1 ring-[var(--primary)]/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--ring)] max-md:min-h-7"
+                      ? "min-h-6 min-w-0 flex-1 rounded-md bg-[var(--card)] px-1.5 py-0.5 text-center text-[0.5625rem] font-semibold text-[var(--foreground)] ring-1 ring-[var(--border)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--ring)] max-md:min-h-7"
                       : "min-h-6 min-w-0 flex-1 rounded-md px-1.5 py-0.5 text-center text-[0.5625rem] font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)]/45 hover:text-[var(--accent-foreground)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--ring)] max-md:min-h-7"
                   }
                 >
@@ -166,23 +157,25 @@ export function RoleplayHUDActionsMenu({
       {activeTab === "activity" && (
         <>
           {isAgentProcessing && (
-            <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
-              <Sparkles size="0.75rem" className="animate-pulse text-foreground/65" />
-              <span className="text-[0.625rem] text-foreground/65">Agents thinking...</span>
+            <div className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-2">
+              <Sparkles size="0.75rem" className="animate-pulse text-[var(--muted-foreground)]" />
+              <span className="text-[0.625rem] text-[var(--muted-foreground)]">Agents thinking...</span>
             </div>
           )}
           {!hasAnyActivity && (
-            <div className="px-3 py-4 text-center text-[0.625rem] text-white/30">No agent activity yet</div>
+            <div className="px-3 py-4 text-center text-[0.625rem] text-[var(--muted-foreground)]">
+              No agent activity yet
+            </div>
           )}
           {thoughtBubbles.length > 0 && (
             <>
-              <div className="flex items-center justify-between border-b border-white/5 px-3 py-1.5">
-                <span className="text-[0.625rem] text-white/40">
+              <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-1.5">
+                <span className="text-[0.625rem] text-[var(--muted-foreground)]">
                   {uniqueAgentCount} agent{uniqueAgentCount !== 1 ? "s" : ""} triggered
                 </span>
                 <button
                   onClick={clearThoughtBubbles}
-                  className="text-[0.625rem] text-white/30 transition-colors hover:text-white/60"
+                  className="text-[0.625rem] text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
                 >
                   Clear all
                 </button>
@@ -191,11 +184,11 @@ export function RoleplayHUDActionsMenu({
                 {thoughtBubbles.map((bubble, index) => (
                   <div
                     key={`${bubble.agentId}-${bubble.timestamp}`}
-                    className="relative rounded-lg bg-white/5 p-2 text-[0.625rem]"
+                    className="relative rounded-lg border border-[var(--border)] bg-[var(--secondary)]/35 p-2 text-[0.625rem]"
                   >
                     <button
                       onClick={() => dismissThoughtBubble(index)}
-                      className="absolute right-1.5 top-1.5 text-white/20 transition-colors hover:text-white/60"
+                      className="absolute right-1.5 top-1.5 text-[var(--muted-foreground)]/50 transition-colors hover:text-[var(--foreground)]"
                     >
                       <X size="0.625rem" />
                     </button>
@@ -204,7 +197,9 @@ export function RoleplayHUDActionsMenu({
                       {bubble.agentId === "continuity" ? (
                         <ContinuityIssueChecklist content={bubble.content} compact />
                       ) : (
-                        <p className="mt-0.5 whitespace-pre-wrap text-white/50 leading-relaxed">{bubble.content}</p>
+                        <p className="mt-0.5 whitespace-pre-wrap text-[var(--muted-foreground)] leading-relaxed">
+                          {bubble.content}
+                        </p>
                       )}
                     </div>
                   </div>
@@ -215,10 +210,16 @@ export function RoleplayHUDActionsMenu({
 
           {(hasCustomRuns || customAgentRunsLoading) && (
             <CustomAgentRunsSection
-              runs={customAgentRuns}
+              runs={customActivityRuns}
               loading={customAgentRunsLoading}
               title="Custom outputs"
-              countMode="all"
+              countMode="latest"
+              collapsible
+              latestNote={
+                showHistoricalCustomRuns
+                  ? "Showing the latest saved custom-agent output until new activity arrives."
+                  : "Showing only the latest saved output for each active custom agent."
+              }
             />
           )}
         </>
@@ -242,26 +243,14 @@ export function RoleplayHUDActionsMenu({
               emptyText="No saved prompt-section output yet."
               countMode="latest"
               collapsible
+              latestNote="Showing the latest saved output per custom agent with Add as Prompt Section enabled."
             />
           )}
         </>
       )}
 
-      {activeTab === "secret" && showSecretPlotTab && (
-        <Suspense
-          fallback={<div className="px-3 py-4 text-center text-[0.625rem] text-white/35">Loading secret plot...</div>}
-        >
-          <SecretPlotPanel
-            chatId={chatId}
-            messages={injectionSourceMessages}
-            isAgentProcessing={isAgentProcessing}
-            isGenerationBusy={isGenerationBusy}
-          />
-        </Suspense>
-      )}
-
       {showFooterActions && (
-        <div className="border-t border-white/5 divide-y divide-white/5">
+        <div className="divide-y divide-[var(--border)] border-t border-[var(--border)]">
           {showRetryFailedAction && displayedFailures.length > 0 && (
             <div className="space-y-1.5 px-3 py-2">
               <div className="flex items-center gap-1.5 text-[0.5625rem] font-semibold uppercase tracking-wide text-amber-300/90">
@@ -276,7 +265,7 @@ export function RoleplayHUDActionsMenu({
                     title={failure.error ?? undefined}
                   >
                     <div className="font-semibold text-amber-200">{formatAgentFailureTitle(failure)}</div>
-                    <div className="mt-0.5 max-h-8 overflow-hidden break-words text-amber-100/65">
+                    <div className="mt-0.5 whitespace-pre-wrap break-words text-amber-100/65">
                       {formatAgentFailureDetail(failure)}
                     </div>
                   </div>
@@ -284,29 +273,13 @@ export function RoleplayHUDActionsMenu({
               </div>
             </div>
           )}
-          {showEcho && (
-            <button
-              onClick={toggleEchoChamber}
-              className="flex w-full items-center gap-2 px-3 py-2 text-[0.625rem] transition-colors hover:bg-white/5"
-            >
-              <MessageCircle size="0.75rem" className={echoChamberOpen ? "text-foreground/75" : "text-foreground/50"} />
-              <span className={echoChamberOpen ? "font-medium text-foreground/75" : "text-foreground/55"}>
-                Echo Chamber {echoChamberOpen ? "On" : "Off"}
-              </span>
-              {echoMessageCount > 0 && (
-                <span className="ml-auto flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-foreground/15 px-1 text-[0.5rem] font-bold text-foreground/80 ring-1 ring-foreground/10">
-                  {echoMessageCount}
-                </span>
-              )}
-            </button>
-          )}
           {showTrackerActions && (
             <button
               onClick={() => {
                 clearGameState();
                 onClose();
               }}
-              className="flex w-full items-center gap-2 px-3 py-2 text-[0.625rem] text-white/60 transition-colors hover:bg-red-500/10 hover:text-red-300"
+              className="flex w-full items-center gap-2 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] transition-colors hover:bg-red-500/10 hover:text-red-300"
             >
               <Trash2 size="0.75rem" className="text-current" />
               <span>Clear Trackers</span>
@@ -319,7 +292,7 @@ export function RoleplayHUDActionsMenu({
                 onClose();
               }}
               disabled={isGenerationBusy}
-              className="flex w-full items-center gap-2 px-3 py-2 text-[0.625rem] font-medium text-foreground/60 transition-colors hover:bg-white/5 hover:text-foreground/75 disabled:opacity-50"
+              className="flex w-full items-center gap-2 px-3 py-2 text-[0.625rem] font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)]/45 hover:text-[var(--foreground)] disabled:opacity-50"
             >
               <RefreshCw size="0.6875rem" className={isGenerationBusy ? "animate-spin" : ""} />
               {isGenerationBusy
@@ -335,11 +308,11 @@ export function RoleplayHUDActionsMenu({
                 onRetryFailedAgents();
                 onClose();
               }}
-              disabled={isAgentProcessing}
+              disabled={isGenerationBusy}
               className="flex w-full items-center gap-2 px-3 py-2 text-[0.625rem] font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
             >
-              <AlertTriangle size="0.6875rem" className={isAgentProcessing ? "animate-pulse" : ""} />
-              {isAgentProcessing ? "Retrying..." : `Retry Failed Agents (${failedAgentTypes?.length ?? 0})`}
+              <AlertTriangle size="0.6875rem" className={isGenerationBusy ? "animate-pulse" : ""} />
+              {isGenerationBusy ? "Busy..." : `Retry Failed Agents (${failureCount})`}
             </button>
           )}
         </div>
@@ -355,6 +328,7 @@ function CustomAgentRunsSection({
   emptyText,
   countMode,
   collapsible,
+  latestNote,
 }: {
   runs: AgentRunRow[];
   loading: boolean;
@@ -362,6 +336,7 @@ function CustomAgentRunsSection({
   emptyText?: string;
   countMode: "all" | "latest";
   collapsible?: boolean;
+  latestNote?: string;
 }) {
   const [open, setOpen] = useState(!collapsible);
   const countLabel = loading ? "Loading..." : runs.length > 0 ? String(runs.length) : "";
@@ -386,7 +361,7 @@ function CustomAgentRunsSection({
   );
 
   return (
-    <div className="border-t border-white/5">
+    <div className="border-t border-[var(--border)]">
       {collapsible ? (
         <button
           type="button"
@@ -409,7 +384,7 @@ function CustomAgentRunsSection({
           )}
           {!loading && countMode === "latest" && runs.length > 0 && (
             <div className="px-1 text-[0.5625rem] text-[var(--muted-foreground)]/70">
-              Showing the latest saved output per custom agent with Add as Prompt Section enabled.
+              {latestNote ?? "Showing the latest saved output per custom agent."}
             </div>
           )}
         </div>
@@ -419,21 +394,54 @@ function CustomAgentRunsSection({
 }
 
 function hasActiveInjectableCustomAgent(configs: AgentConfigRow[], enabledAgentTypes?: Set<string>): boolean {
+  if (!enabledAgentTypes) return false;
   const builtInTypes = new Set(BUILT_IN_AGENTS.map((agent) => agent.id));
   return configs.some((config) => {
     if (builtInTypes.has(config.type)) return false;
-    if (enabledAgentTypes ? !enabledAgentTypes.has(config.type) : config.enabled !== "true") return false;
+    if (!enabledAgentTypes.has(config.type)) return false;
     const settings = parseAgentSettings(config.settings);
     return settings.injectAsSection === true;
   });
 }
 
 function hasActiveCustomAgentType(configs: AgentConfigRow[], enabledAgentTypes?: Set<string>): boolean {
+  if (!enabledAgentTypes) return false;
   const builtInTypes = new Set(BUILT_IN_AGENTS.map((agent) => agent.id));
   return configs.some((config) => {
     if (builtInTypes.has(config.type)) return false;
-    return enabledAgentTypes ? enabledAgentTypes.has(config.type) : config.enabled === "true";
+    return enabledAgentTypes.has(config.type);
   });
+}
+
+function getLatestActiveCustomRuns(
+  runs: AgentRunRow[],
+  configs: AgentConfigRow[],
+  enabledAgentTypes?: Set<string>,
+): AgentRunRow[] {
+  if (!enabledAgentTypes) return [];
+  const builtInTypes = new Set(BUILT_IN_AGENTS.map((agent) => agent.id));
+  const activeCustomTypes = new Set(
+    configs
+      .filter((config) => !builtInTypes.has(config.type) && enabledAgentTypes.has(config.type))
+      .map((config) => config.type),
+  );
+  return getLatestRunsByType(runs, activeCustomTypes);
+}
+
+function getLatestCustomRuns(runs: AgentRunRow[]): AgentRunRow[] {
+  return getLatestRunsByType(runs);
+}
+
+function getLatestRunsByType(runs: AgentRunRow[], allowedTypes?: Set<string>): AgentRunRow[] {
+  const seen = new Set<string>();
+  const latest: AgentRunRow[] = [];
+  for (const run of runs) {
+    if (allowedTypes && !allowedTypes.has(run.agentType)) continue;
+    if (seen.has(run.agentType)) continue;
+    seen.add(run.agentType);
+    latest.push(run);
+  }
+  return latest;
 }
 
 function getLatestInjectableCustomRuns(
@@ -441,25 +449,19 @@ function getLatestInjectableCustomRuns(
   configs: AgentConfigRow[],
   enabledAgentTypes?: Set<string>,
 ): AgentRunRow[] {
+  if (!enabledAgentTypes) return [];
   const builtInTypes = new Set(BUILT_IN_AGENTS.map((agent) => agent.id));
   const injectableTypes = new Set(
     configs
       .filter((config) => {
         if (builtInTypes.has(config.type)) return false;
-        if (enabledAgentTypes ? !enabledAgentTypes.has(config.type) : config.enabled !== "true") return false;
+        if (!enabledAgentTypes.has(config.type)) return false;
         const settings = parseAgentSettings(config.settings);
         return settings.injectAsSection === true;
       })
       .map((config) => config.type),
   );
-  const seen = new Set<string>();
-  const latest: AgentRunRow[] = [];
-  for (const run of runs) {
-    if (!injectableTypes.has(run.agentType) || seen.has(run.agentType)) continue;
-    seen.add(run.agentType);
-    latest.push(run);
-  }
-  return latest;
+  return getLatestRunsByType(runs, injectableTypes);
 }
 
 function parseAgentSettings(value: string): Record<string, unknown> {
@@ -544,12 +546,16 @@ function CustomAgentRunItem({ run }: { run: AgentRunRow }) {
       return;
     }
     setError(null);
-    await updateRun.mutateAsync({ id: run.id, chatId: run.chatId, resultData: parsed.value });
-    setEditing(false);
+    try {
+      await updateRun.mutateAsync({ id: run.id, chatId: run.chatId, resultData: parsed.value });
+      setEditing(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save output");
+    }
   };
 
   return (
-    <div className="rounded-lg border border-[var(--border)] bg-[var(--card)]/55 p-2 text-[0.625rem] text-[var(--popover-foreground)]">
+    <div className="rounded-lg border border-[var(--border)] bg-[var(--secondary)]/35 p-2 text-[0.625rem] text-[var(--foreground)]">
       <div className="flex items-start gap-2">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">

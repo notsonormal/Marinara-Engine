@@ -2,6 +2,7 @@ import type { ComponentProps } from "react";
 import type { Message, SpriteSide } from "@marinara-engine/shared";
 import { ConversationView } from "./ConversationView";
 import { ChatCommonOverlays } from "./ChatCommonOverlays";
+import { useRenderTimer } from "../../lib/perf-diagnostics";
 import type { CharacterMap, MessageSelectionToggle, PeekPromptData, PersonaInfo } from "./chat-area.types";
 
 type SceneInfo =
@@ -35,8 +36,10 @@ type ConversationSurfaceProps = {
   connectedChatName?: string;
   sceneInfo?: SceneInfo;
   settingsOpen: boolean;
-  filesOpen: boolean;
+  settingsAnchor: ComponentProps<typeof ChatCommonOverlays>["settingsAnchor"];
+  settingsInitialSection?: ComponentProps<typeof ChatCommonOverlays>["settingsInitialSection"];
   galleryOpen: boolean;
+  galleryAnchor: ComponentProps<typeof ChatCommonOverlays>["galleryAnchor"];
   wizardOpen: boolean;
   peekPromptData: PeekPromptData | null;
   deleteDialogMessageId: string | null;
@@ -52,15 +55,14 @@ type ConversationSurfaceProps = {
   onSetActiveSwipe: (messageId: string, index: number) => void;
   onToggleHiddenFromAI: (messageId: string, current: boolean) => void;
   onPeekPrompt: () => void;
+  onBranch?: (messageId: string) => void;
   onToggleSelectMessage: (toggle: MessageSelectionToggle) => void;
   onSwitchChat?: () => void;
   onConcludeScene?: () => void;
   onAbandonScene?: () => void;
-  onOpenSettings: () => void;
-  onOpenFiles: () => void;
-  onOpenGallery: () => void;
+  onOpenSettings: ComponentProps<typeof ConversationView>["onOpenSettings"];
+  onOpenGallery: ComponentProps<typeof ConversationView>["onOpenGallery"];
   onCloseSettings: () => void;
-  onCloseFiles: () => void;
   onCloseGallery: () => void;
   onIllustrate?: () => void;
   onWizardFinish: () => void;
@@ -98,8 +100,10 @@ export function ChatConversationSurface({
   connectedChatName,
   sceneInfo,
   settingsOpen,
-  filesOpen,
+  settingsAnchor,
+  settingsInitialSection,
   galleryOpen,
+  galleryAnchor,
   wizardOpen,
   peekPromptData,
   deleteDialogMessageId,
@@ -115,15 +119,14 @@ export function ChatConversationSurface({
   onSetActiveSwipe,
   onToggleHiddenFromAI,
   onPeekPrompt,
+  onBranch,
   onToggleSelectMessage,
   onSwitchChat,
   onConcludeScene,
   onAbandonScene,
   onOpenSettings,
-  onOpenFiles,
   onOpenGallery,
   onCloseSettings,
-  onCloseFiles,
   onCloseGallery,
   onIllustrate,
   onWizardFinish,
@@ -142,6 +145,7 @@ export function ChatConversationSurface({
   onSelectAllBelowSelection,
   lastAssistantMessageId,
 }: ConversationSurfaceProps) {
+  useRenderTimer("convo-surface"); // [#3104 diagnostic]
   return (
     <div data-component="ChatArea.Conversation" className="flex flex-1 overflow-hidden">
       <div className="relative flex flex-1 flex-col overflow-hidden">
@@ -169,8 +173,8 @@ export function ChatConversationSurface({
           onPeekPrompt={onPeekPrompt}
           lastAssistantMessageId={lastAssistantMessageId}
           onOpenSettings={onOpenSettings}
-          onOpenFiles={onOpenFiles}
           onOpenGallery={onOpenGallery}
+          onBranch={onBranch}
           multiSelectMode={multiSelectMode}
           selectedMessageIds={selectedMessageIds}
           onToggleSelectMessage={onToggleSelectMessage}
@@ -184,10 +188,11 @@ export function ChatConversationSurface({
 
       <ChatCommonOverlays
         chat={chat}
-        activeChatId={activeChatId}
         settingsOpen={settingsOpen}
-        filesOpen={filesOpen}
+        settingsAnchor={settingsAnchor}
+        settingsInitialSection={settingsInitialSection}
         galleryOpen={galleryOpen}
+        galleryAnchor={galleryAnchor}
         wizardOpen={wizardOpen}
         peekPromptData={peekPromptData}
         deleteDialogMessageId={deleteDialogMessageId}
@@ -203,7 +208,6 @@ export function ChatConversationSurface({
           onSpriteSideChange,
         }}
         onCloseSettings={onCloseSettings}
-        onCloseFiles={onCloseFiles}
         onCloseGallery={onCloseGallery}
         onIllustrate={onIllustrate}
         onWizardFinish={onWizardFinish}

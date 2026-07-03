@@ -4,7 +4,7 @@
 import type { GenerationParameters } from "../types/prompt.js";
 
 /** App version — single source of truth. */
-export const APP_VERSION = "1.6.1";
+export const APP_VERSION = "2.0.9";
 
 /** Stable synthetic connection id for the built-in local llama sidecar. */
 export const LOCAL_SIDECAR_CONNECTION_ID = "__local_sidecar__";
@@ -14,6 +14,10 @@ export const PROFESSOR_MARI_ID = "__professor_mari__";
 
 /** Stable ID for the default OpenRouter free‑tier connection. */
 export const DEFAULT_CONNECTION_ID = "__default_openrouter__";
+
+/** Default system prompt for AI-backed translation. */
+export const DEFAULT_TRANSLATION_SYSTEM_PROMPT =
+  "You are a translator. Translate the given text accurately, preserving formatting, markdown, and any special characters like *asterisks* for actions. Output ONLY the translated text, nothing else -- no explanations, no extra commentary.";
 
 /** Default generation parameters for new presets. */
 export const DEFAULT_GENERATION_PARAMS: GenerationParameters = {
@@ -29,6 +33,7 @@ export const DEFAULT_GENERATION_PARAMS: GenerationParameters = {
   verbosity: null,
   serviceTier: null,
   assistantPrefill: "",
+  customThinkingTags: [],
   customParameters: {},
   squashSystemMessages: true,
   showThoughts: true,
@@ -53,14 +58,38 @@ export const MAX_FILE_SIZES = {
 export const LIMITS = {
   /** Max messages to include in context for agents */
   AGENT_CONTEXT_MESSAGES: 20,
-  /** Max lorebook entries that can be injected */
+  /** Legacy default for the previous global lorebook entry cap. Prefer LOREBOOK_ENTRY_LIMIT_* for new code. */
   MAX_LOREBOOK_ENTRIES: 100,
+  /** Default max active entries a single lorebook may contribute per generation. */
+  LOREBOOK_ENTRY_LIMIT_DEFAULT: 100,
+  /** Minimum configurable active-entry limit for a lorebook. */
+  LOREBOOK_ENTRY_LIMIT_MIN: 1,
+  /** Maximum configurable active-entry limit for a lorebook. */
+  LOREBOOK_ENTRY_LIMIT_MAX: 1000,
+  /**
+   * Default keyword-scan depth (messages back) for the per-turn lorebook scan
+   * when neither the entry nor its lorebook sets one. An explicit per-entry or
+   * per-lorebook scanDepth of 0 ("scan all") still scans the full history.
+   */
+  LOREBOOK_DEFAULT_SCAN_DEPTH: 10,
   /** Default global lorebook token budget per generation. 0 means unlimited when explicitly configured per chat. */
   DEFAULT_LOREBOOK_TOKEN_BUDGET: 8192,
   /** Default summary trigger: every N messages */
   SUMMARY_INTERVAL: 50,
   /** Default vectorization: top-K results */
   VECTOR_TOP_K: 10,
+  /** Default recent-message window used to build lorebook vector queries. 0 means all messages. */
+  LOREBOOK_VECTOR_QUERY_DEPTH_DEFAULT: 10,
+  /** Maximum recent-message window for lorebook vector queries. */
+  LOREBOOK_VECTOR_QUERY_DEPTH_MAX: 100,
+  /** Default minimum cosine similarity for lorebook vector matches. */
+  LOREBOOK_VECTOR_SCORE_THRESHOLD_DEFAULT: 0.3,
+  /** Default maximum semantic/vector matches a single lorebook may contribute per generation. */
+  LOREBOOK_VECTOR_MAX_RESULTS_DEFAULT: 10,
+  /** Minimum maximum semantic/vector matches per lorebook. */
+  LOREBOOK_VECTOR_MAX_RESULTS_MIN: 1,
+  /** Maximum maximum semantic/vector matches per lorebook. */
+  LOREBOOK_VECTOR_MAX_RESULTS_MAX: 100,
   /** Echo Chamber: messages per generation */
   ECHO_CHAMBER_MESSAGES: 5,
 } as const;

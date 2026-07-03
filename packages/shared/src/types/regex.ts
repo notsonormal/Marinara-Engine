@@ -5,6 +5,9 @@
 /** Where a regex script is applied. */
 export type RegexPlacement = "ai_output" | "user_input";
 
+/** Which runtime contexts a regex script applies to. */
+export type RegexApplyMode = "prompt" | "display" | "both";
+
 /** A find/replace regex script. */
 export interface RegexScript {
   id: string;
@@ -24,6 +27,10 @@ export interface RegexScript {
   flags: string;
   /** Only apply in prompt context (not displayed text) */
   promptOnly: boolean;
+  /** Prompt/display application mode. Legacy promptOnly rows derive this field. */
+  applyMode?: RegexApplyMode;
+  /** Prompt recipient character IDs this script is limited to (empty = all recipients) */
+  targetCharacterIds: string[];
   /** Execution order (lower = runs first) */
   order: number;
   /** Optional minimum message depth to apply (null = no limit) */

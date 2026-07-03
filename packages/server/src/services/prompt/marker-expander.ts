@@ -3,7 +3,8 @@
 // sections into actual content at assembly time.
 // ──────────────────────────────────────────────
 import type { DB } from "../../db/connection.js";
-import { resolveCharacterScopedMacros, stripMacroComments } from "@marinara-engine/shared";
+import { logger } from "../../lib/logger.js";
+import { formatRpgStatsForPrompt, resolveMacros, stripMacroComments } from "@marinara-engine/shared";
 import type {
   CharacterMacroProfile,
   MarkerConfig,
@@ -12,14 +13,14 @@ import type {
   WrapFormat,
   RPGStatsConfig,
   LorebookEntryTimingState,
+  MacroContext,
 } from "@marinara-engine/shared";
 import { createCharactersStorage } from "../storage/characters.storage.js";
 import { createAgentsStorage } from "../storage/agents.storage.js";
 import { processLorebooks, type LorebookFinalContentResolver, type LorebookScanResult } from "../lorebook/index.js";
 import { wrapContent } from "./format-engine.js";
-import { getCharacterDescriptionWithExtensions } from "./character-description-extensions.js";
+import { sanitizePromptLeaf } from "./prompt-escaping.js";
 import { agentRuns } from "../../db/schema/index.js";
-import { gameStateSnapshots } from "../../db/schema/index.js";
 import { eq, and, desc } from "drizzle-orm";
 
 /** Context required for expanding markers. */
@@ -57,6 +58,8 @@ export interface MarkerContext {
   disableLorebooks?: boolean;
   /** Pre-computed embedding of the chat context for semantic lorebook matching. */
   chatEmbedding?: number[] | null;
+  /** Per-lorebook pre-computed embeddings for semantic lorebook matching. */
+  semanticEmbeddingsByLorebookId?: ReadonlyMap<string, number[] | null>;
   /** Per-chat ephemeral state overrides for lorebook entries (from chat metadata). */
   entryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
   /** Per-chat sticky/cooldown/delay timing state for lorebook entries. */
@@ -71,6 +74,8 @@ export interface MarkerContext {
   previewOnly?: boolean;
   /** Resolves prompt macros for final included lorebook entries. May apply macro side effects. */
   resolveLorebookContent?: LorebookFinalContentResolver;
+  /** Standard prompt macro context used before escaping marker leaf text. */
+  macroCtx: MacroContext;
   /** Collector for lorebook depth entries — populated during expansion, consumed by the assembler. */
   lorebookDepthEntries?: Array<{ content: string; role: "system" | "user" | "assistant"; depth: number }>;
   /** Collector for updated entry state overrides after ephemeral processing — saved to chat metadata by caller. */
@@ -95,6 +100,10 @@ export interface ExpandedMarker {
 
 function cardPromptText(value: unknown): string {
   return typeof value === "string" ? stripMacroComments(value).trim() : "";
+}
+
+function resolveSanitizedPromptLeaf(value: string, ctx: MarkerContext, macroCtx: MacroContext = ctx.macroCtx): string {
+  return sanitizePromptLeaf(resolveMacros(value, macroCtx), ctx.wrapFormat);
 }
 
 /**
@@ -128,13 +137,12 @@ export async function expandMarker(config: MarkerConfig, ctx: MarkerContext): Pr
 async function expandCharacter(config: MarkerConfig, ctx: MarkerContext): Promise<ExpandedMarker> {
   const charStorage = createCharactersStorage(ctx.db);
   const parts: string[] = [];
-  const resolveCharacterMacros = ctx.characterIds.length > 1;
-
   for (const charId of ctx.characterIds) {
     const row = await charStorage.getById(charId);
     if (!row) continue;
     const data = JSON.parse(row.data) as CharacterData;
-    let profile: CharacterMacroProfile | null = null;
+    const profile = characterMacroProfileFromData(data);
+    const characterMacroContext = macroContextForCharacterProfile(ctx.macroCtx, profile);
 
     const fields = config.characterFields ?? [
       "description",
@@ -143,29 +151,29 @@ async function expandCharacter(config: MarkerConfig, ctx: MarkerContext): Promis
       "backstory",
       "appearance",
       "system_prompt",
-      "post_history_instructions",
     ];
 
     const charParts: string[] = [];
     for (const field of fields) {
       if (field === "name") continue; // Name is used as the parent tag, not a child field
+      if (field === "post_history_instructions") continue; // Injected after chat history by the assembler.
       // Skip per-character scenario when a group scenario override is active
       if (field === "scenario" && ctx.groupScenarioOverrideText) continue;
       const value = cardPromptText(getCharacterField(data, field));
       if (value) {
-        const resolvedValue =
-          resolveCharacterMacros && value.includes("{{")
-            ? resolveCharacterScopedMacros(value, (profile ??= characterMacroProfileFromData(data)))
-            : value;
-        charParts.push(wrapContent(resolvedValue, field, ctx.wrapFormat, 2));
+        charParts.push(
+          wrapContent(resolveSanitizedPromptLeaf(value, ctx, characterMacroContext), field, ctx.wrapFormat, 2),
+        );
       }
     }
 
     // Auto-include RPG attributes if enabled and not already in fields
     if (!fields.includes("stats") && !fields.includes("rpg_attributes")) {
-      const statsText = formatRPGStats(data.extensions?.rpgStats as RPGStatsConfig | undefined);
+      const statsText = formatRpgStatsForPrompt(data.extensions?.rpgStats as RPGStatsConfig | undefined);
       if (statsText) {
-        charParts.push(wrapContent(statsText, "rpg_attributes", ctx.wrapFormat, 2));
+        charParts.push(
+          wrapContent(resolveSanitizedPromptLeaf(statsText, ctx), "rpg_attributes", ctx.wrapFormat, 2),
+        );
       }
     }
 
@@ -179,16 +187,35 @@ async function expandCharacter(config: MarkerConfig, ctx: MarkerContext): Promis
   // Append group scenario override (replaces individual character scenarios)
   const groupScenarioOverrideText = cardPromptText(ctx.groupScenarioOverrideText);
   if (groupScenarioOverrideText) {
-    parts.push(wrapContent(groupScenarioOverrideText, "scenario", ctx.wrapFormat, 1));
+    parts.push(
+      wrapContent(resolveSanitizedPromptLeaf(groupScenarioOverrideText, ctx), "scenario", ctx.wrapFormat, 1),
+    );
   }
 
   return { content: parts.join("\n") };
 }
 
+function macroContextForCharacterProfile(base: MacroContext, profile: CharacterMacroProfile): MacroContext {
+  return {
+    ...base,
+    char: profile.name,
+    characterFields: {
+      description: profile.description,
+      personality: profile.personality,
+      backstory: profile.backstory,
+      appearance: profile.appearance,
+      scenario: profile.scenario,
+      example: profile.example,
+      systemPrompt: profile.systemPrompt,
+      postHistoryInstructions: profile.postHistoryInstructions,
+    },
+  };
+}
+
 function characterMacroProfileFromData(data: CharacterData): CharacterMacroProfile {
   return {
     name: data.name ?? "Character",
-    description: getCharacterDescriptionWithExtensions(data),
+    description: data.description ?? "",
     personality: data.personality ?? "",
     backstory: data.extensions?.backstory ?? "",
     appearance: data.extensions?.appearance ?? "",
@@ -204,7 +231,7 @@ function getCharacterField(data: CharacterData, field: string): string {
     case "name":
       return data.name;
     case "description":
-      return getCharacterDescriptionWithExtensions(data);
+      return data.description;
     case "personality":
       return data.personality;
     case "scenario":
@@ -225,21 +252,10 @@ function getCharacterField(data: CharacterData, field: string): string {
     case "appearance":
       return data.extensions?.appearance ?? "";
     case "stats":
-      return formatRPGStats(data.extensions?.rpgStats as RPGStatsConfig | undefined);
+      return formatRpgStatsForPrompt(data.extensions?.rpgStats as RPGStatsConfig | undefined);
     default:
       return "";
   }
-}
-
-/** Format RPG stats into a readable block for the prompt. */
-function formatRPGStats(rpgStats: RPGStatsConfig | undefined): string {
-  if (!rpgStats?.enabled) return "";
-  const lines: string[] = [];
-  lines.push(`Max HP: ${rpgStats.hp.max}`);
-  if (rpgStats.attributes.length > 0) {
-    lines.push(rpgStats.attributes.map((a) => `${a.name}: ${a.value}`).join(", "));
-  }
-  return lines.join("\n");
 }
 
 // ── Persona ────────────────────────────────────
@@ -255,27 +271,31 @@ async function expandPersona(_config: MarkerConfig, ctx: MarkerContext): Promise
   const personaScenario = cardPromptText(ctx.personaFields?.scenario);
 
   if (personaDescription) {
-    parts.push(wrapContent(personaDescription, "description", ctx.wrapFormat, 2));
+    parts.push(
+      wrapContent(resolveSanitizedPromptLeaf(personaDescription, ctx), "description", ctx.wrapFormat, 2),
+    );
   }
   if (personaPersonality) {
-    parts.push(wrapContent(personaPersonality, "personality", ctx.wrapFormat, 2));
+    parts.push(
+      wrapContent(resolveSanitizedPromptLeaf(personaPersonality, ctx), "personality", ctx.wrapFormat, 2),
+    );
   }
   if (personaBackstory) {
-    parts.push(wrapContent(personaBackstory, "backstory", ctx.wrapFormat, 2));
+    parts.push(wrapContent(resolveSanitizedPromptLeaf(personaBackstory, ctx), "backstory", ctx.wrapFormat, 2));
   }
   if (personaAppearance) {
-    parts.push(wrapContent(personaAppearance, "appearance", ctx.wrapFormat, 2));
+    parts.push(wrapContent(resolveSanitizedPromptLeaf(personaAppearance, ctx), "appearance", ctx.wrapFormat, 2));
   }
   if (personaScenario) {
-    parts.push(wrapContent(personaScenario, "scenario", ctx.wrapFormat, 2));
+    parts.push(wrapContent(resolveSanitizedPromptLeaf(personaScenario, ctx), "scenario", ctx.wrapFormat, 2));
   }
 
   // Include RPG attributes if enabled
   if (ctx.personaStats?.rpgStats?.enabled) {
     const rpg = ctx.personaStats.rpgStats as RPGStatsConfig;
-    const statsText = formatRPGStats(rpg);
+    const statsText = formatRpgStatsForPrompt(rpg);
     if (statsText) {
-      parts.push(wrapContent(statsText, "rpg_attributes", ctx.wrapFormat, 2));
+      parts.push(wrapContent(resolveSanitizedPromptLeaf(statsText, ctx), "rpg_attributes", ctx.wrapFormat, 2));
     }
   }
 
@@ -306,6 +326,7 @@ async function expandLorebook(config: MarkerConfig, ctx: MarkerContext): Promise
         excludedSourceAgentIds: ctx.excludedLorebookSourceAgentIds,
         tokenBudget: ctx.lorebookTokenBudget,
         chatEmbedding: ctx.chatEmbedding ?? null,
+        semanticEmbeddingsByLorebookId: ctx.semanticEmbeddingsByLorebookId,
         entryStateOverrides: ctx.entryStateOverrides,
         entryTimingStates: ctx.entryTimingStates,
         generationTriggers: ctx.generationTriggers ?? ["chat"],
@@ -331,21 +352,25 @@ async function expandLorebook(config: MarkerConfig, ctx: MarkerContext): Promise
     if (result.depthEntries.length > 0) {
       ctx.lorebookDepthEntries ??= [];
       for (const de of result.depthEntries) {
-        ctx.lorebookDepthEntries.push({ content: de.content, role: de.role, depth: de.depth });
+        ctx.lorebookDepthEntries.push({
+          content: sanitizePromptLeaf(de.content, ctx.wrapFormat),
+          role: de.role,
+          depth: de.depth,
+        });
       }
     }
   }
 
   switch (config.type) {
     case "world_info_before":
-      return { content: result.worldInfoBefore };
+      return { content: sanitizePromptLeaf(result.worldInfoBefore, ctx.wrapFormat) };
     case "world_info_after":
-      return { content: result.worldInfoAfter };
+      return { content: sanitizePromptLeaf(result.worldInfoAfter, ctx.wrapFormat) };
     case "lorebook":
     default: {
       // Combined lorebook — all world info
       const combined = [result.worldInfoBefore, result.worldInfoAfter].filter(Boolean).join("\n\n");
-      return { content: combined };
+      return { content: sanitizePromptLeaf(combined, ctx.wrapFormat) };
     }
   }
 }
@@ -366,20 +391,20 @@ async function expandChatHistory(config: MarkerConfig, ctx: MarkerContext): Prom
     messages = messages.slice(-opts.maxMessages);
   }
 
+  messages = messages.map((message) => {
+    const resolved = resolveMacros(message.content, ctx.macroCtx);
+    return {
+      ...message,
+      content: ctx.wrapFormat === "none" ? resolved : sanitizePromptLeaf(resolved, ctx.wrapFormat),
+    };
+  });
+
   // Add chat_history / last_message wrapping based on format
   if (messages.length > 0 && ctx.wrapFormat !== "none") {
-    // Find the last user message index — this becomes <last_message>
-    let lastUserIdx = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i]!.role === "user") {
-        lastUserIdx = i;
-        break;
-      }
-    }
-
-    // Everything before the last user message is "chat history",
-    // the last user message gets "last_message" wrapping
-    const historyEnd = lastUserIdx >= 0 ? lastUserIdx : messages.length;
+    // Everything before the final chat turn is "chat history"; the final turn gets
+    // "last_message" wrapping, regardless of whether it is user or assistant.
+    const lastMessageIdx = messages.length - 1;
+    const historyEnd = lastMessageIdx;
 
     if (ctx.wrapFormat === "xml") {
       if (historyEnd > 0) {
@@ -389,22 +414,18 @@ async function expandChatHistory(config: MarkerConfig, ctx: MarkerContext): Prom
           content: `${messages[historyEnd - 1]!.content}\n</chat_history>`,
         };
       }
-      if (lastUserIdx >= 0) {
-        messages[lastUserIdx] = {
-          ...messages[lastUserIdx]!,
-          content: `<last_message>\n${messages[lastUserIdx]!.content}\n</last_message>`,
-        };
-      }
+      messages[lastMessageIdx] = {
+        ...messages[lastMessageIdx]!,
+        content: `<last_message>\n${messages[lastMessageIdx]!.content}\n</last_message>`,
+      };
     } else if (ctx.wrapFormat === "markdown") {
       if (historyEnd > 0) {
         messages[0] = { ...messages[0]!, content: `## Chat History\n${messages[0]!.content}` };
       }
-      if (lastUserIdx >= 0) {
-        messages[lastUserIdx] = {
-          ...messages[lastUserIdx]!,
-          content: `## Last Message\n${messages[lastUserIdx]!.content}`,
-        };
-      }
+      messages[lastMessageIdx] = {
+        ...messages[lastMessageIdx]!,
+        content: `## Last Message\n${messages[lastMessageIdx]!.content}`,
+      };
     }
   }
 
@@ -418,7 +439,6 @@ async function expandChatHistory(config: MarkerConfig, ctx: MarkerContext): Prom
 async function expandDialogueExamples(_config: MarkerConfig, ctx: MarkerContext): Promise<ExpandedMarker> {
   const charStorage = createCharactersStorage(ctx.db);
   const parts: string[] = [];
-  const resolveCharacterMacros = ctx.characterIds.length > 1;
 
   for (const charId of ctx.characterIds) {
     const row = await charStorage.getById(charId);
@@ -427,11 +447,13 @@ async function expandDialogueExamples(_config: MarkerConfig, ctx: MarkerContext)
 
     const example = cardPromptText(data.mes_example);
     if (example) {
-      const resolvedExample =
-        resolveCharacterMacros && example.includes("{{")
-          ? resolveCharacterScopedMacros(example, characterMacroProfileFromData(data))
-          : example;
-      parts.push(resolvedExample);
+      parts.push(
+        resolveSanitizedPromptLeaf(
+          example,
+          ctx,
+          macroContextForCharacterProfile(ctx.macroCtx, characterMacroProfileFromData(data)),
+        ),
+      );
     }
   }
 
@@ -441,7 +463,7 @@ async function expandDialogueExamples(_config: MarkerConfig, ctx: MarkerContext)
 // ── Chat Summary ───────────────────────────────
 
 function expandChatSummary(ctx: MarkerContext): ExpandedMarker {
-  return { content: ctx.chatSummary ?? "" };
+  return { content: resolveSanitizedPromptLeaf(ctx.chatSummary ?? "", ctx) };
 }
 
 // ── Agent Data ─────────────────────────────────
@@ -469,19 +491,10 @@ async function expandAgentData(config: MarkerConfig, ctx: MarkerContext): Promis
     return { content: "" };
   }
 
-  // Special case: world-state uses game_state_snapshots for richer structured data
-  if (agentType === "world-state") {
-    const wsStorage = createAgentsStorage(ctx.db);
-    const wsConfig = await wsStorage.getByType("world-state");
-    if (wsConfig && wsConfig.enabled !== "true") return { content: "" };
-    return expandWorldStateAgent(ctx);
-  }
-
   // Generic: find latest successful agent run for this chat
   const agentsStorage = createAgentsStorage(ctx.db);
   const agentConfig = await agentsStorage.getByType(agentType);
   if (!agentConfig) return { content: "" };
-  if (agentConfig.enabled !== "true") return { content: "" };
 
   const latestRuns = await ctx.db
     .select()
@@ -495,116 +508,21 @@ async function expandAgentData(config: MarkerConfig, ctx: MarkerContext): Promis
   const run = latestRuns[0];
   if (!run) return { content: "" };
 
-  const resultData = JSON.parse(run.resultData);
+  let resultData: unknown;
+  try {
+    resultData = JSON.parse(run.resultData);
+  } catch (err) {
+    logger.warn(
+      err,
+      "[prompt] Skipping malformed agent result data for %s in chat %s",
+      agentType,
+      ctx.chatId,
+    );
+    return { content: "" };
+  }
+
   // Format result data as readable text
-  return { content: formatAgentResult(resultData) };
-}
-
-async function expandWorldStateAgent(ctx: MarkerContext): Promise<ExpandedMarker> {
-  // Prefer committed game state — uncommitted snapshots from swipes/regens
-  // are normally skipped so the prompt stays clean between swipes.
-  const committedRows = await ctx.db
-    .select()
-    .from(gameStateSnapshots)
-    .where(and(eq(gameStateSnapshots.chatId, ctx.chatId), eq(gameStateSnapshots.committed, 1)))
-    .orderBy(desc(gameStateSnapshots.createdAt))
-    .limit(1);
-
-  let snap = committedRows[0];
-
-  // Fallback: if no committed snapshot exists yet (e.g. first agent run),
-  // use the latest snapshot regardless of committed status so world state
-  // data isn't silently dropped until the next user message.
-  if (!snap) {
-    const anyRows = await ctx.db
-      .select()
-      .from(gameStateSnapshots)
-      .where(eq(gameStateSnapshots.chatId, ctx.chatId))
-      .orderBy(desc(gameStateSnapshots.createdAt))
-      .limit(1);
-    snap = anyRows[0];
-  }
-
-  if (!snap) return { content: "" };
-
-  // Only include fields from agents that are currently active.
-  // World-state's own fields (date/time/location/weather/temperature) are always included
-  // since this function is only called when world-state is enabled.
-  const active = new Set(ctx.activeAgentIds);
-  const hasCharTracker = active.size === 0 || active.has("character-tracker");
-  const hasPersonaStats = active.size === 0 || active.has("persona-stats");
-  const hasQuest = active.size === 0 || active.has("quest");
-  const hasCustomTracker = active.size === 0 || active.has("custom-tracker");
-
-  const parts: string[] = [];
-  if (snap.date) parts.push(`Date: ${snap.date}`);
-  if (snap.time) parts.push(`Time: ${snap.time}`);
-  if (snap.location) parts.push(`Location: ${snap.location}`);
-  if (snap.weather) parts.push(`Weather: ${snap.weather}`);
-  if (snap.temperature) parts.push(`Temperature: ${snap.temperature}`);
-
-  if (hasCharTracker) {
-    const presentChars = JSON.parse(snap.presentCharacters);
-    if (Array.isArray(presentChars) && presentChars.length > 0) {
-      const charLines = presentChars.map((c: any) => {
-        if (typeof c === "string") return `- ${c}`;
-        const details: string[] = [];
-        if (c.mood) details.push(`mood: ${c.mood}`);
-        if (c.appearance) details.push(`appearance: ${c.appearance}`);
-        if (c.outfit) details.push(`outfit: ${c.outfit}`);
-        if (c.thoughts) details.push(`thoughts: ${c.thoughts}`);
-        if (Array.isArray(c.stats) && c.stats.length > 0) {
-          const statStr = c.stats.map((s: any) => `${s.name}: ${s.value}${s.max ? `/${s.max}` : ""}`).join(", ");
-          details.push(`stats: ${statStr}`);
-        }
-        const detailStr = details.length > 0 ? ` (${details.join("; ")})` : "";
-        return `- ${c.emoji ?? ""} ${c.name ?? c}${detailStr}`;
-      });
-      parts.push(`Present Characters:\n${charLines.join("\n")}`);
-    }
-  }
-
-  // Persona stats (needs/condition bars)
-  if (hasPersonaStats && snap.personaStats) {
-    const psBars = typeof snap.personaStats === "string" ? JSON.parse(snap.personaStats) : snap.personaStats;
-    if (Array.isArray(psBars) && psBars.length > 0) {
-      const barLines = psBars.map((b: any) => `- ${b.name}: ${b.value}/${b.max}`);
-      parts.push(`Persona Stats:\n${barLines.join("\n")}`);
-    }
-  }
-
-  if (snap.playerStats) {
-    const stats = typeof snap.playerStats === "string" ? JSON.parse(snap.playerStats) : snap.playerStats;
-    const statParts: string[] = [];
-    if (hasPersonaStats && stats.status) statParts.push(`Status: ${stats.status}`);
-    if (hasQuest && Array.isArray(stats.activeQuests) && stats.activeQuests.length > 0) {
-      const questLines = stats.activeQuests.map((q: any) => {
-        const objectives = Array.isArray(q.objectives)
-          ? q.objectives.map((o: any) => `  ${o.completed ? "[x]" : "[ ]"} ${o.text}`).join("\n")
-          : "";
-        return `- ${q.name}${q.completed ? " (completed)" : ""}${objectives ? "\n" + objectives : ""}`;
-      });
-      statParts.push(`Active Quests:\n${questLines.join("\n")}`);
-    }
-    if (hasPersonaStats && Array.isArray(stats.inventory) && stats.inventory.length > 0) {
-      const invLines = stats.inventory.map(
-        (item: any) =>
-          `- ${item.name}${item.quantity > 1 ? ` x${item.quantity}` : ""}${item.description ? ` — ${item.description}` : ""}`,
-      );
-      statParts.push(`Inventory:\n${invLines.join("\n")}`);
-    }
-    if (hasPersonaStats && Array.isArray(stats.stats) && stats.stats.length > 0) {
-      const statLines = stats.stats.map((s: any) => `- ${s.name}: ${s.value}${s.max ? `/${s.max}` : ""}`);
-      statParts.push(`Stats:\n${statLines.join("\n")}`);
-    }
-    if (hasCustomTracker && Array.isArray(stats.customTrackerFields) && stats.customTrackerFields.length > 0) {
-      const customLines = stats.customTrackerFields.map((f: any) => `- ${f.name}: ${f.value}`);
-      statParts.push(`Custom:\n${customLines.join("\n")}`);
-    }
-    if (statParts.length > 0) parts.push(statParts.join("\n"));
-  }
-
-  return { content: parts.join("\n") };
+  return { content: sanitizePromptLeaf(formatAgentResult(resultData), ctx.wrapFormat) };
 }
 
 function formatAgentResult(data: unknown): string {

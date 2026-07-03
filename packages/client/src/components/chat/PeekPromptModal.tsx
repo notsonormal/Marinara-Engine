@@ -4,6 +4,17 @@
 import { useState, useMemo } from "react";
 import { X, ChevronRight, ChevronDown } from "lucide-react";
 import { cn } from "../../lib/utils";
+import {
+  NEUTRAL_PANEL_HEADER,
+  NEUTRAL_PANEL_SCROLL_AREA,
+  NEUTRAL_PANEL_SHELL,
+  NEUTRAL_PANEL_TITLE,
+} from "../ui/neutral-surface-styles";
+
+const PROMPT_TAG_CLASS =
+  "border border-[var(--marinara-chat-chrome-button-border)] bg-[var(--marinara-chat-chrome-highlight-bg)] text-[var(--marinara-chat-chrome-highlight-text)]";
+const PROMPT_TAG_ACTIVE_CLASS =
+  "border border-[var(--marinara-chat-chrome-button-border-active)] bg-[var(--marinara-chat-chrome-button-bg-active)] text-[var(--marinara-chat-chrome-button-text-active)]";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
@@ -35,10 +46,24 @@ interface PeekPromptModalProps {
   data: {
     messages: Array<{ role: string; content: string }>;
     parameters: unknown;
+    source?: "cached" | "live_preview" | "raw_messages";
+    exact?: boolean;
     generationInfo?: GenerationInfo | null;
     agentNote?: string;
   };
   onClose: () => void;
+}
+
+function sourceLabel(data: PeekPromptModalProps["data"]): string {
+  if (data.exact) return "Exact Text Model Request";
+  if (data.source === "live_preview") return "Live Preview";
+  if (data.source === "raw_messages") return "Raw Messages";
+  return "Prompt Preview";
+}
+
+function sourceBadgeClass(data: PeekPromptModalProps["data"]): string {
+  if (data.exact) return PROMPT_TAG_ACTIVE_CLASS;
+  return PROMPT_TAG_CLASS;
 }
 
 function prettifyTag(tag: string): string {
@@ -68,6 +93,16 @@ interface ChatHistoryBlock {
 }
 
 type DisplaySection = SectionBlock | ChatHistoryBlock;
+
+interface PromptSegment {
+  role: string;
+  content: string;
+  inChatHistory: boolean;
+}
+
+function isDisplayedChatHistoryRole(role: string): boolean {
+  return role === "user" || role === "assistant";
+}
 
 // ═══════════════════════════════════════════════
 //  Parsing: works on the WHOLE messages array
@@ -107,130 +142,131 @@ function parseXmlSections(content: string, fallbackLabel: string): SectionBlock[
   return blocks.length > 0 ? blocks : [{ kind: "section", label: fallbackLabel, role: fallbackLabel, content }];
 }
 
-/**
- * Build the display section list from the raw messages array.
- *
- * The key challenge: `<chat_history>` opens in one message and closes in another,
- * with bare user/assistant messages in between. We detect boundaries at the
- * array level first, then handle each region appropriately.
- */
+function splitPromptSegments(messages: Array<{ role: string; content: string }>): PromptSegment[] {
+  const segments: PromptSegment[] = [];
+  let inXmlChatHistory = false;
+  let inMarkdownChatHistory = false;
+
+  const pushSegment = (role: string, content: string, inChatHistory: boolean) => {
+    if (!content.trim()) return;
+    segments.push({ role, content: content.trim(), inChatHistory });
+  };
+
+  for (const message of messages) {
+    let remaining = message.content;
+
+    while (remaining.length > 0) {
+      if (inXmlChatHistory) {
+        const closeIdx = remaining.search(/\n?<\/chat_history>/i);
+        if (closeIdx >= 0) {
+          const closeMatch = remaining.slice(closeIdx).match(/^\n?<\/chat_history>/i);
+          pushSegment(message.role, remaining.slice(0, closeIdx), true);
+          remaining = remaining.slice(closeIdx + (closeMatch?.[0].length ?? 0));
+          inXmlChatHistory = false;
+          continue;
+        }
+        pushSegment(message.role, remaining, true);
+        break;
+      }
+
+      if (inMarkdownChatHistory) {
+        const lastMessageIdx = remaining.search(/^## Last Message\n?/im);
+        if (lastMessageIdx >= 0) {
+          pushSegment(message.role, remaining.slice(0, lastMessageIdx), true);
+          remaining = remaining.slice(lastMessageIdx);
+          inMarkdownChatHistory = false;
+          continue;
+        }
+        pushSegment(message.role, remaining, true);
+        break;
+      }
+
+      const xmlOpenIdx = remaining.search(/<chat_history>\n?/i);
+      const markdownOpenIdx = remaining.search(/^## Chat History\n?/im);
+      const hasXmlOpen = xmlOpenIdx >= 0;
+      const hasMarkdownOpen = markdownOpenIdx >= 0;
+      const useXmlOpen = hasXmlOpen && (!hasMarkdownOpen || xmlOpenIdx <= markdownOpenIdx);
+      const openIdx = useXmlOpen ? xmlOpenIdx : markdownOpenIdx;
+
+      if (openIdx >= 0) {
+        pushSegment(message.role, remaining.slice(0, openIdx), false);
+        const openMatch = remaining
+          .slice(openIdx)
+          .match(useXmlOpen ? /<chat_history>\n?/i : /^## Chat History\n?/i);
+        remaining = remaining.slice(openIdx + (openMatch?.[0].length ?? 0));
+        if (useXmlOpen) inXmlChatHistory = true;
+        else inMarkdownChatHistory = true;
+        continue;
+      }
+
+      pushSegment(message.role, remaining, false);
+      break;
+    }
+  }
+
+  return segments;
+}
+
+function appendPromptSection(result: DisplaySection[], segment: PromptSegment) {
+  const openIdx = segment.content.search(/<last_message>/i);
+  const closingIdx = segment.content.search(/<\/last_message>/i);
+  if (openIdx >= 0 && closingIdx >= 0) {
+    const beforeOpen = segment.content.slice(0, openIdx).trim();
+    const innerContent = segment.content.slice(segment.content.indexOf(">", openIdx) + 1, closingIdx).trim();
+    const afterClose = segment.content.slice(segment.content.indexOf(">", closingIdx) + 1).trim();
+
+    if (beforeOpen) {
+      const pre = parseXmlSections(beforeOpen, segment.role);
+      for (const block of pre) result.push(block);
+    }
+    if (innerContent) {
+      result.push({ kind: "section", label: "last_message", role: segment.role, content: innerContent });
+    }
+    if (afterClose) {
+      const post = parseXmlSections(afterClose, segment.role);
+      for (const block of post) result.push(block);
+    }
+    return;
+  }
+
+  if (/^## Last Message\n?/i.test(segment.content)) {
+    result.push({
+      kind: "section",
+      label: "last_message",
+      role: segment.role,
+      content: segment.content.replace(/^## Last Message\n?/i, "").trim(),
+    });
+    return;
+  }
+
+  const blocks = parseXmlSections(segment.content, segment.role);
+  for (const block of blocks) result.push(block);
+}
+
 function buildDisplaySections(messages: Array<{ role: string; content: string }>): DisplaySection[] {
-  // ── Pass 1: find chat history boundaries across the messages array ──
-  let chStartIdx = -1;
-  let chEndIdx = -1;
-  let lastMsgIdx = -1; // <last_message> or ## Last Message
-
-  for (let i = 0; i < messages.length; i++) {
-    const c = messages[i]!.content;
-    if (chStartIdx < 0 && (/<chat_history>/i.test(c) || /^## Chat History\n/i.test(c))) {
-      chStartIdx = i;
-    }
-    if (/<\/chat_history>/i.test(c)) {
-      chEndIdx = i;
-    }
-    if (/<last_message>/i.test(c) || /^## Last Message\n/i.test(c)) {
-      lastMsgIdx = i;
-    }
-  }
-
-  // If we found an opening tag but no explicit close, the history runs until
-  // the message before <last_message>, or to the end of user/assistant messages.
-  if (chStartIdx >= 0 && chEndIdx < 0) {
-    if (lastMsgIdx > chStartIdx) {
-      chEndIdx = lastMsgIdx - 1;
-    } else {
-      // Find the last consecutive user/assistant message after chStartIdx
-      chEndIdx = chStartIdx;
-      for (let i = chStartIdx + 1; i < messages.length; i++) {
-        const r = messages[i]!.role;
-        if (r === "user" || r === "assistant") chEndIdx = i;
-        else break;
-      }
-    }
-  }
-
-  // ── Pass 2: build output sections ──
   const result: DisplaySection[] = [];
+  const historyEntries: ChatHistoryEntry[] = [];
+  const historyRawParts: string[] = [];
 
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i]!;
+  const flushChatHistory = () => {
+    if (historyEntries.length === 0) return;
+    result.push({ kind: "chat-history", entries: [...historyEntries], rawContent: historyRawParts.join("\n\n") });
+    historyEntries.length = 0;
+    historyRawParts.length = 0;
+  };
 
-    // ── Chat history region ──
-    if (chStartIdx >= 0 && i >= chStartIdx && i <= chEndIdx) {
-      // Collect all chat history entries in one pass
-      const entries: ChatHistoryEntry[] = [];
-      const rawParts: string[] = [];
-      for (let j = chStartIdx; j <= chEndIdx; j++) {
-        let content = messages[j]!.content;
-        // Strip the wrapping tags from the content shown inside child blocks
-        content = content
-          .replace(/^<chat_history>\n?/i, "")
-          .replace(/\n?<\/chat_history>\s*$/i, "")
-          .replace(/^## Chat History\n?/i, "");
-        const trimmed = content.trim();
-        if (trimmed) {
-          entries.push({ role: messages[j]!.role, content: trimmed });
-          rawParts.push(trimmed);
-        }
-      }
-      if (entries.length > 0) {
-        result.push({ kind: "chat-history", entries, rawContent: rawParts.join("\n\n") });
-      }
-      i = chEndIdx; // skip past the whole range
+  for (const segment of splitPromptSegments(messages)) {
+    if (segment.inChatHistory && isDisplayedChatHistoryRole(segment.role)) {
+      historyEntries.push({ role: segment.role, content: segment.content });
+      historyRawParts.push(segment.content);
       continue;
     }
 
-    // ── Last message (separate from chat history) ──
-    if (i === lastMsgIdx) {
-      // The server may merge <last_message> with adjacent same-role sections
-      // (e.g. <output_format>) when strict role formatting is on.
-      // Split out the <last_message> portion and parse the rest normally.
-      const openIdx = msg.content.search(/<last_message>/i);
-      const closingIdx = msg.content.search(/<\/last_message>/i);
-      if (openIdx >= 0 && closingIdx >= 0) {
-        const beforeOpen = msg.content.slice(0, openIdx).trim();
-        const innerContent = msg.content.slice(msg.content.indexOf(">", openIdx) + 1, closingIdx).trim();
-        const afterClose = msg.content.slice(msg.content.indexOf(">", closingIdx) + 1).trim();
-
-        // Content before <last_message>
-        if (beforeOpen) {
-          const pre = parseXmlSections(beforeOpen, msg.role);
-          for (const b of pre) result.push(b);
-        }
-        // The last_message block itself
-        if (innerContent) {
-          result.push({
-            kind: "section",
-            label: "last_message",
-            role: msg.role,
-            content: innerContent,
-          });
-        }
-        // Content after </last_message> (e.g. <output_format>)
-        if (afterClose) {
-          const post = parseXmlSections(afterClose, msg.role);
-          for (const b of post) result.push(b);
-        }
-      } else {
-        // Markdown format or no tags — strip heading and show as-is
-        const content = msg.content.replace(/^## Last Message\n?/i, "");
-        result.push({
-          kind: "section",
-          label: "last_message",
-          role: msg.role,
-          content: content.trim(),
-        });
-      }
-      continue;
-    }
-
-    // ── System/other messages: parse XML sections within them ──
-    const blocks = parseXmlSections(msg.content, msg.role);
-    for (const b of blocks) {
-      result.push(b);
-    }
+    flushChatHistory();
+    appendPromptSection(result, segment);
   }
 
+  flushChatHistory();
   return result;
 }
 
@@ -286,9 +322,8 @@ function ChatHistorySection({ entries, rawContent }: { entries: ChatHistoryEntry
   const tokens = estimateTokens(rawContent);
 
   const msgRoleColor = (role: string) => {
-    if (role === "user") return "bg-blue-500/20 text-blue-400";
-    if (role === "assistant") return "bg-purple-500/20 text-purple-400";
-    return "bg-amber-500/20 text-amber-400";
+    if (role === "assistant") return PROMPT_TAG_ACTIVE_CLASS;
+    return PROMPT_TAG_CLASS;
   };
 
   return (
@@ -305,7 +340,7 @@ function ChatHistorySection({ entries, rawContent }: { entries: ChatHistoryEntry
         <span
           className={cn(
             "rounded-md px-2 py-0.5 text-[0.625rem] font-bold uppercase tracking-wider",
-            "bg-green-500/20 text-green-400",
+            PROMPT_TAG_ACTIVE_CLASS,
           )}
         >
           Chat History
@@ -406,10 +441,8 @@ export function PeekPromptModal({ data, onClose }: PeekPromptModalProps) {
   }, [gen, params]);
 
   const sectionRoleColor = (role: string, label: string) => {
-    if (/last.?message/i.test(label)) return "bg-blue-500/20 text-blue-400";
-    if (role === "system") return "bg-amber-500/20 text-amber-400";
-    if (role === "user") return "bg-blue-500/20 text-blue-400";
-    return "bg-purple-500/20 text-purple-400";
+    if (/last.?message/i.test(label) || role === "assistant") return PROMPT_TAG_ACTIVE_CLASS;
+    return PROMPT_TAG_CLASS;
   };
 
   return (
@@ -418,24 +451,33 @@ export function PeekPromptModal({ data, onClose }: PeekPromptModalProps) {
       onClick={onClose}
     >
       <div
-        className="mx-4 flex max-h-[85vh] w-full max-w-3xl flex-col rounded-2xl border border-[var(--border)] bg-[var(--background)] shadow-2xl"
+        className={cn(NEUTRAL_PANEL_SHELL, "mx-4 flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden")}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="shrink-0 flex items-center justify-between border-b border-[var(--border)] px-5 py-3">
-          <div className="flex items-center gap-3">
-            <h3 className="text-sm font-bold">Assembled Prompt</h3>
-            <span className="text-[0.625rem] text-[var(--muted-foreground)]">
+        <div className={cn(NEUTRAL_PANEL_HEADER, "shrink-0 flex items-center justify-between gap-3 px-5 py-3")}>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <h3 className={cn(NEUTRAL_PANEL_TITLE, "shrink-0 text-sm")}>Assembled Prompt</h3>
+            <span
+              className={cn(
+                "shrink-0 rounded-md border px-2 py-0.5 text-[0.5625rem] font-bold uppercase tracking-wider",
+                sourceBadgeClass(data),
+              )}
+            >
+              {sourceLabel(data)}
+            </span>
+            <span className="min-w-0 text-[0.625rem] text-[var(--muted-foreground)]">
               {sections.length} section{sections.length !== 1 ? "s" : ""} &middot; ~{fmtTokens(totalTokens)} tokens
             </span>
           </div>
           <button
             onClick={onClose}
-            className="rounded-lg p-1.5 text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)]"
+            className="mari-chrome-control mari-chrome-control--small p-1.5"
+            aria-label="Close assembled prompt"
           >
             <X size="1rem" />
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-4 space-y-2">
+        <div className={cn(NEUTRAL_PANEL_SCROLL_AREA, "min-h-0 flex-1 overflow-y-auto p-4 space-y-2")}>
           {/* Generation info panel */}
           {(gen || paramPills.length > 0) && (
             <div className="rounded-lg border border-[var(--border)] bg-[var(--secondary)]/30 px-4 py-3 space-y-2">
@@ -473,8 +515,8 @@ export function PeekPromptModal({ data, onClose }: PeekPromptModalProps) {
             </div>
           )}
           {data.agentNote && (
-            <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-[0.6875rem] text-amber-300/80">
-              ⚠ {data.agentNote}
+            <div className="rounded-lg border border-[var(--marinara-chat-chrome-button-border)] bg-[var(--marinara-chat-chrome-highlight-bg)] px-3 py-2 text-[0.6875rem] text-[var(--marinara-chat-chrome-panel-text)]">
+              Note: {data.agentNote}
             </div>
           )}
           {sections.map((s, i) =>

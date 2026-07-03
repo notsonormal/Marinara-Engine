@@ -51,7 +51,6 @@ export const GAME_NPC_PORTRAIT: PromptOverrideKeyDef<GameNpcPortraitCtx> = {
   ],
   defaultBuilder: (ctx) =>
     [
-      `NPC portrait for ${ctx.npcName}.`,
       ctx.appearanceLine,
       ctx.nonHumanRule,
       ctx.artStyleLine,
@@ -82,7 +81,7 @@ export interface GameBackgroundCtx extends Record<string, string | number | unde
 
 export const GAME_BACKGROUND: PromptOverrideKeyDef<GameBackgroundCtx> = {
   key: "game.background",
-  description: "Location background image prompt (in-game, on first visit to a new place).",
+  description: "Location background image prompt for reusable Roleplay/Game scene backgrounds.",
   variables: [
     {
       name: "sceneDescription",
@@ -97,7 +96,7 @@ export const GAME_BACKGROUND: PromptOverrideKeyDef<GameBackgroundCtx> = {
     },
   ],
   defaultBuilder: (ctx) =>
-    `${ctx.sceneDescription}. ${ctx.styleLine} SD/Illustrious tags: scenery, environment, wide shot, landscape, full-frame background, no humans. Wide-angle landscape, detailed environment, single full-frame background, scenery only, no characters, no text, no UI, no panels, no collage, game background art, high quality`,
+    `${ctx.sceneDescription}. ${ctx.styleLine} SD/Illustrious tags: scenery, environment, wide shot, landscape, full-frame background, background-only location art. Wide-angle landscape, detailed environment, readable spatial layout, single full-frame background, no foreground characters, no main characters, no named characters, no posed character focus. Small distant crowds, shopkeepers, silhouettes, or background figures are allowed only when they make the location feel lived-in. No text, no UI, no panels, no collage, game background art, high quality`,
   exampleContext: {
     sceneDescription: "moonlit graveyard with crumbling tombstones",
     styleLine:
@@ -112,6 +111,7 @@ export const GAME_BACKGROUND: PromptOverrideKeyDef<GameBackgroundCtx> = {
 // empty lines dropped.
 
 export interface GameSceneIllustrationCtx extends Record<string, string | number | undefined> {
+  sceneTitleLine: string;
   scenePrompt: string;
   narrativePurposeLine: string;
   charactersLine: string;
@@ -125,6 +125,11 @@ export const GAME_SCENE_ILLUSTRATION: PromptOverrideKeyDef<GameSceneIllustration
   key: "game.sceneIllustration",
   description: "VN-style first-person POV CG illustration prompt (rare, story-defining moments only).",
   variables: [
+    {
+      name: "sceneTitleLine",
+      description: "Pre-formatted visual subject sentence without a metadata label, or empty string.",
+      example: "Lyra watching Korr fall after the moonlit duel.",
+    },
     {
       name: "scenePrompt",
       description: "The exact illustrated moment, written by the scene-analyzer.",
@@ -166,8 +171,9 @@ export const GAME_SCENE_ILLUSTRATION: PromptOverrideKeyDef<GameSceneIllustration
   ],
   defaultBuilder: (ctx) =>
     [
-      "Image type: polished visual novel CG illustration replacing the game background for one important scene.",
+      "Image type: polished visual novel/game scene CG for one important current beat, not a selfie, comic page, manga panel, or background-only plate.",
       "Camera / POV: first-person view from the player protagonist's eyes. Do not show the protagonist except hands or arms when the moment explicitly requires them.",
+      ctx.sceneTitleLine,
       `Scene moment: ${ctx.scenePrompt}`,
       ctx.narrativePurposeLine,
       ctx.charactersLine,
@@ -175,13 +181,14 @@ export const GAME_SCENE_ILLUSTRATION: PromptOverrideKeyDef<GameSceneIllustration
       ctx.appearanceNotesBlock,
       ctx.artDirectionLine,
       ctx.imagePromptInstructionsLine,
-      "SD/Illustrious tags: visual novel CG, cinematic composition, full-frame single scene, dramatic lighting, clear focal point.",
-      "Composition: cinematic 16:9 visual novel CG, one full-frame illustration, emotionally specific staging, clear focal point, high-quality finished illustration.",
-      "Avoid: text, letters, UI, captions, speech bubbles, watermarks, logos, signatures, split panels, collage, contact sheet, character sheet, four-image grid, duplicated faces, and unrelated characters.",
+      "SD/Illustrious tags: visual novel CG, game CG, cinematic composition, full-frame single scene, dramatic lighting, clear focal point.",
+      "Composition: cinematic 16:9 visual novel/game CG, one full-frame illustration, emotionally specific staging, clear focal point, high-quality finished scene art.",
+      "Avoid: UI, subtitles, captions, speech bubbles, dialogue lettering, manga SFX, watermarks, logos, signatures, split panels, collage, contact sheet, character sheet, four-image grid, duplicated faces, and unrelated characters.",
     ]
       .filter(Boolean)
       .join("\n"),
   exampleContext: {
+    sceneTitleLine: "Lyra watching Korr fall after the moonlit duel.",
     scenePrompt: "the moonlit duel finally ends — Korr falls to one knee, sword in the dirt",
     narrativePurposeLine: "Narrative purpose: duel climax — major story beat.",
     charactersLine: "Characters: Lyra, Korr.",

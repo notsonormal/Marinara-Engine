@@ -11,7 +11,7 @@ import { mapSheetAttributesToRPG } from "../services/game/skill-check.service.js
 import { createLLMProvider } from "../services/llm/provider-registry.js";
 import type { ChatMessage } from "../services/llm/base-provider.js";
 import { logger, logDebugOverride } from "../lib/logger.js";
-import { stripMacroComments } from "@marinara-engine/shared";
+import { normalizeRpgStatPools, stripMacroComments } from "@marinara-engine/shared";
 import type {
   EncounterInitRequest,
   EncounterActionRequest,
@@ -20,7 +20,9 @@ import type {
   CombatPartyMember,
   CombatEnemy,
   CombatPlayerActions,
+  CombatActionResult,
   EncounterLogEntry,
+  RPGStatsConfig,
 } from "@marinara-engine/shared";
 
 // ──────────────────────────────────────────────
@@ -31,6 +33,15 @@ const COMBAT_BLUEPRINT_OUTPUT_TOKENS = 12000;
 
 function cardPromptText(value: unknown): string {
   return typeof value === "string" ? stripMacroComments(value).trim() : "";
+}
+
+function configuredHpMax(rpgStats: RPGStatsConfig | undefined): number | null {
+  if (!rpgStats?.enabled) return null;
+  const hpPool = normalizeRpgStatPools(rpgStats).find((pool) =>
+    /^(?:hp|health|health points?|hit points?)$/i.test(pool.name.trim()),
+  );
+  const max = Number(hpPool?.max ?? rpgStats.hp?.max);
+  return Number.isFinite(max) && max > 0 ? max : null;
 }
 
 /** Resolve a connection (handles "random" pool + baseUrl fallback). */
@@ -101,6 +112,19 @@ function parseJSON(raw: string): unknown {
   throw new Error("Unbalanced JSON in AI response");
 }
 
+function fallbackActionResult(input: EncounterActionRequest): CombatActionResult {
+  return {
+    combatStats: {
+      party: input.combatStats.party,
+      enemies: input.combatStats.enemies,
+    },
+    playerActions: input.playerActions ?? { attacks: [], items: [] },
+    enemyActions: [],
+    partyActions: [],
+    narrative: "",
+  };
+}
+
 /** Build character context from the chat's character IDs. */
 async function buildCharacterContext(chars: ReturnType<typeof createCharactersStorage>, characterIds: string[]) {
   let ctx = "";
@@ -116,9 +140,9 @@ async function buildCharacterContext(chars: ReturnType<typeof createCharactersSt
     // instead of inventing one for allies. Only `max` is exposed because
     // combat should always start at full HP regardless of the card's stale
     // `value` field — narrative damage applies after combat begins.
-    const rpg = data.extensions?.rpgStats;
-    const allyMaxHp = Number(rpg?.hp?.max);
-    if (rpg?.enabled && Number.isFinite(allyMaxHp) && allyMaxHp > 0) {
+    const rpg = data.extensions?.rpgStats as RPGStatsConfig | undefined;
+    const allyMaxHp = configuredHpMax(rpg);
+    if (rpg?.enabled && allyMaxHp) {
       ctx += `Max HP: ${allyMaxHp}\n`;
       if (Array.isArray(rpg.attributes) && rpg.attributes.length > 0) {
         ctx += `Attributes: ${rpg.attributes.map((a: { name: string; value: number }) => `${a.name} ${a.value}`).join(", ")}\n`;
@@ -182,15 +206,9 @@ async function buildPersonaContext(chars: ReturnType<typeof createCharactersStor
       ctx += `Persona Stat Bars (configured max for each):\n${renderedBars.join("")}`;
     }
   }
-  const personaRpg = personaStats?.rpgStats as
-    | {
-        enabled?: boolean;
-        attributes?: Array<{ name: string; value: number }>;
-        hp?: { value: number; max: number };
-      }
-    | undefined;
-  const personaMaxHp = Number(personaRpg?.hp?.max);
-  if (personaRpg?.enabled && Number.isFinite(personaMaxHp) && personaMaxHp > 0) {
+  const personaRpg = personaStats?.rpgStats as RPGStatsConfig | undefined;
+  const personaMaxHp = configuredHpMax(personaRpg);
+  if (personaRpg?.enabled && personaMaxHp) {
     ctx += `Persona RPG Stats:\n`;
     ctx += `- Max HP: ${personaMaxHp}\n`;
     if (Array.isArray(personaRpg.attributes) && personaRpg.attributes.length > 0) {
@@ -613,6 +631,8 @@ export async function encounterRoutes(app: FastifyInstance) {
       }
       debugLog("[debug/game/combat:init] parsed response:\n%s", JSON.stringify(combatState, null, 2));
 
+      await chats.patchMetadata(chatId, { encounterActive: true }, { touchUpdatedAt: false });
+
       return { combatState };
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -675,18 +695,18 @@ export async function encounterRoutes(app: FastifyInstance) {
       });
 
       if (!result.content) {
-        return reply.status(502).send({ error: "No response from AI" });
+        return { result: fallbackActionResult(req.body), invalid: true };
       }
 
       let actionResult: Record<string, unknown>;
       try {
         actionResult = parseJSON(result.content) as Record<string, unknown>;
       } catch {
-        return reply.status(502).send({ error: "AI returned invalid JSON for action result" });
+        return { result: fallbackActionResult(req.body), invalid: true };
       }
 
       if (!actionResult?.combatStats) {
-        return reply.status(502).send({ error: "Invalid action result returned by AI" });
+        return { result: fallbackActionResult(req.body), invalid: true };
       }
 
       // Validate that party/enemies are actual arrays — AI may return null, a string, or omit them
@@ -773,6 +793,8 @@ export async function encounterRoutes(app: FastifyInstance) {
         characterId: null,
         content: summary,
       });
+
+      await chats.patchMetadata(chatId, { encounterActive: false }, { touchUpdatedAt: false });
 
       return { summary, messageId: msg?.id ?? "" };
     } catch (err) {

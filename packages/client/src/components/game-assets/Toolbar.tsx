@@ -20,6 +20,17 @@ import {
 import { cn } from "../../lib/utils";
 import { SearchInput } from "./SearchInput";
 
+const TOOLBAR_MENU_MARGIN = 8;
+const TOOLBAR_MENU_WIDTH = 176;
+
+function clampToolbarMenuX(left: number) {
+  if (typeof window === "undefined") return left;
+  return Math.max(
+    TOOLBAR_MENU_MARGIN,
+    Math.min(left, window.innerWidth - TOOLBAR_MENU_WIDTH - TOOLBAR_MENU_MARGIN),
+  );
+}
+
 /**
  * Props for the Toolbar component.
  */
@@ -124,13 +135,13 @@ export function Toolbar({
 
   const openNew = () => {
     const rect = newBtnRef.current?.getBoundingClientRect();
-    if (rect) setNewPos({ x: rect.left, y: rect.bottom + 4 });
+    if (rect) setNewPos({ x: clampToolbarMenuX(rect.left), y: rect.bottom + 4 });
     setNewOpen((prev) => !prev);
   };
 
   const openCols = () => {
     const rect = colsBtnRef.current?.getBoundingClientRect();
-    if (rect) setColsPos({ x: rect.left, y: rect.bottom + 4 });
+    if (rect) setColsPos({ x: clampToolbarMenuX(rect.left), y: rect.bottom + 4 });
     setColsOpen((prev) => !prev);
   };
 
@@ -203,7 +214,7 @@ export function Toolbar({
             className={cn(
               "rounded-md p-1.5 transition-colors",
               viewMode === "grid"
-                ? "bg-[var(--accent)] text-[var(--primary)]"
+                ? "bg-[var(--accent)] text-[var(--foreground)]/80"
                 : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]",
             )}
             title="Grid view"
@@ -215,7 +226,7 @@ export function Toolbar({
             className={cn(
               "rounded-md p-1.5 transition-colors",
               viewMode === "list"
-                ? "bg-[var(--accent)] text-[var(--primary)]"
+                ? "bg-[var(--accent)] text-[var(--foreground)]/80"
                 : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]",
             )}
             title="List view"
@@ -273,7 +284,7 @@ export function Toolbar({
             className={cn(
               "flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors",
               assetSelection.active
-                ? "border-[var(--primary)]/40 bg-[var(--primary)]/10 text-[var(--primary)]"
+                ? "border-[var(--foreground)]/25 bg-[var(--foreground)]/10 text-[var(--foreground)]/80"
                 : "border-[var(--border)] bg-[var(--background)] text-[var(--foreground)] hover:bg-[var(--accent)]",
             )}
             title="Select assets for this game"
@@ -283,7 +294,7 @@ export function Toolbar({
             <FolderCheck size="0.875rem" />
             <span className="max-md:hidden">{assetSelection.active ? "Selecting" : "Game assets"}</span>
             {assetSelection.excludedCount > 0 && (
-              <span className="rounded-full bg-[var(--primary)]/15 px-1.5 py-0.5 text-[0.625rem] leading-none text-[var(--primary)]">
+              <span className="rounded-full bg-[var(--foreground)]/12 px-1.5 py-0.5 text-[0.625rem] leading-none text-[var(--foreground)]/80">
                 {assetSelection.excludedCount}
               </span>
             )}
@@ -292,7 +303,7 @@ export function Toolbar({
 
         <button
           onClick={onUploadClick}
-          className="flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+          className="flex items-center gap-1.5 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-xs font-medium text-[var(--foreground)] ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)]"
         >
           <Upload size="0.875rem" />
           <span className="max-sm:hidden">Upload</span>

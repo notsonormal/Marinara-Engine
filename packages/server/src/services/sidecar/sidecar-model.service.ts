@@ -11,6 +11,7 @@ import { basename, join, relative, resolve, sep } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import {
   SIDECAR_DEFAULT_CONFIG,
+  SIDECAR_EMBEDDING_POOLING_TYPES,
   SIDECAR_RUNTIME_PREFERENCES,
   SIDECAR_MLX_MODELS,
   SIDECAR_MODELS,
@@ -28,6 +29,7 @@ import { downloadFileWithProgress, fetchJson, isAbortError } from "./sidecar-dow
 import { mlxRuntimeService } from "./mlx-runtime.service.js";
 import { sidecarRuntimeService } from "./sidecar-runtime.service.js";
 import { assertSupportedLlamaCppModelPath, isSupportedLlamaCppModelFilename } from "./sidecar-model-files.js";
+import { logger } from "../../lib/logger.js";
 
 export const MODELS_DIR = join(getDataDir(), "models");
 export const CUSTOM_MODELS_DIR = join(MODELS_DIR, "custom");
@@ -104,14 +106,27 @@ function isRuntimePreference(value: unknown): value is SidecarConfig["runtimePre
   return typeof value === "string" && (SIDECAR_RUNTIME_PREFERENCES as readonly string[]).includes(value);
 }
 
-function normalizeIntegerSetting(value: unknown, fallback: number, min: number, max: number): number {
+function isEmbeddingPooling(value: unknown): value is SidecarConfig["embeddingPooling"] {
+  return typeof value === "string" && (SIDECAR_EMBEDDING_POOLING_TYPES as readonly string[]).includes(value);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeIntegerSetting(value: unknown, fallback: number, min: number, max?: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
-  return Math.min(max, Math.max(min, Math.round(value)));
+  const rounded = Math.max(min, Math.round(value));
+  return max === undefined ? rounded : Math.min(max, rounded);
 }
 
 function normalizeFloatSetting(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
   return Math.min(max, Math.max(min, value));
+}
+
+function normalizeBooleanSetting(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
 }
 
 class SidecarModelService {
@@ -139,13 +154,11 @@ class SidecarModelService {
           nextConfig.contextSize,
           SIDECAR_DEFAULT_CONFIG.contextSize,
           512,
-          32768,
         );
         nextConfig.maxTokens = normalizeIntegerSetting(
           nextConfig.maxTokens,
           SIDECAR_DEFAULT_CONFIG.maxTokens,
           64,
-          32768,
         );
         nextConfig.temperature = normalizeFloatSetting(
           nextConfig.temperature,
@@ -161,6 +174,21 @@ class SidecarModelService {
           -1,
           1024,
         );
+        nextConfig.enableNativeToolCalls = normalizeBooleanSetting(
+          nextConfig.enableNativeToolCalls,
+          SIDECAR_DEFAULT_CONFIG.enableNativeToolCalls,
+        );
+        nextConfig.embeddingBatchSize = normalizeIntegerSetting(
+          nextConfig.embeddingBatchSize,
+          SIDECAR_DEFAULT_CONFIG.embeddingBatchSize,
+          128,
+          32768,
+        );
+
+        if (!isEmbeddingPooling(nextConfig.embeddingPooling)) {
+          nextConfig.embeddingPooling = SIDECAR_DEFAULT_CONFIG.embeddingPooling;
+          shouldRewrite = true;
+        }
 
         if (!isRuntimePreference(nextConfig.runtimePreference)) {
           nextConfig.runtimePreference = SIDECAR_DEFAULT_CONFIG.runtimePreference;
@@ -269,7 +297,9 @@ class SidecarModelService {
   }
 
   private hasConfiguredModel(config: SidecarConfig = this.config): boolean {
-    return this.resolveBackend(config) === "mlx" ? !!config.modelRepo : this.getModelFilePathForConfig(config) !== null;
+    return this.resolveBackend(config) === "mlx"
+      ? mlxRuntimeService.hasModelCache(config.modelRepo)
+      : this.getModelFilePathForConfig(config) !== null;
   }
 
   private getConfiguredModelSize(config: SidecarConfig = this.config): number | null {
@@ -289,6 +319,32 @@ class SidecarModelService {
       return statSync(modelPath).size;
     } catch {
       return null;
+    }
+  }
+
+  private isUsableModelFile(path: string, expectedSize: number | null | undefined): boolean {
+    try {
+      const actualSize = statSync(path).size;
+      if (actualSize <= 0) {
+        return false;
+      }
+      return typeof expectedSize === "number" && expectedSize > 0 ? actualSize === expectedSize : true;
+    } catch {
+      return false;
+    }
+  }
+
+  private getExactDownloadSize(modelInfo: SidecarModelInfo): number | null {
+    return typeof modelInfo.downloadSizeBytes === "number" && modelInfo.downloadSizeBytes > 0
+      ? modelInfo.downloadSizeBytes
+      : null;
+  }
+
+  private removeInvalidModelFile(path: string): void {
+    try {
+      unlinkSync(path);
+    } catch {
+      // Best-effort cleanup; the follow-up download will surface persistent filesystem errors.
     }
   }
 
@@ -312,7 +368,7 @@ class SidecarModelService {
 
     if (previousBackend === "mlx") {
       if (previousConfig.modelRepo && previousConfig.modelRepo !== nextConfig.modelRepo) {
-        mlxRuntimeService.clearModelCache();
+        mlxRuntimeService.clearModelCache(previousConfig.modelRepo);
       }
       return;
     }
@@ -415,9 +471,17 @@ class SidecarModelService {
   }
 
   private emitProgress(progress: SidecarDownloadProgress, inline?: ProgressCallback): void {
-    inline?.(progress);
+    try {
+      inline?.(progress);
+    } catch (error) {
+      logger.warn(error, "[sidecar] Inline progress listener failed");
+    }
     for (const listener of this.progressListeners) {
-      listener(progress);
+      try {
+        listener(progress);
+      } catch (error) {
+        logger.warn(error, "[sidecar] Progress listener failed");
+      }
     }
   }
 
@@ -470,7 +534,11 @@ class SidecarModelService {
   }
 
   getConfiguredModelRef(): string | null {
-    return this.resolveBackend() === "mlx" ? this.config.modelRepo : this.getModelFilePath();
+    return this.resolveBackend() === "mlx"
+      ? mlxRuntimeService.hasModelCache(this.config.modelRepo)
+        ? this.config.modelRepo
+        : null
+      : this.getModelFilePath();
   }
 
   getModelFilePath(): string | null {
@@ -497,6 +565,9 @@ class SidecarModelService {
         | "topP"
         | "topK"
         | "gpuLayers"
+        | "enableNativeToolCalls"
+        | "embeddingPooling"
+        | "embeddingBatchSize"
         | "runtimePreference"
       >
     >,
@@ -527,26 +598,26 @@ class SidecarModelService {
         quantization,
         customModelRepo: null,
       };
+      this.status = "downloading_model";
+      try {
+        await mlxRuntimeService.downloadModel(repoId, modelInfo.label, modelInfo.sizeBytes, (progress) =>
+          this.emitProgress(progress, onProgress),
+        );
+      } catch (error) {
+        this.status = this.detectStatus();
+        this.emitProgress(this.buildModelErrorProgress(error), onProgress);
+        throw error;
+      }
       this.cleanupPreviousModel(previousConfig, nextConfig);
       this.config = nextConfig;
       this.saveConfig();
       this.status = "downloaded";
-      this.emitProgress(
-        {
-          phase: "model",
-          status: "complete",
-          downloaded: modelInfo.sizeBytes,
-          total: modelInfo.sizeBytes,
-          speed: 0,
-          label: modelInfo.label,
-        },
-        onProgress,
-      );
       return;
     }
 
     const relativePath = modelInfo.filename;
     const destination = this.resolveModelPath(relativePath);
+    const expectedBytes = this.getExactDownloadSize(modelInfo);
     const nextConfig: SidecarConfig = {
       ...previousConfig,
       backend: "llama_cpp",
@@ -555,23 +626,27 @@ class SidecarModelService {
       quantization,
       customModelRepo: null,
     };
-    if (existsSync(destination)) {
+    if (existsSync(destination) && this.isUsableModelFile(destination, expectedBytes)) {
       this.cleanupPreviousModel(previousConfig, nextConfig);
       this.config = nextConfig;
       this.saveConfig();
       this.status = "downloaded";
+      const downloadedBytes = expectedBytes ?? statSync(destination).size;
       this.emitProgress(
         {
           phase: "model",
           status: "complete",
-          downloaded: modelInfo.sizeBytes,
-          total: modelInfo.sizeBytes,
+          downloaded: downloadedBytes,
+          total: downloadedBytes,
           speed: 0,
           label: modelInfo.label,
         },
         onProgress,
       );
       return;
+    }
+    if (existsSync(destination)) {
+      this.removeInvalidModelFile(destination);
     }
 
     if (!modelInfo.downloadUrl) {
@@ -583,6 +658,7 @@ class SidecarModelService {
         url: modelInfo.downloadUrl,
         relativePath,
         label: modelInfo.label,
+        expectedBytes,
       },
       onProgress,
     );
@@ -647,21 +723,20 @@ class SidecarModelService {
         quantization: null,
         customModelRepo: repo,
       };
+      this.status = "downloading_model";
+      try {
+        await mlxRuntimeService.downloadModel(repo, selected.filename, selected.sizeBytes, (progress) =>
+          this.emitProgress(progress, onProgress),
+        );
+      } catch (error) {
+        this.status = this.detectStatus();
+        this.emitProgress(this.buildModelErrorProgress(error), onProgress);
+        throw error;
+      }
       this.cleanupPreviousModel(previousConfig, nextConfig);
       this.config = nextConfig;
       this.saveConfig();
       this.status = "downloaded";
-      this.emitProgress(
-        {
-          phase: "model",
-          status: "complete",
-          downloaded: selected.sizeBytes ?? 0,
-          total: selected.sizeBytes ?? 0,
-          speed: 0,
-          label: selected.filename,
-        },
-        onProgress,
-      );
       return selected;
     }
 
@@ -682,12 +757,17 @@ class SidecarModelService {
       quantization: null,
       customModelRepo: repo,
     };
+    if (existsSync(destination) && !this.isUsableModelFile(destination, selected.sizeBytes)) {
+      this.removeInvalidModelFile(destination);
+    }
+
     if (!existsSync(destination)) {
       await this.downloadModelFile(
         {
           url: selected.downloadUrl,
           relativePath,
           label: selected.filename,
+          expectedBytes: selected.sizeBytes,
         },
         onProgress,
       );
@@ -731,7 +811,7 @@ class SidecarModelService {
   }
 
   private async downloadModelFile(
-    input: { url: string; relativePath: string; label: string },
+    input: { url: string; relativePath: string; label: string; expectedBytes?: number | null },
     onProgress?: ProgressCallback,
   ): Promise<void> {
     if (this.downloadAbort) {
@@ -747,6 +827,7 @@ class SidecarModelService {
         url: input.url,
         destPath: destination,
         signal: this.downloadAbort.signal,
+        expectedBytes: input.expectedBytes,
         progress: {
           phase: "model",
           label: input.label,
@@ -772,13 +853,30 @@ class SidecarModelService {
     this.downloadAbort = null;
   }
 
-  deleteModel(): void {
+  private async removeModelFileWithRetry(modelPath: string): Promise<void> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        unlinkSync(modelPath);
+        return;
+      } catch (error) {
+        const code = error instanceof Error && "code" in error ? String((error as NodeJS.ErrnoException).code) : "";
+        const canRetry = (code === "EBUSY" || code === "EPERM") && attempt < 4;
+        if (!canRetry) {
+          logger.warn(error, "[sidecar] Failed to remove local model file %s", modelPath);
+          return;
+        }
+        await delay(250);
+      }
+    }
+  }
+
+  async deleteModel(): Promise<void> {
     if (this.resolveBackend() === "mlx") {
       mlxRuntimeService.clearModelCache();
     } else {
       const modelPath = this.getModelFilePath();
       if (modelPath && existsSync(modelPath)) {
-        unlinkSync(modelPath);
+        await this.removeModelFileWithRetry(modelPath);
       }
     }
 

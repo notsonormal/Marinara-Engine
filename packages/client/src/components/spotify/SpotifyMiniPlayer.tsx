@@ -37,6 +37,7 @@ import {
 } from "../../lib/spotify-playback-events";
 import { cn } from "../../lib/utils";
 import { useUIStore } from "../../stores/ui.store";
+import { MusicSourceButton } from "../music/MusicSourceButton";
 
 type SpotifyRepeatState = "off" | "track" | "context";
 
@@ -78,6 +79,17 @@ type SpotifyDevicesState = {
 type SpotifyAccessTokenResponse = {
   accessToken: string;
   expiresAt: number;
+  hasStreamingScope: boolean;
+};
+
+type SpotifyStatusResponse = {
+  connected: boolean;
+  expired: boolean;
+  agentId: string | null;
+  clientId: string | null;
+  redirectUri: string;
+  scopes: string[];
+  missingScopes: string[];
   hasStreamingScope: boolean;
 };
 
@@ -129,12 +141,26 @@ declare global {
 }
 
 const spotifyKeys = {
+  status: ["spotify", "status"] as const,
   player: ["spotify", "player"] as const,
   devices: ["spotify", "devices"] as const,
 };
 
-const SPOTIFY_GREEN_CLASS = "text-[oklch(0.72_0.18_145)]";
-const SPOTIFY_GREEN_BG_CLASS = "bg-[oklch(0.72_0.18_145)]";
+const SPOTIFY_GREEN_CLASS = "text-[#1DB954]";
+const SPOTIFY_GREEN_BG_CLASS = "bg-[#1DB954]";
+const MUSIC_PLAYER_SHELL_BORDER_CLASS = "border-[var(--marinara-music-player-shell-border)]";
+const MUSIC_PLAYER_SHELL_BG_CLASS = "bg-[var(--marinara-music-player-shell-bg)]";
+const MUSIC_PLAYER_BORDER_CLASS = "border-[#f7f3ef]/15";
+const MUSIC_PLAYER_BUTTON_BG_CLASS = "bg-[#f7f3ef]/5";
+const MUSIC_PLAYER_TILE_BG_CLASS = "bg-[#f7f3ef]/5";
+const MUSIC_PLAYER_TILE_RING_CLASS = "ring-[#f7f3ef]/10";
+const MUSIC_PLAYER_TEXT_CLASS = "text-[#f7f3ef]";
+const MUSIC_PLAYER_MUTED_CLASS = "text-[#b3b3b3]";
+const MUSIC_PLAYER_ICON_CLASS = "text-[#b3b3b3]";
+const MUSIC_PLAYER_ICON_HOVER_CLASS = "hover:bg-[#f7f3ef]/10 hover:text-[#f7f3ef]";
+const MUSIC_PLAYER_ACTION_BG_CLASS = "bg-[#f7f3ef]";
+const MUSIC_PLAYER_ACTION_TEXT_CLASS = "text-[#191414]";
+const MUSIC_PLAYER_PROGRESS_BG_CLASS = "bg-[#f7f3ef]/15";
 const REPEAT_TRACK_END_GRACE_MS = 15_000;
 const REPEAT_TRACK_REPLAY_COOLDOWN_MS = 8_000;
 const MANUAL_CONTROL_REPEAT_SUPPRESS_MS = 15_000;
@@ -216,39 +242,48 @@ function clampMobilePosition(x: number, y: number, collapsed: boolean) {
 function getMobileWidgetStyle(
   position: { x: number; y: number },
   collapsed: boolean,
+  viewportWidth?: number,
+  viewportHeight?: number,
 ): Pick<CSSProperties, "left" | "top"> {
   if (typeof window === "undefined") {
     return { left: position.x, top: position.y };
   }
+  const width = viewportWidth ?? window.innerWidth;
+  const height = viewportHeight ?? window.innerHeight;
 
   return {
     left: Math.max(
       MOBILE_WIDGET_VIEWPORT_PADDING,
-      Math.min(window.innerWidth - MOBILE_WIDGET_COLLAPSED_SIZE - MOBILE_WIDGET_VIEWPORT_PADDING, position.x),
+      Math.min(width - MOBILE_WIDGET_COLLAPSED_SIZE - MOBILE_WIDGET_VIEWPORT_PADDING, position.x),
     ),
-    top: collapsed
-      ? position.y
-      : Math.max(
-          MOBILE_WIDGET_VIEWPORT_PADDING,
-          Math.min(window.innerHeight - MOBILE_WIDGET_EXPANDED_HEIGHT - MOBILE_WIDGET_VIEWPORT_PADDING, position.y),
-        ),
+    top: Math.max(
+      MOBILE_WIDGET_VIEWPORT_PADDING,
+      Math.min(
+        height - (collapsed ? MOBILE_WIDGET_COLLAPSED_SIZE : MOBILE_WIDGET_EXPANDED_HEIGHT) - MOBILE_WIDGET_VIEWPORT_PADDING,
+        position.y,
+      ),
+    ),
   };
 }
 
-function getMobileExpandedPanelStyle(position: { x: number; y: number }): CSSProperties {
+function getMobileExpandedPanelStyle(
+  position: { x: number; y: number },
+  viewportWidth?: number,
+): CSSProperties {
   if (typeof window === "undefined") return {};
+  const availableWidth = viewportWidth ?? window.innerWidth;
 
   const width = Math.min(
     MOBILE_WIDGET_EXPANDED_MAX_WIDTH,
-    window.innerWidth - MOBILE_WIDGET_EXPANDED_HORIZONTAL_GUTTER,
+    availableWidth - MOBILE_WIDGET_EXPANDED_HORIZONTAL_GUTTER,
   );
   const opensLeft =
-    position.x + width > window.innerWidth - MOBILE_WIDGET_VIEWPORT_PADDING ||
-    position.x + MOBILE_WIDGET_COLLAPSED_SIZE / 2 > window.innerWidth / 2;
+    position.x + width > availableWidth - MOBILE_WIDGET_VIEWPORT_PADDING ||
+    position.x + MOBILE_WIDGET_COLLAPSED_SIZE / 2 > availableWidth / 2;
   const preferredLeft = opensLeft ? position.x + MOBILE_WIDGET_COLLAPSED_SIZE - width : position.x;
   const clampedLeft = Math.max(
     MOBILE_WIDGET_VIEWPORT_PADDING,
-    Math.min(window.innerWidth - width - MOBILE_WIDGET_VIEWPORT_PADDING, preferredLeft),
+    Math.min(availableWidth - width - MOBILE_WIDGET_VIEWPORT_PADDING, preferredLeft),
   );
 
   return {
@@ -273,9 +308,15 @@ function isSpotifyRestrictionError(error: unknown): boolean {
   return /restriction\s+violated/i.test(message);
 }
 
-export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
+export function SpotifyMiniPlayer({
+  mobile = false,
+  forceFloating = false,
+}: {
+  mobile?: boolean;
+  forceFloating?: boolean;
+}) {
   const qc = useQueryClient();
-  const enabled = useUIStore((s) => s.spotifyPlayerEnabled);
+  const enabled = useUIStore((s) => s.musicPlayerEnabled && s.musicPlayerSource === "spotify");
   const openRightPanel = useUIStore((s) => s.openRightPanel);
   const openAgentDetail = useUIStore((s) => s.openAgentDetail);
   const collapsed = useUIStore((s) => s.spotifyMobileWidgetCollapsed);
@@ -284,8 +325,13 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
   const setMobilePosition = useUIStore((s) => s.setSpotifyMobileWidgetPosition);
   const [sdkDeviceId, setSdkDeviceId] = useState<string | null>(null);
   const [sdkError, setSdkError] = useState<string | null>(null);
+  const [browserPlaybackRequested, setBrowserPlaybackRequested] = useState(false);
   const [volumeDraft, setVolumeDraft] = useState(50);
   const [volumeUnsupportedDeviceKey, setVolumeUnsupportedDeviceKey] = useState<string | null>(null);
+  const [viewport, setViewport] = useState(() => ({
+    w: typeof window === "undefined" ? 0 : window.innerWidth,
+    h: typeof window === "undefined" ? 0 : window.innerHeight,
+  }));
   const previousVolumeRef = useRef(50);
   const previousPlaybackRef = useRef<SpotifyPlaybackState | null>(null);
   const repeatReplayRef = useRef<{ key: string; at: number } | null>(null);
@@ -298,11 +344,44 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
     originX: number;
     originY: number;
   } | null>(null);
+  const floating = mobile || forceFloating;
+  const wasForceFloatingRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let frame = 0;
+    const updateViewport = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        setViewport({ w: window.innerWidth, h: window.innerHeight });
+      });
+    };
+    updateViewport();
+    window.addEventListener("resize", updateViewport);
+    window.addEventListener("orientationchange", updateViewport);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updateViewport);
+      window.removeEventListener("orientationchange", updateViewport);
+    };
+  }, []);
+
+  const statusQuery = useQuery({
+    queryKey: spotifyKeys.status,
+    queryFn: () => api.get<SpotifyStatusResponse>("/spotify/status"),
+    enabled,
+    staleTime: 10_000,
+    refetchInterval: 30_000,
+    retry: false,
+  });
+  const spotifyConnected = statusQuery.data?.connected === true && statusQuery.data.expired !== true;
+  const spotifyStreamingAvailable = spotifyConnected && statusQuery.data?.hasStreamingScope === true;
 
   const playerQuery = useQuery({
     queryKey: spotifyKeys.player,
     queryFn: () => api.get<SpotifyPlaybackState>("/spotify/player"),
-    enabled,
+    enabled: enabled && spotifyConnected,
     staleTime: 2_000,
     refetchInterval: 5_000,
     retry: false,
@@ -311,7 +390,7 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
   const devicesQuery = useQuery({
     queryKey: spotifyKeys.devices,
     queryFn: () => api.get<SpotifyDevicesState>("/spotify/devices"),
-    enabled: enabled && mobile,
+    enabled: enabled && spotifyConnected && mobile,
     staleTime: 2_000,
     refetchInterval: 5_000,
     retry: false,
@@ -349,6 +428,11 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
     (typeof deviceVolume !== "number" || (!!volumeDeviceKey && volumeUnsupportedDeviceKey === volumeDeviceKey));
 
   useEffect(() => {
+    if (forceFloating && !wasForceFloatingRef.current) setCollapsed(true);
+    wasForceFloatingRef.current = forceFloating;
+  }, [forceFloating, setCollapsed]);
+
+  useEffect(() => {
     if (!controlDevice) {
       setVolumeUnsupportedDeviceKey(null);
       return;
@@ -365,7 +449,7 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
   }, [controlDevice, deviceVolume, volumeDeviceKey]);
 
   useEffect(() => {
-    if (!enabled || mobile) return;
+    if (!enabled || mobile || !browserPlaybackRequested || !spotifyStreamingAvailable) return;
     let disposed = false;
     let sdkPlayer: SpotifyWebPlaybackPlayer | null = null;
 
@@ -421,7 +505,7 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
         sdkPlayer.disconnect();
       }
     };
-  }, [enabled, mobile, qc]);
+  }, [browserPlaybackRequested, enabled, mobile, qc, spotifyStreamingAvailable]);
 
   const invalidate = useCallback(() => {
     void qc.invalidateQueries({ queryKey: spotifyKeys.player });
@@ -525,16 +609,8 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
   const showDjMariToast = useCallback(() => {
     dismissDjMariToast();
     djMariToastRef.current = toast.custom(
-      (id) => (
-        <div className="relative flex max-w-[22rem] items-center gap-3 rounded-xl border border-primary/35 bg-card/95 p-3 pr-9 text-card-foreground shadow-2xl backdrop-blur-xl">
-          <button
-            type="button"
-            onClick={() => toast.dismiss(id)}
-            className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground"
-            aria-label="Dismiss"
-          >
-            <X size="0.875rem" />
-          </button>
+      () => (
+        <div className="flex max-w-[22rem] items-center gap-3 pr-1 text-[var(--foreground)]">
           <img
             src={DOTTOR_SUPPORT_GIF}
             alt=""
@@ -542,6 +618,14 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
             draggable={false}
           />
           <p className="text-sm font-medium leading-snug">DJ Mari is composing a playlist for you, hold on tight!</p>
+          <button
+            type="button"
+            onClick={dismissDjMariToast}
+            className="rounded-full p-1 text-foreground/45 transition-colors hover:bg-foreground/10 hover:text-foreground"
+            aria-label="Dismiss DJ Mari playlist toast"
+          >
+            <X size="0.75rem" />
+          </button>
         </div>
       ),
       { duration: Infinity, position: "bottom-right" },
@@ -603,6 +687,33 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
       shouldTransfer: !mobile && !player?.active && !!sdkDeviceId,
     });
   }, [controlDeviceId, mobile, player?.active, player?.device?.id, player?.isPlaying, runControl, sdkDeviceId]);
+
+  const handleMarinaraPlayerPress = useCallback(() => {
+    if (sdkDeviceId) {
+      runControl.mutate({ type: "transfer", deviceId: sdkDeviceId, play: player?.isPlaying === true });
+      return;
+    }
+    if (!spotifyConnected) {
+      openRightPanel("agents");
+      openAgentDetail("spotify");
+      return;
+    }
+    if (!spotifyStreamingAvailable) {
+      setSdkError("Reconnect Spotify to enable in-app playback.");
+      toast.info("Reconnect Spotify with the streaming scope to use Marinara as a Spotify player.");
+      return;
+    }
+    setSdkError(null);
+    setBrowserPlaybackRequested(true);
+  }, [
+    openAgentDetail,
+    openRightPanel,
+    player?.isPlaying,
+    runControl,
+    sdkDeviceId,
+    spotifyConnected,
+    spotifyStreamingAvailable,
+  ]);
 
   const openSpotifyAgent = useCallback(() => {
     openRightPanel("agents");
@@ -675,7 +786,11 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
 
   const startDrag = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (!mobile) return;
+      if (!floating) return;
+      if (event.target instanceof Element && event.target.closest("button,a,input,textarea,select,[role='button']")) {
+        return;
+      }
+      event.preventDefault();
       dragRef.current = {
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -683,15 +798,20 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
         originX: mobilePosition.x,
         originY: mobilePosition.y,
       };
-      event.currentTarget.setPointerCapture(event.pointerId);
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // Some mobile browsers can deny capture if the pointer was already cancelled.
+      }
     },
-    [mobile, mobilePosition.x, mobilePosition.y],
+    [floating, mobilePosition.x, mobilePosition.y],
   );
 
   const moveDrag = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       const drag = dragRef.current;
       if (!drag || drag.pointerId !== event.pointerId) return;
+      event.preventDefault();
       const next = clampMobilePosition(
         drag.originX + event.clientX - drag.startX,
         drag.originY + event.clientY - drag.startY,
@@ -708,13 +828,22 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
       if (!drag || drag.pointerId !== event.pointerId) return;
       const moved = Math.abs(event.clientX - drag.startX) + Math.abs(event.clientY - drag.startY);
       dragRef.current = null;
-      if (moved < 6 && mobile && collapsed) setCollapsed(false);
+      try {
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }
+      } catch {
+        // Ignore browsers that already released capture.
+      }
+      if (moved < 6 && floating && collapsed) setCollapsed(false);
     },
-    [collapsed, mobile, setCollapsed],
+    [collapsed, floating, setCollapsed],
   );
 
-  const title = item?.name ?? (playerQuery.isError ? "Spotify not connected" : "Spotify");
-  const subtitle = item ? formatArtists(item.artists) : sdkError || "No active playback";
+  const title = item?.name ?? (!spotifyConnected ? "Spotify not connected" : "Spotify");
+  const subtitle = item
+    ? formatArtists(item.artists)
+    : sdkError || (!spotifyConnected ? "Open Music DJ setup" : "No active playback");
   const cover = item?.imageUrl;
   const playPauseBusy =
     runControl.isPending && (runControl.variables?.type === "play" || runControl.variables?.type === "pause");
@@ -726,7 +855,9 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
   const RepeatIcon = repeatState === "track" ? Repeat1 : Repeat2;
   const repeatTitle =
     repeatState === "track" ? "Repeat track" : repeatState === "context" ? "Repeat playlist" : "Repeat off";
-  const canTransferToApp = !mobile && !!sdkDeviceId && player?.device?.id !== sdkDeviceId;
+  const browserPlaybackLoading = browserPlaybackRequested && !sdkDeviceId && !sdkError;
+  const canUseMarinaraPlayer =
+    !mobile && spotifyConnected && (browserPlaybackLoading || !sdkDeviceId || player?.device?.id !== sdkDeviceId);
   const progressPercent =
     typeof player?.progressMs === "number" && typeof player.durationMs === "number" && player.durationMs > 0
       ? Math.max(0, Math.min(100, (player.progressMs / player.durationMs) * 100))
@@ -737,17 +868,25 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
   const spotifyVolumeStyle: RangeCssProperties = useMemo(
     () => ({
       "--range-progress": `${volumeDraft}%`,
-      "--range-track-color": "oklch(0.36 0.006 145)",
-      "--range-fill-color": "oklch(0.96 0.006 145)",
-      "--range-thumb-color": "oklch(0.96 0.006 145)",
+      "--range-track-color": "color-mix(in srgb, #1DB954 26%, transparent)",
+      "--range-fill-color": "#1DB954",
+      "--range-thumb-color": "#1DB954",
       "--range-thumb-size": "0.6875rem",
       "--range-track-height": "0.25rem",
-      "--range-thumb-shadow": "0 0 0 0.125rem oklch(0.16 0.006 145)",
+      "--range-thumb-shadow": "0 0 0 0.125rem #191414",
     }),
     [volumeDraft],
   );
-  const mobileWidgetStyle = useMemo(() => getMobileWidgetStyle(mobilePosition, collapsed), [collapsed, mobilePosition]);
-  const mobileExpandedPanelStyle = useMemo(() => getMobileExpandedPanelStyle(mobilePosition), [mobilePosition]);
+  const viewportWidth = viewport.w;
+  const viewportHeight = viewport.h;
+  const mobileWidgetStyle = useMemo(
+    () => getMobileWidgetStyle(mobilePosition, collapsed, viewportWidth, viewportHeight),
+    [collapsed, mobilePosition, viewportHeight, viewportWidth],
+  );
+  const mobileExpandedPanelStyle = useMemo(
+    () => getMobileExpandedPanelStyle(mobilePosition, viewportWidth),
+    [mobilePosition, viewportWidth],
+  );
   const volumeControls = useMemo(() => {
     const stopPointer = (event: ReactPointerEvent<HTMLElement>) => event.stopPropagation();
 
@@ -755,7 +894,11 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
       return (
         <button
           type="button"
-          className="flex w-full shrink-0 items-center gap-1 rounded-md px-1 py-0.5 text-left text-[oklch(0.70_0.012_145)] transition-colors hover:bg-[oklch(0.22_0.008_145)] hover:text-[oklch(0.96_0.006_145)]"
+          className={cn(
+            "flex w-full shrink-0 items-center gap-1 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-[#f7f3ef]/10",
+            MUSIC_PLAYER_ICON_CLASS,
+            MUSIC_PLAYER_ICON_HOVER_CLASS,
+          )}
           onPointerDown={stopPointer}
           onPointerMove={stopPointer}
           onPointerUp={stopPointer}
@@ -784,8 +927,9 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
           type="button"
           onClick={toggleMute}
           className={cn(
-            "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[oklch(0.70_0.012_145)] transition-colors hover:text-[oklch(0.96_0.006_145)]",
-            volumeMuted && SPOTIFY_GREEN_CLASS,
+            "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition-colors",
+            MUSIC_PLAYER_ICON_CLASS,
+            MUSIC_PLAYER_ICON_HOVER_CLASS,
           )}
           title={volumeMuted ? "Restore volume" : "Mute"}
         >
@@ -812,8 +956,15 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
   const compactBody = useMemo(
     () => (
       <>
-        <div className="flex min-w-0 flex-1 items-center gap-2.5">
-          <div className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-[0.375rem] bg-[oklch(0.23_0.006_145)] ring-1 ring-[oklch(0.34_0.01_145)]">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <MusicSourceButton source="spotify" className={cn(MUSIC_PLAYER_BORDER_CLASS, MUSIC_PLAYER_BUTTON_BG_CLASS)} />
+          <div
+            className={cn(
+              "flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-[0.375rem] ring-1",
+              MUSIC_PLAYER_TILE_BG_CLASS,
+              MUSIC_PLAYER_TILE_RING_CLASS,
+            )}
+          >
             {cover ? (
               <img src={cover} alt="" className="h-full w-full object-cover" />
             ) : (
@@ -821,10 +972,10 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
             )}
           </div>
           <div className="min-w-0">
-            <p className="truncate text-[0.6875rem] font-semibold leading-tight text-[oklch(0.96_0.006_145)]">
+            <p className={cn("truncate text-[0.6875rem] font-semibold leading-tight", MUSIC_PLAYER_TEXT_CLASS)}>
               {title}
             </p>
-            <p className="truncate text-[0.5625rem] leading-tight text-[oklch(0.72_0.012_145)]">{subtitle}</p>
+            <p className={cn("truncate text-[0.5625rem] leading-tight", MUSIC_PLAYER_MUTED_CLASS)}>{subtitle}</p>
           </div>
         </div>
 
@@ -833,7 +984,9 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
             type="button"
             onClick={() => handleShufflePress({ shuffle: shuffleActive, smartShuffle: smartShuffleActive, deviceId })}
             className={cn(
-              "relative inline-flex h-7 w-7 items-center justify-center rounded-full text-[oklch(0.70_0.012_145)] transition-colors hover:text-[oklch(0.96_0.006_145)]",
+              "relative inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors",
+              MUSIC_PLAYER_ICON_CLASS,
+              MUSIC_PLAYER_ICON_HOVER_CLASS,
               shuffleEnabled && SPOTIFY_GREEN_CLASS,
             )}
             aria-pressed={shuffleEnabled}
@@ -844,7 +997,11 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
           <button
             type="button"
             onClick={() => runControl.mutate({ type: "previous", deviceId })}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-full text-[oklch(0.82_0.01_145)] transition-colors hover:text-[oklch(0.96_0.006_145)]"
+            className={cn(
+              "inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors",
+              MUSIC_PLAYER_ICON_CLASS,
+              MUSIC_PLAYER_ICON_HOVER_CLASS,
+            )}
             title="Previous"
           >
             <SkipBack size="0.8125rem" />
@@ -852,7 +1009,11 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
           <button
             type="button"
             onClick={() => void handlePlayPause()}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-[oklch(0.96_0.006_145)] text-[oklch(0.16_0.006_145)] shadow-[0_1px_8px_rgba(29,185,84,0.18)] transition-transform hover:scale-105 active:scale-95"
+            className={cn(
+              "inline-flex h-7 w-7 items-center justify-center rounded-full shadow-[0_1px_8px_rgba(255,255,255,0.18)] transition-transform hover:scale-105 active:scale-95",
+              MUSIC_PLAYER_ACTION_BG_CLASS,
+              MUSIC_PLAYER_ACTION_TEXT_CLASS,
+            )}
             title={player?.isPlaying ? "Pause" : "Play"}
           >
             {playPauseBusy ? (
@@ -866,7 +1027,11 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
           <button
             type="button"
             onClick={() => runControl.mutate({ type: "next", deviceId })}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-full text-[oklch(0.82_0.01_145)] transition-colors hover:text-[oklch(0.96_0.006_145)]"
+            className={cn(
+              "inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors",
+              MUSIC_PLAYER_ICON_CLASS,
+              MUSIC_PLAYER_ICON_HOVER_CLASS,
+            )}
             title="Next"
           >
             <SkipForward size="0.8125rem" />
@@ -875,7 +1040,9 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
             type="button"
             onClick={() => runControl.mutate({ type: "repeat", state: getNextRepeatState(repeatState), deviceId })}
             className={cn(
-              "inline-flex h-7 w-7 items-center justify-center rounded-full text-[oklch(0.70_0.012_145)] transition-colors hover:text-[oklch(0.96_0.006_145)]",
+              "inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors",
+              MUSIC_PLAYER_ICON_CLASS,
+              MUSIC_PLAYER_ICON_HOVER_CLASS,
               repeatState !== "off" && SPOTIFY_GREEN_CLASS,
             )}
             aria-pressed={repeatState !== "off"}
@@ -887,29 +1054,40 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
             type="button"
             onClick={() => createDjMariPlaylist.mutate()}
             disabled={createDjMariPlaylist.isPending}
-            className="inline-flex h-7 min-w-7 items-center justify-center rounded-full px-1.5 text-[0.625rem] font-black leading-none text-[oklch(0.70_0.012_145)] transition-colors hover:text-[oklch(0.96_0.006_145)] disabled:cursor-wait disabled:opacity-80"
+            className={cn(
+              "inline-flex h-7 min-w-7 items-center justify-center rounded-full px-1.5 text-[0.625rem] font-black leading-none transition-colors disabled:cursor-wait disabled:opacity-80",
+              MUSIC_PLAYER_ICON_CLASS,
+              MUSIC_PLAYER_ICON_HOVER_CLASS,
+            )}
             title="DJ Mari composes a playlist for you!"
             aria-label="DJ Mari composes a playlist for you!"
           >
             {createDjMariPlaylist.isPending ? <Loader2 size="0.8125rem" className="animate-spin" /> : "DJ"}
           </button>
-          {canTransferToApp && (
+          {canUseMarinaraPlayer && (
             <button
               type="button"
-              onClick={() =>
-                runControl.mutate({ type: "transfer", deviceId: sdkDeviceId, play: player?.isPlaying === true })
-              }
-              className="hidden h-7 w-7 items-center justify-center rounded-full text-[oklch(0.70_0.012_145)] transition-colors hover:text-[oklch(0.96_0.006_145)] sm:inline-flex"
-              title="Use Marinara player"
+              onClick={handleMarinaraPlayerPress}
+              disabled={browserPlaybackLoading}
+              className={cn(
+                "hidden h-7 w-7 items-center justify-center rounded-full transition-colors disabled:cursor-wait disabled:opacity-80 sm:inline-flex",
+                MUSIC_PLAYER_ICON_CLASS,
+                MUSIC_PLAYER_ICON_HOVER_CLASS,
+              )}
+              title={sdkDeviceId ? "Use Marinara player" : "Enable Marinara player"}
             >
-              <Laptop size="0.8125rem" />
+              {browserPlaybackLoading ? <Loader2 size="0.8125rem" className="animate-spin" /> : <Laptop size="0.8125rem" />}
             </button>
           )}
           <button
             type="button"
             onClick={openSpotifyAgent}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-full text-[oklch(0.70_0.012_145)] transition-colors hover:text-[oklch(0.96_0.006_145)]"
-            title="Spotify setup"
+            className={cn(
+              "inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors",
+              MUSIC_PLAYER_ICON_CLASS,
+              MUSIC_PLAYER_ICON_HOVER_CLASS,
+            )}
+            title="Music DJ setup"
           >
             <Settings size="0.8125rem" />
           </button>
@@ -917,10 +1095,12 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
       </>
     ),
     [
-      canTransferToApp,
+      browserPlaybackLoading,
+      canUseMarinaraPlayer,
       cover,
       createDjMariPlaylist,
       deviceId,
+      handleMarinaraPlayerPress,
       handleShufflePress,
       handlePlayPause,
       openSpotifyAgent,
@@ -942,10 +1122,10 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
 
   if (!enabled) return null;
 
-  if (mobile) {
+  if (floating) {
     return (
       <div
-        className="fixed z-[60] md:hidden"
+        className={cn("fixed z-[35] touch-none select-none", mobile && "md:hidden")}
         style={mobileWidgetStyle}
         onPointerDown={startDrag}
         onPointerMove={moveDrag}
@@ -953,17 +1133,28 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
         onPointerCancel={endDrag}
       >
         {collapsed ? (
-          <div className="flex h-12 w-12 items-center justify-center rounded-full border border-[oklch(0.30_0.012_145)] bg-[oklch(0.16_0.006_145)] text-[oklch(0.72_0.18_145)] shadow-lg backdrop-blur-xl">
+          <div
+            className={cn(
+              "flex h-12 w-12 items-center justify-center rounded-full border shadow-lg backdrop-blur-xl",
+              MUSIC_PLAYER_SHELL_BORDER_CLASS,
+              MUSIC_PLAYER_SHELL_BG_CLASS,
+              SPOTIFY_GREEN_CLASS,
+            )}
+          >
             <Music2 size="1.125rem" />
           </div>
         ) : (
           <div
-            className="rounded-xl border border-[oklch(0.30_0.012_145)] bg-[oklch(0.16_0.006_145)] p-2 shadow-2xl backdrop-blur-xl"
+            className={cn(
+              "rounded-xl border p-2 shadow-2xl backdrop-blur-xl",
+              MUSIC_PLAYER_SHELL_BORDER_CLASS,
+              MUSIC_PLAYER_SHELL_BG_CLASS,
+            )}
             style={mobileExpandedPanelStyle}
           >
             <div className="mb-1 flex items-center gap-1">
-              <GripVertical size="0.875rem" className="text-[oklch(0.70_0.012_145)]" />
-              <span className="flex-1 truncate text-[0.625rem] font-medium text-[oklch(0.70_0.012_145)]">
+              <GripVertical size="0.875rem" className={MUSIC_PLAYER_ICON_CLASS} />
+              <span className={cn("flex-1 truncate text-[0.625rem] font-medium", MUSIC_PLAYER_ICON_CLASS)}>
                 {player?.device?.name ?? "Spotify"}
               </span>
               <button
@@ -976,7 +1167,7 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
                   event.stopPropagation();
                   setCollapsed(true);
                 }}
-                className="rounded-full p-1 text-[oklch(0.70_0.012_145)] hover:text-[oklch(0.96_0.006_145)]"
+                className={cn("rounded-full p-1", MUSIC_PLAYER_ICON_CLASS, MUSIC_PLAYER_ICON_HOVER_CLASS)}
                 title="Close player"
               >
                 <X size="0.875rem" />
@@ -991,10 +1182,21 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
   }
 
   return (
-    <div className="relative hidden h-10 min-w-0 max-w-[31rem] flex-1 items-center gap-2 overflow-hidden rounded-full border border-[oklch(0.30_0.012_145)] bg-[oklch(0.16_0.006_145)] px-2.5 md:flex">
+    <div
+      className={cn(
+        "relative hidden h-10 min-w-0 max-w-[31rem] flex-1 items-center gap-2 overflow-hidden rounded-full border px-2.5 md:flex",
+        MUSIC_PLAYER_SHELL_BORDER_CLASS,
+        MUSIC_PLAYER_SHELL_BG_CLASS,
+      )}
+    >
       {compactBody}
       <div className="hidden w-24 lg:flex">{volumeControls}</div>
-      <div className="pointer-events-none absolute bottom-0 left-3 right-3 h-px overflow-hidden rounded-full bg-[oklch(0.28_0.01_145)]">
+      <div
+        className={cn(
+          "pointer-events-none absolute bottom-0 left-3 right-3 h-px overflow-hidden rounded-full",
+          MUSIC_PLAYER_PROGRESS_BG_CLASS,
+        )}
+      >
         <div className={cn("h-full rounded-full", SPOTIFY_GREEN_BG_CLASS)} style={{ width: `${progressPercent}%` }} />
       </div>
     </div>
@@ -1002,9 +1204,27 @@ export function SpotifyMiniPlayer({ mobile = false }: { mobile?: boolean }) {
 }
 
 export function SpotifyMobileWidget() {
-  const enabled = useUIStore((s) => s.spotifyPlayerEnabled);
+  const enabled = useUIStore((s) => s.musicPlayerEnabled && s.musicPlayerSource === "spotify");
+  const isMobileViewport = useMediaQuery("(max-width: 767px)");
 
-  if (!enabled) return null;
+  if (!enabled || !isMobileViewport) return null;
 
   return <SpotifyMiniPlayer mobile />;
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(() =>
+    typeof window === "undefined" ? false : window.matchMedia(query).matches,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+
+  return matches;
 }

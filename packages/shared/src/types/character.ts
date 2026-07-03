@@ -1,8 +1,6 @@
 // ──────────────────────────────────────────────
 // Character Card V2 Types (compatible with ST / Chub)
 // ──────────────────────────────────────────────
-import type { AltDescription } from "./persona";
-
 /** Full Character Card V2 envelope. */
 export interface CharacterCardV2 {
   spec: "chara_card_v2";
@@ -27,6 +25,7 @@ export interface CharacterData {
   alternate_greetings: string[];
   extensions: CharacterExtensions;
   character_book: CharacterBook | null;
+  [key: string]: unknown;
 }
 
 /** ST-compatible extension fields. */
@@ -39,8 +38,6 @@ export interface CharacterExtensions {
   backstory: string;
   /** Marinara Engine extension: physical appearance description */
   appearance: string;
-  /** Marinara Engine: toggleable additions appended to the main character description */
-  altDescriptions?: AltDescription[];
   /** Marinara Engine: Name display color/gradient (CSS value, e.g. "linear-gradient(90deg, #ff6b6b, #ffd93d)" or "#ff6b6b") */
   nameColor?: string;
   /** Marinara Engine: Dialogue highlight color — text in quotation marks is bold + colored with this */
@@ -50,11 +47,18 @@ export interface CharacterExtensions {
   /** Marinara Engine: RPG stats toggle + custom attributes */
   rpgStats?: RPGStatsConfig;
   /** Marinara Engine: Conversation-mode availability status */
-  conversationStatus?: "online" | "idle" | "dnd" | "offline";
+  conversationStatus?: import("./chat.js").ConversationPresenceStatus;
   [key: string]: unknown;
 }
 
 /** RPG stats configuration attached to a character card. */
+export interface RPGStatPool {
+  name: string;
+  value: number;
+  max: number;
+  color: string;
+}
+
 export interface RPGStatsConfig {
   /** Whether RPG stats are enabled for this character */
   enabled: boolean;
@@ -62,6 +66,8 @@ export interface RPGStatsConfig {
   attributes: Array<{ name: string; value: number }>;
   /** Hit Points */
   hp: { value: number; max: number };
+  /** HP-like bars such as HP, MP, EP, Sanity, etc. */
+  pools?: RPGStatPool[];
 }
 
 /** Depth-injected prompt attached to a character. */
@@ -82,6 +88,20 @@ export interface CharacterBook {
   entries: CharacterBookEntry[];
 }
 
+export type CharacterBookEntryPosition =
+  | "before_char"
+  | "after_char"
+  | "at_depth"
+  | "depth"
+  | 0
+  | 1
+  | 2
+  | 3
+  | 4
+  | 5
+  | 6;
+export type CharacterBookEntryRole = "system" | "user" | "assistant" | 0 | 1 | 2;
+
 /** A single entry in a character book. */
 export interface CharacterBookEntry {
   keys: string[];
@@ -97,7 +117,10 @@ export interface CharacterBookEntry {
   selective: boolean;
   secondary_keys: string[];
   constant: boolean;
-  position: "before_char" | "after_char";
+  position: CharacterBookEntryPosition;
+  depth?: number;
+  role?: CharacterBookEntryRole;
+  [key: string]: unknown;
 }
 
 /** Our internal Character representation (extends V2 with engine-specific fields). */
@@ -120,6 +143,40 @@ export interface CharacterCardVersion {
   id: string;
   characterId: string;
   data: CharacterData;
+  comment: string;
+  avatarPath: string | null;
+  version: string;
+  source: "manual" | "agent" | "command" | "restore" | string;
+  reason: string;
+  createdAt: string;
+}
+
+/** Snapshot data saved for a previous persona card state. */
+export interface PersonaCardSnapshot {
+  name: string;
+  creator: string;
+  personaVersion: string;
+  creatorNotes: string;
+  description: string;
+  personality: string;
+  scenario: string;
+  backstory: string;
+  appearance: string;
+  avatarCrop: string;
+  nameColor: string;
+  dialogueColor: string;
+  boxColor: string;
+  trackerCardColors: string;
+  personaStats: string;
+  tags: string;
+  savedStatusOptions: string;
+}
+
+/** Saved snapshot of a previous persona card state. */
+export interface PersonaCardVersion {
+  id: string;
+  personaId: string;
+  data: PersonaCardSnapshot;
   comment: string;
   avatarPath: string | null;
   version: string;

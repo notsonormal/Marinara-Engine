@@ -17,9 +17,25 @@ export interface ChatImage {
   url: string;
 }
 
+export interface ChatAssetBrowserItem {
+  id: string;
+  kind: "chat-gallery" | "character-gallery" | "persona-gallery" | "sprite";
+  ownerType: "chat" | "character" | "persona";
+  ownerId: string;
+  ownerName: string;
+  name: string;
+  prompt: string;
+  width: number | null;
+  height: number | null;
+  createdAt: string | null;
+  url: string;
+  cardUrl: string;
+}
+
 const galleryKeys = {
   all: ["gallery"] as const,
   chat: (chatId: string) => ["gallery", chatId] as const,
+  assets: (chatId: string) => ["gallery", "assets", chatId] as const,
 };
 
 export function useGalleryImages(chatId: string | undefined) {
@@ -27,6 +43,15 @@ export function useGalleryImages(chatId: string | undefined) {
     queryKey: galleryKeys.chat(chatId!),
     queryFn: () => api.get<ChatImage[]>(`/gallery/${chatId}`),
     enabled: !!chatId,
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function useChatAssetBrowser(chatId: string | undefined, enabled = true) {
+  return useQuery({
+    queryKey: galleryKeys.assets(chatId!),
+    queryFn: () => api.get<ChatAssetBrowserItem[]>(`/gallery/assets/${chatId}`),
+    enabled: enabled && !!chatId,
     staleTime: 5 * 60_000,
   });
 }
@@ -66,8 +91,29 @@ export function useDeleteGalleryImage(chatId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (imageId: string) => api.delete(`/gallery/${imageId}`),
-    onSuccess: () => {
+    onMutate: async (imageId) => {
+      await Promise.all([
+        qc.cancelQueries({ queryKey: galleryKeys.chat(chatId) }),
+        qc.cancelQueries({ queryKey: galleryKeys.assets(chatId) }),
+      ]);
+
+      const previousImages = qc.getQueryData<ChatImage[]>(galleryKeys.chat(chatId));
+      const previousAssets = qc.getQueryData<ChatAssetBrowserItem[]>(galleryKeys.assets(chatId));
+
+      qc.setQueryData<ChatImage[]>(galleryKeys.chat(chatId), (old) => old?.filter((image) => image.id !== imageId));
+      qc.setQueryData<ChatAssetBrowserItem[]>(galleryKeys.assets(chatId), (old) =>
+        old?.filter((asset) => asset.id !== imageId && asset.id !== `chat-gallery:${imageId}`),
+      );
+
+      return { previousImages, previousAssets };
+    },
+    onError: (_error, _imageId, context) => {
+      if (context?.previousImages) qc.setQueryData(galleryKeys.chat(chatId), context.previousImages);
+      if (context?.previousAssets) qc.setQueryData(galleryKeys.assets(chatId), context.previousAssets);
+    },
+    onSettled: () => {
       qc.invalidateQueries({ queryKey: galleryKeys.chat(chatId) });
+      qc.invalidateQueries({ queryKey: galleryKeys.assets(chatId) });
     },
   });
 }
