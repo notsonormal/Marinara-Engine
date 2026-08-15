@@ -1,9 +1,9 @@
 // ──────────────────────────────────────────────
 // Schema: API Connections
 // ──────────────────────────────────────────────
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { fileTable, text, integer } from "../file-schema.js";
 
-export const apiConnections = sqliteTable("api_connections", {
+export const apiConnections = fileTable("api_connections", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   provider: text("provider", {
@@ -12,6 +12,7 @@ export const apiConnections = sqliteTable("api_connections", {
       "openai_chatgpt",
       "anthropic",
       "claude_subscription",
+      "grok_subscription",
       "google",
       "google_vertex",
       "mistral",
@@ -19,17 +20,23 @@ export const apiConnections = sqliteTable("api_connections", {
       "openrouter",
       "nanogpt",
       "xai",
+      "arli",
       "custom",
       "image_generation",
+      "video_generation",
     ],
   }).notNull(),
   baseUrl: text("base_url").notNull().default(""),
   /** Encrypted API key */
   apiKeyEncrypted: text("api_key_encrypted").notNull().default(""),
+  /** Imported endpoints stay unavailable until the user reviews and saves them locally. */
+  profileImportReviewRequired: text("profile_import_review_required").notNull().default("false"),
   model: text("model").notNull().default(""),
   imagePath: text("image_path"),
   maxContext: integer("max_context").notNull().default(128000),
   isDefault: text("is_default").notNull().default("false"),
+  /** Whether this language connection is the fallback for main generations (only one allowed). */
+  fallbackForMain: text("fallback_for_main").notNull().default("false"),
   /** Whether this connection is part of the random-selection pool */
   useForRandom: text("use_for_random").notNull().default("false"),
   /** Whether to enable Anthropic prompt caching */
@@ -40,6 +47,8 @@ export const apiConnections = sqliteTable("api_connections", {
   cachingAtDepth: integer("caching_at_depth").notNull().default(5),
   /** Whether this connection is the default for all agents (only one allowed) */
   defaultForAgents: text("default_for_agents").notNull().default("false"),
+  /** Category-aware fallback for language agents, image generation, or video generation. */
+  fallbackForAgents: text("fallback_for_agents").notNull().default("false"),
   /** Model to use for embedding generation (e.g. text-embedding-3-small) */
   embeddingModel: text("embedding_model"),
   /** Optional: separate base URL for the embedding backend (e.g. a second llama.cpp instance) */
@@ -56,9 +65,17 @@ export const apiConnections = sqliteTable("api_connections", {
   imageService: text("image_service"),
   /** For endpoint-based image services (e.g. RunPod Serverless ComfyUI): the endpoint ID. */
   imageEndpointId: text("image_endpoint_id"),
+  /** Instructions passed to the default language model before image generation. */
+  imagePromptInstructions: text("image_prompt_instructions"),
+  /** OpenAI GPT Image quality for this connection. */
+  imageGenerationQuality: text("image_generation_quality").notNull().default("auto"),
+  /** Explicit video backend selection for video-generation connections. */
+  videoGenerationSource: text("video_generation_source"),
+  /** Video generation: explicitly selected service ID. */
+  videoService: text("video_service"),
   /** Default generation parameters (stored as JSON) for new chats using this connection */
   defaultParameters: text("default_parameters"),
-  /** Optional prompt preset override for roleplay/visual-novel chats using this connection */
+  /** Optional prompt preset override for Roleplay chats using this connection */
   promptPresetId: text("prompt_preset_id"),
   /** Optional hard cap on max_tokens for the API response (for providers like DeepSeek that have lower limits). */
   maxTokensOverride: integer("max_tokens_override"),

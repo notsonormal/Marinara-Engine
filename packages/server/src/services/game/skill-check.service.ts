@@ -33,7 +33,7 @@ export interface SkillCheckResult {
   dc: number;
   /** The raw d20 roll(s) — 2 if advantage/disadvantage, 1 otherwise. */
   rolls: number[];
-  /** Which roll was used (index into rolls). */
+  /** The die value that was used (1-20), not an index into rolls. */
   usedRoll: number;
   /** Total modifier applied (skill + attribute). */
   modifier: number;
@@ -47,6 +47,10 @@ export interface SkillCheckResult {
   criticalFailure: boolean;
   /** Roll mode used by the resolver. */
   rollMode: "advantage" | "disadvantage" | "normal";
+  /** Built-in checks add the used die and modifiers. */
+  resolution: "sum";
+  /** Notation for the dice actually thrown (e.g. "1d20", "2d20" with advantage). */
+  dice: string;
 }
 
 function d20(): number {
@@ -209,5 +213,9 @@ export function resolveSkillCheck(input: SkillCheckInput): SkillCheckResult {
     criticalSuccess,
     criticalFailure,
     rollMode: useAdvantage ? "advantage" : useDisadvantage ? "disadvantage" : "normal",
+    resolution: "sum",
+    // Notation for the dice actually thrown, so the card labels advantage rolls
+    // "2d20" rather than claiming a single die.
+    dice: `${rolls.length}d20`,
   };
 }

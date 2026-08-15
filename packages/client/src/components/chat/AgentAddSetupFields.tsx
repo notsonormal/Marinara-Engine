@@ -1,10 +1,12 @@
 import { useRef, type ReactNode } from "react";
-import { Check, Loader2, Upload } from "lucide-react";
+import { Check, FolderOpen, Loader2, Upload } from "lucide-react";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import {
   DEFAULT_AGENT_PROMPT_TEMPLATE_ID,
   getDefaultBuiltInAgentSettings,
   normalizeAgentPromptTemplateSelectionMap,
+  normalizeSpotifySourceType,
+  resolveDefaultAgentPromptTemplateId,
   type AgentPromptTemplateOption,
   type HapticFeedbackSensitivity,
   type KnowledgeAgentSourceSettings,
@@ -29,12 +31,13 @@ import {
   normalizeSpriteDisplayModes,
   type SpriteDisplayMode,
 } from "./sprite-display-modes";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 export type KnowledgeAgentType = "knowledge-retrieval" | "knowledge-router";
 export type MusicProvider = "spotify" | "youtube" | "custom";
+export type CustomMusicSource = "game-assets" | "folder";
 
 export type AgentAddSetupState = {
-  directorMode: "natural" | "random";
   secretPlotEnabled: boolean;
   secretPlotRunInterval: number;
   proseGuardianBanned: string;
@@ -62,7 +65,9 @@ export type AgentAddSetupState = {
   spotifyPlaylistName: string | null;
   spotifyArtist: string;
   musicProvider: MusicProvider;
+  customMusicSource: CustomMusicSource;
   customMusicFolder: string;
+  customMusicExternalFolder: string;
   hapticFeedbackEnabled: boolean;
   hapticSensitivity: HapticFeedbackSensitivity;
   hapticIncidentalContact: boolean;
@@ -123,19 +128,28 @@ function readString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
-function normalizeSpotifySourceType(value: unknown): SpotifySourceType {
-  return value === "playlist" || value === "artist" || value === "any" ? value : "liked";
-}
-
 function normalizeMusicProvider(value: unknown, fallback: MusicProvider): MusicProvider {
   return value === "spotify" || value === "youtube" || value === "custom" ? value : fallback;
 }
 
 function normalizeCustomMusicFolder(value: unknown): string {
   const raw = typeof value === "string" ? value.trim().replace(/\\/g, "/") : "";
-  const normalized = raw.replace(/^\/+/, "").replace(/\/+$/g, "");
+  let start = 0;
+  let end = raw.length;
+  while (raw[start] === "/") start++;
+  while (end > start && raw[end - 1] === "/") end--;
+  const normalized = raw.slice(start, end);
   if (!normalized || normalized.includes("..")) return "music";
   return normalized.startsWith("music") ? normalized : `music/${normalized}`;
+}
+
+export function normalizeCustomMusicSource(settings: Record<string, unknown>): CustomMusicSource {
+  const source = settings.customMusicSource ?? settings.localMusicSource;
+  return source === "folder" ? "folder" : "game-assets";
+}
+
+export function normalizeCustomMusicExternalFolder(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function normalizeHapticSensitivity(value: unknown): HapticFeedbackSensitivity {
@@ -205,9 +219,13 @@ function normalizeKnowledgeAgentSourceSettings(
   };
 }
 
-function readPromptTemplateId(metadata: Record<string, unknown>, agentId: string): string {
+function readPromptTemplateId(
+  metadata: Record<string, unknown>,
+  agentId: string,
+  settings: Record<string, unknown>,
+): string {
   const selections = normalizeAgentPromptTemplateSelectionMap(metadata.agentPromptTemplateIds);
-  return selections[agentId] ?? DEFAULT_AGENT_PROMPT_TEMPLATE_ID;
+  return selections[agentId] ?? resolveDefaultAgentPromptTemplateId(settings);
 }
 
 export function buildInitialAgentAddSetupState({
@@ -243,7 +261,6 @@ export function buildInitialAgentAddSetupState({
   );
 
   return {
-    directorMode: settings.directorMode === "random" ? "random" : "natural",
     secretPlotEnabled:
       allowSecretPlot &&
       (typeof metadata.narrativeDirectorSecretPlotEnabled === "boolean"
@@ -272,7 +289,7 @@ export function buildInitialAgentAddSetupState({
         metadata.knowledgeAgentSources,
       ),
     },
-    promptTemplateId: readPromptTemplateId(metadata, agentId),
+    promptTemplateId: readPromptTemplateId(metadata, agentId, settings),
     includeCharacterAppearance:
       typeof metadata.illustratorIncludeCharacterAppearance === "boolean"
         ? metadata.illustratorIncludeCharacterAppearance
@@ -281,7 +298,7 @@ export function buildInitialAgentAddSetupState({
       typeof metadata.illustratorUseAvatarReferences === "boolean"
         ? metadata.illustratorUseAvatarReferences
         : settings.useAvatarReferences === true,
-    spriteCharacterIds: normalizeStringArray(metadata.spriteCharacterIds).slice(0, 3),
+    spriteCharacterIds: normalizeStringArray(metadata.spriteCharacterIds),
     spriteDisplayModes: normalizeSpriteDisplayModes(metadata.spriteDisplayModes),
     expressionAvatarsEnabled: metadata.expressionAvatarsEnabled === true,
     spritePosition: metadata.spritePosition === "right" ? "right" : "left",
@@ -316,7 +333,11 @@ export function buildInitialAgentAddSetupState({
     spotifyPlaylistName: readString(metadata.spotifyPlaylistName) || null,
     spotifyArtist: readString(metadata.spotifyArtist),
     musicProvider,
+    customMusicSource: normalizeCustomMusicSource(settings),
     customMusicFolder: normalizeCustomMusicFolder(settings.customMusicFolder ?? metadata.customMusicFolder),
+    customMusicExternalFolder: normalizeCustomMusicExternalFolder(
+      settings.customMusicExternalFolder ?? settings.localMusicExternalFolder,
+    ),
     hapticFeedbackEnabled: metadata.enableHapticFeedback === true,
     hapticSensitivity: normalizeHapticSensitivity(metadata.hapticSensitivity),
     hapticIncidentalContact: metadata.hapticIncidentalContact === true,
@@ -332,7 +353,6 @@ export function applyAgentAddSetupToAgentSettings(
 ): Record<string, unknown> {
   const next = { ...settings };
   if (agentId === "director") {
-    next.directorMode = setup.directorMode;
     next.secretPlotEnabled = options?.allowSecretPlot === false ? false : setup.secretPlotEnabled;
     next.secretPlotRunInterval = setup.secretPlotRunInterval;
     delete next.runInterval;
@@ -357,9 +377,10 @@ export function applyAgentAddSetupToAgentSettings(
   }
   if (agentId === "spotify") {
     next.musicProvider = setup.musicProvider;
+    next.customMusicSource = setup.customMusicSource;
     next.customMusicFolder = normalizeCustomMusicFolder(setup.customMusicFolder);
-    next.enabledTools =
-      setup.musicProvider === "spotify" ? next.enabledTools : [];
+    next.customMusicExternalFolder = normalizeCustomMusicExternalFolder(setup.customMusicExternalFolder);
+    next.enabledTools = setup.musicProvider === "spotify" ? next.enabledTools : [];
   }
   if (agentId === "illustrator") {
     next.includeCharacterAppearance = setup.includeCharacterAppearance;
@@ -372,13 +393,19 @@ export function buildAgentAddMetadataPatch(
   agentId: string,
   setup: AgentAddSetupState,
   metadata: Record<string, unknown>,
-  options?: { allowSecretPlot?: boolean },
+  options?: {
+    allowSecretPlot?: boolean;
+    defaultPromptTemplateId?: string;
+    illustratorDefaults?: { includeCharacterAppearance: boolean; useAvatarReferences: boolean };
+  },
 ): Record<string, unknown> {
   const patch: Record<string, unknown> = {};
 
   const existingPromptSelections = normalizeAgentPromptTemplateSelectionMap(metadata.agentPromptTemplateIds);
   const nextPromptSelections = { ...existingPromptSelections };
-  if (setup.promptTemplateId && setup.promptTemplateId !== DEFAULT_AGENT_PROMPT_TEMPLATE_ID) {
+  const defaultPromptTemplateId =
+    options?.defaultPromptTemplateId ?? resolveDefaultAgentPromptTemplateId(getDefaultBuiltInAgentSettings(agentId));
+  if (setup.promptTemplateId && setup.promptTemplateId !== defaultPromptTemplateId) {
     nextPromptSelections[agentId] = setup.promptTemplateId;
   } else {
     delete nextPromptSelections[agentId];
@@ -391,7 +418,6 @@ export function buildAgentAddMetadataPatch(
   }
 
   if (agentId === "director") {
-    patch.narrativeDirectorMode = setup.directorMode;
     patch.narrativeDirectorSecretPlotEnabled = options?.allowSecretPlot === false ? false : setup.secretPlotEnabled;
     patch.narrativeDirectorSecretPlotRunInterval = setup.secretPlotRunInterval;
   }
@@ -435,8 +461,25 @@ export function buildAgentAddMetadataPatch(
     patch.spotifyArtist = setup.spotifySourceType === "artist" ? setup.spotifyArtist.trim() || null : null;
   }
   if (agentId === "illustrator") {
-    patch.illustratorIncludeCharacterAppearance = setup.includeCharacterAppearance;
-    patch.illustratorUseAvatarReferences = setup.useAvatarReferences;
+    const defaults = options?.illustratorDefaults;
+    const applyIllustratorDefault = (
+      key: "illustratorIncludeCharacterAppearance" | "illustratorUseAvatarReferences",
+      value: boolean,
+      defaultValue: boolean | undefined,
+    ) => {
+      if (defaultValue === undefined || value !== defaultValue) patch[key] = value;
+      else if (hasOwn(metadata, key)) patch[key] = null;
+    };
+    applyIllustratorDefault(
+      "illustratorIncludeCharacterAppearance",
+      setup.includeCharacterAppearance,
+      defaults?.includeCharacterAppearance,
+    );
+    applyIllustratorDefault(
+      "illustratorUseAvatarReferences",
+      setup.useAvatarReferences,
+      defaults?.useAvatarReferences,
+    );
   }
   if (agentId === "haptic") {
     patch.enableHapticFeedback = setup.hapticFeedbackEnabled;
@@ -529,41 +572,6 @@ function SetupToggle({
   );
 }
 
-function SetupSegmentedControl<T extends string>({
-  value,
-  options,
-  disabled,
-  onChange,
-}: {
-  value: T;
-  options: Array<{ id: T; label: string; description?: string }>;
-  disabled?: boolean;
-  onChange: (value: T) => void;
-}) {
-  return (
-    <div className="grid grid-cols-2 gap-1 rounded-lg border border-[var(--border)] bg-[var(--background)]/75 p-1">
-      {options.map((option) => (
-        <button
-          key={option.id}
-          type="button"
-          disabled={disabled}
-          onClick={() => onChange(option.id)}
-          aria-pressed={value === option.id}
-          className={cn(
-            "rounded-md px-2.5 py-2 text-left transition-all disabled:cursor-not-allowed disabled:opacity-60",
-            value === option.id
-              ? "bg-[var(--primary)]/12 text-[var(--foreground)] ring-1 ring-[var(--primary)]/35"
-              : "text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
-          )}
-        >
-          <span className="block text-[0.6875rem] font-semibold">{option.label}</span>
-          {option.description ? <span className="mt-0.5 block text-[0.625rem]">{option.description}</span> : null}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 function PromptTemplateSelect({
   options,
   value,
@@ -575,12 +583,13 @@ function PromptTemplateSelect({
   disabled?: boolean;
   onChange: (value: string) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   if (options.length <= 1) return null;
   const activeOption = options.find((option) => option.id === value) ?? options[0];
   return (
     <div className="rounded-lg bg-[var(--background)]/75 px-3 py-2 ring-1 ring-[var(--border)]">
       <label className="flex flex-col gap-1.5">
-        <SetupLabel>Prompt Mode</SetupLabel>
+        <SetupLabel>{localizeUi("ui.chat.prompttemplateselect.promptMode")}</SetupLabel>
         <select
           value={activeOption?.id ?? DEFAULT_AGENT_PROMPT_TEMPLATE_ID}
           disabled={disabled}
@@ -616,6 +625,7 @@ function KnowledgeSourceFields({
   disabled?: boolean;
   onChange: (patch: Partial<KnowledgeAgentSourceSettings>) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const knowledgeSourcesQuery = useKnowledgeSources();
   const uploadSource = useUploadKnowledgeSource();
@@ -626,11 +636,11 @@ function KnowledgeSourceFields({
   return (
     <div className="space-y-2.5 rounded-lg bg-[var(--background)]/65 px-3 py-2.5 ring-1 ring-[var(--border)]">
       <SetupToggle
-        label="Use chat-active lorebooks"
+        label={localizeUi("ui.chat.knowledgesourcefields.useChatActiveLorebooks")}
         description={
           sourceLorebookIds.length > 0
-            ? "Fixed source lorebooks are selected below, so they override chat-active lorebooks."
-            : "Use the lorebooks currently active for this chat when no fixed source is selected."
+            ?localizeUi("ui.chat.knowledgesourcefields.fixedSourceLorebooksAreSelectedBelowSoTheyOverride")
+            :localizeUi("ui.chat.knowledgesourcefields.useTheLorebooksCurrentlyActiveForThisChatWhen")
         }
         enabled={settings.useChatActiveLorebooks !== false}
         disabled={disabled}
@@ -638,7 +648,7 @@ function KnowledgeSourceFields({
       />
 
       <div className="space-y-1.5">
-        <SetupLabel>Fixed Source Lorebooks</SetupLabel>
+        <SetupLabel>{localizeUi("ui.chat.knowledgesourcefields.fixedSourceLorebooks")}</SetupLabel>
         {lorebooks.length > 0 ? (
           <div className="max-h-36 space-y-1 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--background)]/75 p-2">
             {lorebooks.map((lorebook) => {
@@ -686,15 +696,13 @@ function KnowledgeSourceFields({
             })}
           </div>
         ) : (
-          <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
-            No lorebooks available.
-          </p>
+          <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">{localizeUi("ui.agents.agenteditor.noLorebooksAvailable")}</p>
         )}
       </div>
 
       {isRetrieval && (
         <div className="space-y-1.5">
-          <SetupLabel>Uploaded Files</SetupLabel>
+          <SetupLabel>{localizeUi("ui.chat.knowledgesourcefields.uploadedFiles")}</SetupLabel>
           {knowledgeSourcesQuery.data?.length ? (
             <div className="max-h-32 space-y-1 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--background)]/75 p-2">
               {knowledgeSourcesQuery.data.map((source) => {
@@ -732,17 +740,14 @@ function KnowledgeSourceFields({
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-medium">{source.originalName}</span>
                       <span className="block text-[0.625rem] text-[var(--muted-foreground)]">
-                        {(source.size / 1024).toFixed(1)} KB
-                      </span>
+                        {(source.size / 1024).toFixed(1)} {localizeUi("ui.agents.agenteditor.kb")}</span>
                     </span>
                   </button>
                 );
               })}
             </div>
           ) : (
-            <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
-              No uploaded knowledge files yet.
-            </p>
+            <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">{localizeUi("ui.chat.knowledgesourcefields.noUploadedKnowledgeFilesYet")}</p>
           )}
           <input
             ref={fileInputRef}
@@ -778,14 +783,10 @@ function KnowledgeSourceFields({
           >
             {uploadSource.isPending ? (
               <>
-                <Loader2 size="0.8125rem" className="animate-spin" />
-                Uploading...
-              </>
+                <Loader2 size="0.8125rem" className="animate-spin" />{localizeUi("ui.noodle.noodleprofilesurface.uploading")}</>
             ) : (
               <>
-                <Upload size="0.8125rem" />
-                Upload file
-              </>
+                <Upload size="0.8125rem" />{localizeUi("ui.chat.knowledgesourcefields.uploadFile")}</>
             )}
           </button>
         </div>
@@ -803,6 +804,7 @@ function SpriteDisplayModeToggle({
   disabled?: boolean;
   onToggle: (mode: SpriteDisplayMode) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const options: Array<{ id: SpriteDisplayMode; label: string }> = [
     { id: "expressions", label: "Expressions" },
     { id: "full-body", label: "Full-body" },
@@ -811,8 +813,8 @@ function SpriteDisplayModeToggle({
   return (
     <div className="space-y-1.5 rounded-lg bg-[var(--background)]/75 px-3 py-2 ring-1 ring-[var(--border)]">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[0.6875rem] font-medium text-[var(--foreground)]">Sprite Source</span>
-        <span className="text-[0.5625rem] text-[var(--muted-foreground)]">choose one or both</span>
+        <span className="text-[0.6875rem] font-medium text-[var(--foreground)]">{localizeUi("ui.chat.spritedisplaymodetoggle.spriteSource")}</span>
+        <span className="text-[0.5625rem] text-[var(--muted-foreground)]">{localizeUi("ui.chat.spritedisplaymodetoggle.chooseOneOrBoth")}</span>
       </div>
       <div className="grid grid-cols-2 overflow-hidden rounded-md ring-1 ring-[var(--border)]">
         {options.map((option, index) => {
@@ -894,6 +896,7 @@ function ExpressionSetupFields({
   disabled?: boolean;
   onChange: (patch: Partial<AgentAddSetupState>) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const spriteQueries = useQueries({
     queries: spriteSubjects.map((subject) => ({
       queryKey: ["sprites", subject.id],
@@ -916,7 +919,6 @@ function ExpressionSetupFields({
       onChange({ spriteCharacterIds: selectedSpriteIds.filter((current) => current !== id) });
       return;
     }
-    if (selectedSpriteIds.length >= 3) return;
     onChange({ spriteCharacterIds: [...selectedSpriteIds, id] });
   };
 
@@ -930,25 +932,24 @@ function ExpressionSetupFields({
     <div className="space-y-2.5 rounded-lg bg-[var(--background)]/65 px-3 py-2.5 ring-1 ring-[var(--border)]">
       <SpriteDisplayModeToggle modes={value.spriteDisplayModes} disabled={disabled} onToggle={toggleDisplayMode} />
       <SetupToggle
-        label="Expression Avatars"
-        description="Replace message avatars with the selected expression sprite."
+        label={localizeUi("ui.chat.expressionsetupfields.expressionAvatars")}
+        description={localizeUi("ui.chat.expressionsetupfields.replaceMessageAvatarsWithTheSelectedExpressionSprite")}
         enabled={value.expressionAvatarsEnabled}
         disabled={disabled}
         onToggle={() => onChange({ expressionAvatarsEnabled: !value.expressionAvatarsEnabled })}
       />
 
       <div className="space-y-1.5">
-        <SetupLabel>Sprite Owners</SetupLabel>
+        <SetupLabel>{localizeUi("ui.chat.expressionsetupfields.spriteOwners")}</SetupLabel>
         {subjectsWithSprites.length > 0 ? (
           <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--background)]/75 p-2">
             {subjectsWithSprites.map((subject) => {
               const active = selectedSpriteIds.includes(subject.id);
-              const maxed = !active && selectedSpriteIds.length >= 3;
               return (
                 <button
                   key={subject.id}
                   type="button"
-                  disabled={disabled || maxed}
+                  disabled={disabled}
                   onClick={() => toggleSprite(subject.id)}
                   className={cn(
                     "flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs transition-all disabled:cursor-not-allowed disabled:opacity-50",
@@ -978,27 +979,22 @@ function ExpressionSetupFields({
                     ) : null}
                   </span>
                   <span className="text-[0.625rem] text-[var(--muted-foreground)]">
-                    {active ? "Enabled" : "Enable"}
+                    {active ?localizeUi("ui.noodle.noodlehome.enabled") :localizeUi("ui.presets.sectionstab.enable")}
                   </span>
                 </button>
               );
             })}
           </div>
         ) : loading ? (
-          <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
-            Checking added characters for uploaded sprites...
-          </p>
+          <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">{localizeUi("ui.chat.expressionsetupfields.checkingAddedCharactersForUploadedSprites")}</p>
         ) : (
-          <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
-            No added character or persona has uploaded sprites yet. You can still add Expression Engine and configure
-            sprites later.
-          </p>
+          <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">{localizeUi("ui.chat.expressionsetupfields.noAddedCharacterOrPersonaHasUploadedSpritesYet")}</p>
         )}
       </div>
 
       <div className="rounded-lg bg-[var(--background)]/75 px-3 py-2 ring-1 ring-[var(--border)]">
         <div className="flex items-center gap-2">
-          <span className="flex-1 text-[0.6875rem] text-[var(--muted-foreground)]">Sprite Layout</span>
+          <span className="flex-1 text-[0.6875rem] text-[var(--muted-foreground)]">{localizeUi("ui.chat.expressionsetupfields.spriteLayout")}</span>
           <div className="flex rounded-md ring-1 ring-[var(--border)]">
             {(["left", "right"] as const).map((side) => (
               <button
@@ -1021,7 +1017,7 @@ function ExpressionSetupFields({
         </div>
         <div className="mt-3 grid gap-3 sm:grid-cols-2">
           <SpriteRangeSlider
-            label="Expression Size"
+            label={localizeUi("ui.chat.expressionsetupfields.expressionSize")}
             value={Math.round(value.expressionSpriteScale * 100)}
             min={SPRITE_DISPLAY_SCALE_PERCENT_MIN}
             max={SPRITE_DISPLAY_SCALE_PERCENT_MAX}
@@ -1034,7 +1030,7 @@ function ExpressionSetupFields({
             }}
           />
           <SpriteRangeSlider
-            label="Full-body Size"
+            label={localizeUi("ui.chat.expressionsetupfields.fullBodySize")}
             value={Math.round(value.fullBodySpriteScale * 100)}
             min={SPRITE_DISPLAY_SCALE_PERCENT_MIN}
             max={SPRITE_DISPLAY_SCALE_PERCENT_MAX}
@@ -1044,7 +1040,7 @@ function ExpressionSetupFields({
             onChange={(percent) => onChange({ fullBodySpriteScale: clampSpriteDisplayPercent(percent) / 100 })}
           />
           <SpriteRangeSlider
-            label="Expression Opacity"
+            label={localizeUi("ui.chat.expressionsetupfields.expressionOpacity")}
             value={Math.round(value.expressionSpriteOpacity * 100)}
             min={SPRITE_DISPLAY_OPACITY_PERCENT_MIN}
             max={SPRITE_DISPLAY_OPACITY_PERCENT_MAX}
@@ -1057,7 +1053,7 @@ function ExpressionSetupFields({
             }}
           />
           <SpriteRangeSlider
-            label="Full-body Opacity"
+            label={localizeUi("ui.chat.expressionsetupfields.fullBodyOpacity")}
             value={Math.round(value.fullBodySpriteOpacity * 100)}
             min={SPRITE_DISPLAY_OPACITY_PERCENT_MIN}
             max={SPRITE_DISPLAY_OPACITY_PERCENT_MAX}
@@ -1081,6 +1077,7 @@ function MusicDjSetupFields({
   disabled?: boolean;
   onChange: (patch: Partial<AgentAddSetupState>) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const spotifyPlaylistsQuery = useQuery({
     queryKey: ["spotify", "playlists", 50],
     queryFn: () =>
@@ -1098,16 +1095,28 @@ function MusicDjSetupFields({
     retry: false,
   });
 
+  const selectCustomMusicFolder = async () => {
+    try {
+      const data = await api.post<{ success: boolean; path: string }>("/game-assets/pick-local-music-folder");
+      if (data.success !== true || !data.path) throw new Error("No folder selected.");
+      onChange({ customMusicSource: "folder", customMusicExternalFolder: data.path });
+    } catch (error) {
+      await showAlertDialog({
+        title: "Couldn't Select Music Folder",
+        message: error instanceof Error ? error.message : "The music folder could not be selected.",
+      });
+    }
+  };
+
   return (
     <div className="space-y-2.5 rounded-lg bg-[var(--background)]/65 px-3 py-2.5 ring-1 ring-[var(--border)]">
-      <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-        Active player:{" "}
-        {value.musicProvider === "spotify" ? "Spotify" : value.musicProvider === "youtube" ? "YouTube" : "Custom"}.
+      <p className="text-[0.625rem] text-[var(--muted-foreground)]">{localizeUi("ui.chat.musicdjsetupfields.activePlayer")}{" "}
+        {value.musicProvider === "spotify" ?localizeUi("ui.agents.agenteditor.spotify") : value.musicProvider === "youtube" ?localizeUi("ui.chat.youtubeplayer.youtube") :localizeUi("settings.notifications.customSound.status.custom")}.
       </p>
       {value.musicProvider === "spotify" ? (
         <>
           <label className="flex flex-col gap-1">
-            <SetupLabel>Spotify Source</SetupLabel>
+            <SetupLabel>{localizeUi("ui.chat.musicdjsetupfields.spotifySource")}</SetupLabel>
             <select
               value={value.spotifySourceType}
               disabled={disabled}
@@ -1135,7 +1144,7 @@ function MusicDjSetupFields({
 
           {value.spotifySourceType === "playlist" && (
             <label className="flex flex-col gap-1">
-              <SetupLabel>Playlist</SetupLabel>
+              <SetupLabel>{localizeUi("ui.chat.musicdjsetupfields.playlist")}</SetupLabel>
               {spotifyPlaylistsQuery.data?.playlists.length ? (
                 <select
                   value={value.spotifyPlaylistId}
@@ -1151,7 +1160,7 @@ function MusicDjSetupFields({
                   }}
                   className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 text-xs text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  <option value="">Choose playlist...</option>
+                  <option value="">{localizeUi("ui.chat.musicdjsetupfields.choosePlaylist")}</option>
                   {spotifyPlaylistsQuery.data.playlists.map((playlist) => {
                     const suffix =
                       typeof playlist.trackCount === "number"
@@ -1172,50 +1181,88 @@ function MusicDjSetupFields({
                   value={value.spotifyPlaylistId}
                   disabled={disabled}
                   onChange={(event) => onChange({ spotifyPlaylistId: event.target.value, spotifyPlaylistName: null })}
-                  placeholder={spotifyPlaylistsQuery.isFetching ? "Loading playlists..." : "Paste playlist ID"}
+                  placeholder={spotifyPlaylistsQuery.isFetching ?localizeUi("ui.chat.musicdjsetupfields.loadingPlaylists") :localizeUi("ui.chat.musicdjsetupfields.pastePlaylistId")}
                   className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]/50 disabled:cursor-not-allowed disabled:opacity-60"
                 />
               )}
               {spotifyPlaylistsQuery.isError && (
-                <span className="text-[0.5625rem] text-amber-400/90">
-                  Connect Spotify in the Music DJ agent to load playlist names.
-                </span>
+                <span className="text-[0.5625rem] text-[var(--primary)]">{localizeUi("ui.chat.musicdjsetupfields.connectSpotifyInTheMusicDjAgentToLoad")}</span>
               )}
             </label>
           )}
 
           {value.spotifySourceType === "artist" && (
             <label className="flex flex-col gap-1">
-              <SetupLabel>Artist</SetupLabel>
+              <SetupLabel>{localizeUi("ui.chat.musicdjsetupfields.artist")}</SetupLabel>
               <input
                 value={value.spotifyArtist}
                 disabled={disabled}
                 onChange={(event) => onChange({ spotifyArtist: event.target.value })}
-                placeholder="HOYO-MiX"
+                placeholder={localizeUi("ui.chat.musicdjsetupfields.hoyoMix")}
                 className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]/50 disabled:cursor-not-allowed disabled:opacity-60"
               />
             </label>
           )}
         </>
       ) : value.musicProvider === "youtube" ? (
-        <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
-          YouTube mode uses the Music DJ agent's saved YouTube connection and embedded player.
-        </p>
+        <p className="rounded-lg bg-[var(--background)]/75 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">{localizeUi("ui.chat.musicdjsetupfields.youtubeModeUsesTheMusicDjAgentSSaved")}</p>
       ) : (
-        <label className="flex flex-col gap-1 rounded-lg bg-[var(--background)]/75 px-3 py-2 ring-1 ring-[var(--border)]">
-          <SetupLabel>Custom Music Folder</SetupLabel>
-          <input
-            value={value.customMusicFolder}
-            disabled={disabled}
-            onChange={(event) => onChange({ customMusicFolder: event.target.value })}
-            onBlur={() => onChange({ customMusicFolder: normalizeCustomMusicFolder(value.customMusicFolder) })}
-            placeholder="music"
-            className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 font-mono text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]/50 disabled:cursor-not-allowed disabled:opacity-60"
-          />
-          <span className="text-[0.5625rem] text-[var(--muted-foreground)]">
-            Reads local audio from Game Assets, for example <code>music</code> or <code>music/combat</code>.
-          </span>
-        </label>
+        <div className="space-y-2 rounded-lg bg-[var(--background)]/75 px-3 py-2 ring-1 ring-[var(--border)]">
+          <label className="flex flex-col gap-1">
+            <SetupLabel>{localizeUi("ui.chat.musicdjsetupfields.customMusicSource")}</SetupLabel>
+            <select
+              value={value.customMusicSource}
+              disabled={disabled}
+              onChange={(event) => onChange({ customMusicSource: event.target.value as CustomMusicSource })}
+              className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 text-xs text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <option value="game-assets">{localizeUi("game.toolbar.assets")}</option>
+              <option value="folder">{localizeUi("ui.chat.musicdjsetupfields.folderOnThisDevice")}</option>
+            </select>
+          </label>
+
+          {value.customMusicSource === "folder" ? (
+            <div className="flex flex-col gap-1">
+              <SetupLabel>{localizeUi("ui.chat.musicdjsetupfields.musicFolderOnThisDevice")}</SetupLabel>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <input
+                  value={value.customMusicExternalFolder}
+                  disabled={disabled}
+                  onChange={(event) => onChange({ customMusicExternalFolder: event.target.value })}
+                  onBlur={() =>
+                    onChange({
+                      customMusicExternalFolder: normalizeCustomMusicExternalFolder(value.customMusicExternalFolder),
+                    })
+                  }
+                  placeholder={localizeUi("ui.agents.agenteditor.noFolderSelected")}
+                  className="min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 font-mono text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]/50 disabled:cursor-not-allowed disabled:opacity-60"
+                />
+                <button
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => void selectCustomMusicFolder()}
+                  className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--muted)] px-3 text-xs font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <FolderOpen size="0.75rem" />{localizeUi("ui.chat.musicdjsetupfields.chooseFolder")}</button>
+              </div>
+              <span className="text-[0.5625rem] text-[var(--muted-foreground)]">{localizeUi("ui.chat.musicdjsetupfields.musicDjWillChooseFromAudioFilesInThis")}</span>
+            </div>
+          ) : (
+            <label className="flex flex-col gap-1">
+              <SetupLabel>{localizeUi("ui.chat.musicdjsetupfields.gameAssetsMusicFolder")}</SetupLabel>
+              <input
+                value={value.customMusicFolder}
+                disabled={disabled}
+                onChange={(event) => onChange({ customMusicFolder: event.target.value })}
+                onBlur={() => onChange({ customMusicFolder: normalizeCustomMusicFolder(value.customMusicFolder) })}
+                placeholder={localizeUi("ui.agents.agenteditor.music")}
+                className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 font-mono text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]/50 disabled:cursor-not-allowed disabled:opacity-60"
+              />
+              <span className="text-[0.5625rem] text-[var(--muted-foreground)]">{localizeUi("ui.chat.musicdjsetupfields.readsLocalAudioFromGameAssetsForExample")} <code>music</code> {localizeUi("ui.noodle.noodlehome.or")} <code>music/combat</code>.
+              </span>
+            </label>
+          )}
+        </div>
       )}
     </div>
   );
@@ -1230,14 +1277,15 @@ function HapticSetupFields({
   disabled?: boolean;
   onChange: (patch: Partial<AgentAddSetupState>) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   return (
     <div className="space-y-2.5 rounded-lg bg-[var(--background)]/65 px-3 py-2.5 ring-1 ring-[var(--border)]">
       <SetupToggle
-        label="Haptic Feedback"
+        label={localizeUi("ui.chat.hapticsetupfields.hapticFeedback")}
         description={
           value.hapticFeedbackEnabled
-            ? "Touch cues are enabled for this chat."
-            : "Allow this agent to send touch cues during the chat."
+            ?localizeUi("ui.chat.hapticsetupfields.touchCuesAreEnabledForThisChat")
+            :localizeUi("ui.chat.hapticsetupfields.allowThisAgentToSendTouchCuesDuringThe")
         }
         enabled={value.hapticFeedbackEnabled}
         disabled={disabled}
@@ -1247,8 +1295,8 @@ function HapticSetupFields({
         <>
           <div className="space-y-1">
             <div className="flex items-center justify-between gap-2">
-              <SetupLabel>Touch Sensitivity</SetupLabel>
-              <span className="text-[0.5625rem] text-[var(--muted-foreground)]">Roleplay only</span>
+              <SetupLabel>{localizeUi("ui.chat.hapticsetupfields.touchSensitivity")}</SetupLabel>
+              <span className="text-[0.5625rem] text-[var(--muted-foreground)]">{localizeUi("ui.chat.hapticsetupfields.roleplayOnly")}</span>
             </div>
             <div className="grid grid-cols-3 gap-1 rounded-lg bg-[var(--background)]/35 p-1">
               {HAPTIC_SENSITIVITY_OPTIONS.map((option) => (
@@ -1271,19 +1319,19 @@ function HapticSetupFields({
             </div>
           </div>
           <SetupToggle
-            label="Incidental Contact"
-            description="Tiny taps for accidental brushes and bumps."
+            label={localizeUi("ui.chat.hapticsetupfields.incidentalContact")}
+            description={localizeUi("ui.chat.hapticsetupfields.tinyTapsForAccidentalBrushesAndBumps")}
             enabled={value.hapticIncidentalContact}
             disabled={disabled}
             onToggle={() => onChange({ hapticIncidentalContact: !value.hapticIncidentalContact })}
           />
           <label className="flex flex-col gap-1">
-            <SetupLabel>Intiface URL</SetupLabel>
+            <SetupLabel>{localizeUi("ui.chat.hapticsetupfields.intifaceUrl")}</SetupLabel>
             <input
               value={value.hapticIntifaceUrl}
               disabled={disabled}
               onChange={(event) => onChange({ hapticIntifaceUrl: event.target.value })}
-              placeholder="ws://127.0.0.1:12345"
+              placeholder={localizeUi("ui.chat.hapticsetupfields.ws12700112345")}
               className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 text-xs text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]/50 disabled:cursor-not-allowed disabled:opacity-60"
             />
           </label>
@@ -1312,6 +1360,7 @@ export function AgentAddSetupFields({
   allowSecretPlotControls?: boolean;
   onChange: (patch: Partial<AgentAddSetupState>) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const knowledgeAgentType = agentId === "knowledge-retrieval" || agentId === "knowledge-router" ? agentId : null;
   const knowledgeSettings = knowledgeAgentType ? value.knowledgeSources[knowledgeAgentType] : null;
   const hasSpecificSetup =
@@ -1341,15 +1390,15 @@ export function AgentAddSetupFields({
       {agentId === "illustrator" && (
         <div className="space-y-2">
           <SetupToggle
-            label="Attach Card Appearance"
-            description="Append matched character appearance lines to image prompts, using only visible/generated names."
+            label={localizeUi("ui.chat.agentaddsetupfields.attachCardAppearance")}
+            description={localizeUi("ui.chat.agentaddsetupfields.appendMatchedCharacterAppearanceLinesToImagePromptsUsing")}
             enabled={value.includeCharacterAppearance}
             disabled={disabled}
             onToggle={() => onChange({ includeCharacterAppearance: !value.includeCharacterAppearance })}
           />
           <SetupToggle
-            label="Send Avatar References"
-            description="Send matching character and persona avatars or sprites as reference images when the provider supports them."
+            label={localizeUi("ui.chat.agentaddsetupfields.sendAvatarReferences")}
+            description={localizeUi("ui.chat.agentaddsetupfields.sendMatchingCharacterAndPersonaAvatarsOrSpritesAs")}
             enabled={value.useAvatarReferences}
             disabled={disabled}
             onToggle={() => onChange({ useAvatarReferences: !value.useAvatarReferences })}
@@ -1359,19 +1408,11 @@ export function AgentAddSetupFields({
 
       {agentId === "director" && (
         <div className="space-y-2">
-          <SetupSegmentedControl
-            value={value.directorMode}
-            disabled={disabled}
-            options={[
-              { id: "natural", label: "Natural", description: "Advance existing story threads." },
-              { id: "random", label: "Random Event", description: "Introduce a plausible surprise." },
-            ]}
-            onChange={(directorMode) => onChange({ directorMode })}
-          />
+          <p className="rounded-lg bg-[var(--background)]/65 px-3 py-2 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">{localizeUi("ui.chat.agentaddsetupfields.chooseBetweenANaturalOrRandomPushEachTime")}</p>
           {allowSecretPlotControls && (
             <SetupToggle
-              label="Secret Plot"
-              description="Maintain a hidden long-term arc for roleplay prompts."
+              label={localizeUi("ui.agents.agenteditor.secretPlot")}
+              description={localizeUi("ui.chat.agentaddsetupfields.maintainAHiddenLongTermArcForRoleplayPrompts")}
               enabled={value.secretPlotEnabled}
               disabled={disabled}
               onToggle={() => onChange({ secretPlotEnabled: !value.secretPlotEnabled })}
@@ -1379,7 +1420,7 @@ export function AgentAddSetupFields({
           )}
           {allowSecretPlotControls && value.secretPlotEnabled && (
             <label className="flex flex-col gap-1 rounded-lg bg-[var(--background)]/65 px-3 py-2 ring-1 ring-[var(--border)]">
-              <SetupLabel>Run Interval</SetupLabel>
+              <SetupLabel>{localizeUi("ui.agents.agenteditor.runInterval")}</SetupLabel>
               <div className="flex items-center gap-2">
                 <input
                   type="number"
@@ -1398,7 +1439,7 @@ export function AgentAddSetupFields({
                   }
                   className="w-24 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 text-xs tabular-nums text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-60"
                 />
-                <span className="text-[0.625rem] text-[var(--muted-foreground)]">assistant messages</span>
+                <span className="text-[0.625rem] text-[var(--muted-foreground)]">{localizeUi("ui.agents.agenteditor.assistantMessages")}</span>
               </div>
             </label>
           )}
@@ -1409,7 +1450,7 @@ export function AgentAddSetupFields({
         <div className="space-y-2.5 rounded-lg bg-[var(--background)]/65 px-3 py-2.5 ring-1 ring-[var(--border)]">
           <div className="grid gap-2 sm:grid-cols-2">
             <SetupTextarea
-              label="Banned Words"
+              label={localizeUi("ui.agents.agenteditor.bannedWords")}
               value={value.proseGuardianBanned}
               placeholder={DEFAULT_PROSE_GUARDIAN_BANNED_WORDS}
               rows={2}
@@ -1417,16 +1458,16 @@ export function AgentAddSetupFields({
               onChange={(proseGuardianBanned) => onChange({ proseGuardianBanned })}
             />
             <SetupTextarea
-              label="Prefer In Writing"
+              label={localizeUi("ui.agents.agenteditor.preferInWriting")}
               value={value.proseGuardianPrefer}
-              placeholder="Optional style notes, phrases, or authorial preferences."
+              placeholder={localizeUi("ui.agents.agenteditor.optionalStyleNotesPhrasesOrAuthorialPreferences")}
               rows={2}
               disabled={disabled}
               onChange={(proseGuardianPrefer) => onChange({ proseGuardianPrefer })}
             />
           </div>
           <SetupTextarea
-            label="Remove From Writing"
+            label={localizeUi("ui.agents.agenteditor.removeFromWriting")}
             value={value.proseGuardianAvoid}
             placeholder={DEFAULT_PROSE_GUARDIAN_AVOID}
             rows={3}
@@ -1438,11 +1479,11 @@ export function AgentAddSetupFields({
 
       {(agentId === "prose-guardian" || agentId === "continuity" || agentId === "html") && (
         <SetupToggle
-          label="Hold Message Until Rewrite"
+          label={localizeUi("ui.chat.agentaddsetupfields.holdMessageUntilRewrite")}
           description={
             value.holdForRewrite
-              ? "Show the rewrite working indicator, then reveal the edited message."
-              : "Stream the original message normally, then replace it if edits are needed."
+              ?localizeUi("ui.chat.agentaddsetupfields.showTheRewriteWorkingIndicatorThenRevealTheEdited")
+              :localizeUi("ui.chat.agentaddsetupfields.streamTheOriginalMessageNormallyThenReplaceItIf")
           }
           enabled={value.holdForRewrite}
           disabled={disabled}
@@ -1453,14 +1494,14 @@ export function AgentAddSetupFields({
       {agentId === "lorebook-keeper" && (
         <div className="grid gap-2 rounded-lg bg-[var(--background)]/65 px-3 py-2.5 ring-1 ring-[var(--border)] sm:grid-cols-2">
           <label className="flex min-w-0 flex-col gap-1 text-[0.625rem] text-[var(--muted-foreground)]">
-            <SetupLabel>Target Lorebook</SetupLabel>
+            <SetupLabel>{localizeUi("ui.chat.agentaddsetupfields.targetLorebook")}</SetupLabel>
             <select
               value={value.lorebookKeeperTargetLorebookId}
               disabled={disabled}
               onChange={(event) => onChange({ lorebookKeeperTargetLorebookId: event.target.value })}
               className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 text-xs text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-60"
             >
-              <option value="">Auto-select first writable lorebook</option>
+              <option value="">{localizeUi("ui.chat.agentaddsetupfields.autoSelectFirstWritableLorebook")}</option>
               {lorebooks.map((lorebook) => (
                 <option key={lorebook.id} value={lorebook.id}>
                   {lorebook.name}
@@ -1469,7 +1510,7 @@ export function AgentAddSetupFields({
             </select>
           </label>
           <label className="flex min-w-0 flex-col gap-1 text-[0.625rem] text-[var(--muted-foreground)]">
-            <SetupLabel>Read Behind</SetupLabel>
+            <SetupLabel>{localizeUi("ui.chat.agentaddsetupfields.readBehind")}</SetupLabel>
             <input
               type="number"
               min={0}

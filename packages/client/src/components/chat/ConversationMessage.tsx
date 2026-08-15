@@ -5,24 +5,31 @@
 // ──────────────────────────────────────────────
 import { useState, useCallback, useRef, useEffect, memo, useMemo, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { Brain, Trash2, X } from "lucide-react";
+import { Phone, PhoneIncoming, PhoneOff, Trash2 } from "lucide-react";
 import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
-import { formatTextQuotes, normalizeTextForMatch, type Message, type MessageReaction } from "@marinara-engine/shared";
+import {
+  formatTextQuotes,
+  normalizeTextForMatch,
+  parseGroupedSpeakerSegments,
+  type Message,
+  type MessageReaction,
+} from "@marinara-engine/shared";
 import { toast } from "sonner";
 import { useUIStore, type ConversationMessageStyle } from "../../stores/ui.store";
-import { cn, copyToClipboard, getAvatarCropStyle, parseAvatarCropJson } from "../../lib/utils";
+import { cn, copyToClipboard, getAvatarCropStyle } from "../../lib/utils";
+import { normalizeAvatarCrop } from "@marinara-engine/shared";
 import { resolveMessageMacros } from "../../lib/chat-macros";
 import { useTranslate } from "../../hooks/use-translate";
+import { useApplyRegex } from "../../hooks/use-apply-regex";
 import { api } from "../../lib/api-client";
 import { chatKeys } from "../../hooks/use-chats";
+import { useChatGalleryFilenameIndex } from "../../hooks/use-characters";
 import type { CharacterMap, MessageSelectionToggle, PersonaInfo } from "./chat-area.types";
+import { MESSAGE_SELECTION_SURFACE_CLASS } from "./message-selection-styles";
 import { GenerationReplayDetailsModal, hasGenerationReplayDetails } from "./GenerationReplayDetailsModal";
 import {
   HiddenFromAIConversationButton,
   ConversationMessageLightbox,
-  parseSpeakerTags,
-  parseNamePrefixFormat,
-  groupConsecutiveSegments,
   type MessageData,
   type MessageRenderContext,
 } from "./ConversationMessageShared";
@@ -31,17 +38,40 @@ import { ConversationMessageGrouped } from "./ConversationMessageGrouped";
 import { ConversationMessageBubble } from "./ConversationMessageBubble";
 import { ConversationMessageLine } from "./ConversationMessageLine";
 import { MessageReactions } from "./MessageReactions";
-import { toggleReaction, USER_REACTOR } from "../../lib/reactions";
+import { MessageThinkingModal } from "./MessageThinkingModal";
+import { useChatStore } from "../../stores/chat.store";
+import { parseChatMetadata } from "../../lib/chat-display";
+import { resolveMessageReasoningDisplay } from "../../lib/message-reasoning";
 import {
-  NEUTRAL_PANEL_HEADER,
-  NEUTRAL_PANEL_SCROLL_AREA,
-  NEUTRAL_PANEL_SHELL,
-  NEUTRAL_PANEL_TITLE,
-} from "../ui/neutral-surface-styles";
+  findRetargetableUserReaction,
+  reactionTargetOf,
+  splitReactionsBySegment,
+  toggleReaction,
+  USER_REACTOR,
+  type ReactionSegmentTarget,
+} from "../../lib/reactions";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 const EMPTY_CUSTOM_EMOJI_MAP = new Map<string, string>();
 const EMPTY_CUSTOM_STICKER_MAP = new Map<string, string>();
 const CONVERSATION_MESSAGE_CHROME_RING_CLASS = "ring-[var(--marinara-chat-chrome-focus-ring)]";
+
+function formatCallDuration(value: unknown): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const seconds = Math.max(0, Math.round(value / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remaining = seconds % 60;
+  if (minutes <= 0) return `${remaining} seconds`;
+  if (minutes === 1) return remaining > 0 ? `1 minute ${remaining} seconds` : "1 minute";
+  return remaining > 0 ? `${minutes} minutes ${remaining} seconds` : `${minutes} minutes`;
+}
+
+function formatCallTimestamp(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
 
 // ── Public props interface (unchanged external API) ──────────────
 
@@ -77,10 +107,12 @@ interface ConversationMessageProps {
   chatCharacterIds?: string[];
   messageIndex?: number;
   messageOrderIndex?: number;
+  messageDepth?: number;
   multiSelectMode?: boolean;
   isSelected?: boolean;
   onToggleSelect?: (toggle: MessageSelectionToggle) => void;
   hasDraftInput?: boolean;
+  translationDisplayOnly?: boolean;
 }
 
 // ── Shell component ──────────────────────────────────────────────
@@ -117,11 +149,14 @@ export const ConversationMessage = memo(function ConversationMessage({
   chatCharacterIds,
   messageIndex,
   messageOrderIndex,
+  messageDepth,
   multiSelectMode,
   isSelected,
   onToggleSelect,
   hasDraftInput = false,
+  translationDisplayOnly = false,
 }: ConversationMessageProps) {
+  const { t: localizeUi } = useUiTranslation();
   // ── Local state ──
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState(message.content);
@@ -133,6 +168,7 @@ export const ConversationMessage = memo(function ConversationMessage({
   const [imageLightbox, setImageLightbox] = useState<{ url: string; prompt?: string | null } | null>(null);
   const editRef = useRef<HTMLTextAreaElement>(null);
   const msgRef = useRef<HTMLDivElement>(null);
+  const thinkingButtonRef = useRef<HTMLButtonElement>(null);
   const editSwipeIndexRef = useRef<number | null>(null);
 
   // ── Store selectors ──
@@ -142,10 +178,15 @@ export const ConversationMessage = memo(function ConversationMessage({
   const chatFontColor = useUIStore((s) => s.chatFontColor);
   const showMessageNumbers = useUIStore((s) => s.showMessageNumbers);
   const quoteFormat = useUIStore((s) => s.quoteFormat);
+  const conversationAvatarShape = useUIStore((s) => s.conversationAvatarShape);
+  const activeChatMetadata = useChatStore((s) => s.activeChat?.metadata);
+  const scopedRegexMode = useMemo(() => parseChatMetadata(activeChatMetadata).scopedRegexMode, [activeChatMetadata]);
+  const { applyToAIOutput } = useApplyRegex();
 
   // ── Translation ──
-  const { translate, translations, translating } = useTranslate();
+  const { translate, translations, translationSources, translating } = useTranslate();
   const translatedText = translations[message.id];
+  const translationSource = translationSources[message.id];
   const isTranslating = !!translating[message.id];
 
   // ── Derived flags ──
@@ -169,9 +210,21 @@ export const ConversationMessage = memo(function ConversationMessage({
   }, [message.extra]);
   const isConversationStart = extra.isConversationStart === true;
   const isHiddenFromAI = extra.hiddenFromAI === true;
+  const conversationCallEvent =
+    extra.conversationCallEvent &&
+    typeof extra.conversationCallEvent === "object" &&
+    !Array.isArray(extra.conversationCallEvent)
+      ? (extra.conversationCallEvent as Record<string, unknown>)
+      : null;
   const generationReplay = hasGenerationReplayDetails(extra.generationReplay) ? extra.generationReplay : null;
   const canRegenerate = !isUser || generationReplay !== null;
-  const thinking = extra?.thinking as string | null | undefined;
+  const { summary: thinking, summaryUnavailable: reasoningSummaryUnavailable, hasReasoning } =
+    resolveMessageReasoningDisplay(extra);
+
+  useEffect(() => {
+    if (!hasReasoning) setShowThinking(false);
+  }, [hasReasoning]);
+
   const reactions = useMemo<MessageReaction[]>(
     () => (Array.isArray(extra.reactions) ? extra.reactions : []),
     [extra.reactions],
@@ -203,6 +256,21 @@ export const ConversationMessage = memo(function ConversationMessage({
     (scopedCharacterMap
       ? (Array.from(scopedCharacterMap.values()).find((c): c is NonNullable<typeof c> => !!c) ?? null)
       : null);
+  // Speaking character id for portable card://self/gallery refs. Mirrors
+  // resolvedCharacterInfo exactly (same message.characterId gate + fallback),
+  // so the resolved image and the shown name/avatar always belong to the same
+  // character. Null for user/system messages — self never resolves there.
+  const selfCharacterId =
+    isUser || isSystem
+      ? null
+      : message.characterId
+        ? charInfo
+          ? message.characterId
+          : (fallbackChatCharacterEntry?.id ?? message.characterId)
+        : null;
+  // Chat-wide filename index (group chats only): lets card://self refs fall
+  // back to whichever chat character owns the file when the speaker doesn't.
+  const galleryIndex = useChatGalleryFilenameIndex(chatCharacterIds);
 
   const msgPersona = isUser && !plainUserMessages && extra.personaSnapshot ? extra.personaSnapshot : null;
   const avatarUrl = isUser
@@ -213,7 +281,7 @@ export const ConversationMessage = memo(function ConversationMessage({
   const personaAvatarCrop = isUser
     ? plainUserMessages
       ? null
-      : (parseAvatarCropJson(msgPersona?.avatarCrop) ?? personaInfo?.avatarCrop ?? null)
+      : (normalizeAvatarCrop(msgPersona?.avatarCrop) ?? personaInfo?.avatarCrop ?? null)
     : null;
   const avatarCropStyle = isUser
     ? getAvatarCropStyle(personaAvatarCrop)
@@ -228,6 +296,21 @@ export const ConversationMessage = memo(function ConversationMessage({
       ? undefined
       : (msgPersona?.nameColor ?? personaInfo?.nameColor)
     : resolvedCharacterInfo?.nameColor;
+
+  // Conversation-only cosmetic display name (convoDisplayName). This component only
+  // ever mounts in Conversation mode, so reading it here can't leak into RP/Game.
+  // It's read live (character map / active persona), so renaming reflects on
+  // existing messages. Identity and macros keep the base `name`; only the visible
+  // label swaps. For personas we only have the *current* persona's live name, so we
+  // never stamp it onto a different persona's historical messages.
+  const convoDisplayName = isUser
+    ? plainUserMessages
+      ? undefined
+      : !msgPersona || msgPersona.personaId === personaInfo?.id
+        ? personaInfo?.convoDisplayName
+        : undefined
+    : primaryCharInfo?.convoDisplayName;
+  const headerDisplayName = convoDisplayName && convoDisplayName.trim() ? convoDisplayName : displayName;
 
   const macroContext = useMemo(
     () => ({
@@ -265,17 +348,75 @@ export const ConversationMessage = memo(function ConversationMessage({
     ],
   );
 
-  const renderedContent = useMemo(
-    () => formatTextQuotes(resolveMessageMacros(message.content, macroContext), quoteFormat),
-    [macroContext, message.content, quoteFormat],
-  );
+  // #3164: seed display randomness by message identity — this site previously
+  // passed no seed, so every {{random}}/{{roll}} re-rolled (Math.random) on
+  // every recompute, even for finished messages.
+  const renderedContent = useMemo(() => {
+    const randomSeed = `${message.id}:${message.activeSwipeIndex ?? 0}`;
+    const resolveDisplayMacros = (value: string) => resolveMessageMacros(value, macroContext, { randomSeed });
+    if (!isUser && !isSystem) {
+      return resolveDisplayMacros(
+        applyToAIOutput(message.content, {
+          depth: messageDepth,
+          resolveMacros: resolveDisplayMacros,
+          scopedMode: scopedRegexMode,
+          characterId: message.characterId,
+        }),
+      );
+    }
+    return formatTextQuotes(resolveDisplayMacros(message.content), quoteFormat);
+  }, [
+    applyToAIOutput,
+    isSystem,
+    isUser,
+    macroContext,
+    message.activeSwipeIndex,
+    message.characterId,
+    message.content,
+    message.id,
+    messageDepth,
+    quoteFormat,
+    scopedRegexMode,
+  ]);
   const renderedContentParts = useMemo(() => {
     if (!contentParts?.length) return null;
     const count = Math.max(1, Math.min(visiblePartCount ?? contentParts.length, contentParts.length));
-    return contentParts
-      .slice(0, count)
-      .map((part) => formatTextQuotes(resolveMessageMacros(part, macroContext), quoteFormat));
-  }, [contentParts, macroContext, quoteFormat, visiblePartCount]);
+    return contentParts.slice(0, count).map((part, partIndex) => {
+      const randomSeed = `${message.id}:${message.activeSwipeIndex ?? 0}:${partIndex}`;
+      const resolveDisplayMacros = (value: string) => resolveMessageMacros(value, macroContext, { randomSeed });
+      if (!isUser && !isSystem) {
+        return resolveDisplayMacros(
+          applyToAIOutput(part, {
+            depth: messageDepth,
+            resolveMacros: resolveDisplayMacros,
+            scopedMode: scopedRegexMode,
+            characterId: message.characterId,
+          }),
+        );
+      }
+      return formatTextQuotes(resolveDisplayMacros(part), quoteFormat);
+    });
+  }, [
+    applyToAIOutput,
+    contentParts,
+    isSystem,
+    isUser,
+    macroContext,
+    message.activeSwipeIndex,
+    message.characterId,
+    message.id,
+    messageDepth,
+    quoteFormat,
+    scopedRegexMode,
+    visiblePartCount,
+  ]);
+  const showTranslationOnly =
+    translationDisplayOnly &&
+    !!translatedText &&
+    !isTranslating &&
+    (translationSource === renderedContent || translationSource === message.content);
+  const displayedContent = showTranslationOnly ? translatedText : renderedContent;
+  const displayedContentParts = showTranslationOnly ? null : renderedContentParts;
 
   // ── Attachment removal ──
   const qc = useQueryClient();
@@ -302,20 +443,19 @@ export const ConversationMessage = memo(function ConversationMessage({
         await api.patch(`/chats/${message.chatId}/messages/${message.id}/extra`, { attachments: updated });
       } catch (err) {
         qc.setQueryData(msgKey, previous);
-        toast.error(err instanceof Error ? err.message : "Failed to remove attachment.");
+        toast.error(err instanceof Error ? err.message :localizeUi("ui.chat.conversationmessage.failedToRemoveAttachment"));
       } finally {
         await qc.invalidateQueries({ queryKey: msgKey });
       }
     },
-    [extra.attachments, message.chatId, message.id, qc],
+    [extra.attachments, message.chatId, message.id, qc, localizeUi],
   );
 
   // ── Reactions ──
-  // Toggle the human's reaction on this message; optimistic, then PATCH extra
+  // Persist a new reactions array for this message; optimistic, then PATCH extra
   // (mirrors handleRemoveAttachment). Character reactions are applied server-side.
-  const handleToggleReaction = useCallback(
-    async (emoji: string, imageUrl: string | null) => {
-      const next = toggleReaction(reactions, emoji, USER_REACTOR, imageUrl);
+  const applyReactions = useCallback(
+    async (next: MessageReaction[]) => {
       const msgKey = chatKeys.messages(message.chatId);
       const previous = qc.getQueryData<InfiniteData<Message[]>>(msgKey);
       qc.setQueryData<InfiniteData<Message[]>>(msgKey, (old) => {
@@ -335,12 +475,20 @@ export const ConversationMessage = memo(function ConversationMessage({
         await api.patch(`/chats/${message.chatId}/messages/${message.id}/extra`, { reactions: next });
       } catch (err) {
         qc.setQueryData(msgKey, previous);
-        toast.error(err instanceof Error ? err.message : "Failed to update reaction.");
+        toast.error(err instanceof Error ? err.message :localizeUi("ui.chat.conversationmessage.failedToUpdateReaction"));
       } finally {
         await qc.invalidateQueries({ queryKey: msgKey });
       }
     },
-    [reactions, message.chatId, message.id, qc],
+    [message.chatId, message.id, qc, localizeUi],
+  );
+
+  // Toggle the human's reaction. `target` aims it at one grouped speaker segment
+  // (issue #3210); omitted, it applies to the whole message as before.
+  const handleToggleReaction = useCallback(
+    (emoji: string, imageUrl: string | null, target?: ReactionSegmentTarget) =>
+      applyReactions(toggleReaction(reactions, emoji, USER_REACTOR, imageUrl, target)),
+    [applyReactions, reactions],
   );
 
   // Resolve a reactor id to a display name for the chip tooltips.
@@ -350,18 +498,36 @@ export const ConversationMessage = memo(function ConversationMessage({
     [scopedCharacterMap],
   );
 
+  // Toggle the user's membership in an existing reaction entry (chip click) —
+  // re-targets the entry's own segment so orphaned entries toggle themselves.
+  const handleToggleReactionEntry = useCallback(
+    (reaction: MessageReaction) =>
+      handleToggleReaction(reaction.emoji, reaction.imageUrl ?? null, reactionTargetOf(reaction)),
+    [handleToggleReaction],
+  );
+
   // ── Speaker-segment parsing (for grouped / group-in-bubble) ──
-  const charByName = useMemo(() => {
-    if (!scopedCharacterMap) return null;
-    const map = new Map<string, NonNullable<ReturnType<CharacterMap["get"]>>>();
+  // Built as a pair in one pass: CharInfo carries no id, and grouped segments
+  // need the speaker's id to resolve portable card://self gallery refs.
+  const { charByName, charIdByName } = useMemo(() => {
+    if (!scopedCharacterMap) return { charByName: null, charIdByName: null };
+    const byName = new Map<string, NonNullable<ReturnType<CharacterMap["get"]>>>();
+    const idByName = new Map<string, string>();
     for (const [id, v] of scopedCharacterMap) {
       if (v) {
-        const key = normalizeTextForMatch(v.name);
-        if (id === message.characterId) map.set(key, v);
-        else if (!map.has(key)) map.set(key, v);
+        const aliases = [v.name, v.convoDisplayName].filter(
+          (name): name is string => typeof name === "string" && name.trim().length > 0,
+        );
+        for (const alias of aliases) {
+          const key = normalizeTextForMatch(alias);
+          if (id === message.characterId || !byName.has(key)) {
+            byName.set(key, v);
+            idByName.set(key, id);
+          }
+        }
       }
     }
-    return map;
+    return { charByName: byName, charIdByName: idByName };
   }, [scopedCharacterMap, message.characterId]);
 
   const mentionNames = useMemo(() => {
@@ -369,23 +535,51 @@ export const ConversationMessage = memo(function ConversationMessage({
     const names: string[] = [];
     for (const [, v] of scopedCharacterMap) {
       if (v?.name) names.push(v.name);
+      if (v?.convoDisplayName?.trim()) names.push(v.convoDisplayName);
     }
     return names;
   }, [scopedCharacterMap]);
 
   const groupedSegments = useMemo(() => {
-    if (isUser || !renderedContent) return null;
+    if (isUser || !displayedContent) return null;
     const knownNames = charByName ? new Set(charByName.keys()) : new Set<string>();
-    const speakerSegs = parseSpeakerTags(renderedContent, knownNames);
-    if (speakerSegs) return groupConsecutiveSegments(speakerSegs);
-    const nameSegs = parseNamePrefixFormat(renderedContent, knownNames);
-    if (nameSegs) return groupConsecutiveSegments(nameSegs);
-    return null;
-  }, [isUser, renderedContent, charByName]);
+    const leadingCharacter = message.characterId ? scopedCharacterMap?.get(message.characterId) : null;
+    const leadingSpeaker = leadingCharacter?.convoDisplayName?.trim() || leadingCharacter?.name || null;
+    return parseGroupedSpeakerSegments(displayedContent, knownNames, leadingSpeaker);
+  }, [isUser, displayedContent, charByName, message.characterId, scopedCharacterMap]);
+
+  // Segment-targeted reactions render inline under their speaker's segment; the
+  // remainder (whole-message entries + orphans from a re-segmentation) keeps the
+  // block-bottom row. The grouped layout is the only surface with per-segment
+  // rows, so while it isn't rendered (editing, no parseable segments) every
+  // reaction belongs to the bottom row — otherwise segment chips would vanish.
+  const groupedLayoutActive = !!groupedSegments && !editing && !isUser;
+  const { segmentReactions, messageReactions } = useMemo(
+    () => splitReactionsBySegment(reactions, groupedLayoutActive ? groupedSegments : null),
+    [reactions, groupedLayoutActive, groupedSegments],
+  );
+
+  // Add/toggle the user's reaction on one grouped speaker segment (per-segment
+  // picker). If the user's same-emoji reaction to this speaker is stranded as an
+  // orphan (stale segment target from another swipe's layout or an edit), move it
+  // to the picked segment instead of stacking a second entry — unless this pick
+  // is a plain toggle-off of a reaction already on the target segment.
+  const handlePickSegmentReaction = useCallback(
+    (target: ReactionSegmentTarget, emoji: string, imageUrl: string | null) => {
+      const targetHasUser = (segmentReactions?.[target.segment] ?? []).some(
+        (reaction) => reaction.emoji === emoji && reaction.by.includes(USER_REACTOR),
+      );
+      const orphan = targetHasUser ? undefined : findRetargetableUserReaction(messageReactions, emoji, target);
+      const base = orphan ? toggleReaction(reactions, emoji, USER_REACTOR, null, reactionTargetOf(orphan)) : reactions;
+      return applyReactions(toggleReaction(base, emoji, USER_REACTOR, imageUrl, target));
+    },
+    [applyReactions, messageReactions, reactions, segmentReactions],
+  );
 
   // ── Staggered reveal for multi-speaker segments ──
   const segmentCount = groupedSegments?.length ?? 0;
-  const prevContentRef = useRef(renderedContent);
+  const prevContentRef = useRef(displayedContent);
+  const prevTranslationOnlyRef = useRef(showTranslationOnly);
   const initialRenderRef = useRef(true);
   const [internalVisibleSegments, setInternalVisibleSegments] = useState(segmentCount);
 
@@ -393,11 +587,18 @@ export const ConversationMessage = memo(function ConversationMessage({
     if (initialRenderRef.current) {
       initialRenderRef.current = false;
       setInternalVisibleSegments(segmentCount);
-      prevContentRef.current = renderedContent;
+      prevContentRef.current = displayedContent;
+      prevTranslationOnlyRef.current = showTranslationOnly;
       return;
     }
-    if (renderedContent !== prevContentRef.current && segmentCount > 1) {
-      prevContentRef.current = renderedContent;
+    if (prevTranslationOnlyRef.current !== showTranslationOnly) {
+      prevTranslationOnlyRef.current = showTranslationOnly;
+      prevContentRef.current = displayedContent;
+      setInternalVisibleSegments(segmentCount);
+      return;
+    }
+    if (displayedContent !== prevContentRef.current && segmentCount > 1) {
+      prevContentRef.current = displayedContent;
       setInternalVisibleSegments(1);
       let count = 1;
       const reveal = () => {
@@ -409,8 +610,9 @@ export const ConversationMessage = memo(function ConversationMessage({
       return () => timers.forEach(clearTimeout);
     }
     setInternalVisibleSegments(segmentCount);
-    prevContentRef.current = renderedContent;
-  }, [renderedContent, segmentCount]);
+    prevContentRef.current = displayedContent;
+    prevTranslationOnlyRef.current = showTranslationOnly;
+  }, [displayedContent, segmentCount, showTranslationOnly]);
   const visibleSegments =
     segmentCount > 0 ? Math.max(1, Math.min(visibleSegmentCount ?? internalVisibleSegments, segmentCount)) : 0;
 
@@ -503,14 +705,14 @@ export const ConversationMessage = memo(function ConversationMessage({
 
   // ── Copy / translate ──
   const handleCopy = useCallback(() => {
-    copyToClipboard(renderedContent);
+    copyToClipboard(displayedContent);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
-  }, [renderedContent]);
+  }, [displayedContent]);
 
   const handleTranslate = useCallback(
-    () => translate(message.id, renderedContent, message.chatId),
-    [message.id, message.chatId, renderedContent, translate],
+    () => translate(message.id, renderedContent, message.chatId, [message.content]),
+    [message.content, message.id, message.chatId, renderedContent, translate],
   );
 
   // ── Mobile tap (show actions / multi-select) ──
@@ -554,7 +756,7 @@ export const ConversationMessage = memo(function ConversationMessage({
 
   // ── Bubble-specific derived values ──
   const streamingBubbleDraftContent =
-    isBubbleStyle && !!isStreaming && renderedContentParts?.length ? renderedContentParts.join("\n\n") : null;
+    isBubbleStyle && !!isStreaming && displayedContentParts?.length ? displayedContentParts.join("\n\n") : null;
   const shouldHideUserAvatar = (isUser && !!hideUserAvatar) || (isBubbleStyle && isUser);
   const bubbleCornerClass = isUser
     ? bubbleGroupPosition === "single"
@@ -573,20 +775,55 @@ export const ConversationMessage = memo(function ConversationMessage({
           : "rounded-2xl rounded-tl-md";
 
   // ── Build shared render context ──
+  // Convo-only: clicking an avatar opens the about-me viewer for that identity.
+  // The component only mounts in conversation mode, so this never applies elsewhere.
+  const aboutMeTarget: { kind: "character" | "persona"; id: string } | null = isUser
+    ? (msgPersona?.personaId ?? personaInfo?.id)
+      ? { kind: "persona", id: (msgPersona?.personaId ?? personaInfo?.id)! }
+      : null
+    : message.characterId
+      ? { kind: "character", id: message.characterId }
+      : null;
+  const onOpenAboutMe = aboutMeTarget
+    ? (anchor: DOMRect) =>
+        useUIStore.getState().openModal("about-me-viewer", {
+          ...aboutMeTarget,
+          anchorRect: {
+            top: anchor.top,
+            left: anchor.left,
+            right: anchor.right,
+            bottom: anchor.bottom,
+            width: anchor.width,
+            height: anchor.height,
+          },
+          avatarUrl,
+          avatarCrop: isUser ? personaAvatarCrop : (resolvedCharacterInfo?.avatarCrop ?? null),
+          displayName: headerDisplayName,
+          nameColor: nameColor ?? null,
+          status: aboutMeTarget.kind === "character" ? (resolvedCharacterInfo?.conversationStatus ?? null) : null,
+          activity: aboutMeTarget.kind === "character" ? (resolvedCharacterInfo?.conversationActivity ?? null) : null,
+        })
+    : undefined;
+
   const ctx: MessageRenderContext = {
     message,
     extra,
     isUser,
     isGrouped: !!isGrouped,
-    displayName,
+    displayName: headerDisplayName,
     avatarUrl,
     avatarCropStyle,
+    avatarCornerClass: conversationAvatarShape === "square" ? "rounded-lg" : "rounded-full",
     nameColor,
+    onOpenAboutMe,
     mentionNames,
     charByName,
+    charIdByName,
+    selfCharacterId,
+    galleryIndex,
     quoteFormat,
-    renderedContent,
-    renderedContentParts,
+    renderedContent: displayedContent,
+    renderedContentParts: displayedContentParts,
     emojiMap: emojiMap ?? EMPTY_CUSTOM_EMOJI_MAP,
     stickerMap: stickerMap ?? EMPTY_CUSTOM_STICKER_MAP,
     groupedSegments,
@@ -615,12 +852,15 @@ export const ConversationMessage = memo(function ConversationMessage({
     isGuided,
     regenerateButtonTitle,
     regenerateGuidedClass,
-    thinking,
+    hasReasoning,
+    reasoningSummaryUnavailable,
+    thinkingButtonRef,
     generationReplay,
     canRegenerate,
     isLastAssistantMessage,
     translatedText,
     isTranslating,
+    showTranslationOnly,
     hasSwipes: (message.swipeCount ?? 0) > 1,
     swipeCount: message.swipeCount ?? 0,
     multiSelectMode,
@@ -649,6 +889,10 @@ export const ConversationMessage = memo(function ConversationMessage({
     onShowGenerationReplay: () => setShowGenerationReplay(true),
     onShowThinking: () => setShowThinking(true),
     onPickReaction: handleToggleReaction,
+    segmentReactions,
+    resolveReactorName,
+    onPickSegmentReaction: handlePickSegmentReaction,
+    onToggleReactionEntry: handleToggleReactionEntry,
     messageTextStyle,
     isBubbleStyle,
     bubbleGroupPosition,
@@ -660,8 +904,10 @@ export const ConversationMessage = memo(function ConversationMessage({
   // Rendered by the shell as a sibling of the message row, OUTSIDE the
   // [data-card-css] container, so a character's bubble theme can't restyle it.
   // Indented to sit under the message body; right-aligned for user bubbles.
+  // Holds the whole-message reactions; segment-targeted ones render inline under
+  // their segment inside the grouped layout instead.
   const reactionRow =
-    reactions.length > 0 && !isHiddenCollapsed ? (
+    messageReactions.length > 0 && !isHiddenCollapsed ? (
       <div
         className={cn(
           "mari-message-reactions-row pb-1",
@@ -669,9 +915,9 @@ export const ConversationMessage = memo(function ConversationMessage({
         )}
       >
         <MessageReactions
-          reactions={reactions}
+          reactions={messageReactions}
           resolveReactorName={resolveReactorName}
-          onToggle={handleToggleReaction}
+          onToggle={handleToggleReactionEntry}
         />
       </div>
     ) : null;
@@ -679,42 +925,14 @@ export const ConversationMessage = memo(function ConversationMessage({
   // ── Shared modals (portals, rendered outside the layout) ──
   const modals = (
     <>
-      {showThinking &&
-        thinking &&
-        createPortal(
-          <div
-            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm max-md:pt-[env(safe-area-inset-top)]"
-            onClick={() => setShowThinking(false)}
-          >
-            <div
-              className={cn(
-                NEUTRAL_PANEL_SHELL,
-                "relative mx-4 flex max-h-[70vh] w-full max-w-xl flex-col overflow-hidden",
-              )}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className={cn(NEUTRAL_PANEL_HEADER, "flex items-center justify-between gap-3 px-4 py-3")}>
-                <div className={cn(NEUTRAL_PANEL_TITLE, "text-sm")}>
-                  <Brain size="0.875rem" className="text-[var(--marinara-chat-chrome-button-text-active)]" />
-                  Model Thoughts
-                </div>
-                <button
-                  onClick={() => setShowThinking(false)}
-                  className="mari-chrome-control mari-chrome-control--small p-1.5"
-                  aria-label="Close thoughts"
-                >
-                  <X size="0.875rem" />
-                </button>
-              </div>
-              <div className={cn(NEUTRAL_PANEL_SCROLL_AREA, "overflow-y-auto px-4 py-3")}>
-                <pre className="whitespace-pre-wrap break-words text-[0.8125rem] leading-relaxed text-[var(--marinara-chat-chrome-panel-text)]">
-                  {thinking}
-                </pre>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
+      {showThinking && hasReasoning && (
+        <MessageThinkingModal
+          thinking={thinking}
+          summaryUnavailable={reasoningSummaryUnavailable}
+          onClose={() => setShowThinking(false)}
+          restoreFocusRef={thinkingButtonRef}
+        />
+      )}
       {generationReplay && (
         <GenerationReplayDetailsModal
           open={showGenerationReplay}
@@ -736,12 +954,78 @@ export const ConversationMessage = memo(function ConversationMessage({
 
   // ── System message ──
   if (isSystem) {
+    if (conversationCallEvent) {
+      const status = typeof conversationCallEvent.status === "string" ? conversationCallEvent.status : "";
+      const duration = formatCallDuration(conversationCallEvent.durationMs);
+      const timestamp = formatCallTimestamp(message.createdAt);
+      const title =
+        status === "ended"
+          ? "Call Ended"
+          : status === "declined"
+            ? "Call Declined"
+            : status === "missed"
+              ? "Missed Call"
+              : status === "ringing"
+                ? "Incoming Call"
+                : "Call Started";
+      const subtitle =
+        status === "ended" && duration
+          ? `${duration}${timestamp ? ` - ${timestamp}` : ""}`
+          : timestamp || message.content;
+      const Icon =
+        status === "ended" || status === "declined" || status === "missed"
+          ? PhoneOff
+          : status === "ringing"
+            ? PhoneIncoming
+            : Phone;
+      const iconClass =
+        status === "ended" || status === "declined" || status === "missed"
+          ? "text-[var(--muted-foreground)]"
+          : "text-emerald-400";
+
+      return (
+        <div
+          ref={msgRef}
+          className={cn(
+            "group flex justify-center px-4 py-2",
+            multiSelectMode && isSelected && cn("rounded-lg", MESSAGE_SELECTION_SURFACE_CLASS),
+          )}
+          onClick={handleMobileTap}
+        >
+          <div className="relative w-full max-w-xl">
+            {!multiSelectMode && onDelete && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDelete(message.id);
+                }}
+                className={cn(
+                  "absolute -right-1 -top-1 rounded-md p-1 text-[var(--muted-foreground)]/30 opacity-0 transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] group-hover:opacity-100",
+                  showActions && "opacity-100",
+                )}
+                title={localizeUi("lorebook.editor.batch.delete")}
+              >
+                <Trash2 size="0.75rem" />
+              </button>
+            )}
+            <div className="flex items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--secondary)]/90 px-4 py-3 text-left shadow-sm">
+              <Icon size="1.25rem" className={cn("shrink-0", iconClass)} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-semibold text-[var(--foreground)]">{title}</div>
+                <div className="truncate text-xs text-[var(--marinara-chat-chrome-panel-muted)]">{subtitle}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div
         ref={msgRef}
         className={cn(
           "group flex justify-center py-1",
-          multiSelectMode && isSelected && "rounded-lg bg-[var(--destructive)]/10",
+          multiSelectMode && isSelected && cn("rounded-lg", MESSAGE_SELECTION_SURFACE_CLASS),
         )}
         onClick={handleMobileTap}
       >
@@ -756,12 +1040,12 @@ export const ConversationMessage = memo(function ConversationMessage({
                 "absolute -right-1 -top-1 rounded-md p-1 text-[var(--muted-foreground)]/30 opacity-0 transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] group-hover:opacity-100",
                 showActions && "opacity-100",
               )}
-              title="Delete"
+              title={localizeUi("lorebook.editor.batch.delete")}
             >
               <Trash2 size="0.75rem" />
             </button>
           )}
-          <span className="rounded-full bg-[var(--secondary)] px-3 py-1 text-[0.6875rem] text-[var(--muted-foreground)]">
+          <span className="rounded-full bg-[var(--secondary)] px-3 py-1 text-[0.6875rem] text-[var(--marinara-chat-chrome-panel-muted)]">
             {message.content}
           </span>
         </div>
@@ -770,7 +1054,7 @@ export const ConversationMessage = memo(function ConversationMessage({
   }
 
   // ── Grouped multi-speaker layout ──
-  if (groupedSegments && !editing && !isUser) {
+  if (groupedLayoutActive) {
     return (
       <>
         <ConversationMessageGrouped ctx={ctx} msgRef={msgRef} />
@@ -786,7 +1070,7 @@ export const ConversationMessage = memo(function ConversationMessage({
       <div
         ref={msgRef}
         className={cn(
-          "mari-message relative px-4 transition-colors",
+          "mari-message relative w-full min-w-0 max-w-full px-4 transition-colors",
           !noHoverGroup && "group",
           isBubbleStyle
             ? cn("py-1", isUser ? "mari-message-user" : "mari-message-assistant", !isGrouped && "mt-2.5")
@@ -798,7 +1082,8 @@ export const ConversationMessage = memo(function ConversationMessage({
               ),
           isConversationStart && cn("rounded-lg ring-1", CONVERSATION_MESSAGE_CHROME_RING_CLASS),
           isHiddenFromAI && cn("rounded-lg ring-1 saturate-75", CONVERSATION_MESSAGE_CHROME_RING_CLASS),
-          multiSelectMode && isSelected && "bg-[var(--destructive)]/10 ring-[var(--destructive)]/50",
+          multiSelectMode && isSelected && MESSAGE_SELECTION_SURFACE_CLASS,
+          hideActions && hasReasoning && !isUser && "max-sm:pb-8",
         )}
         data-message-id={message.id}
         data-message-role={message.role}
@@ -808,18 +1093,21 @@ export const ConversationMessage = memo(function ConversationMessage({
       >
         {isBubbleStyle ? <ConversationMessageBubble ctx={ctx} /> : <ConversationMessageLine ctx={ctx} />}
 
-        {!hideActions && (
+        {(!hideActions || (hasReasoning && !isUser)) && (
           <ConversationMessageActions
             isBubbleStyle={isBubbleStyle}
             isUser={isUser}
             showActions={showActions}
-            forceShowActions={forceShowActions}
+            forceShowActions={hideActions && hasReasoning ? true : forceShowActions}
+            thinkingOnly={hideActions && hasReasoning}
             copied={copied}
             translatedText={translatedText}
             isHiddenFromAI={isHiddenFromAI}
             canRegenerate={canRegenerate}
             isLastAssistantMessage={isLastAssistantMessage}
-            thinking={thinking}
+            hasReasoning={hasReasoning}
+            reasoningSummaryUnavailable={reasoningSummaryUnavailable}
+            thinkingButtonRef={thinkingButtonRef}
             generationReplay={generationReplay}
             isGuided={isGuided}
             regenerateButtonTitle={regenerateButtonTitle}

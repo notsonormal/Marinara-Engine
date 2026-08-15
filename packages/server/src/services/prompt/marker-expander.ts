@@ -4,7 +4,11 @@
 // ──────────────────────────────────────────────
 import type { DB } from "../../db/connection.js";
 import { logger } from "../../lib/logger.js";
-import { formatRpgStatsForPrompt, resolveMacros, stripMacroComments } from "@marinara-engine/shared";
+import {
+  formatRpgStatsForPrompt,
+  isExternallyImportedAgent,
+  resolveMacros,
+} from "@marinara-engine/shared";
 import type {
   CharacterMacroProfile,
   MarkerConfig,
@@ -14,14 +18,17 @@ import type {
   RPGStatsConfig,
   LorebookEntryTimingState,
   MacroContext,
+  ResolveMacroOptions,
 } from "@marinara-engine/shared";
 import { createCharactersStorage } from "../storage/characters.storage.js";
 import { createAgentsStorage } from "../storage/agents.storage.js";
+import { getCustomAgentImportPolicy } from "../agents/custom-agent-import-policy.service.js";
 import { processLorebooks, type LorebookFinalContentResolver, type LorebookScanResult } from "../lorebook/index.js";
+import { cardPromptText } from "./card-text.js";
 import { wrapContent } from "./format-engine.js";
-import { sanitizePromptLeaf } from "./prompt-escaping.js";
+import { sanitizeExampleDialoguePromptLeaf, sanitizePromptLeaf } from "./prompt-escaping.js";
 import { agentRuns } from "../../db/schema/index.js";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc } from "../../db/file-query.js";
 
 /** Context required for expanding markers. */
 export interface MarkerContext {
@@ -50,6 +57,8 @@ export interface MarkerContext {
   activeAgentIds: string[];
   /** Per-chat list of manually activated lorebook IDs from chat settings */
   activeLorebookIds: string[];
+  /** Entries attached to the exact current hierarchical location. */
+  forcedLorebookEntryIds?: string[];
   /** Lorebook IDs that should be excluded even if otherwise scoped to the chat. */
   excludedLorebookIds?: string[];
   /** Source agent IDs whose generated lorebooks should be excluded from scanning. */
@@ -60,6 +69,8 @@ export interface MarkerContext {
   chatEmbedding?: number[] | null;
   /** Per-lorebook pre-computed embeddings for semantic lorebook matching. */
   semanticEmbeddingsByLorebookId?: ReadonlyMap<string, number[] | null>;
+  /** Unrelated-text cosine floor used to calibrate clustered embedding models. */
+  semanticSimilarityBaseline?: number;
   /** Per-chat ephemeral state overrides for lorebook entries (from chat metadata). */
   entryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
   /** Per-chat sticky/cooldown/delay timing state for lorebook entries. */
@@ -84,10 +95,16 @@ export interface MarkerContext {
   updatedEntryTimingStates?: Record<string, LorebookEntryTimingState>;
   /** Cached lorebook scan for all lorebook marker sections in this prompt build. */
   lorebookScanResult?: LorebookScanResult;
+  /** Adds context for character-ID macros found only after lorebook activation. */
+  onLorebookScan?: (result: LorebookScanResult) => Promise<void>;
+  /** True once the activated lorebook callback has completed. */
+  lorebookScanCallbackApplied?: boolean;
   /** True once cached lorebook state/depth side effects have been applied to this marker context. */
   lorebookScanResultApplied?: boolean;
   /** When set, replaces all individual character scenario fields with this shared group scenario. */
   groupScenarioOverrideText?: string | null;
+  /** Whether the preset has an enabled marker that owns Example Dialogue placement. */
+  hasDialogueExamplesMarker?: boolean;
 }
 
 /** Expanded marker result. */
@@ -98,18 +115,62 @@ export interface ExpandedMarker {
   messages?: ChatMLMessage[];
 }
 
-function cardPromptText(value: unknown): string {
-  return typeof value === "string" ? stripMacroComments(value).trim() : "";
+function resolveSanitizedPromptLeaf(
+  value: string,
+  ctx: MarkerContext,
+  macroCtx: MacroContext = ctx.macroCtx,
+  macroOptions?: ResolveMacroOptions,
+): string {
+  return sanitizePromptLeaf(resolveMacros(value, macroCtx, macroOptions), ctx.wrapFormat);
 }
 
-function resolveSanitizedPromptLeaf(value: string, ctx: MarkerContext, macroCtx: MacroContext = ctx.macroCtx): string {
-  return sanitizePromptLeaf(resolveMacros(value, macroCtx), ctx.wrapFormat);
+const DEFAULT_CHARACTER_MARKER_FIELDS = [
+  "description",
+  "personality",
+  "backstory",
+  "appearance",
+  "scenario",
+  "system_prompt",
+];
+
+const CHARACTER_CARD_FIELD_ORDER = new Map(
+  ["description", "personality", "backstory", "appearance", "scenario", "mes_example", "example_dialogue"].map(
+    (field, index) => [field, index],
+  ),
+);
+
+/** Keep selected card sections in the same order as the Character editor. */
+export function orderCharacterMarkerFields(fields: readonly string[]): string[] {
+  return fields
+    .map((field, index) => ({ field, index }))
+    .sort((left, right) => {
+      const leftOrder = CHARACTER_CARD_FIELD_ORDER.get(left.field) ?? Number.POSITIVE_INFINITY;
+      const rightOrder = CHARACTER_CARD_FIELD_ORDER.get(right.field) ?? Number.POSITIVE_INFINITY;
+      return leftOrder - rightOrder || left.index - right.index;
+    })
+    .map(({ field }) => field);
+}
+
+/** Append Example Dialogue to Character Info when no dedicated marker owns it. */
+export function resolveCharacterMarkerFields(
+  configuredFields: readonly string[] | undefined,
+  hasDialogueExamplesMarker: boolean,
+): string[] {
+  const fields = [...(configuredFields ?? DEFAULT_CHARACTER_MARKER_FIELDS)];
+  if (!hasDialogueExamplesMarker && !fields.includes("mes_example") && !fields.includes("example_dialogue")) {
+    fields.push("mes_example");
+  }
+  return orderCharacterMarkerFields(fields);
 }
 
 /**
  * Expand a marker section into actual content based on its type and config.
  */
-export async function expandMarker(config: MarkerConfig, ctx: MarkerContext): Promise<ExpandedMarker> {
+export async function expandMarker(
+  config: MarkerConfig,
+  ctx: MarkerContext,
+  macroOptions?: ResolveMacroOptions,
+): Promise<ExpandedMarker> {
   switch (config.type) {
     case "character":
       return expandCharacter(config, ctx);
@@ -122,7 +183,7 @@ export async function expandMarker(config: MarkerConfig, ctx: MarkerContext): Pr
     case "chat_history":
       return expandChatHistory(config, ctx);
     case "chat_summary":
-      return expandChatSummary(ctx);
+      return expandChatSummary(ctx, macroOptions);
     case "dialogue_examples":
       return expandDialogueExamples(config, ctx);
     case "agent_data":
@@ -144,14 +205,7 @@ async function expandCharacter(config: MarkerConfig, ctx: MarkerContext): Promis
     const profile = characterMacroProfileFromData(data);
     const characterMacroContext = macroContextForCharacterProfile(ctx.macroCtx, profile);
 
-    const fields = config.characterFields ?? [
-      "description",
-      "personality",
-      "scenario",
-      "backstory",
-      "appearance",
-      "system_prompt",
-    ];
+    const fields = resolveCharacterMarkerFields(config.characterFields, ctx.hasDialogueExamplesMarker === true);
 
     const charParts: string[] = [];
     for (const field of fields) {
@@ -161,8 +215,16 @@ async function expandCharacter(config: MarkerConfig, ctx: MarkerContext): Promis
       if (field === "scenario" && ctx.groupScenarioOverrideText) continue;
       const value = cardPromptText(getCharacterField(data, field));
       if (value) {
+        const resolved = resolveMacros(value, characterMacroContext);
         charParts.push(
-          wrapContent(resolveSanitizedPromptLeaf(value, ctx, characterMacroContext), field, ctx.wrapFormat, 2),
+          wrapContent(
+            field === "mes_example" || field === "example_dialogue"
+              ? sanitizeExampleDialoguePromptLeaf(resolved, ctx.wrapFormat)
+              : sanitizePromptLeaf(resolved, ctx.wrapFormat),
+            field,
+            ctx.wrapFormat,
+            2,
+          ),
         );
       }
     }
@@ -171,9 +233,7 @@ async function expandCharacter(config: MarkerConfig, ctx: MarkerContext): Promis
     if (!fields.includes("stats") && !fields.includes("rpg_attributes")) {
       const statsText = formatRpgStatsForPrompt(data.extensions?.rpgStats as RPGStatsConfig | undefined);
       if (statsText) {
-        charParts.push(
-          wrapContent(resolveSanitizedPromptLeaf(statsText, ctx), "rpg_attributes", ctx.wrapFormat, 2),
-        );
+        charParts.push(wrapContent(resolveSanitizedPromptLeaf(statsText, ctx), "rpg_attributes", ctx.wrapFormat, 2));
       }
     }
 
@@ -187,9 +247,7 @@ async function expandCharacter(config: MarkerConfig, ctx: MarkerContext): Promis
   // Append group scenario override (replaces individual character scenarios)
   const groupScenarioOverrideText = cardPromptText(ctx.groupScenarioOverrideText);
   if (groupScenarioOverrideText) {
-    parts.push(
-      wrapContent(resolveSanitizedPromptLeaf(groupScenarioOverrideText, ctx), "scenario", ctx.wrapFormat, 1),
-    );
+    parts.push(wrapContent(resolveSanitizedPromptLeaf(groupScenarioOverrideText, ctx), "scenario", ctx.wrapFormat, 1));
   }
 
   return { content: parts.join("\n") };
@@ -271,14 +329,10 @@ async function expandPersona(_config: MarkerConfig, ctx: MarkerContext): Promise
   const personaScenario = cardPromptText(ctx.personaFields?.scenario);
 
   if (personaDescription) {
-    parts.push(
-      wrapContent(resolveSanitizedPromptLeaf(personaDescription, ctx), "description", ctx.wrapFormat, 2),
-    );
+    parts.push(wrapContent(resolveSanitizedPromptLeaf(personaDescription, ctx), "description", ctx.wrapFormat, 2));
   }
   if (personaPersonality) {
-    parts.push(
-      wrapContent(resolveSanitizedPromptLeaf(personaPersonality, ctx), "personality", ctx.wrapFormat, 2),
-    );
+    parts.push(wrapContent(resolveSanitizedPromptLeaf(personaPersonality, ctx), "personality", ctx.wrapFormat, 2));
   }
   if (personaBackstory) {
     parts.push(wrapContent(resolveSanitizedPromptLeaf(personaBackstory, ctx), "backstory", ctx.wrapFormat, 2));
@@ -308,9 +362,11 @@ async function expandPersona(_config: MarkerConfig, ctx: MarkerContext): Promise
 
 // ── Lorebook / World Info ──────────────────────
 
-async function expandLorebook(config: MarkerConfig, ctx: MarkerContext): Promise<ExpandedMarker> {
-  if (ctx.disableLorebooks === true) return { content: "" };
-
+export async function ensureLorebookScan(ctx: MarkerContext): Promise<LorebookScanResult | null> {
+  if (ctx.disableLorebooks === true) {
+    ctx.macroCtx.outlets = {};
+    return null;
+  }
   const result =
     ctx.lorebookScanResult ??
     (ctx.lorebookScanResult = await processLorebooks(
@@ -322,11 +378,13 @@ async function expandLorebook(config: MarkerConfig, ctx: MarkerContext): Promise
         characterIds: ctx.characterIds,
         personaId: ctx.personaId ?? null,
         activeLorebookIds: ctx.activeLorebookIds,
+        forcedEntryIds: ctx.forcedLorebookEntryIds,
         excludedLorebookIds: ctx.excludedLorebookIds,
         excludedSourceAgentIds: ctx.excludedLorebookSourceAgentIds,
         tokenBudget: ctx.lorebookTokenBudget,
         chatEmbedding: ctx.chatEmbedding ?? null,
         semanticEmbeddingsByLorebookId: ctx.semanticEmbeddingsByLorebookId,
+        semanticSimilarityBaseline: ctx.semanticSimilarityBaseline,
         entryStateOverrides: ctx.entryStateOverrides,
         entryTimingStates: ctx.entryTimingStates,
         generationTriggers: ctx.generationTriggers ?? ["chat"],
@@ -334,6 +392,13 @@ async function expandLorebook(config: MarkerConfig, ctx: MarkerContext): Promise
         resolveContent: ctx.resolveLorebookContent,
       },
     ));
+
+  if (ctx.lorebookScanCallbackApplied !== true && ctx.onLorebookScan) {
+    await ctx.onLorebookScan(result);
+    ctx.lorebookScanCallbackApplied = true;
+  }
+
+  ctx.macroCtx.outlets = result.outlets;
 
   if (ctx.lorebookScanResultApplied !== true) {
     ctx.lorebookScanResultApplied = true;
@@ -353,7 +418,7 @@ async function expandLorebook(config: MarkerConfig, ctx: MarkerContext): Promise
       ctx.lorebookDepthEntries ??= [];
       for (const de of result.depthEntries) {
         ctx.lorebookDepthEntries.push({
-          content: sanitizePromptLeaf(de.content, ctx.wrapFormat),
+          content: de.content,
           role: de.role,
           depth: de.depth,
         });
@@ -361,16 +426,23 @@ async function expandLorebook(config: MarkerConfig, ctx: MarkerContext): Promise
     }
   }
 
+  return result;
+}
+
+async function expandLorebook(config: MarkerConfig, ctx: MarkerContext): Promise<ExpandedMarker> {
+  const result = await ensureLorebookScan(ctx);
+  if (!result) return { content: "" };
+
   switch (config.type) {
     case "world_info_before":
-      return { content: sanitizePromptLeaf(result.worldInfoBefore, ctx.wrapFormat) };
+      return { content: result.worldInfoBefore };
     case "world_info_after":
-      return { content: sanitizePromptLeaf(result.worldInfoAfter, ctx.wrapFormat) };
+      return { content: result.worldInfoAfter };
     case "lorebook":
     default: {
       // Combined lorebook — all world info
       const combined = [result.worldInfoBefore, result.worldInfoAfter].filter(Boolean).join("\n\n");
-      return { content: sanitizePromptLeaf(combined, ctx.wrapFormat) };
+      return { content: combined };
     }
   }
 }
@@ -447,13 +519,11 @@ async function expandDialogueExamples(_config: MarkerConfig, ctx: MarkerContext)
 
     const example = cardPromptText(data.mes_example);
     if (example) {
-      parts.push(
-        resolveSanitizedPromptLeaf(
-          example,
-          ctx,
-          macroContextForCharacterProfile(ctx.macroCtx, characterMacroProfileFromData(data)),
-        ),
+      const resolved = resolveMacros(
+        example,
+        macroContextForCharacterProfile(ctx.macroCtx, characterMacroProfileFromData(data)),
       );
+      parts.push(sanitizeExampleDialoguePromptLeaf(resolved, ctx.wrapFormat));
     }
   }
 
@@ -462,8 +532,8 @@ async function expandDialogueExamples(_config: MarkerConfig, ctx: MarkerContext)
 
 // ── Chat Summary ───────────────────────────────
 
-function expandChatSummary(ctx: MarkerContext): ExpandedMarker {
-  return { content: resolveSanitizedPromptLeaf(ctx.chatSummary ?? "", ctx) };
+function expandChatSummary(ctx: MarkerContext, macroOptions?: ResolveMacroOptions): ExpandedMarker {
+  return { content: resolveSanitizedPromptLeaf(ctx.chatSummary ?? "", ctx, ctx.macroCtx, macroOptions) };
 }
 
 // ── Agent Data ─────────────────────────────────
@@ -495,6 +565,16 @@ async function expandAgentData(config: MarkerConfig, ctx: MarkerContext): Promis
   const agentsStorage = createAgentsStorage(ctx.db);
   const agentConfig = await agentsStorage.getByType(agentType);
   if (!agentConfig) return { content: "" };
+  if (
+    isExternallyImportedAgent(agentConfig.type, agentConfig.settings) &&
+    !(await getCustomAgentImportPolicy(ctx.db)).enabled
+  ) {
+    logger.debug(
+      "[prompt] Skipping externally imported Agent data for %s because custom imports are disabled",
+      agentType,
+    );
+    return { content: "" };
+  }
 
   const latestRuns = await ctx.db
     .select()
@@ -512,12 +592,7 @@ async function expandAgentData(config: MarkerConfig, ctx: MarkerContext): Promis
   try {
     resultData = JSON.parse(run.resultData);
   } catch (err) {
-    logger.warn(
-      err,
-      "[prompt] Skipping malformed agent result data for %s in chat %s",
-      agentType,
-      ctx.chatId,
-    );
+    logger.warn(err, "[prompt] Skipping malformed agent result data for %s in chat %s", agentType, ctx.chatId);
     return { content: "" };
   }
 

@@ -1,4 +1,53 @@
 import type { AgentWriteApprovalEnvelope, AgentWriteApprovalProposal } from "@marinara-engine/shared";
+import { mergeLorebookKeeperUpdateContent } from "./lorebook-keeper-utils.js";
+
+const LOREBOOK_APPROVAL_ENTRY_DELIMITER = "<!-- marinara:lorebook-entry:v1 -->";
+
+type ApprovalHeading = { index: number; end: number; name: string };
+
+function splitLinesWithOffsets(value: string): Array<{ text: string; start: number; end: number }> {
+  const lines: Array<{ text: string; start: number; end: number }> = [];
+  let start = 0;
+  while (start <= value.length) {
+    const newline = value.indexOf("\n", start);
+    const rawEnd = newline < 0 ? value.length : newline;
+    const end = rawEnd > start && value[rawEnd - 1] === "\r" ? rawEnd - 1 : rawEnd;
+    lines.push({ text: value.slice(start, end), start, end });
+    if (newline < 0) break;
+    start = newline + 1;
+  }
+  return lines;
+}
+
+function readApprovalHeading(line: string): string | null {
+  if (!line.startsWith("###") || !/\s/u.test(line[3] ?? "")) return null;
+  const name = line.slice(3).trim();
+  return name || null;
+}
+
+function scanApprovalHeadings(value: string): ApprovalHeading[] {
+  const lines = splitLinesWithOffsets(value);
+  const explicit: ApprovalHeading[] = [];
+  for (let index = 0; index + 1 < lines.length; index++) {
+    const marker = lines[index]!;
+    if (marker.text !== LOREBOOK_APPROVAL_ENTRY_DELIMITER) continue;
+    const headingLine = lines[index + 1]!;
+    const name = readApprovalHeading(headingLine.text);
+    if (name) explicit.push({ index: marker.start, end: headingLine.end, name });
+  }
+  if (explicit.length > 0) return explicit;
+
+  const legacy: ApprovalHeading[] = [];
+  for (let index = 0; index < lines.length; index++) {
+    const headingLine = lines[index]!;
+    const name = readApprovalHeading(headingLine.text);
+    if (name) legacy.push({ index: headingLine.start, end: headingLine.end, name });
+  }
+  // Pre-delimiter approval text always started with its first entry heading.
+  // Keeping that boundary lets users remove either or both metadata lines while
+  // avoiding reinterpretation of arbitrary prose that merely contains a heading.
+  return legacy[0]?.index === 0 ? legacy : [];
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -21,14 +70,10 @@ function readUpdateName(update: Record<string, unknown>): string {
   return raw.trim();
 }
 
-function readUpdateContent(update: Record<string, unknown>): string {
+function readUpdateReplacementContent(update: Record<string, unknown>): string {
   const nested = readNestedEntry(update);
   if (typeof update.content === "string" && update.content.trim()) return update.content.trim();
   if (typeof nested.content === "string" && nested.content.trim()) return nested.content.trim();
-  if (Array.isArray(update.newFacts)) {
-    const facts = update.newFacts.filter((fact): fact is string => typeof fact === "string" && fact.trim().length > 0);
-    if (facts.length > 0) return facts.map((fact) => `- ${fact.trim()}`).join("\n");
-  }
   return "";
 }
 
@@ -58,14 +103,39 @@ export function isAgentWriteApprovalEnvelope(value: unknown): value is AgentWrit
   return isRecord(value) && value.requiresApproval === true && isRecord(value.approval);
 }
 
-export function formatLorebookWriteApprovalText(updates: Array<Record<string, unknown>>): string {
+function normalizeEntryName(value: string): string {
+  return value.trim().toLocaleLowerCase();
+}
+
+function buildExistingContentByName(
+  entries: Array<{ name?: string | null; content?: string | null }> | undefined,
+): Map<string, string> {
+  const byName = new Map<string, string>();
+  for (const entry of entries ?? []) {
+    const name = typeof entry.name === "string" ? normalizeEntryName(entry.name) : "";
+    if (!name || typeof entry.content !== "string") continue;
+    byName.set(name, entry.content);
+  }
+  return byName;
+}
+
+export function formatLorebookWriteApprovalText(
+  updates: Array<Record<string, unknown>>,
+  options: { existingEntries?: Array<{ name?: string | null; content?: string | null }> } = {},
+): string {
+  const existingContentByName = buildExistingContentByName(options.existingEntries);
   return updates
     .map((update, index) => {
       const name = readUpdateName(update) || `Entry ${index + 1}`;
       const keys = readUpdateKeys(update);
       const tag = readUpdateTag(update);
-      const content = readUpdateContent(update);
+      const content = mergeLorebookKeeperUpdateContent({
+        existingContent: existingContentByName.get(normalizeEntryName(name)) ?? "",
+        replacementContent: readUpdateReplacementContent(update),
+        newFacts: update.newFacts,
+      });
       return [
+        LOREBOOK_APPROVAL_ENTRY_DELIMITER,
         `### ${name}`,
         `Keys: ${keys.join(", ")}`,
         `Tag: ${tag}`,
@@ -80,8 +150,7 @@ export function parseLorebookWriteApprovalText(text: string): Array<Record<strin
   const trimmed = text.trim();
   if (!trimmed) return [];
 
-  const headingPattern = /^###\s+(.+)$/gm;
-  const headings = [...trimmed.matchAll(headingPattern)];
+  const headings = scanApprovalHeadings(trimmed);
   if (headings.length === 0) {
     return [{ action: "append", name: "Approved Agent Lore", content: trimmed, keys: [], tag: "" }];
   }
@@ -90,8 +159,8 @@ export function parseLorebookWriteApprovalText(text: string): Array<Record<strin
   for (let index = 0; index < headings.length; index++) {
     const heading = headings[index]!;
     const next = headings[index + 1];
-    const name = (heading[1] ?? "").trim();
-    const blockStart = (heading.index ?? 0) + heading[0].length;
+    const name = heading.name;
+    const blockStart = heading.end;
     const blockEnd = next?.index ?? trimmed.length;
     const block = trimmed.slice(blockStart, blockEnd).replace(/^\r?\n/, "");
     const lines = block.split(/\r?\n/);
@@ -150,6 +219,7 @@ export function buildLorebookWriteApprovalProposal(args: {
   updates: Array<Record<string, unknown>>;
   preferredTargetLorebookId: string | null;
   writableLorebookIds: string[] | null;
+  existingEntries?: Array<{ name?: string | null; content?: string | null }>;
 }): AgentWriteApprovalProposal {
   return {
     kind: "lorebook_update",
@@ -157,7 +227,7 @@ export function buildLorebookWriteApprovalProposal(args: {
     agentType: args.agentType,
     agentName: args.agentName,
     title: `${args.agentName} Lorebook Proposal`,
-    text: formatLorebookWriteApprovalText(args.updates),
+    text: formatLorebookWriteApprovalText(args.updates, { existingEntries: args.existingEntries }),
     payload: {
       preferredTargetLorebookId: args.preferredTargetLorebookId,
       writableLorebookIds: args.writableLorebookIds,

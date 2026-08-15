@@ -2,51 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Mic, MicOff } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "../../lib/utils";
-
-type SpeechRecognitionAlternativeLike = {
-  transcript?: string;
-};
-
-type SpeechRecognitionResultLike = {
-  readonly isFinal: boolean;
-  readonly length: number;
-  item(index: number): SpeechRecognitionAlternativeLike;
-  [index: number]: SpeechRecognitionAlternativeLike | undefined;
-};
-
-type SpeechRecognitionResultListLike = {
-  readonly length: number;
-  item(index: number): SpeechRecognitionResultLike;
-  [index: number]: SpeechRecognitionResultLike | undefined;
-};
-
-type SpeechRecognitionEventLike = Event & {
-  readonly resultIndex: number;
-  readonly results: SpeechRecognitionResultListLike;
-};
-
-type SpeechRecognitionErrorEventLike = Event & {
-  readonly error?: string;
-};
-
-type SpeechRecognitionLike = EventTarget & {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-};
-
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-
-type SpeechRecognitionWindow = Window & {
-  SpeechRecognition?: SpeechRecognitionConstructor;
-  webkitSpeechRecognition?: SpeechRecognitionConstructor;
-};
+import {
+  getBrowserSpeechRecognitionCtor,
+  readBrowserSpeechRecognitionTranscript,
+  type BrowserSpeechRecognition,
+} from "../../lib/browser-speech-recognition";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 interface SpeechToTextButtonProps {
   disabled?: boolean;
@@ -55,24 +16,15 @@ interface SpeechToTextButtonProps {
   iconSize?: number;
 }
 
-function getSpeechRecognitionCtor(): SpeechRecognitionConstructor | null {
-  if (typeof window === "undefined") return null;
-  const speechWindow = window as SpeechRecognitionWindow;
-  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
-}
-
-function readTranscript(result: SpeechRecognitionResultLike | undefined): string {
-  return result?.[0]?.transcript ?? result?.item(0)?.transcript ?? "";
-}
-
 export function SpeechToTextButton({ disabled, onTranscript, className, iconSize = 16 }: SpeechToTextButtonProps) {
+  const { t: localizeUi } = useUiTranslation();
   const [supported, setSupported] = useState(false);
   const [listening, setListening] = useState(false);
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const disabledRef = useRef(Boolean(disabled));
 
   useEffect(() => {
-    setSupported(Boolean(getSpeechRecognitionCtor()));
+    setSupported(Boolean(getBrowserSpeechRecognitionCtor()));
     return () => {
       recognitionRef.current?.abort();
       recognitionRef.current = null;
@@ -99,9 +51,9 @@ export function SpeechToTextButton({ disabled, onTranscript, className, iconSize
     }
     if (disabledRef.current) return;
 
-    const Recognition = getSpeechRecognitionCtor();
+    const Recognition = getBrowserSpeechRecognitionCtor();
     if (!Recognition) {
-      toast.error("Speech recognition is not supported in this browser.");
+      toast.error(localizeUi("ui.ui.speechtotextbutton.speechRecognitionIsNotSupportedInThisBrowser"));
       return;
     }
 
@@ -113,7 +65,7 @@ export function SpeechToTextButton({ disabled, onTranscript, className, iconSize
     recognition.onresult = (event) => {
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
         const result = event.results[index] ?? event.results.item(index);
-        const transcript = readTranscript(result);
+        const transcript = readBrowserSpeechRecognitionTranscript(result);
         if (result?.isFinal && transcript.trim()) {
           finalTranscript = `${finalTranscript} ${transcript}`.trim();
         }
@@ -123,7 +75,7 @@ export function SpeechToTextButton({ disabled, onTranscript, className, iconSize
       const error = event.error ?? "unknown";
       setListening(false);
       if (!["aborted", "no-speech"].includes(error)) {
-        toast.error(`Speech recognition failed: ${error}`);
+        toast.error(localizeUi("ui.ui.speechtotextbutton.speechRecognitionFailedValue1", { value1: error }));
       }
     };
     recognition.onend = () => {
@@ -141,9 +93,9 @@ export function SpeechToTextButton({ disabled, onTranscript, className, iconSize
     } catch {
       recognitionRef.current = null;
       setListening(false);
-      toast.error("Could not start speech recognition.");
+      toast.error(localizeUi("ui.ui.speechtotextbutton.couldNotStartSpeechRecognition"));
     }
-  }, [listening, onTranscript, stopListening]);
+  }, [listening, onTranscript, stopListening, localizeUi]);
 
   return (
     <button
@@ -162,13 +114,13 @@ export function SpeechToTextButton({ disabled, onTranscript, className, iconSize
       )}
       title={
         listening
-          ? "Stop dictation"
+          ?localizeUi("ui.ui.speechtotextbutton.stopDictation")
           : supported
-            ? "Dictate message"
-            : "Speech recognition is not supported in this browser"
+            ?localizeUi("ui.ui.speechtotextbutton.dictateMessage")
+            :localizeUi("ui.ui.speechtotextbutton.speechRecognitionIsNotSupportedInThisBrowser_d6f5969")
       }
       aria-pressed={listening}
-      aria-label={listening ? "Stop dictation" : "Dictate message"}
+      aria-label={listening ?localizeUi("ui.ui.speechtotextbutton.stopDictation") :localizeUi("ui.ui.speechtotextbutton.dictateMessage")}
     >
       {supported ? <Mic size={iconSize} /> : <MicOff size={iconSize} />}
     </button>

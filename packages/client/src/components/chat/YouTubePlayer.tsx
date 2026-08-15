@@ -13,6 +13,7 @@ import { useUIStore } from "@/stores/ui.store";
 import { api } from "@/lib/api-client";
 import { cn } from "@/lib/utils";
 import { MusicSourceButton, MusicSourceGlyph } from "@/components/music/MusicSourceButton";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 // The YouTube IFrame API attaches itself to window; it has no bundled types.
 type YTPlayer = {
@@ -34,19 +35,21 @@ interface SearchResult {
 
 let ytApiPromise: Promise<void> | null = null;
 
-const MUSIC_NEUTRAL_BORDER_CLASS = "border-[#f7f3ef]/15";
-const MUSIC_NEUTRAL_SHELL_BORDER_CLASS = "border-[#f7f3ef]/15";
-const MUSIC_NEUTRAL_SHELL_BG_CLASS = "bg-[#0f0f0f]/95";
-const MUSIC_NEUTRAL_BUTTON_BG_CLASS = "bg-[#f7f3ef]/5";
-const MUSIC_NEUTRAL_TILE_BG_CLASS = "bg-[#f7f3ef]/5";
-const MUSIC_NEUTRAL_TEXT_CLASS = "text-[#f7f3ef]";
-const MUSIC_NEUTRAL_MUTED_CLASS = "text-[#aaa]";
-const MUSIC_NEUTRAL_ICON_CLASS = "text-[#aaa]";
-const MUSIC_NEUTRAL_ICON_HOVER_CLASS = "hover:bg-[#f7f3ef]/10 hover:text-[#f7f3ef]";
-const MUSIC_NEUTRAL_PROGRESS_BG_CLASS = "bg-[#f7f3ef]/15";
+const MUSIC_NEUTRAL_BORDER_CLASS = "border-[var(--marinara-music-player-button-border)]";
+const MUSIC_NEUTRAL_SHELL_BORDER_CLASS = "border-[var(--marinara-music-player-shell-border)]";
+const MUSIC_NEUTRAL_SHELL_BG_CLASS = "bg-[var(--marinara-music-player-shell-bg)]";
+const MUSIC_NEUTRAL_BUTTON_BG_CLASS = "bg-[var(--marinara-music-player-button-bg)]";
+const MUSIC_NEUTRAL_TILE_BG_CLASS = "bg-[var(--marinara-music-player-tile-bg)]";
+const MUSIC_NEUTRAL_TILE_RING_CLASS = "ring-[var(--marinara-music-player-tile-ring)]";
+const MUSIC_NEUTRAL_TEXT_CLASS = "text-[var(--marinara-music-player-text)]";
+const MUSIC_NEUTRAL_MUTED_CLASS = "text-[var(--marinara-music-player-muted)]";
+const MUSIC_NEUTRAL_ICON_CLASS = "text-[var(--marinara-music-player-icon)]";
+const MUSIC_NEUTRAL_ICON_HOVER_CLASS =
+  "hover:bg-[var(--marinara-music-player-button-bg-hover)] hover:text-[var(--marinara-music-player-icon-hover)]";
+const MUSIC_NEUTRAL_PROGRESS_BG_CLASS = "bg-[var(--marinara-music-player-progress-bg)]";
 const MUSIC_NEUTRAL_PROGRESS_FILL_CLASS = "bg-[#FF0000]";
-const MUSIC_NEUTRAL_ACTION_BG_CLASS = "bg-[#f7f3ef]";
-const MUSIC_NEUTRAL_ACTION_TEXT_CLASS = "text-[#0f0f0f]";
+const MUSIC_NEUTRAL_ACTION_BG_CLASS = "bg-[var(--marinara-music-player-action-bg)]";
+const MUSIC_NEUTRAL_ACTION_TEXT_CLASS = "text-[var(--marinara-music-player-action-text)]";
 const YOUTUBE_LOGO_CLASS = "text-[#FF0000]";
 const MOBILE_WIDGET_COLLAPSED_SIZE = 48;
 const MOBILE_WIDGET_EXPANDED_MAX_WIDTH = 320;
@@ -140,6 +143,7 @@ function loadYouTubeApi(): Promise<void> {
  * and plays it in an in-app IFrame player. No OAuth, no external device.
  */
 export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
+  const { t: localizeUi } = useUiTranslation();
   const youtubePlay = useAgentStore((s) => s.youtubePlay);
   const youtubeVolume = useAgentStore((s) => s.youtubeVolume);
   const clearYoutube = useAgentStore((s) => s.clearYoutube);
@@ -412,8 +416,8 @@ export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
           MUSIC_NEUTRAL_ICON_CLASS,
           MUSIC_NEUTRAL_ICON_HOVER_CLASS,
         )}
-        title={volumeMuted ? "Unmute" : "Mute"}
-        aria-label={volumeMuted ? "Unmute" : "Mute"}
+        title={volumeMuted ?localizeUi("ui.game.gamevolumemixer.unmute") :localizeUi("ui.game.gamevolumemixer.mute")}
+        aria-label={volumeMuted ?localizeUi("ui.game.gamevolumemixer.unmute") :localizeUi("ui.game.gamevolumemixer.mute")}
       >
         <VolumeIcon size="0.75rem" />
       </button>
@@ -425,8 +429,9 @@ export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
         value={playerVolume}
         onChange={(event) => setPlayerVolume(Number(event.target.value))}
         className="mari-youtube-volume-slider w-full"
-        title="Volume"
-        aria-label="YouTube volume"
+        title={localizeUi("game.toolbar.volume")}
+        aria-label={localizeUi("ui.chat.youtubeplayer.youtubeVolume")}
+        style={{ "--range-progress": `${playerVolume}%` } as CSSProperties}
       />
     </div>
   );
@@ -439,7 +444,7 @@ export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
           className={cn(
             "flex h-7 w-10 shrink-0 items-center justify-center overflow-hidden rounded-[0.375rem] ring-1",
             MUSIC_NEUTRAL_TILE_BG_CLASS,
-            "ring-[#f7f3ef]/10",
+            MUSIC_NEUTRAL_TILE_RING_CLASS,
           )}
         >
           {loading ? (
@@ -469,7 +474,7 @@ export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
             MUSIC_NEUTRAL_ACTION_BG_CLASS,
             MUSIC_NEUTRAL_ACTION_TEXT_CLASS,
           )}
-          aria-label={paused ? "Play" : "Pause"}
+          aria-label={paused ?localizeUi("ui.chat.localmusicplayer.play") :localizeUi("ui.chat.localmusicplayer.pause")}
         >
           {paused ? <Play size="0.8125rem" className="translate-x-px" /> : <Pause size="0.8125rem" />}
         </button>
@@ -483,7 +488,7 @@ export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
             MUSIC_NEUTRAL_ICON_CLASS,
             MUSIC_NEUTRAL_ICON_HOVER_CLASS,
           )}
-          aria-label={showVideo ? "Hide video" : "Show video"}
+          aria-label={showVideo ?localizeUi("ui.chat.youtubeplayer.hideVideo") :localizeUi("ui.chat.youtubeplayer.showVideo")}
         >
           {showVideo ? <ChevronUp size="0.8125rem" /> : <ChevronDown size="0.8125rem" />}
         </button>
@@ -497,7 +502,7 @@ export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
             MUSIC_NEUTRAL_ICON_CLASS,
             MUSIC_NEUTRAL_ICON_HOVER_CLASS,
           )}
-          aria-label="Stop"
+          aria-label={localizeUi("ui.chat.summarypopover.stop")}
         >
           <X size="0.8125rem" />
         </button>
@@ -540,7 +545,7 @@ export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
       <>
         {showPlayer && (
           <div
-            className="fixed z-[35] touch-none select-none md:hidden"
+            className="fixed z-[45] touch-none select-none md:hidden"
             style={mobileWidgetStyle}
             onPointerDown={startDrag}
             onPointerMove={moveDrag}
@@ -568,9 +573,7 @@ export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
               >
                 <div className="mb-1 flex items-center gap-1">
                   <GripVertical size="0.875rem" className={MUSIC_NEUTRAL_ICON_CLASS} />
-                  <span className={cn("flex-1 truncate text-[0.625rem] font-medium", MUSIC_NEUTRAL_ICON_CLASS)}>
-                    YouTube
-                  </span>
+                  <span className={cn("flex-1 truncate text-[0.625rem] font-medium", MUSIC_NEUTRAL_ICON_CLASS)}>{localizeUi("ui.chat.youtubeplayer.youtube")}</span>
                   <button
                     type="button"
                     onPointerDown={(event) => event.stopPropagation()}
@@ -586,7 +589,7 @@ export function YouTubePlayer({ mobile = false }: { mobile?: boolean } = {}) {
                       MUSIC_NEUTRAL_ICON_CLASS,
                       MUSIC_NEUTRAL_ICON_HOVER_CLASS,
                     )}
-                    title="Close player"
+                    title={localizeUi("ui.chat.localmusicplayer.closePlayer")}
                   >
                     <X size="0.875rem" />
                   </button>

@@ -19,6 +19,7 @@ export function isClaudeAdaptiveOnlyNoSamplingModel(model: string): boolean {
   const normalized = model.toLowerCase();
   return (
     CLAUDE_ADAPTIVE_ONLY_OPUS_RE.test(normalized) ||
+    /claude-(?:opus|sonnet)-5(?:$|[-.])/u.test(normalized) ||
     normalized.includes("claude-fable-5") ||
     normalized.includes("claude-mythos-5")
   );
@@ -27,6 +28,7 @@ export function isClaudeAdaptiveOnlyNoSamplingModel(model: string): boolean {
 export function supportsXhighReasoningEffort(model: string): boolean {
   const normalized = model.toLowerCase();
   return (
+    normalized.startsWith("gpt-5.6") ||
     normalized.startsWith("gpt-5.5") ||
     normalized.startsWith("gpt-5.4") ||
     normalized === "grok-4.20-multi-agent" ||
@@ -34,9 +36,72 @@ export function supportsXhighReasoningEffort(model: string): boolean {
   );
 }
 
+export function isOpenAIGpt56Model(model: string): boolean {
+  return model.toLowerCase().startsWith("gpt-5.6");
+}
+
+export function isOpenAIGpt56SolProAlias(model: string): boolean {
+  return model.toLowerCase() === "gpt-5.6-sol-pro";
+}
+
+export function resolveOpenAIGpt56ModelForRequest(model: string): string {
+  return isOpenAIGpt56SolProAlias(model) ? "gpt-5.6-sol" : model;
+}
+
+export type StoredReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "maximum" | "max" | null;
+export type ProviderReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | null;
+
+export function resolveProviderReasoningEffort(args: {
+  provider: string;
+  model: string;
+  reasoningEffort: StoredReasoningEffort | undefined;
+}): ProviderReasoningEffort {
+  if (!args.reasoningEffort || args.reasoningEffort === "none") return null;
+  const modelLower = args.model.toLowerCase();
+  const providerLower = args.provider.toLowerCase();
+
+  const xaiUsesAutoReasoning =
+    (providerLower === "xai" && isXaiAutoReasoningModel(modelLower)) ||
+    (providerLower === "openrouter" && modelLower.startsWith("x-ai/grok-"));
+  if (xaiUsesAutoReasoning) return null;
+
+  const isNativeAnthropicAdaptiveOnly =
+    (providerLower === "anthropic" || providerLower === "claude_subscription") &&
+    isClaudeAdaptiveOnlyNoSamplingModel(modelLower);
+  const supportsXhigh = supportsXhighReasoningEffort(modelLower);
+  const supportsMax = isOpenAIGpt56Model(modelLower) || isNativeAnthropicAdaptiveOnly;
+
+  if (args.reasoningEffort === "maximum") {
+    return supportsMax ? "max" : supportsXhigh ? "xhigh" : "high";
+  }
+  if (args.reasoningEffort === "max") {
+    return supportsMax ? "max" : supportsXhigh ? "xhigh" : "high";
+  }
+  if (args.reasoningEffort === "xhigh") {
+    return supportsXhigh ? "xhigh" : "high";
+  }
+  return args.reasoningEffort;
+}
+
+export function isXaiConfigurableReasoningModel(model: string): boolean {
+  const normalized = model.toLowerCase().replace(/^x-ai\//, "");
+  return normalized.startsWith("grok-4.5") || normalized.startsWith("grok-4.3");
+}
+
+export function isXaiAutoReasoningModel(model: string): boolean {
+  const normalized = model.toLowerCase().replace(/^x-ai\//, "");
+  return normalized.startsWith("grok-4-1-fast");
+}
+
 // ── OpenAI (from #model_openai_select) ──
 
 export const OPENAI_MODELS: KnownModel[] = [
+  // GPT-5.6
+  { id: "gpt-5.6", name: "gpt-5.6 (alias for gpt-5.6-sol)", context: 1050000, maxOutput: 128000 },
+  { id: "gpt-5.6-sol", name: "gpt-5.6-sol", context: 1050000, maxOutput: 128000 },
+  { id: "gpt-5.6-sol-pro", name: "gpt-5.6-sol-pro (Sol with pro mode)", context: 1050000, maxOutput: 128000 },
+  { id: "gpt-5.6-terra", name: "gpt-5.6-terra", context: 1050000, maxOutput: 128000 },
+  { id: "gpt-5.6-luna", name: "gpt-5.6-luna", context: 1050000, maxOutput: 128000 },
   // GPT-5.5
   { id: "gpt-5.5", name: "gpt-5.5", context: 1050000, maxOutput: 128000 },
   { id: "gpt-5.5-2026-04-23", name: "gpt-5.5-2026-04-23", context: 1050000, maxOutput: 128000 },
@@ -137,6 +202,8 @@ export const OPENAI_MODELS: KnownModel[] = [
 // ── Anthropic / Claude (from #model_claude_select) ──
 
 export const ANTHROPIC_MODELS: KnownModel[] = [
+  { id: "claude-opus-5", name: "claude-opus-5", context: 1000000, maxOutput: 128000 },
+  { id: "claude-sonnet-5", name: "claude-sonnet-5", context: 1000000, maxOutput: 128000 },
   { id: "claude-fable-5", name: "claude-fable-5", context: 1000000, maxOutput: 128000 },
   { id: "claude-mythos-5", name: "claude-mythos-5 (limited access)", context: 1000000, maxOutput: 128000 },
   { id: "claude-opus-4-8", name: "claude-opus-4-8", context: 1000000, maxOutput: 128000 },
@@ -173,6 +240,8 @@ export const ANTHROPIC_MODELS: KnownModel[] = [
 // to the current tool-eligible families to avoid offering retired aliases that
 // the subscription path no longer accepts.
 export const CLAUDE_SUBSCRIPTION_MODELS: KnownModel[] = [
+  { id: "claude-opus-5", name: "Claude Opus 5", context: 1000000, maxOutput: 128000 },
+  { id: "claude-sonnet-5", name: "Claude Sonnet 5", context: 1000000, maxOutput: 128000 },
   { id: "claude-fable-5", name: "Claude Fable 5", context: 1000000, maxOutput: 128000 },
   { id: "claude-opus-4-8", name: "Claude Opus 4.8", context: 1000000, maxOutput: 128000 },
   { id: "claude-opus-4-7", name: "Claude Opus 4.7", context: 1000000, maxOutput: 128000 },
@@ -206,6 +275,8 @@ export const OPENAI_CHATGPT_MODELS: KnownModel[] = [
 // ── Google AI Studio (from #model_google_select) ──
 
 export const GOOGLE_MODELS: KnownModel[] = [
+  // Gemini 3.6
+  { id: "gemini-3.6-flash", name: "gemini-3.6-flash", context: 1000000, maxOutput: 65536 },
   // Gemini 3.5
   { id: "gemini-3.5-flash", name: "gemini-3.5-flash", context: 1000000, maxOutput: 65536 },
   // Gemini 3.1
@@ -313,6 +384,10 @@ export const GOOGLE_MODELS: KnownModel[] = [
   { id: "gemini-2.0-flash-lite-preview", name: "gemini-2.0-flash-lite-preview", context: 1000000, maxOutput: 8192 },
   { id: "gemini-2.0-flash-lite", name: "gemini-2.0-flash-lite", context: 1000000, maxOutput: 8192 },
   // Gemma
+  { id: "gemma-4-31b-it", name: "gemma-4-31b-it", context: 256000, maxOutput: 8192 },
+  { id: "gemma-4-26b-a4b-it", name: "gemma-4-26b-a4b-it", context: 256000, maxOutput: 8192 },
+  { id: "gemma-4-12b-it", name: "gemma-4-12b-it", context: 256000, maxOutput: 8192 },
+  { id: "gemma-4-4b-it", name: "gemma-4-4b-it", context: 131072, maxOutput: 8192 },
   { id: "gemma-3n-e4b-it", name: "gemma-3n-e4b-it", context: 32768, maxOutput: 8192 },
   { id: "gemma-3n-e2b-it", name: "gemma-3n-e2b-it", context: 32768, maxOutput: 8192 },
   { id: "gemma-3-27b-it", name: "gemma-3-27b-it", context: 32768, maxOutput: 8192 },
@@ -364,7 +439,10 @@ export const OPENROUTER_MODELS: KnownModel[] = [];
 // ── xAI / Grok (OpenAI-compatible API) ──
 
 export const XAI_MODELS: KnownModel[] = [
-  // Official xAI docs recommend Grok 4.3 for standard chat API usage.
+  // Grok 4.5 launched July 8, 2026. The launch post gives the API ID; xAI's
+  // current Grok text family uses a 1M context window in the model docs.
+  { id: "grok-4.5", name: "Grok 4.5", context: 1000000, maxOutput: 0 },
+  { id: "grok-4.5-latest", name: "Grok 4.5 Latest", context: 1000000, maxOutput: 0 },
   { id: "grok-4.3", name: "Grok 4.3", context: 1000000, maxOutput: 0 },
   { id: "grok-4.3-latest", name: "Grok 4.3 Latest", context: 1000000, maxOutput: 0 },
   { id: "grok-latest", name: "Grok Latest", context: 1000000, maxOutput: 0 },
@@ -385,6 +463,12 @@ export const XAI_MODELS: KnownModel[] = [
   { id: "grok-code-fast-1-0825", name: "Grok Code Fast 1 0825", context: 256000, maxOutput: 0 },
   { id: "grok-code-fast-1-0831", name: "Grok Code Fast 1 0831", context: 256000, maxOutput: 0 },
 ];
+
+// ── Grok CLI (Subscription via local Grok Build auth) ──
+// Account-tier availability is discovered from the installed CLI with
+// `grok models`. Keep this empty so Marinara does not hand the CLI stale API
+// aliases such as `grok-build-latest` that some Grok CLI installs reject.
+export const GROK_SUBSCRIPTION_MODELS: KnownModel[] = [];
 
 // ── Additional providers with static lists in SillyTavern ──
 
@@ -415,9 +499,16 @@ export const GROQ_MODELS: KnownModel[] = [
 
 // DeepSeek (from #model_deepseek_select)
 export const DEEPSEEK_MODELS: KnownModel[] = [
+  { id: "deepseek-v4-pro", name: "deepseek-v4-pro", context: 1_000_000, maxOutput: 384_000 },
+  { id: "deepseek-v4-flash", name: "deepseek-v4-flash", context: 1_000_000, maxOutput: 384_000 },
   { id: "deepseek-chat", name: "deepseek-chat", context: 131072, maxOutput: 8192 },
   { id: "deepseek-coder", name: "deepseek-coder", context: 131072, maxOutput: 8192 },
   { id: "deepseek-reasoner", name: "deepseek-reasoner", context: 131072, maxOutput: 8192 },
+];
+
+// Xiaomi MiMo (available through OAI-compatible aggregators and direct APIs)
+export const MIMO_MODELS: KnownModel[] = [
+  { id: "mimo-v2.5-pro", name: "mimo-v2.5-pro", context: 1_000_000, maxOutput: 128_000 },
 ];
 
 // Perplexity (from #model_perplexity_select)
@@ -434,6 +525,8 @@ export const PERPLEXITY_MODELS: KnownModel[] = [
 
 // Moonshot (from #model_moonshot_select)
 export const MOONSHOT_MODELS: KnownModel[] = [
+  { id: "kimi-k3", name: "kimi-k3", context: 1_048_576, maxOutput: 131_072 },
+  { id: "kimi-k2.6", name: "kimi-k2.6", context: 262_144, maxOutput: 32_768 },
   { id: "kimi-k2-0711-preview", name: "kimi-k2-0711-preview", context: 256000, maxOutput: 8192 },
   { id: "moonshot-v1-8k", name: "moonshot-v1-8k", context: 8192, maxOutput: 4096 },
   { id: "moonshot-v1-32k", name: "moonshot-v1-32k", context: 32768, maxOutput: 4096 },
@@ -448,7 +541,9 @@ export const MOONSHOT_MODELS: KnownModel[] = [
 
 // Z.AI / GLM (from #model_zai_select)
 export const ZAI_MODELS: KnownModel[] = [
-  { id: "glm-5", name: "glm-5", context: 200000, maxOutput: 8192 },
+  { id: "glm-5.2", name: "glm-5.2", context: 1000000, maxOutput: 128000 },
+  { id: "glm-5.1", name: "glm-5.1", context: 200_000, maxOutput: 128_000 },
+  { id: "glm-5", name: "glm-5", context: 200000, maxOutput: 128000 },
   { id: "glm-4.7", name: "glm-4.7", context: 200000, maxOutput: 8192 },
   { id: "glm-4.7-flash", name: "glm-4.7-flash", context: 200000, maxOutput: 8192 },
   { id: "glm-4.7-flashx", name: "glm-4.7-flashx", context: 200000, maxOutput: 8192 },
@@ -494,6 +589,66 @@ export interface ImageGenSource {
   requiresApiKey: boolean;
 }
 
+export interface VideoGenSource {
+  id: string;
+  name: string;
+  description: string;
+  defaultBaseUrl: string;
+  requiresApiKey: boolean;
+}
+
+export const VIDEO_GENERATION_SOURCES: VideoGenSource[] = [
+  {
+    id: "google_ai_studio",
+    name: "Google AI Studio",
+    description: "Gemini Omni and Veo video models via the Gemini API.",
+    defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    requiresApiKey: true,
+  },
+  {
+    id: "xai",
+    name: "xAI Imagine",
+    description: "Grok Imagine video and image-to-video via the xAI Videos API.",
+    defaultBaseUrl: "https://api.x.ai/v1",
+    requiresApiKey: true,
+  },
+  {
+    id: "openrouter",
+    name: "OpenRouter Video",
+    description: "Video generation models exposed through OpenRouter's asynchronous Videos API.",
+    defaultBaseUrl: "https://openrouter.ai/api/v1",
+    requiresApiKey: true,
+  },
+  {
+    id: "atlas",
+    name: "Atlas Cloud",
+    description: "Atlas Cloud image and video models through its asynchronous media API.",
+    defaultBaseUrl: "https://api.atlascloud.ai/api/v1",
+    requiresApiKey: true,
+  },
+  {
+    id: "seedance",
+    name: "Seedance 2.0",
+    description: "Seedance 2.0 video generation with text, first-frame, and first/last-frame modes.",
+    defaultBaseUrl: "https://api.seedance2.ai",
+    requiresApiKey: true,
+  },
+  {
+    id: "comfyui",
+    name: "ComfyUI",
+    description: "Local API-format workflows for WAN and other video models.",
+    defaultBaseUrl: "http://127.0.0.1:8188",
+    requiresApiKey: false,
+  },
+  {
+    id: "swarmui",
+    name: "SwarmUI",
+    description: "Swarm-managed video generation through distributed ComfyUI workflows.",
+    defaultBaseUrl: "http://127.0.0.1:7801",
+    requiresApiKey: false,
+  },
+];
+
 export const IMAGE_GENERATION_SOURCES: ImageGenSource[] = [
   {
     id: "openai",
@@ -517,6 +672,13 @@ export const IMAGE_GENERATION_SOURCES: ImageGenSource[] = [
     requiresApiKey: true,
   },
   {
+    id: "arli",
+    name: "Arli AI",
+    description: "Hosted Stable Diffusion models through Arli AI's native image API.",
+    defaultBaseUrl: "https://api.arliai.com/v1",
+    requiresApiKey: true,
+  },
+  {
     id: "novelai",
     name: "NovelAI",
     description: "NovelAI Diffusion anime-style image generation.",
@@ -535,6 +697,27 @@ export const IMAGE_GENERATION_SOURCES: ImageGenSource[] = [
     name: "xAI / Grok Imagine",
     description: "Grok Imagine image generation via xAI's Images API.",
     defaultBaseUrl: "https://api.x.ai/v1",
+    requiresApiKey: true,
+  },
+  {
+    id: "venice",
+    name: "Venice.ai",
+    description: "Private image generation through Venice's native image API.",
+    defaultBaseUrl: "https://api.venice.ai/api/v1",
+    requiresApiKey: true,
+  },
+  {
+    id: "zai",
+    name: "Z.AI",
+    description: "GLM-Image and CogView image generation through Z.AI's native API.",
+    defaultBaseUrl: "https://api.z.ai/api/paas/v4",
+    requiresApiKey: true,
+  },
+  {
+    id: "atlas",
+    name: "Atlas Cloud",
+    description: "Image generation across Atlas Cloud's model catalog.",
+    defaultBaseUrl: "https://api.atlascloud.ai/api/v1",
     requiresApiKey: true,
   },
   {
@@ -563,6 +746,13 @@ export const IMAGE_GENERATION_SOURCES: ImageGenSource[] = [
     name: "ComfyUI",
     description: "Local node-based image generation with ComfyUI.",
     defaultBaseUrl: "http://127.0.0.1:8188",
+    requiresApiKey: false,
+  },
+  {
+    id: "swarmui",
+    name: "SwarmUI",
+    description: "Swarm-managed image generation and distributed ComfyUI workflows.",
+    defaultBaseUrl: "http://127.0.0.1:7801",
     requiresApiKey: false,
   },
   {
@@ -596,6 +786,39 @@ export const IMAGE_GENERATION_SOURCES: ImageGenSource[] = [
 ];
 
 // Known image generation models (grouped by service)
+export const ATLAS_CLOUD_IMAGE_MODELS: KnownModel[] = [
+  { id: "google/nano-banana/text-to-image", name: "Nano Banana (Atlas Cloud)", context: 0, maxOutput: 0 },
+  {
+    id: "google/gemini-2.5-flash-image/text-to-image",
+    name: "Gemini 2.5 Flash Image (Atlas Cloud)",
+    context: 0,
+    maxOutput: 0,
+  },
+  { id: "black-forest-labs/flux-1.1-pro", name: "FLUX 1.1 Pro (Atlas Cloud)", context: 0, maxOutput: 0 },
+];
+
+export const ZAI_IMAGE_MODELS: KnownModel[] = [
+  { id: "glm-image", name: "GLM-Image", context: 0, maxOutput: 0 },
+  { id: "cogview-4-250304", name: "CogView 4", context: 0, maxOutput: 0 },
+];
+
+export const ATLAS_CLOUD_VIDEO_MODELS: KnownModel[] = [
+  { id: "google/veo3.1/text-to-video", name: "Veo 3.1 Text to Video (Atlas Cloud)", context: 0, maxOutput: 0 },
+  { id: "google/veo3.1/image-to-video", name: "Veo 3.1 Image to Video (Atlas Cloud)", context: 0, maxOutput: 0 },
+  {
+    id: "bytedance/seedance-2.0-fast/text-to-video",
+    name: "Seedance 2.0 Fast Text to Video (Atlas Cloud)",
+    context: 0,
+    maxOutput: 0,
+  },
+  {
+    id: "bytedance/seedance-2.0-fast/image-to-video",
+    name: "Seedance 2.0 Fast Image to Video (Atlas Cloud)",
+    context: 0,
+    maxOutput: 0,
+  },
+];
+
 const IMAGE_GEN_MODELS: KnownModel[] = [
   // OpenAI
   { id: "gpt-image-2", name: "GPT Image 2", context: 0, maxOutput: 0 },
@@ -636,10 +859,22 @@ const IMAGE_GEN_MODELS: KnownModel[] = [
     context: 0,
     maxOutput: 0,
   },
+  {
+    id: "bytedance-seed/seedream-4.5",
+    name: "Seedream 4.5 (OpenRouter)",
+    context: 0,
+    maxOutput: 0,
+  },
   // xAI / Grok Imagine
   { id: "grok-4.1-fast-image", name: "Grok 4.1 Fast Image", context: 0, maxOutput: 0 },
   { id: "grok-imagine-image", name: "Grok Imagine Image", context: 0, maxOutput: 0 },
   { id: "grok-2-image", name: "Grok 2 Image", context: 0, maxOutput: 0 },
+  // Venice.ai
+  { id: "chroma", name: "Chroma (Venice)", context: 0, maxOutput: 0 },
+  { id: "flux-2-pro", name: "FLUX 2 Pro (Venice)", context: 0, maxOutput: 0 },
+  { id: "venice-sd35", name: "Venice SD3.5", context: 0, maxOutput: 0 },
+  ...ZAI_IMAGE_MODELS,
+  ...ATLAS_CLOUD_IMAGE_MODELS,
   // NovelAI
   { id: "nai-diffusion-4-curated-preview", name: "NAI Diffusion 4 Curated", context: 0, maxOutput: 0 },
   { id: "nai-diffusion-4-5-full", name: "NAI Diffusion 4.5 Full", context: 0, maxOutput: 0 },
@@ -647,6 +882,37 @@ const IMAGE_GEN_MODELS: KnownModel[] = [
   // Pollinations (model-free, but include as placeholder)
   { id: "pollinations", name: "Pollinations (Auto)", context: 0, maxOutput: 0 },
 ];
+
+const VIDEO_GEN_MODELS: KnownModel[] = [
+  { id: "gemini-omni-flash-preview", name: "Gemini Omni Flash Preview", context: 0, maxOutput: 0 },
+  { id: "veo-3.1-generate-preview", name: "Veo 3.1 Generate Preview", context: 0, maxOutput: 0 },
+  { id: "veo-3.1-fast-generate-preview", name: "Veo 3.1 Fast Generate Preview", context: 0, maxOutput: 0 },
+  { id: "veo-3.1-lite-generate-preview", name: "Veo 3.1 Lite Generate Preview", context: 0, maxOutput: 0 },
+  { id: "veo-3.0-generate-preview", name: "Veo 3 Generate Preview", context: 0, maxOutput: 0 },
+  { id: "veo-3.0-fast-generate-preview", name: "Veo 3 Fast Generate Preview", context: 0, maxOutput: 0 },
+  { id: "grok-imagine-video-1.5", name: "Grok Imagine Video 1.5", context: 0, maxOutput: 0 },
+  { id: "grok-imagine-video", name: "Grok Imagine Video", context: 0, maxOutput: 0 },
+  { id: "google/veo-3.1", name: "Google Veo 3.1 (OpenRouter)", context: 0, maxOutput: 0 },
+  { id: "alibaba/wan-2.7", name: "Alibaba WAN 2.7 (OpenRouter)", context: 0, maxOutput: 0 },
+  { id: "seedance-2-0", name: "Seedance 2.0", context: 0, maxOutput: 0 },
+  { id: "seedance-2-0-fast", name: "Seedance 2.0 Fast", context: 0, maxOutput: 0 },
+  ...ATLAS_CLOUD_VIDEO_MODELS,
+];
+
+export function inferVideoSource(model: string, baseUrl: string): string {
+  const m = model.toLowerCase();
+  const u = baseUrl.toLowerCase();
+  if (m === "swarmui" || u.includes(":7801") || u.includes("swarmui")) return "swarmui";
+  if (m === "comfyui" || u.includes(":8188") || u.includes("comfyui")) return "comfyui";
+  if (m === "atlas" || u.includes("atlascloud.ai")) return "atlas";
+  if (m === "seedance" || m.startsWith("seedance-") || u.includes("seedance2.ai")) return "seedance";
+  if (m === "openrouter" || u.includes("openrouter.ai")) return "openrouter";
+  if (m.includes("/") && (m.includes("veo") || m.includes("wan"))) return "openrouter";
+  if (m === "google_veo" || m === "veo" || /^veo-[\d.]+/.test(m)) return "google_veo";
+  if (m === "xai" || u.includes("api.x.ai") || u.includes("x.ai")) return "xai";
+  if (m.includes("grok") && m.includes("imagine") && m.includes("video")) return "xai";
+  return "gemini_omni";
+}
 
 /**
  * Infer which image generation API source to use from the model name and base URL.
@@ -659,13 +925,18 @@ export function inferImageSource(model: string, baseUrl: string): string {
     m === "openai" ||
     m === "stability" ||
     m === "togetherai" ||
+    m === "arli" ||
     m === "novelai" ||
     m === "pollinations" ||
     m === "horde" ||
     m === "blockentropy" ||
     m === "openrouter" ||
     m === "xai" ||
+    m === "venice" ||
+    m === "zai" ||
+    m === "atlas" ||
     m === "comfyui" ||
+    m === "swarmui" ||
     m === "automatic1111" ||
     m === "runpod_comfyui" ||
     m === "gemini_image"
@@ -676,6 +947,11 @@ export function inferImageSource(model: string, baseUrl: string): string {
   if (u.includes("nano-gpt.com")) return "nanogpt";
   if (u.includes("openrouter.ai")) return "openrouter";
   if (u.includes("api.x.ai") || u.includes("x.ai")) return "xai";
+  if (u.includes("venice.ai")) return "venice";
+  if (u.includes("api.z.ai")) return "zai";
+  if (u.includes("atlascloud.ai")) return "atlas";
+  if (u.includes("arliai.com")) return "arli";
+  if (m === "glm-image" || m.startsWith("cogview")) return "zai";
   if (m.startsWith("grok-") && m.includes("image")) return "xai";
   if (m.includes("grok") && m.includes("imagine")) return "xai";
   if (m.startsWith("dall-e") || m.startsWith("gpt-image") || u.includes("openai.com")) return "openai";
@@ -685,6 +961,7 @@ export function inferImageSource(model: string, baseUrl: string): string {
   if (m.includes("black-forest") || m.includes("flux") || u.includes("together.xyz")) return "togetherai";
   if (u.includes("stablehorde.net")) return "horde";
   if (u.includes("blockentropy")) return "blockentropy";
+  if (u.includes(":7801") || u.includes("swarmui")) return "swarmui";
   if (u.includes(":8188") || u.includes("comfyui")) return "comfyui";
   if (u.includes("runpod.ai")) return "runpod_comfyui";
   if (u.includes(":7860") && !u.includes("drawthings")) return "automatic1111";
@@ -702,6 +979,7 @@ export const MODEL_LISTS: Record<APIProvider, KnownModel[]> = {
   openai_chatgpt: OPENAI_CHATGPT_MODELS,
   anthropic: ANTHROPIC_MODELS,
   claude_subscription: CLAUDE_SUBSCRIPTION_MODELS,
+  grok_subscription: GROK_SUBSCRIPTION_MODELS,
   google: GOOGLE_MODELS,
   google_vertex: GOOGLE_MODELS,
   mistral: MISTRAL_MODELS,
@@ -709,16 +987,37 @@ export const MODEL_LISTS: Record<APIProvider, KnownModel[]> = {
   openrouter: OPENROUTER_MODELS,
   nanogpt: [], // NanoGPT aggregator — models fetched dynamically via API
   xai: XAI_MODELS,
+  arli: [], // Arli AI — models fetched dynamically via the /models endpoint
   // Seed OAI-compatible endpoints with the OpenAI catalog; remote /models still merge on top.
-  custom: OPENAI_MODELS,
+  custom: [...OPENAI_MODELS, ...ZAI_MODELS],
   image_generation: IMAGE_GEN_MODELS,
+  video_generation: VIDEO_GEN_MODELS,
 };
+
+const OPENAI_COMPATIBLE_AGGREGATOR_MODELS: KnownModel[] = [
+  ...OPENAI_MODELS,
+  ...ANTHROPIC_MODELS,
+  ...GOOGLE_MODELS,
+  ...DEEPSEEK_MODELS,
+  ...MIMO_MODELS,
+  ...MOONSHOT_MODELS,
+  ...ZAI_MODELS,
+  ...XAI_MODELS,
+];
 
 /**
  * Look up a known model by ID across all providers.
  */
 export function findKnownModel(provider: APIProvider, modelId: string): KnownModel | undefined {
-  return MODEL_LISTS[provider]?.find((m) => m.id === modelId);
+  const exact = MODEL_LISTS[provider]?.find((model) => model.id === modelId);
+  if (exact || (provider !== "openrouter" && provider !== "nanogpt" && provider !== "custom")) return exact;
+
+  // Aggregators namespace model IDs (for example, `deepseek/deepseek-v4-pro`)
+  // while direct OAI-compatible endpoints generally do not. Resolve both
+  // forms without exposing a large, stale static list in their model pickers.
+  const normalizedId = modelId.trim().toLowerCase();
+  const unqualifiedId = normalizedId.split("/").pop()?.split(":", 1)[0] ?? normalizedId;
+  return OPENAI_COMPATIBLE_AGGREGATOR_MODELS.find((model) => model.id.toLowerCase() === unqualifiedId);
 }
 
 function normalizeProviderForCatalog(provider: APIProvider | string): APIProvider | null {
@@ -733,6 +1032,10 @@ export function shouldSuppressUnknownModelParameters(
   if (!provider || !modelId?.trim()) return false;
   const normalizedProvider = normalizeProviderForCatalog(provider);
   if (!normalizedProvider) return false;
+  // Custom OAI-compatible endpoints are user-defined. Their explicit parameter
+  // switches are the compatibility policy; a built-in catalog cannot know what
+  // an arbitrary endpoint accepts.
+  if (normalizedProvider === "custom") return false;
   const catalog = MODEL_LISTS[normalizedProvider];
   if (!catalog || catalog.length === 0) return false;
   return !findKnownModel(normalizedProvider, modelId.trim());

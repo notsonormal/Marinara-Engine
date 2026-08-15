@@ -2,21 +2,30 @@
 // Bubble message layout (Messenger-style)
 // ──────────────────────────────────────────────
 import { User } from "lucide-react";
-import { normalizeTextForMatch } from "@marinara-engine/shared";
+import { normalizeTextForMatch, splitGroupedSegmentDisplayLines } from "@marinara-engine/shared";
 import { cn } from "../../lib/utils";
+import { PendingTypingDots } from "./PendingTypingDots";
+import {
+  MESSAGE_SELECTION_CHECKBOX_CLASS,
+  MESSAGE_SELECTION_CHECKBOX_SELECTED_CLASS,
+} from "./message-selection-styles";
 import {
   HiddenFromAIConversationSummary,
+  DiceMessageContent,
   MessageContent,
   ConversationMessageEditForm,
   ConversationMessageAttachments,
   ConversationMessageTranslation,
   ConversationMessageSwipes,
+  ConversationMessageName,
   nameColorStyle,
   formatTimestamp,
   type MessageRenderContext,
 } from "./ConversationMessageShared";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }) {
+  const { t: localizeUi } = useUiTranslation();
   const {
     message,
     extra,
@@ -25,10 +34,14 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
     displayName,
     avatarUrl,
     avatarCropStyle,
+    avatarCornerClass,
     nameColor,
     mentionNames,
     quoteFormat,
     charByName,
+    charIdByName,
+    selfCharacterId,
+    galleryIndex,
     groupedSegments,
     visibleSegments,
     renderedContent,
@@ -71,7 +84,7 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
   return (
     <>
       {/* Inner row: avatar + body — swipes live outside so avatar never drifts */}
-      <div className={cn("flex items-end gap-2", isUser ? "justify-end" : "justify-start")}>
+      <div className={cn("flex w-full min-w-0 max-w-full items-end gap-2", isUser ? "justify-end" : "justify-start")}>
         {/* Multi-select checkbox */}
         {multiSelectMode && (
           <div className="flex items-center flex-shrink-0">
@@ -79,7 +92,7 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
               type="button"
               role="checkbox"
               aria-checked={isSelected}
-              aria-label={isSelected ? "Deselect message" : "Select message"}
+              aria-label={isSelected ?localizeUi("ui.chat.chatmessage.deselectMessage") :localizeUi("ui.chat.chatmessage.selectMessage")}
               tabIndex={0}
               onClick={(e) => {
                 e.stopPropagation();
@@ -92,13 +105,14 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
                 }
               }}
               className={cn(
-                "h-5 w-5 rounded border-2 flex items-center justify-center transition-colors cursor-pointer",
-                isSelected
-                  ? "border-[var(--destructive)] bg-[var(--destructive)]"
-                  : "border-[var(--muted-foreground)]/40 bg-[var(--secondary)]",
+                MESSAGE_SELECTION_CHECKBOX_CLASS,
+                "flex items-center justify-center",
+                isSelected && MESSAGE_SELECTION_CHECKBOX_SELECTED_CLASS,
               )}
             >
-              {isSelected && <span className="text-white text-xs font-bold">✓</span>}
+              {isSelected && (
+                <span className="text-xs font-bold text-[var(--marinara-chat-chrome-panel-bg)]">✓</span>
+              )}
             </button>
           </div>
         )}
@@ -107,21 +121,48 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
         <div className={cn("mari-message-avatar w-10 flex-shrink-0", shouldHideUserAvatar && "hidden")}>
           {!isGrouped && (
             <>
-              <div className="relative h-10 w-10 overflow-hidden rounded-full bg-[var(--accent)]">
-                {avatarUrl ? (
-                  <img
-                    src={avatarUrl}
-                    alt={displayName}
-                    loading="lazy"
-                    className="h-full w-full object-cover"
-                    style={avatarCropStyle}
-                  />
-                ) : (
-                  <div className="flex h-full w-full items-center justify-center text-sm font-bold text-[var(--muted-foreground)]">
-                    {isUser ? <User size="1.125rem" /> : displayName[0]?.toUpperCase()}
-                  </div>
-                )}
-              </div>
+              {ctx.onOpenAboutMe ? (
+                <button
+                  type="button"
+                  onClick={(e) => ctx.onOpenAboutMe?.(e.currentTarget.getBoundingClientRect())}
+                  aria-label={localizeUi("ui.chat.conversationmessagebubble.viewValue1SAboutMe", { value1: displayName })}
+                  title={localizeUi("ui.chat.conversationmessagebubble.viewValue1SAboutMe", { value1: displayName })}
+                  className={cn(
+                    "relative block h-10 w-10 overflow-hidden bg-[var(--accent)] cursor-pointer transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]/50",
+                    avatarCornerClass,
+                  )}
+                >
+                  {avatarUrl ? (
+                    <img
+                      src={avatarUrl}
+                      alt={displayName}
+                      loading="lazy"
+                      className="h-full w-full object-cover"
+                      style={avatarCropStyle}
+                    />
+                  ) : (
+                    <div className="flex h-full w-full items-center justify-center text-sm font-bold text-[var(--muted-foreground)]">
+                      {isUser ? <User size="1.125rem" /> : displayName[0]?.toUpperCase()}
+                    </div>
+                  )}
+                </button>
+              ) : (
+                <div className={cn("relative h-10 w-10 overflow-hidden bg-[var(--accent)]", avatarCornerClass)}>
+                  {avatarUrl ? (
+                    <img
+                      src={avatarUrl}
+                      alt={displayName}
+                      loading="lazy"
+                      className="h-full w-full object-cover"
+                      style={avatarCropStyle}
+                    />
+                  ) : (
+                    <div className="flex h-full w-full items-center justify-center text-sm font-bold text-[var(--muted-foreground)]">
+                      {isUser ? <User size="1.125rem" /> : displayName[0]?.toUpperCase()}
+                    </div>
+                  )}
+                </div>
+              )}
               {(showActions || forceShowActions || showMessageNumbers) && messageIndex != null && (
                 <span className="mt-0.5 block text-center text-[0.5rem] font-medium text-[var(--muted-foreground)] select-none">
                   #{messageIndex}
@@ -134,7 +175,7 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
         {/* Body column — header + bubble + attachments (no swipes) */}
         <div
           className={cn(
-            "mari-message-body min-w-0 flex max-w-[72%] flex-none flex-col",
+            "mari-message-body min-w-0 flex max-w-[72%] flex-initial flex-col",
             isUser ? "items-end" : "items-start",
           )}
         >
@@ -148,12 +189,7 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
             >
               {hiddenFromAIHeader}
               {!isUser && (
-                <span
-                  className="mari-message-name text-[0.9375rem] font-semibold leading-tight hover:underline cursor-default"
-                  style={nameColorStyle(nameColor)}
-                >
-                  {displayName}
-                </span>
+                <ConversationMessageName displayName={displayName} nameColor={nameColor} onOpenAboutMe={ctx.onOpenAboutMe} />
               )}
               {!hideTimestamp && !isUser && (
                 <span className="mari-message-timestamp text-[0.6875rem] text-[var(--muted-foreground)]/60">
@@ -176,6 +212,63 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
               messageTextStyle={messageTextStyle}
               quoteFormat={quoteFormat}
             />
+          ) : groupedSegments && !isUser ? (
+            <div className="flex flex-col items-start gap-1.5">
+              {groupedSegments.slice(0, visibleSegments).map((grp, i) => {
+                const segChar =
+                  grp.speaker && charByName ? charByName.get(normalizeTextForMatch(grp.speaker)) : null;
+                const segSelfId =
+                  (grp.speaker && charIdByName ? charIdByName.get(normalizeTextForMatch(grp.speaker)) : null) ??
+                  selfCharacterId;
+                const segName = segChar?.convoDisplayName?.trim() || segChar?.name || grp.speaker || "";
+                const displayLines = splitGroupedSegmentDisplayLines(grp);
+
+                if (!grp.speaker) {
+                  if (displayLines.length === 0) return null;
+                  return (
+                    <div
+                      key={`${grp.start}-${i}`}
+                      className="mari-message-content py-0.5 text-[0.875rem] leading-relaxed break-words whitespace-pre-wrap text-[var(--muted-foreground)] italic animate-[fadeSlideIn_0.25s_ease-out]"
+                      style={messageTextStyle}
+                    >
+                      <MessageContent
+                        content={displayLines.join("\n")}
+                        mentionNames={mentionNames}
+                        emojiMap={emojiMap}
+                        stickerMap={stickerMap}
+                        onImageOpen={(url) => onImageOpen(url)}
+                        selfCharacterId={selfCharacterId}
+                        galleryIndex={galleryIndex}
+                      />
+                    </div>
+                  );
+                }
+
+                return displayLines.map((line, lineIndex) => (
+                  <div
+                    key={`${grp.start}-${i}-${lineIndex}`}
+                    className="mari-message-content mari-message-bubble texting-bubble texting-bubble-other relative rounded-2xl rounded-tl-md px-3.5 py-2 text-[0.9375rem] leading-relaxed break-words whitespace-pre-wrap shadow-sm animate-[fadeSlideIn_0.25s_ease-out]"
+                    style={messageTextStyle}
+                  >
+                    <div
+                      className="mb-0.5 text-[0.75rem] font-semibold leading-tight opacity-90"
+                      style={nameColorStyle(segChar?.nameColor)}
+                    >
+                      {segName}
+                    </div>
+                    <MessageContent
+                      content={line}
+                      mentionNames={mentionNames}
+                      emojiMap={emojiMap}
+                      stickerMap={stickerMap}
+                      onImageOpen={(url) => onImageOpen(url)}
+                      selfCharacterId={segSelfId}
+                    galleryIndex={galleryIndex}
+                    />
+                  </div>
+                ));
+              })}
+            </div>
           ) : (
             <div
               className={cn(
@@ -197,55 +290,14 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
                       emojiMap={emojiMap}
                       stickerMap={stickerMap}
                       onImageOpen={(url) => onImageOpen(url)}
+                      selfCharacterId={selfCharacterId}
+                    galleryIndex={galleryIndex}
                     />
                   )}
-                  <div className="flex items-center gap-1" aria-label="Still typing">
-                    <span className="h-2 w-2 animate-bounce rounded-full bg-[var(--muted-foreground)]/60 [animation-delay:0ms]" />
-                    <span className="h-2 w-2 animate-bounce rounded-full bg-[var(--muted-foreground)]/60 [animation-delay:150ms]" />
-                    <span className="h-2 w-2 animate-bounce rounded-full bg-[var(--muted-foreground)]/60 [animation-delay:300ms]" />
-                  </div>
+                  <PendingTypingDots label={localizeUi("ui.chat.conversationmessagebubble.stillTyping")} dotClassName="bg-[var(--muted-foreground)]/60" />
                 </div>
-              ) : groupedSegments && !isUser ? (
-                /* Multi-speaker content inside a bubble */
-                <div className="space-y-2">
-                  {groupedSegments.slice(0, visibleSegments).map((grp, i) => {
-                    const segChar =
-                      grp.speaker && charByName ? charByName.get(normalizeTextForMatch(grp.speaker)) : null;
-                    const segName = segChar?.name ?? grp.speaker ?? "";
-                    const segColor = segChar?.nameColor;
-                    const combinedText = grp.lines.join("\n");
-                    if (!grp.speaker) {
-                      return (
-                        <div key={i} className="italic text-[var(--muted-foreground)]">
-                          <MessageContent
-                            content={combinedText}
-                            mentionNames={mentionNames}
-                            emojiMap={emojiMap}
-                            stickerMap={stickerMap}
-                            onImageOpen={(url) => onImageOpen(url)}
-                          />
-                        </div>
-                      );
-                    }
-                    return (
-                      <div key={i} className="space-y-0.5">
-                        <div
-                          className="text-[0.75rem] font-semibold leading-tight opacity-90"
-                          style={nameColorStyle(segColor)}
-                        >
-                          {segName}
-                        </div>
-                        <MessageContent
-                          content={combinedText}
-                          mentionNames={mentionNames}
-                          emojiMap={emojiMap}
-                          stickerMap={stickerMap}
-                          onImageOpen={(url) => onImageOpen(url)}
-                        />
-                      </div>
-                    );
-                  })}
-                </div>
+              ) : extra.diceRollResult ? (
+                <DiceMessageContent diceRollResult={extra.diceRollResult} createdAt={message.createdAt} />
               ) : (
                 <MessageContent
                   content={renderedContent}
@@ -253,6 +305,8 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
                   emojiMap={emojiMap}
                   stickerMap={stickerMap}
                   onImageOpen={(url) => onImageOpen(url)}
+                  selfCharacterId={selfCharacterId}
+                galleryIndex={galleryIndex}
                 />
               )}
             </div>
@@ -260,7 +314,10 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
 
           {!isHiddenCollapsed && (
             <>
-              <ConversationMessageTranslation translatedText={translatedText} isTranslating={isTranslating} />
+              <ConversationMessageTranslation
+                translatedText={ctx.showTranslationOnly ? null : translatedText}
+                isTranslating={isTranslating}
+              />
               <ConversationMessageAttachments
                 attachments={extra.attachments ?? []}
                 renderedContent={renderedContent}

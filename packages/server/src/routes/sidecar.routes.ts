@@ -7,6 +7,7 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { logger, logDebugOverride } from "../lib/logger.js";
 import { z } from "zod";
 import { sidecarModelService } from "../services/sidecar/sidecar-model.service.js";
+import { sidecarSpeechService } from "../services/sidecar/sidecar-speech.service.js";
 import { mlxRuntimeService } from "../services/sidecar/mlx-runtime.service.js";
 import { sidecarRuntimeService } from "../services/sidecar/sidecar-runtime.service.js";
 import { getLocalSidecarProvider, LOCAL_SIDECAR_MODEL } from "../services/llm/local-sidecar.js";
@@ -19,6 +20,7 @@ import {
   unloadModel,
 } from "../services/sidecar/sidecar-inference.service.js";
 import { sidecarProcessService } from "../services/sidecar/sidecar-process.service.js";
+import { capabilityPackageManager } from "../services/capability-packages/package-manager.service.js";
 import {
   buildSceneAnalyzerSystemPrompt,
   buildSceneAnalyzerUserPrompt,
@@ -28,16 +30,23 @@ import { postProcessSceneResult, type PostProcessContext } from "../services/sid
 import {
   SIDECAR_EMBEDDING_POOLING_TYPES,
   SIDECAR_RUNTIME_PREFERENCES,
+  SIDECAR_SCENE_ANALYSIS_NARRATION_BUDGET_CHARS,
+  SIDECAR_SPEECH_MODELS,
+  sceneAnalysisRequestSchema,
   scoreAmbient,
   scoreMusic,
   type GameActiveState,
   type SidecarDownloadProgress,
   type SidecarQuantization,
+  type SidecarSpeechModelId,
 } from "@marinara-engine/shared";
 import { isSidecarRuntimeInstallEnabled } from "../config/runtime-config.js";
 import { isAdminAuthorized, requirePrivilegedAccess } from "../middleware/privileged-gate.js";
 
 const quantizationSchema = z.enum(["q8_0", "q4_k_m"]);
+const speechModelIdSchema = z.enum(
+  SIDECAR_SPEECH_MODELS.map((model) => model.id) as [SidecarSpeechModelId, ...SidecarSpeechModelId[]],
+);
 const hfRepoSchema = z
   .string()
   .trim()
@@ -65,6 +74,19 @@ function createResponseAbortSignal(reply: FastifyReply, label: string): AbortSig
   return controller.signal;
 }
 
+async function requireConversationCallsForSpeech(reply: FastifyReply): Promise<boolean> {
+  const installed = await capabilityPackageManager.installed();
+  const callsAvailable = installed.some(
+    (item) => item.status !== "error" && item.manifest.kind.includes("conversation-calls"),
+  );
+  if (callsAvailable) return true;
+  reply.status(409).send({
+    error: "Calls is not installed",
+    message: "Install Calls from Agents before managing the Local Speech Model.",
+  });
+  return false;
+}
+
 export const sidecarRoutes: FastifyPluginAsync = async (app) => {
   app.get("/status", async () => {
     void sidecarProcessService
@@ -82,6 +104,11 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
+  app.get("/speech/status", async (_req, reply) => {
+    if (!(await requireConversationCallsForSpeech(reply))) return;
+    return sidecarSpeechService.getStatus();
+  });
+
   const configSchema = z.object({
     useForTrackers: z.boolean().optional(),
     useForGameScene: z.boolean().optional(),
@@ -90,6 +117,7 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
     temperature: z.number().min(0).max(2).optional(),
     topP: z.number().gt(0).max(1).optional(),
     topK: z.number().int().min(0).max(500).optional(),
+    maxParallelJobs: z.number().int().min(1).max(16).optional(),
     gpuLayers: z.number().int().min(-1).max(1024).optional(),
     enableNativeToolCalls: z.boolean().optional(),
     embeddingPooling: z.enum(SIDECAR_EMBEDDING_POOLING_TYPES).optional(),
@@ -276,6 +304,76 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
     }
   }
 
+  async function handleSpeechDownloadSse(
+    reply: FastifyReply,
+    task: (onProgress: (progress: SidecarDownloadProgress) => void) => Promise<void>,
+  ): Promise<void> {
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    const sendEvent = (data: unknown) => {
+      if (reply.raw.destroyed || reply.raw.writableEnded) return;
+      try {
+        reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+      } catch {
+        // Client disconnected between the guard and the write.
+      }
+    };
+
+    let lastProgressPhase: SidecarDownloadProgress["phase"] = "model";
+    let lastProgressLabel: string | undefined;
+    try {
+      await task((progress) => {
+        lastProgressPhase = progress.phase;
+        lastProgressLabel = progress.label;
+        if (progress.status === "downloading") sendEvent(progress);
+      });
+      sendEvent({ done: true });
+    } catch (error) {
+      if (!reply.raw.destroyed) {
+        sendEvent({
+          status: "error",
+          phase: lastProgressPhase,
+          label: lastProgressLabel,
+          error: error instanceof Error ? error.message : "Local Whisper download failed",
+        });
+      }
+    } finally {
+      if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+        try {
+          reply.raw.end();
+        } catch {
+          // Client disconnected between the guard and the end call.
+        }
+      }
+    }
+  }
+
+  app.post<{
+    Body: { modelId?: SidecarSpeechModelId };
+  }>("/speech/download", async (req, reply) => {
+    if (!requirePrivilegedAccess(req, reply, { feature: "Local Whisper download" })) return;
+    if (!(await requireConversationCallsForSpeech(reply))) return;
+    const body = z.object({ modelId: speechModelIdSchema.optional() }).parse(req.body ?? {});
+    await handleSpeechDownloadSse(reply, async (onProgress) => {
+      await sidecarSpeechService.download(body.modelId, onProgress);
+    });
+  });
+
+  app.delete<{
+    Body: { modelId?: SidecarSpeechModelId };
+  }>("/speech/model", async (req, reply) => {
+    if (!requirePrivilegedAccess(req, reply, { feature: "Local Whisper model deletion" })) return;
+    if (!(await requireConversationCallsForSpeech(reply))) return;
+    const body = z.object({ modelId: speechModelIdSchema.optional() }).parse(req.body ?? {});
+    await sidecarSpeechService.deleteModel(body.modelId);
+    return { ok: true };
+  });
+
   app.post<{
     Body: { quantization: SidecarQuantization };
   }>("/download", async (req, reply) => {
@@ -341,52 +439,8 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true };
   });
 
-  const sceneBodySchema = z.object({
-    narration: z.string().max(16000),
-    playerAction: z.string().max(4000).optional(),
-    context: z.object({
-      currentState: z.string().optional(),
-      availableBackgrounds: z.array(z.string()).optional(),
-      availableSfx: z.array(z.string()).optional(),
-      activeWidgets: z.array(z.unknown()).optional(),
-      trackedNpcs: z.array(z.unknown()).optional(),
-      characterNames: z.array(z.string()).optional(),
-      currentBackground: z.string().nullable().optional(),
-      currentMusic: z.string().nullable().optional(),
-      recentMusic: z.array(z.string()).max(20).optional(),
-      useSpotifyMusic: z.boolean().optional(),
-      availableSpotifyTracks: z
-        .array(
-          z.object({
-            uri: z.string().min(1).max(300),
-            name: z.string().min(1).max(300),
-            artist: z.string().min(1).max(300),
-            album: z.string().max(300).nullable().optional(),
-            position: z.number().nullable().optional(),
-            score: z.number().nullable().optional(),
-          }),
-        )
-        .max(50)
-        .optional(),
-      currentSpotifyTrack: z.string().max(300).nullable().optional(),
-      recentSpotifyTracks: z.array(z.string().max(300)).max(20).optional(),
-      currentAmbient: z.string().nullable().optional(),
-      currentLocation: z.string().nullable().optional(),
-      currentWeather: z.string().nullable().optional(),
-      currentTimeOfDay: z.string().nullable().optional(),
-      genre: z.string().nullable().optional(),
-      setting: z.string().nullable().optional(),
-      worldOverview: z.string().nullable().optional(),
-      canGenerateBackgrounds: z.boolean().optional(),
-      canGenerateIllustrations: z.boolean().optional(),
-      artStylePrompt: z.string().nullable().optional(),
-      imagePromptInstructions: z.string().max(5000).nullable().optional(),
-    }),
-    debugMode: z.boolean().optional().default(false),
-  });
-
   app.post("/analyze-scene", async (req, reply) => {
-    const body = sceneBodySchema.parse(req.body);
+    const body = sceneAnalysisRequestSchema.parse(req.body);
     const requestDebug = body.debugMode === true;
     const debugLogsEnabled = requestDebug || logger.isLevelEnabled("debug");
     const debugLog = (message: string, ...args: any[]) => {
@@ -402,7 +456,12 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
 
     const sceneCtx = body.context as SceneAnalyzerContext;
     const systemPrompt = buildSceneAnalyzerSystemPrompt(sceneCtx);
-    const userPrompt = buildSceneAnalyzerUserPrompt(body.narration, body.playerAction, sceneCtx);
+    const userPrompt = buildSceneAnalyzerUserPrompt(
+      body.narration,
+      body.playerAction,
+      sceneCtx,
+      SIDECAR_SCENE_ANALYSIS_NARRATION_BUDGET_CHARS,
+    );
 
     try {
       if (debugLogsEnabled) {
@@ -431,6 +490,8 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
         availableBackgrounds: bgTags,
         availableSfx: sfxTags,
         useSpotifyMusic: !!body.context.useSpotifyMusic,
+        generateSoundEffects: !!body.context.generateSoundEffects,
+        generateMusic: !!body.context.generateMusic,
         availableSpotifyTracks: body.context.availableSpotifyTracks ?? [],
         canGenerateBackgrounds: !!body.context.canGenerateBackgrounds,
         validWidgetIds: new Set(
@@ -455,7 +516,7 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
 
       if (body.context.useSpotifyMusic) {
         result.music = null;
-      } else {
+      } else if (!body.context.generateMusic) {
         const scoredMusic = scoreMusic({
           state: (body.context.currentState as GameActiveState) ?? "exploration",
           weather: result.weather ?? body.context.currentWeather ?? null,

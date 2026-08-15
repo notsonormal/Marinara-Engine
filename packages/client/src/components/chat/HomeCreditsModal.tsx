@@ -1,30 +1,47 @@
 import { ExternalLink } from "lucide-react";
 import { Modal } from "../ui/Modal";
+import { Trans, useTranslation } from "react-i18next";
+
+const FONT_AWESOME_D20_SOURCE_URL = "https://github.com/FortAwesome/Font-Awesome/blob/5.15.4/svgs/solid/dice-d20.svg";
+const CC_BY_4_0_LICENSE_URL = "https://creativecommons.org/licenses/by/4.0/";
 
 const CONTRIBUTORS = [
-  { login: "SpicyMarinara", url: "https://github.com/SpicyMarinara", contributions: 497 },
+  { login: "SpicyMarinara", url: "https://github.com/SpicyMarinara", contributions: 2635 },
+  { login: "kolacheee", url: "https://github.com/kolacheee", contributions: 485 },
+  { login: "Gunterlie", url: "https://github.com/Gunterlie", contributions: 363 },
+  { login: "thetopham", url: "https://github.com/thetopham", contributions: 336 },
   { login: "cha1latte", url: "https://github.com/cha1latte", contributions: 319 },
+  { login: "Romuromylus", url: "https://github.com/Romuromylus", contributions: 202 },
+  { login: "Xelvanis", url: "https://github.com/Xelvanis", contributions: 160 },
   { login: "LukaTheHero", url: "https://github.com/LukaTheHero", contributions: 86 },
-  { login: "Romuromylus", url: "https://github.com/Romuromylus", contributions: 77 },
-  { login: "TheLonelyDevil9", url: "https://github.com/TheLonelyDevil9", contributions: 66 },
-  { login: "Xelvanis", url: "https://github.com/Xelvanis", contributions: 66 },
-  { login: "Promansis", url: "https://github.com/Promansis", contributions: 64 },
+  { login: "Promansis", url: "https://github.com/Promansis", contributions: 80 },
+  { login: "TheLonelyDevil9", url: "https://github.com/TheLonelyDevil9", contributions: 69 },
   { login: "coxde", url: "https://github.com/coxde", contributions: 60 },
-  { login: "kolacheee", url: "https://github.com/kolacheee", contributions: 15 },
-  { login: "aeriondyseti", url: "https://github.com/aeriondyseti", contributions: 14 },
-  { login: "Copilot", url: "https://github.com/apps/copilot-swe-agent", contributions: 13 },
-  { login: "Minsklatte", url: "https://github.com/Minsklatte", contributions: 12 },
+  { login: "munimunigamer", url: "https://github.com/munimunigamer", contributions: 31 },
+  { login: "SonaGat3", url: "https://github.com/SonaGat3", contributions: 16 },
+  { login: "Minsklatte", url: "https://github.com/Minsklatte", contributions: 16 },
+  { login: "aeriondyseti", url: "https://github.com/aeriondyseti", contributions: 15 },
   { login: "JorgeLTE", url: "https://github.com/JorgeLTE", contributions: 11 },
-  { login: "munimunigamer", url: "https://github.com/munimunigamer", contributions: 11 },
+  { login: "Sulphuratum", url: "https://github.com/Sulphuratum", contributions: 10 },
   { login: "loungemeister", url: "https://github.com/loungemeister", contributions: 9 },
-  { login: "NeoKazuya", url: "https://github.com/NeoKazuya", contributions: 7 },
+  { login: "NeoKazuya", url: "https://github.com/NeoKazuya", contributions: 9 },
+  { login: "kaldigo", url: "https://github.com/kaldigo", contributions: 8 },
   { login: "felorhik", url: "https://github.com/felorhik", contributions: 6 },
-  { login: "amauragis", url: "https://github.com/amauragis", contributions: 5 },
+  { login: "Nero10578", url: "https://github.com/Nero10578", contributions: 6 },
+  { login: "bignast", url: "https://github.com/bignast", contributions: 6 },
+  { login: "jake9000", url: "https://github.com/jake9000", contributions: 5 },
+  { login: "JurijPietrowicz", url: "https://github.com/JurijPietrowicz", contributions: 5 },
   { login: "mm14141", url: "https://github.com/mm14141", contributions: 5 },
+  { login: "amauragis", url: "https://github.com/amauragis", contributions: 5 },
   { login: "marysia", url: "https://github.com/marysia", contributions: 4 },
-  { login: "jake9000", url: "https://github.com/jake9000", contributions: 4 },
+  { login: "myaiexp", url: "https://github.com/myaiexp", contributions: 3 },
+  { login: "bobneumann77-hub", url: "https://github.com/bobneumann77-hub", contributions: 3 },
+  { login: "mallang0723", url: "https://github.com/mallang0723", contributions: 3 },
+  { login: "kh0p", url: "https://github.com/kh0p", contributions: 3 },
   { login: "LightD31", url: "https://github.com/LightD31", contributions: 3 },
+  { login: "MetzeVanDeus", url: "https://github.com/MetzeVanDeus", contributions: 2 },
   { login: "Lochalan", url: "https://github.com/Lochalan", contributions: 2 },
+  { login: "Lamboozled", url: "https://github.com/Lamboozled", contributions: 2 },
   { login: "ailthrim", url: "https://github.com/ailthrim", contributions: 2 },
   { login: "adunato", url: "https://github.com/adunato", contributions: 2 },
   { login: "Trade-Mottoes", url: "https://github.com/Trade-Mottoes", contributions: 2 },
@@ -34,20 +51,25 @@ const CONTRIBUTORS = [
   { login: "Javedz678", url: "https://github.com/Javedz678", contributions: 2 },
   { login: "Morgul", url: "https://github.com/Morgul", contributions: 2 },
   { login: "BahamutRU", url: "https://github.com/BahamutRU", contributions: 2 },
-  { login: "Anarchistcowboy", url: "https://github.com/Anarchistcowboy", contributions: 1 },
-  { login: "DarthTheMonster", url: "https://github.com/DarthTheMonster", contributions: 1 },
-  { login: "Dinokin", url: "https://github.com/Dinokin", contributions: 1 },
-  { login: "Gunterlie", url: "https://github.com/Gunterlie", contributions: 1 },
-  { login: "Rafa-Ross", url: "https://github.com/Rafa-Ross", contributions: 1 },
-  { login: "kevin-ho", url: "https://github.com/kevin-ho", contributions: 1 },
-  { login: "pwildani", url: "https://github.com/pwildani", contributions: 1 },
-  { login: "vanta-jack", url: "https://github.com/vanta-jack", contributions: 1 },
-  { login: "Yasyasyasvil", url: "https://github.com/Yasyasyasvil", contributions: 1 },
-  { login: "taiman724", url: "https://github.com/taiman724", contributions: 1 },
   { login: "smurfboyyessir", url: "https://github.com/smurfboyyessir", contributions: 1 },
+  { login: "taiman724", url: "https://github.com/taiman724", contributions: 1 },
+  { login: "abhi-0203", url: "https://github.com/abhi-0203", contributions: 1 },
+  { login: "Yasyasyasvil", url: "https://github.com/Yasyasyasvil", contributions: 1 },
+  { login: "vanta-jack", url: "https://github.com/vanta-jack", contributions: 1 },
+  { login: "pwildani", url: "https://github.com/pwildani", contributions: 1 },
+  { login: "olegpro171", url: "https://github.com/olegpro171", contributions: 1 },
+  { login: "Lemon-will", url: "https://github.com/Lemon-will", contributions: 1 },
+  { login: "kevin-ho", url: "https://github.com/kevin-ho", contributions: 1 },
+  { login: "KeKKERUUU", url: "https://github.com/KeKKERUUU", contributions: 1 },
+  { login: "Rafa-Ross", url: "https://github.com/Rafa-Ross", contributions: 1 },
+  { login: "Dinokin", url: "https://github.com/Dinokin", contributions: 1 },
+  { login: "DarthTheMonster", url: "https://github.com/DarthTheMonster", contributions: 1 },
+  { login: "Anarchistcowboy", url: "https://github.com/Anarchistcowboy", contributions: 1 },
 ];
 
 const SPECIAL_THANKS = [
+  "DSBwizzard",
+  "Nevi",
   "Xel",
   "Jorge",
   "Cha1latte",
@@ -91,16 +113,17 @@ const SPECIAL_THANKS = [
 ];
 
 export function HomeCreditsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { t } = useTranslation();
   return (
-    <Modal open={open} onClose={onClose} title="Credits" width="max-w-2xl">
+    <Modal open={open} onClose={onClose} title={t("home.actions.credits")} width="max-w-2xl">
       <div className="space-y-5">
         <section className="space-y-2">
           <div>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
-              GitHub Contributors
+              {t("home.credits.contributors")}
             </h3>
             <p className="mt-1 text-xs text-[var(--muted-foreground)]">
-              Current contributors from the Marinara Engine GitHub repository.
+              {t("home.credits.contributorsDescription")}
             </p>
           </div>
           <div className="grid max-h-[18rem] grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
@@ -124,9 +147,34 @@ export function HomeCreditsModal({ open, onClose }: { open: boolean; onClose: ()
 
         <section className="space-y-2">
           <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
-            Special Thanks
+            {t("home.credits.specialThanks")}
           </h3>
           <p className="text-xs leading-relaxed text-[var(--muted-foreground)]">{SPECIAL_THANKS.join(", ")}.</p>
+        </section>
+
+        <section className="space-y-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
+            {t("home.credits.thirdPartyAssets")}
+          </h3>
+          <p className="text-xs leading-relaxed text-[var(--muted-foreground)]">
+            <Trans
+              i18nKey="home.credits.thirdPartyAssetsDescription"
+              components={[
+                <a
+                  href={FONT_AWESOME_D20_SOURCE_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-medium text-[var(--primary)] underline-offset-2 hover:underline"
+                />,
+                <a
+                  href={CC_BY_4_0_LICENSE_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-medium text-[var(--primary)] underline-offset-2 hover:underline"
+                />,
+              ]}
+            />
+          </p>
         </section>
       </div>
     </Modal>

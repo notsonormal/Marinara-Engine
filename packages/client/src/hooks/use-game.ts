@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 import { useEffect, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { api, isJsonRepairApiError } from "../lib/api-client";
 import { chatKeys } from "./use-chats";
@@ -21,6 +22,7 @@ import { useUIStore } from "../stores/ui.store";
 import type {
   GameActiveState,
   GameMap,
+  GameInitialSetupLabels,
   GameSetupConfig,
   GameNpc,
   DiceRollResult,
@@ -30,6 +32,10 @@ import type {
   CombatPlayerAction,
   HudWidget,
   GameBlueprint,
+  TacticalCombatState,
+  TacticalAction,
+  TacticalEvent,
+  RPGStatPool,
 } from "@marinara-engine/shared";
 import type { Chat } from "@marinara-engine/shared";
 
@@ -100,10 +106,22 @@ interface RecruitPartyMemberResponse {
   cardCreated: boolean;
 }
 
-interface RegeneratePartyCardResponse {
-  sessionChat: Chat;
+interface RegenerateCharacterSheetResponse {
   characterName: string;
-  gameCard: unknown;
+  gameCard: {
+    name: string;
+    shortDescription: string;
+    class: string;
+    abilities: string[];
+    strengths: string[];
+    weaknesses: string[];
+    extra: Record<string, string>;
+    rpgStats?: {
+      attributes: Array<{ name: string; value: number }>;
+      hp: { value: number; max: number };
+      pools?: RPGStatPool[];
+    };
+  };
 }
 
 interface RemovePartyMemberResponse {
@@ -174,8 +192,9 @@ export function useCreateGame() {
     mutationFn: (data: {
       name: string;
       setupConfig: GameSetupConfig;
+      preferences?: string;
+      shareLabels?: GameInitialSetupLabels;
       connectionId?: string;
-      characterConnectionId?: string;
       promptPresetId?: string;
       chatId?: string;
     }) => api.post<CreateGameResponse>("/game/create", data),
@@ -200,14 +219,23 @@ export function useGameSetup() {
   const store = useGameModeStore;
 
   return useMutation({
-    mutationFn: (data: { chatId: string; connectionId?: string; promptPresetId?: string | null; preferences: string }) =>
+    mutationFn: (data: {
+      chatId: string;
+      connectionId?: string;
+      promptPresetId?: string | null;
+      preferences: string;
+      keepSetupActive?: boolean;
+    }) =>
       api.post<SetupResponse>("/game/setup", {
-        ...data,
+        chatId: data.chatId,
+        connectionId: data.connectionId,
+        promptPresetId: data.promptPresetId,
+        preferences: data.preferences,
         streaming: useUIStore.getState().enableStreaming,
         debugMode: useUIStore.getState().debugMode,
       }),
-    onSuccess: (res) => {
-      store.getState().setSetupActive(false);
+    onSuccess: (res, variables) => {
+      if (!variables.keepSetupActive) store.getState().setSetupActive(false);
       if (Array.isArray(res.gameNpcs)) {
         store.getState().setNpcs(res.gameNpcs);
       }
@@ -259,7 +287,7 @@ export function useStartSession() {
   const store = useGameModeStore;
 
   return useMutation({
-    mutationFn: (data: { gameId: string; connectionId?: string }) =>
+    mutationFn: (data: { gameId: string; sourceChatId?: string; connectionId?: string }) =>
       api.post<StartSessionResponse>("/game/session/start", data),
     onMutate: (variables) => {
       toast.loading("Starting the next session and generating recap...", {
@@ -312,6 +340,14 @@ export function useConcludeSession() {
       });
       qc.invalidateQueries({ queryKey: chatKeys.detail(variables.chatId) });
       qc.invalidateQueries({ queryKey: chatKeys.messages(variables.chatId) });
+      // Game Lorebook Keeper finishes in the background after the conclusion
+      // response. Refresh the chat at bounded intervals so its running/failure
+      // state and retry action appear without requiring a page reload.
+      for (const delay of [1_500, 5_000, 15_000, 30_000, 60_000, 120_000]) {
+        window.setTimeout(() => {
+          void qc.invalidateQueries({ queryKey: chatKeys.detail(variables.chatId) });
+        }, delay);
+      }
     },
     onError: (err, variables) => {
       console.error("[game/session/conclude] Error:", err);
@@ -462,21 +498,23 @@ export function useRecruitPartyMember() {
   });
 }
 
-export function useRegeneratePartyCard() {
-  const qc = useQueryClient();
+export function useRegenerateCharacterSheet() {
+  const { t } = useTranslation();
 
   return useMutation({
-    mutationFn: (data: { chatId: string; characterName: string; characterId?: string; connectionId?: string }) =>
-      api.post<RegeneratePartyCardResponse>("/game/party/card/regenerate", data),
-    onSuccess: (res, variables) => {
-      qc.setQueryData(chatKeys.detail(variables.chatId), res.sessionChat);
-      qc.invalidateQueries({ queryKey: chatKeys.detail(variables.chatId) });
-      qc.invalidateQueries({ queryKey: chatKeys.list() });
-      toast.success(`${res.characterName}'s sheet was regenerated.`);
+    mutationFn: (data: {
+      chatId: string;
+      characterId: string;
+      characterName: string;
+      connectionId?: string;
+      debugMode?: boolean;
+    }) => api.post<RegenerateCharacterSheetResponse>("/game/character-sheet/regenerate", data),
+    onSuccess: (res) => {
+      toast.success(t("game.characterSheet.regenerate.ready", { name: res.characterName }));
     },
     onError: (err) => {
-      console.error("[regeneratePartyCard] Error:", err);
-      toast.error(err.message || "Failed to regenerate party sheet.");
+      console.error("[regenerateCharacterSheet] Error:", err);
+      toast.error(err.message || t("game.characterSheet.regenerate.error"));
     },
   });
 }
@@ -719,6 +757,8 @@ export function useSyncGameState(activeChatId: string, chatMeta: Record<string, 
       useGameModeStore.getState().setMaps(metadataMaps, activeMapId);
     } else if (chatMeta.gameMap && chatMeta.gameMap !== state.currentMap) {
       useGameModeStore.getState().setCurrentMap(chatMeta.gameMap as GameMap);
+    } else if (!chatMeta.gameMap) {
+      useGameModeStore.getState().setMaps([], null);
     }
     if (Array.isArray(chatMeta.gameNpcs)) {
       useGameModeStore.getState().setNpcs(chatMeta.gameNpcs as any[]);
@@ -774,26 +814,33 @@ export function useCombatRound() {
   });
 }
 
-export function useCombatLoot() {
-  return useMutation({
-    mutationFn: async (data: { chatId: string; enemyCount: number }) => {
-      const res = await api.post<{
-        drops: Array<{ item?: { name?: string | null } | null; quantity?: number | null } | null>;
-      }>("/game/combat/loot", data);
+// ── Tactical (grid) combat ──
+// Mirrors useCombatRound's shape: thin mutations over the pure shared engine that
+// lives server-side behind these endpoints. State round-trips through the client
+// exactly like classic combat (no new DB table); the client persists the returned
+// snapshot to chat metadata.
 
-      return {
-        drops: (res.drops ?? [])
-          .filter((drop): drop is NonNullable<(typeof res.drops)[number]> => !!drop?.item?.name)
-          .map((drop) => ({ name: drop.item!.name!, quantity: drop.quantity ?? undefined })),
-      };
-    },
+/** Start a fresh tactical battle. Server builds the seeded grid + spawns. */
+export function useTacticalCombatStart() {
+  return useMutation({
+    mutationFn: (data: {
+      chatId: string;
+      party: Combatant[];
+      enemies: Combatant[];
+      seed?: number;
+      /** Blueprint scene context — themes the terrain (styleNotes.environmentType). */
+      environment?: string;
+      /** Blueprint battlefield.formation — drives spawn placement. */
+      formation?: string;
+    }) => api.post<{ state: TacticalCombatState }>("/game/combat/tactical/start", data),
   });
 }
 
-export function useLootGenerate() {
+/** Apply one tactical action; server validates + resolves, running the enemy phase if it flips. */
+export function useTacticalCombatAction() {
   return useMutation({
-    mutationFn: (data: { chatId: string; count?: number }) =>
-      api.post<{ drops: unknown[] }>("/game/loot/generate", data),
+    mutationFn: (data: { chatId: string; state: TacticalCombatState; action: TacticalAction }) =>
+      api.post<{ state: TacticalCombatState; events: TacticalEvent[] }>("/game/combat/tactical/action", data),
   });
 }
 
@@ -840,16 +887,6 @@ export function useUpdateWeather() {
   });
 }
 
-export function useRollEncounter() {
-  return useMutation({
-    mutationFn: (data: { chatId: string; action: string; location?: string }) =>
-      api.post<{ encounter: { triggered: boolean; type: string | null; hint: string }; enemyCount: number }>(
-        "/game/encounter/roll",
-        data,
-      ),
-  });
-}
-
 export function useUpdateReputation() {
   const qc = useQueryClient();
   const store = useGameModeStore;
@@ -861,56 +898,5 @@ export function useUpdateReputation() {
       qc.invalidateQueries({ queryKey: chatKeys.detail(variables.chatId) });
       qc.invalidateQueries({ queryKey: [...gameKeys.all, "journal", variables.chatId] });
     },
-  });
-}
-
-export function useJournalEntry() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (data: { chatId: string; type: string; data: Record<string, unknown> }) =>
-      api.post<{ journal: unknown }>("/game/journal/entry", data),
-    onSuccess: (_, variables) => {
-      qc.invalidateQueries({ queryKey: [...gameKeys.all, "journal", variables.chatId] });
-    },
-  });
-}
-
-export function useGameJournal(chatId: string | null) {
-  return useQuery({
-    queryKey: [...gameKeys.all, "journal", chatId],
-    queryFn: () => api.get<{ journal: unknown; recap: string }>(`/game/${chatId}/journal`),
-    enabled: !!chatId,
-    staleTime: 30_000,
-  });
-}
-
-// ── Checkpoints ──
-
-export function useGameCheckpoints(chatId: string | null) {
-  return useQuery({
-    queryKey: [...gameKeys.all, "checkpoints", chatId],
-    queryFn: () => api.get<import("@marinara-engine/shared").GameCheckpoint[]>(`/game/${chatId}/checkpoints`),
-    enabled: !!chatId,
-    staleTime: 30_000,
-  });
-}
-
-export function useCreateCheckpoint() {
-  return useMutation({
-    mutationFn: (data: { chatId: string; label: string; triggerType: string }) =>
-      api.post<{ id: string }>("/game/checkpoint", data),
-  });
-}
-
-export function useLoadCheckpoint() {
-  return useMutation({
-    mutationFn: (data: { chatId: string; checkpointId: string }) =>
-      api.post<{ ok: boolean; messageId: string }>("/game/checkpoint/load", data),
-  });
-}
-
-export function useDeleteCheckpoint() {
-  return useMutation({
-    mutationFn: (id: string) => api.delete<{ ok: boolean }>(`/game/checkpoint/${id}`),
   });
 }

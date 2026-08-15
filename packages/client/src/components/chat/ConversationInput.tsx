@@ -5,71 +5,87 @@ import { useState, useRef, useCallback, useEffect, useMemo, type FormEvent } fro
 import {
   Send,
   Smile,
-  Sticker,
   StopCircle,
   X,
   Paperclip,
-  ImagePlay,
   Keyboard,
   AtSign,
-  Users,
   Languages,
   Loader2,
   FileText,
   RefreshCw,
+  Sparkles,
   WandSparkles,
 } from "lucide-react";
-import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { useChatStore } from "../../stores/chat.store";
+import { useAgentStore } from "../../stores/agent.store";
 import { useUIStore } from "../../stores/ui.store";
-import { useUnoGameStore } from "../../stores/uno-game.store";
-import { useChessGameStore } from "../../stores/chess-game.store";
+import { useConversationGamesStore } from "../../stores/conversation-games.store";
 import { useGenerate } from "../../hooks/use-generate";
 import { useApplyRegex } from "../../hooks/use-apply-regex";
 import { useCreateMessage, useDeleteMessage, useUpdateMessageExtra, useChat, chatKeys } from "../../hooks/use-chats";
 import { characterKeys } from "../../hooks/use-characters";
 import {
   matchSlashCommand,
+  shouldExecuteQuickPostAsCommand,
   getSlashCompletions,
+  type ConversationGameSlashContribution,
   type SlashCommand,
   type SlashCommandContext,
 } from "../../lib/slash-commands";
 import { createInputMacroResolverForChat, isPromptPreviewMacro } from "../../lib/chat-macros";
 import { parseChatMetadata } from "../../lib/chat-display";
-import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
+import type { AvatarCrop } from "@marinara-engine/shared";
+import { cn } from "../../lib/utils";
 import { applyTextareaQuoteFormat } from "../../lib/textarea-quotes";
 import { translateDraftText } from "../../lib/draft-translation";
 import { prepareImageAttachment } from "../../lib/chat-attachment-images";
+import { isFileDrag } from "../../lib/chat-resource-drag";
 import { CARD_ASSET_INSERT_EVENT, type CardAssetInsertDetail } from "../../lib/card-asset-links";
+import { isGenerationSendBlocked } from "../../lib/generation-stream-policy";
+import { requestChatScrollToBottom } from "../../lib/chat-scroll-events";
+import { searchStandardEmojiShortcodes, type StandardEmojiShortcode } from "../../lib/emoji-shortcodes";
 import { QuickConnectionSwitcher } from "./QuickConnectionSwitcher";
 import { QuickPersonaSwitcher } from "./QuickPersonaSwitcher";
 import { QuickSwitcherMobile } from "./QuickSwitcherMobile";
-import { EmojiPicker } from "../ui/EmojiPicker";
-import { CustomEmojiTab } from "./CustomEmojiTab";
-import { StickerPicker } from "./StickerPicker";
 import { showChoiceDialog } from "../../lib/app-dialogs";
 import { useConversationCustomEmojis, type ConversationCustomEmoji } from "../../hooks/use-conversation-custom-emojis";
-import { GifPicker } from "../ui/GifPicker";
 import { SpeechToTextButton } from "../ui/SpeechToTextButton";
 import { SlashCommandFeedback } from "./SlashCommandFeedback";
 import { QuickReplyMenu, type QuickReplyAction } from "./QuickReplyMenu";
 import { getChatInputShellClass } from "./chat-input-styles";
+import { MariSuggestionChips } from "./MariSuggestionChips";
 import {
-  buildGuidedGenerationInstructionMessage,
+  ConversationMediaPickerPanel,
+  type ConversationMediaPickerTab,
+  type ConversationMediaPickerTabId,
+} from "./ConversationMediaPickerPanel";
+import { useInstalledCapabilityPackages } from "../../hooks/use-capability-packages";
+import {
   formatTextQuotes,
   includesTextForMatch,
+  MARI_STARTER_CHIPS,
   normalizeTextForMatch,
+  PROFESSOR_MARI_ID,
   startsWithTextForMatch,
+  type MariSuggestionChip,
   type Message,
+  type Persona,
+  isInstalledCapabilityReady,
 } from "@marinara-engine/shared";
+import { useTranslation, useTranslation as useUiTranslation } from "react-i18next";
 
 interface Attachment {
   type: string;
   data: string;
   name: string;
 }
+
+type EmojiCompletion =
+  | ({ kind: "custom" } & ConversationCustomEmoji)
+  | ({ kind: "standard"; source: "Standard" } & StandardEmojiShortcode);
 
 const TEXT_ATTACHMENT_EXTENSIONS = new Set([
   "csv",
@@ -86,7 +102,8 @@ const TEXT_ATTACHMENT_EXTENSIONS = new Set([
 const PDF_ATTACHMENT_MIME_TYPE = "application/pdf";
 
 const CONVERSATION_HIDDEN_SLASH_COMMANDS = new Set(["impersonate", "impersonate_prompt"]);
-const QUOTE_INPUT_TRIGGER_RE = /["'\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f]/;
+
+type MobilePickerTab = ConversationMediaPickerTabId;
 
 type ConversationSlashCompletion = {
   key: string;
@@ -95,6 +112,23 @@ type ConversationSlashCompletion = {
   insertValue: string;
   cursor: number;
   kind: "command" | "status" | "character";
+};
+
+type SubmittedConversationInput = {
+  chatId: string;
+  draft: string;
+  height: string;
+  attachments: Attachment[];
+  completions: ConversationSlashCompletion[];
+  mentionQuery: string | null;
+  mentionCompletions: string[];
+};
+
+type PersistedAttachment = {
+  type: string;
+  data: string;
+  filename: string;
+  name: string;
 };
 
 const CONVERSATION_STATUS_COMPLETIONS = [
@@ -107,13 +141,6 @@ const CONVERSATION_STATUS_COMPLETIONS = [
 
 function isConversationHiddenSlashCommand(command: SlashCommand): boolean {
   return CONVERSATION_HIDDEN_SLASH_COMMANDS.has(command.name);
-}
-
-function shouldFormatQuoteInput(event: FormEvent<HTMLTextAreaElement> | undefined, value: string): boolean {
-  const inputEvent = event?.nativeEvent as InputEvent | undefined;
-  const inputType = typeof inputEvent?.inputType === "string" ? inputEvent.inputType : "";
-  if (inputType.startsWith("delete")) return false;
-  return QUOTE_INPUT_TRIGGER_RE.test(value);
 }
 
 function quoteSlashArgument(value: string): string {
@@ -148,6 +175,8 @@ function stripLeadingQuote(value: string): string {
 function buildConversationSlashCompletions(
   input: string,
   characters: Array<{ id: string; name: string }> | undefined,
+  availableCapabilityIds: ReadonlySet<string>,
+  conversationGames: readonly ConversationGameSlashContribution[],
 ): ConversationSlashCompletion[] {
   if (!input.startsWith("/")) return [];
 
@@ -204,7 +233,7 @@ function buildConversationSlashCompletions(
       });
   }
 
-  return getSlashCompletions(input)
+  return getSlashCompletions(input, { mode: "conversation", availableCapabilityIds, conversationGames })
     .filter((command) => !isConversationHiddenSlashCommand(command))
     .map((command) => {
       const { value, cursor } = buildSlashCommandPrefill(command, characters);
@@ -286,26 +315,30 @@ interface ConversationInputProps {
   mobileHistoryCollapsed?: boolean;
   onMobileHistoryCollapsedChange?: (collapsed: boolean) => void;
   characterNames?: string[];
-  groupResponseOrder?: string;
   chatCharacters?: Array<{
     id: string;
     name: string;
     avatarUrl: string | null;
-    avatarCrop?: AvatarCropValue | null;
+    avatarCrop?: AvatarCrop | null;
     conversationStatus?: "online" | "idle" | "dnd" | "offline";
     conversationActivity?: string;
   }>;
   onPeekPrompt?: () => void;
+  onIllustrate?: () => void | Promise<void>;
+  onGenerateSelfie?: (characterId?: string) => void | Promise<void>;
 }
 
 export function ConversationInput({
   mobileHistoryCollapsed = false,
   onMobileHistoryCollapsedChange,
   characterNames = [],
-  groupResponseOrder,
   chatCharacters,
   onPeekPrompt,
+  onIllustrate,
+  onGenerateSelfie,
 }: ConversationInputProps) {
+  const { t: localizeUi } = useUiTranslation();
+  const { t } = useTranslation();
   const [hasInput, setHasInput] = useState(false);
   const [completions, setCompletions] = useState<ConversationSlashCompletion[]>([]);
   const [selectedCompletion, setSelectedCompletion] = useState(0);
@@ -313,11 +346,8 @@ export function ConversationInput({
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [pendingAttachmentReadsByChat, setPendingAttachmentReadsByChat] = useState<Record<string, number>>({});
   const [isTranslatingDraft, setIsTranslatingDraft] = useState(false);
-  const [emojiOpen, setEmojiOpen] = useState(false);
-  const [gifOpen, setGifOpen] = useState(false);
-  const [stickerOpen, setStickerOpen] = useState(false);
   const [mobilePickerOpen, setMobilePickerOpen] = useState(false);
-  const [mobilePickerTab, setMobilePickerTab] = useState<"emoji" | "gifs" | "stickers">("emoji");
+  const [mobilePickerTab, setMobilePickerTab] = useState<MobilePickerTab>("emoji");
   const isMobileComposerViewport = useIsMobileComposerViewport();
   const [isDragging, setIsDragging] = useState(false);
   // @mention autocomplete
@@ -326,20 +356,13 @@ export function ConversationInput({
   const [selectedMention, setSelectedMention] = useState(0);
   const [mentionStartPos, setMentionStartPos] = useState(0);
   // :emoji: autocomplete
-  const [emojiCompletions, setEmojiCompletions] = useState<ConversationCustomEmoji[]>([]);
+  const [emojiCompletions, setEmojiCompletions] = useState<EmojiCompletion[]>([]);
   const [selectedEmojiCompletion, setSelectedEmojiCompletion] = useState(0);
   const [emojiStartPos, setEmojiStartPos] = useState(0);
   const { list: customEmojiList } = useConversationCustomEmojis();
-  const [charPickerOpen, setCharPickerOpen] = useState(false);
-  const [charPickerPos, setCharPickerPos] = useState<{ left: number; top: number } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const emojiButtonRef = useRef<HTMLButtonElement>(null);
-  const gifButtonRef = useRef<HTMLButtonElement>(null);
-  const stickerButtonRef = useRef<HTMLButtonElement>(null);
-  const charPickerBtnRef = useRef<HTMLButtonElement>(null);
-  const charPickerMenuRef = useRef<HTMLDivElement>(null);
   const inputBarRef = useRef<HTMLDivElement>(null);
   const focusAfterMobileRestoreRef = useRef(false);
   const attachmentsRef = useRef<Attachment[]>([]);
@@ -347,12 +370,55 @@ export function ConversationInput({
   const currentInputFrameRef = useRef<number | null>(null);
   const pendingCurrentInputRef = useRef("");
   const activeChatId = useChatStore((s) => s.activeChatId);
+  const mariChips = useAgentStore((s) => s.mariChips);
+  const mariChipsChatId = useAgentStore((s) => s.mariChipsChatId);
+  const clearMariChips = useAgentStore((s) => s.clearMariChips);
+  const professorMariSuggestionsEnabled = useUIStore((s) => s.professorMariSuggestionsEnabled);
   const { data: activeChat } = useChat(activeChatId);
+  const { data: installedCapabilities = [] } = useInstalledCapabilityPackages();
+  const availableCapabilityIds = useMemo(
+    () => new Set(installedCapabilities.filter((item) => item.status === "active").map((item) => item.id)),
+    [installedCapabilities],
+  );
+  const availableConversationGames = useMemo(
+    () =>
+      installedCapabilities.filter(
+        (item) =>
+          isInstalledCapabilityReady(item) &&
+          item.manifest.kind.includes("turn-game") &&
+          item.manifest.entrypoints.client &&
+          item.manifest.contributions?.conversationGame,
+      ),
+    [installedCapabilities],
+  );
+  const conversationGameSlashContributions = useMemo<ConversationGameSlashContribution[]>(
+    () =>
+      availableConversationGames.map((game) => ({
+        packageId: game.id,
+        packageName: game.manifest.name,
+        command: game.manifest.contributions!.conversationGame!.command,
+        aliases: game.manifest.contributions!.conversationGame!.aliases,
+      })),
+    [availableConversationGames],
+  );
   const chatName = activeChat?.name;
   const streamingChatId = useChatStore((s) => s.streamingChatId);
   const isStreamingGlobal = useChatStore((s) => s.isStreaming);
-  const isStreaming = isStreamingGlobal && streamingChatId === activeChatId;
+  const isBackgroundIllustration = useChatStore((s) =>
+    activeChatId ? s.backgroundIllustrationChatIds.has(activeChatId) : false,
+  );
+  const agentsProcessing = useAgentStore((s) =>
+    activeChatId ? s.processingChatIds.includes(activeChatId) : s.isProcessing,
+  );
   const delayedCharacterInfo = useChatStore((s) => s.delayedCharacterInfo);
+  const hasActiveStream = isStreamingGlobal && streamingChatId === activeChatId;
+  const isStreaming = hasActiveStream && !isBackgroundIllustration;
+  const isSendBlocked = isGenerationSendBlocked({
+    streamActive: hasActiveStream,
+    agentsProcessing,
+    backgroundIllustration: isBackgroundIllustration,
+    delayedResponse: delayedCharacterInfo !== null,
+  });
   // Show stop button only during actual generation, not during busy delay
   const isActuallyGenerating = isStreaming && !delayedCharacterInfo;
   const setInputDraft = useChatStore((s) => s.setInputDraft);
@@ -361,10 +427,10 @@ export function ConversationInput({
   const { generate } = useGenerate();
   const { applyToUserInput } = useApplyRegex();
   const enterToSend = useUIStore((s) => s.enterToSendConvo);
-  const guideGenerations = useUIStore((s) => s.guideGenerations);
   const showQuickRepliesMenu = useUIStore((s) => s.showQuickRepliesMenu);
   const showQuickReplyPostOnly = useUIStore((s) => s.showQuickReplyPostOnly);
   const showQuickReplyGuide = useUIStore((s) => s.showQuickReplyGuide);
+  const customQuickReplies = useUIStore((s) => s.customQuickReplies);
   const speechToTextEnabled = useUIStore((s) => s.speechToTextEnabled);
   const quoteFormat = useUIStore((s) => s.quoteFormat);
   const createMessage = useCreateMessage(activeChatId);
@@ -381,12 +447,8 @@ export function ConversationInput({
     !hasInput &&
     attachments.length === 0 &&
     !isReadingAttachments &&
-    !isStreaming &&
-    !mobilePickerOpen &&
-    !emojiOpen &&
-    !gifOpen &&
-    !stickerOpen &&
-    !charPickerOpen;
+    !isSendBlocked &&
+    !mobilePickerOpen;
   const chatMetadata = useMemo(() => parseChatMetadata(activeChat?.metadata), [activeChat?.metadata]);
   const inactiveCharacterIds = useMemo(
     () =>
@@ -405,21 +467,16 @@ export function ConversationInput({
     () => (activeChatCharacters ? activeChatCharacters.map((character) => character.name) : characterNames),
     [activeChatCharacters, characterNames],
   );
-  const requiresManualGuideTarget = groupResponseOrder === "manual" && activeCharacterNames.length > 1;
   const inputPlaceholder = useMemo(() => {
-    if (groupResponseOrder === "manual") {
-      if (isMobileComposerViewport) {
-        return activeCharacterNames.length > 0 ? `Message… @${activeCharacterNames[0]}` : "Message freely…";
-      }
-      return activeCharacterNames.length > 0
-        ? `Message freely; @${activeCharacterNames[0]} to get a reply`
-        : "Message freely...";
+    if (isMobileComposerViewport) return t("chat.input.mobile.message");
+    if (activeCharacterNames.length > 1 && chatName) {
+      return t("chat.input.messageCharacters", { names: chatName });
     }
-    if (isMobileComposerViewport) return "Message… /cmds";
-    if (activeCharacterNames.length > 1 && chatName) return `Message ${chatName}, / for commands`;
-    if (activeCharacterNames.length > 0) return `Message @${activeCharacterNames[0]}, / for commands`;
-    return "Message...";
-  }, [activeCharacterNames, chatName, groupResponseOrder, isMobileComposerViewport]);
+    if (activeCharacterNames.length > 0) {
+      return t("chat.input.messageCharacters", { names: `@${activeCharacterNames[0]}` });
+    }
+    return t("chat.input.message");
+  }, [activeCharacterNames, chatName, isMobileComposerViewport, t]);
 
   // Read from the existing infinite-message cache so an empty Send can retry
   // after a failed generation without adding a second user message.
@@ -434,6 +491,16 @@ export function ConversationInput({
     });
   }, [activeChatId, qc]);
   const messagesData = qc.getQueryData<InfiniteData<Message[]>>(chatKeys.messages(activeChatId ?? ""));
+  const isProfessorMariChat = activeChatCharacters?.some((character) => character.id === PROFESSOR_MARI_ID) ?? false;
+  const hasMessages = (messagesData?.pages ?? []).some((page) => page.length > 0);
+  const visibleMariChips =
+    isProfessorMariChat && professorMariSuggestionsEnabled
+      ? mariChipsChatId === activeChatId && mariChips.length > 0
+        ? mariChips
+        : !hasMessages
+          ? MARI_STARTER_CHIPS
+          : []
+      : [];
   const lastMessage = useMemo(() => {
     const firstPage = messagesData?.pages?.[0];
     return firstPage?.[firstPage.length - 1] ?? null;
@@ -448,10 +515,16 @@ export function ConversationInput({
     return null;
   }, [messagesData]);
   const lastMessageRole = lastMessage?.role ?? null;
-  const canRetry = !isStreaming && groupResponseOrder !== "manual" && lastMessageRole === "user";
+  const canRetry = !delayedCharacterInfo && !isSendBlocked && lastMessageRole === "user";
   const canSubmit = hasInput || attachments.length > 0 || canRetry;
   const showRetrySendState = canRetry && !hasInput && attachments.length === 0;
-  const sendButtonTitle = isActuallyGenerating ? "Stop generating" : showRetrySendState ? "Retry generation" : "Send";
+  const sendButtonTitle = isActuallyGenerating
+    ? t("chat.input.stopGenerating")
+    : isSendBlocked
+      ? t("chat.input.waitForAgents")
+      : showRetrySendState
+        ? t("chat.input.retryGeneration")
+        : t("chat.input.send");
 
   const syncInputState = useCallback(
     (value: string) => {
@@ -506,6 +579,62 @@ export function ConversationInput({
     [activeChatId, setInputDraft, syncInputState],
   );
 
+  const mariPlan = useAgentStore((s) => s.mariPlan);
+  const mariPlanChatId = useAgentStore((s) => s.mariPlanChatId);
+  const mariPlanCursor = useAgentStore((s) => s.mariPlanCursor);
+  const recordMariPlanAnswer = useAgentStore((s) => s.recordMariPlanAnswer);
+  const clearMariPlan = useAgentStore((s) => s.clearMariPlan);
+  const activeGuidedPlan = professorMariSuggestionsEnabled && mariPlanChatId === activeChatId ? mariPlan : null;
+  const guidedPlanStep = activeGuidedPlan ? (activeGuidedPlan[mariPlanCursor] ?? null) : null;
+  const chipRowChips = guidedPlanStep ? guidedPlanStep.chips : visibleMariChips;
+  const chipRowHint = guidedPlanStep
+    ? `${guidedPlanStep.question} Suggestions only; you can type your own answer.`
+    : chipRowChips.length > 0
+      ? "Suggestions only. Pick one, or type your own."
+      : null;
+
+  const handleMariChipSelect = useCallback(
+    (chip: MariSuggestionChip) => {
+      if (guidedPlanStep) {
+        const result = recordMariPlanAnswer(guidedPlanStep.fieldKey, chip.prompt);
+        if (result === "complete") {
+          const answers = useAgentStore.getState().mariPlanAnswers;
+          const summary = Object.entries(answers)
+            .map(([key, value]) => `${key}: ${value}`)
+            .join("; ");
+          clearMariPlan();
+          const el = textareaRef.current;
+          if (el && activeChatId) {
+            const text = `Create it - ${summary}`;
+            el.value = text;
+            el.style.height = "auto";
+            el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+            syncInputState(text);
+            setInputDraft(activeChatId, text);
+            el.focus();
+          }
+        }
+        return;
+      }
+      const el = textareaRef.current;
+      if (!el || !activeChatId) return;
+      const current = el.value;
+      const next = current.trim() ? `${current.trimEnd()} ${chip.prompt}` : chip.prompt;
+      el.value = next;
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+      syncInputState(next);
+      setInputDraft(activeChatId, next);
+      el.focus();
+    },
+    [activeChatId, setInputDraft, syncInputState, guidedPlanStep, recordMariPlanAnswer, clearMariPlan],
+  );
+  useEffect(() => {
+    if (professorMariSuggestionsEnabled) return;
+    clearMariChips();
+    clearMariPlan();
+  }, [clearMariChips, clearMariPlan, professorMariSuggestionsEnabled]);
+
   useEffect(() => {
     const handleCardAssetInsert = (event: Event) => {
       const detail = (event as CustomEvent<CardAssetInsertDetail>).detail;
@@ -525,6 +654,85 @@ export function ConversationInput({
       return next;
     });
   }, []);
+
+  const restoreSubmittedInput = useCallback(
+    (submitted: SubmittedConversationInput) => {
+      const activeChatIdAfterFailure = useChatStore.getState().activeChatId;
+      const currentValue = textareaRef.current?.value ?? "";
+      const canRestoreVisibleDraft = activeChatIdAfterFailure === submitted.chatId && currentValue.length === 0;
+      if (canRestoreVisibleDraft && textareaRef.current) {
+        textareaRef.current.value = submitted.draft;
+        textareaRef.current.style.height = submitted.height;
+        syncInputState(submitted.draft);
+        setCompletions(submitted.completions);
+        setMentionQuery(submitted.mentionQuery);
+        setMentionCompletions(submitted.mentionCompletions);
+      }
+      if (submitted.attachments.length > 0) {
+        if (activeChatIdAfterFailure === submitted.chatId) {
+          updateAttachments((current) => (current.length === 0 ? submitted.attachments : current));
+        } else {
+          pendingAttachmentDraftsRef.current.set(submitted.chatId, submitted.attachments);
+        }
+      }
+      if (submitted.draft && (canRestoreVisibleDraft || activeChatIdAfterFailure !== submitted.chatId)) {
+        setInputDraft(submitted.chatId, submitted.draft);
+      }
+    },
+    [setInputDraft, syncInputState, updateAttachments],
+  );
+
+  const createDurableMessageWithRollback = useCallback(
+    async ({
+      content,
+      attachments: persistedAttachments,
+      submitted,
+      scrollToBottom = false,
+    }: {
+      content: string;
+      attachments: PersistedAttachment[];
+      submitted: SubmittedConversationInput;
+      scrollToBottom?: boolean;
+    }) => {
+      let createdMessageId: string | null = null;
+      try {
+        const created = await createMessage.mutateAsync({
+          role: "user",
+          content,
+          characterId: null,
+        });
+        createdMessageId = created.id;
+        if (persistedAttachments.length > 0) {
+          await updateMessageExtra.mutateAsync({
+            messageId: created.id,
+            extra: { attachments: persistedAttachments },
+          });
+        }
+        if (scrollToBottom) {
+          requestChatScrollToBottom({ chatId: submitted.chatId, behavior: "auto" });
+        }
+        return true;
+      } catch (error) {
+        let rollbackFailed = false;
+        if (createdMessageId) {
+          try {
+            await deleteMessage.mutateAsync(createdMessageId);
+          } catch {
+            rollbackFailed = true;
+          }
+        }
+        restoreSubmittedInput(submitted);
+        const message = error instanceof Error ? error.message : "Failed to post message";
+        toast.error(
+          rollbackFailed
+            ? localizeUi("ui.chat.chatinput.value1ThePartialMessageMayNeedToBeRemoved", { value1: message })
+            : message,
+        );
+        return false;
+      }
+    },
+    [createMessage, deleteMessage, localizeUi, restoreSubmittedInput, updateMessageExtra],
+  );
 
   const adjustPendingAttachmentReads = useCallback((chatId: string, delta: number) => {
     setPendingAttachmentReadsByChat((current) => {
@@ -635,12 +843,14 @@ export function ConversationInput({
       const MAX_SIZE = 20 * 1024 * 1024;
       const acceptedFiles = Array.from(files).filter((file) => {
         if (file.size > MAX_SIZE) {
-          toast.error(`${file.name} exceeds 20 MB limit`);
+          toast.error(localizeUi("ui.chat.conversationinput.value1Exceeds20MbLimit", { value1: file.name }));
           return false;
         }
         if (!isSupportedChatAttachment(file)) {
           toast.error(
-            `${file.name || "That file"} is not supported in chat. Attach images, PDFs, or text files like JSON, TXT, Markdown, or CSV.`,
+            localizeUi("ui.chat.chatinput.value1IsNotSupportedInChatAttachImagesPdfs", {
+              value1: file.name || localizeUi("ui.chat.chatinput.thatFile"),
+            }),
           );
           return false;
         }
@@ -656,7 +866,7 @@ export function ConversationInput({
           try {
             appendAttachmentForChat(originChatId, await prepareImageAttachment(file, displayName));
           } catch {
-            toast.error(`Failed to prepare ${displayName}`);
+            toast.error(localizeUi("ui.chat.chatinput.failedToPrepareValue1", { value1: displayName }));
           } finally {
             adjustPendingAttachmentReads(originChatId, -1);
           }
@@ -667,13 +877,13 @@ export function ConversationInput({
           const data = await readFileAsDataUrl(file);
           appendAttachmentForChat(originChatId, { type: inferAttachmentType(file), data, name: displayName });
         } catch {
-          toast.error(`Failed to read ${displayName}`);
+          toast.error(localizeUi("ui.chat.chatinput.failedToReadValue1", { value1: displayName }));
         } finally {
           adjustPendingAttachmentReads(originChatId, -1);
         }
       }
     },
-    [adjustPendingAttachmentReads, appendAttachmentForChat],
+    [adjustPendingAttachmentReads, appendAttachmentForChat, localizeUi],
   );
 
   const handlePaste = useCallback(
@@ -697,6 +907,7 @@ export function ConversationInput({
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
+      if (!isFileDrag(e.dataTransfer)) return;
       e.preventDefault();
       setIsDragging(false);
       if (!activeChatId) return;
@@ -709,6 +920,7 @@ export function ConversationInput({
   );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
+    if (!isFileDrag(e.dataTransfer)) return;
     e.preventDefault();
     setIsDragging(true);
   }, []);
@@ -759,13 +971,14 @@ export function ConversationInput({
 
   /** Insert an emoji completion into the textarea, replacing the :query. */
   const insertEmoji = useCallback(
-    (name: string) => {
+    (completion: EmojiCompletion) => {
       const el = textareaRef.current;
       if (!el) return;
       const before = el.value.slice(0, emojiStartPos);
       const after = el.value.slice(el.selectionStart);
-      el.value = `${before}:${name}: ${after}`;
-      const cursorPos = before.length + name.length + 3; // ':' + name + ':' + space
+      const inserted = completion.kind === "standard" ? completion.emoji : `:${completion.name}:`;
+      el.value = `${before}${inserted} ${after}`;
+      const cursorPos = before.length + inserted.length + 1;
       el.selectionStart = el.selectionEnd = cursorPos;
       syncInputState(el.value);
       if (activeChatId) setInputDraft(activeChatId, el.value);
@@ -776,9 +989,9 @@ export function ConversationInput({
   );
 
   const handleSend = useCallback(async () => {
-    if (!activeChatId) return;
+    if (!activeChatId || isSendBlocked) return;
     if (isReadingAttachments) {
-      toast.info("Still reading attached files. Send will be ready in a moment.");
+      toast.info(localizeUi("ui.chat.chatinput.stillReadingAttachedFilesSendWillBeReadyIn"));
       return;
     }
     const raw = textareaRef.current?.value.trim() ?? "";
@@ -806,61 +1019,12 @@ export function ConversationInput({
       return;
     }
 
-    // If already generating for this chat, just save the message without
-    // triggering another generation — the in-progress generation will see
-    // it (server re-reads messages after any busy delay).
-    if (isStreaming) {
-      const activeChatData = useChatStore.getState().activeChat;
-      const cachedCharacters = qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list());
-      const cachedPersonas = qc.getQueryData<Array<Record<string, unknown>>>(characterKeys.personas);
-      const resolveInputMacros = createInputMacroResolverForChat(activeChatData, cachedCharacters, cachedPersonas, raw);
-      const streamMeta = parseChatMetadata(activeChatData?.metadata);
-      // First pass: resolve macros against raw input, so {{input}} uses the pre-translation text.
-      let message = applyToUserInput(raw, {
-        resolveMacros: resolveInputMacros,
-        scopedMode: streamMeta.scopedRegexMode,
-      });
-      // Input translation for streaming path too
-      if (streamMeta.translateInput && message.trim()) {
-        try {
-          const { translateText } = await import("../../lib/translate-text");
-          const translated = await translateText(message);
-          if (translated.trim()) message = translated;
-        } catch {
-          toast.error("Failed to translate message — sending original");
-        }
-      }
-      // Final pass: resolve macros introduced by translation while {{input}} still points to raw.
-      message = resolveInputMacros(message);
-      if (textareaRef.current) {
-        textareaRef.current.value = "";
-        textareaRef.current.style.height = "auto";
-      }
-      clearInputDraft(activeChatId);
-      syncInputState("");
-      const currentAttachments = attachments.map((a) => ({
-        type: a.type,
-        data: a.data,
-        filename: a.name,
-        name: a.name,
-      }));
-      replaceAttachments([]);
-      const created = await createMessage.mutateAsync({
-        role: "user",
-        content: message,
-        characterId: null,
-      });
-      if (currentAttachments.length) {
-        await updateMessageExtra.mutateAsync({
-          messageId: created.id,
-          extra: { attachments: currentAttachments },
-        });
-      }
-      return;
-    }
-
     // Slash command check
-    const matched = matchSlashCommand(raw);
+    const matched = matchSlashCommand(raw, {
+      mode: "conversation",
+      availableCapabilityIds,
+      conversationGames: conversationGameSlashContributions,
+    });
     if (matched) {
       if (isConversationHiddenSlashCommand(matched.command)) {
         setFeedback("Impersonate is not available in Conversation mode.");
@@ -870,19 +1034,29 @@ export function ConversationInput({
         chatId: activeChatId,
         mode: "conversation",
         generate,
-        createMessage: (data) => createMessage.mutate(data),
+        createMessage: async (data) => {
+          await createMessage.mutateAsync(data);
+          requestChatScrollToBottom({ chatId: activeChatId, behavior: "auto" });
+        },
         invalidate: () => qc.invalidateQueries({ queryKey: chatKeys.all }),
         characterNames: activeCharacterNames,
         characters: activeChatCharacters?.map((character) => ({ id: character.id, name: character.name })),
         latestAssistantMessageId: latestAssistantMessage?.id ?? null,
         lastMessageRole,
+        illustrate: onIllustrate,
+        selfie: onGenerateSelfie,
+        availableCapabilityIds,
+        conversationGames: conversationGameSlashContributions,
       };
-      const submittedDraft = textareaRef.current?.value ?? "";
-      const submittedHeight = textareaRef.current?.style.height ?? "auto";
-      const submittedAttachments = attachments;
-      const submittedCompletions = completions;
-      const submittedMentionQuery = _mentionQuery;
-      const submittedMentionCompletions = mentionCompletions;
+      const submittedInput: SubmittedConversationInput = {
+        chatId: activeChatId,
+        draft: textareaRef.current?.value ?? "",
+        height: textareaRef.current?.style.height ?? "auto",
+        attachments,
+        completions,
+        mentionQuery: _mentionQuery,
+        mentionCompletions,
+      };
       if (textareaRef.current) {
         textareaRef.current.value = "";
         textareaRef.current.style.height = "auto";
@@ -899,51 +1073,33 @@ export function ConversationInput({
           setFeedback(result.feedback);
         }
       } catch (error) {
-        const activeChatIdAfterFailure = useChatStore.getState().activeChatId;
-        const currentValue = textareaRef.current?.value ?? "";
-        const canRestoreVisibleDraft = activeChatIdAfterFailure === activeChatId && currentValue.length === 0;
-        if (canRestoreVisibleDraft && textareaRef.current) {
-          textareaRef.current.value = submittedDraft;
-          textareaRef.current.style.height = submittedHeight;
-          syncInputState(submittedDraft);
-          setCompletions(submittedCompletions);
-          setMentionQuery(submittedMentionQuery);
-          setMentionCompletions(submittedMentionCompletions);
-        }
-        if (submittedAttachments.length > 0) {
-          if (activeChatIdAfterFailure === activeChatId) {
-            updateAttachments((current) => (current.length === 0 ? submittedAttachments : current));
-          } else {
-            pendingAttachmentDraftsRef.current.set(activeChatId, submittedAttachments);
-          }
-        }
-        if (submittedDraft && (canRestoreVisibleDraft || activeChatIdAfterFailure !== activeChatId)) {
-          setInputDraft(activeChatId, submittedDraft);
-        }
+        restoreSubmittedInput(submittedInput);
         const msg = error instanceof Error ? error.message : "Command failed";
         toast.error(msg);
       }
       return;
     }
 
-    // Natural-language launchers: "let's play uno" / "let's play chess" open the game
-    // setup. The message still sends normally, so the characters can react too.
+    // Downloaded games contribute their own aliases. The message still sends so characters can react.
     {
-      const activeUno = useUnoGameStore.getState().current;
-      const unoActive = !!activeUno && activeUno.chatId === activeChatId && activeUno.status !== "finished";
-      if (!unoActive && /\b(?:play|start)\b[^.!?\n]{0,16}\buno\b/i.test(raw)) {
-        useUnoGameStore.getState().openSetup(activeChatId);
-      }
-      const activeChess = useChessGameStore.getState().current;
-      const chessActive = !!activeChess && activeChess.chatId === activeChatId && activeChess.status !== "finished";
-      if (!chessActive && /\b(?:play|start)\b[^.!?\n]{0,16}\bchess\b/i.test(raw)) {
-        useChessGameStore.getState().openSetup(activeChatId);
+      const normalized = raw.toLocaleLowerCase();
+      if (/\b(?:play|start|deal|rack)\b/i.test(normalized)) {
+        const matchedGame = availableConversationGames.find((game) => {
+          const contribution = game.manifest.contributions!.conversationGame!;
+          const aliases = [game.manifest.name, contribution.command.slice(1), ...contribution.aliases].map((alias) =>
+            alias.toLocaleLowerCase(),
+          );
+          return aliases.some((alias) => normalized.includes(alias));
+        });
+        if (matchedGame) {
+          useConversationGamesStore.getState().openSetup(matchedGame.id, activeChatId);
+        }
       }
     }
 
     const activeChat = useChatStore.getState().activeChat;
     const cachedCharacters = qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list());
-    const cachedPersonas = qc.getQueryData<Array<Record<string, unknown>>>(characterKeys.personas);
+    const cachedPersonas = qc.getQueryData<Persona[]>(characterKeys.personas);
     const resolveInputMacros = createInputMacroResolverForChat(activeChat, cachedCharacters, cachedPersonas, raw);
     const chatMeta = parseChatMetadata(activeChat?.metadata);
     // First pass: resolve macros against raw input, so {{input}} uses the pre-translation text.
@@ -956,15 +1112,31 @@ export function ConversationInput({
     if (chatMeta.translateInput && message.trim()) {
       try {
         const { translateText } = await import("../../lib/translate-text");
-        const translated = await translateText(message);
+        const translated = await translateText(message, "input");
         if (translated.trim()) message = translated;
       } catch {
-        toast.error("Failed to translate message — sending original");
+        toast.error(localizeUi("ui.chat.chatinput.failedToTranslateMessageSendingOriginal"));
       }
     }
 
     // Final pass: resolve macros introduced by translation while {{input}} still points to raw.
     message = resolveInputMacros(message);
+
+    const submittedInput: SubmittedConversationInput = {
+      chatId: activeChatId,
+      draft: textareaRef.current?.value ?? raw,
+      height: textareaRef.current?.style.height ?? "auto",
+      attachments,
+      completions,
+      mentionQuery: _mentionQuery,
+      mentionCompletions,
+    };
+    const pendingAttachments = submittedInput.attachments.map((attachment) => ({
+      type: attachment.type,
+      data: attachment.data,
+      filename: attachment.name,
+      name: attachment.name,
+    }));
 
     if (textareaRef.current) {
       textareaRef.current.value = "";
@@ -972,25 +1144,24 @@ export function ConversationInput({
     }
     clearInputDraft(activeChatId);
     syncInputState("");
-
-    const pendingAttachments = attachments.map((a) => ({ type: a.type, data: a.data, filename: a.name, name: a.name }));
     replaceAttachments([]);
+    setCompletions([]);
+    setMentionQuery(null);
+    setMentionCompletions([]);
 
     // Extract @mentions from the raw message (before regex transforms)
     const mentioned = extractMentions(raw);
 
-    if (groupResponseOrder === "manual" && mentioned.length === 0) {
-      const created = await createMessage.mutateAsync({
-        role: "user",
+    // A presence-delayed request refreshes chat history immediately before
+    // prompting. Persist additional user messages without starting a competing
+    // generation; the waiting request will include all of them when it resumes.
+    if (delayedCharacterInfo) {
+      await createDurableMessageWithRollback({
         content: message,
-        characterId: null,
+        attachments: pendingAttachments,
+        submitted: submittedInput,
+        scrollToBottom: true,
       });
-      if (pendingAttachments.length) {
-        await updateMessageExtra.mutateAsync({
-          messageId: created.id,
-          extra: { attachments: pendingAttachments },
-        });
-      }
       return;
     }
 
@@ -1003,40 +1174,49 @@ export function ConversationInput({
     });
   }, [
     activeChatId,
+    availableConversationGames,
     activeChatCharacters,
     lastMessageRole,
     attachments,
     canRetry,
     isReadingAttachments,
-    isStreaming,
+    isSendBlocked,
+    delayedCharacterInfo,
     generate,
     applyToUserInput,
     extractMentions,
     clearInputDraft,
+    createDurableMessageWithRollback,
     createMessage,
-    updateMessageExtra,
     activeCharacterNames,
     completions,
     _mentionQuery,
     mentionCompletions,
     latestAssistantMessage,
-    groupResponseOrder,
     qc,
+    restoreSubmittedInput,
     syncInputState,
-    setInputDraft,
     replaceAttachments,
-    updateAttachments,
     onPeekPrompt,
+    onIllustrate,
+    onGenerateSelfie,
+    availableCapabilityIds,
+    conversationGameSlashContributions,
+    localizeUi,
   ]);
 
   const runQuickSlashCommand = useCallback(
     async (commandLine: string, fallbackError: string) => {
       if (!activeChatId) return;
       const submittingChatId = activeChatId;
-      const matched = matchSlashCommand(commandLine);
+      const matched = matchSlashCommand(commandLine, {
+        mode: "conversation",
+        availableCapabilityIds,
+        conversationGames: conversationGameSlashContributions,
+      });
       if (!matched) return;
       if (isConversationHiddenSlashCommand(matched.command)) {
-        toast.info("Impersonate is not available in Conversation mode.");
+        toast.info(localizeUi("ui.chat.conversationinput.impersonateIsNotAvailableInConversationMode"));
         return;
       }
       const generationStatus: { succeeded?: boolean } = {};
@@ -1048,34 +1228,29 @@ export function ConversationInput({
           if (succeeded !== undefined) generationStatus.succeeded = succeeded;
           return succeeded;
         },
-        createMessage: (data) => createMessage.mutate(data),
+        createMessage: async (data) => {
+          await createMessage.mutateAsync(data);
+          requestChatScrollToBottom({ chatId: submittingChatId, behavior: "auto" });
+        },
         invalidate: () => qc.invalidateQueries({ queryKey: chatKeys.all }),
         characterNames: activeCharacterNames,
         characters: activeChatCharacters?.map((character) => ({ id: character.id, name: character.name })),
         latestAssistantMessageId: latestAssistantMessage?.id ?? null,
         lastMessageRole,
+        illustrate: onIllustrate,
+        selfie: onGenerateSelfie,
+        availableCapabilityIds,
+        conversationGames: conversationGameSlashContributions,
       };
 
-      const previousDraft = textareaRef.current?.value ?? "";
-      const previousHeight = textareaRef.current?.style.height ?? "auto";
-      const previousCompletions = completions;
-      const previousMentionQuery = _mentionQuery;
-      const previousMentionCompletions = mentionCompletions;
-      const restoreSubmittedDraft = () => {
-        const currentValue = textareaRef.current?.value ?? "";
-        const canRestoreVisibleDraft =
-          useChatStore.getState().activeChatId === submittingChatId && currentValue.length === 0;
-        if (canRestoreVisibleDraft && textareaRef.current) {
-          textareaRef.current.value = previousDraft;
-          textareaRef.current.style.height = previousHeight;
-          syncInputState(previousDraft);
-          setCompletions(previousCompletions);
-          setMentionQuery(previousMentionQuery);
-          setMentionCompletions(previousMentionCompletions);
-        }
-        if (previousDraft && (canRestoreVisibleDraft || useChatStore.getState().activeChatId !== submittingChatId)) {
-          setInputDraft(submittingChatId, previousDraft);
-        }
+      const submittedInput: SubmittedConversationInput = {
+        chatId: submittingChatId,
+        draft: textareaRef.current?.value ?? "",
+        height: textareaRef.current?.style.height ?? "auto",
+        attachments: [],
+        completions,
+        mentionQuery: _mentionQuery,
+        mentionCompletions,
       };
       if (draftTimerRef.current) {
         clearTimeout(draftTimerRef.current);
@@ -1097,10 +1272,10 @@ export function ConversationInput({
           setFeedback(result.feedback);
         }
         if (generationStatus.succeeded === false) {
-          restoreSubmittedDraft();
+          restoreSubmittedInput(submittedInput);
         }
       } catch (error) {
-        restoreSubmittedDraft();
+        restoreSubmittedInput(submittedInput);
         const msg = error instanceof Error ? error.message : fallbackError;
         toast.error(msg);
       }
@@ -1117,23 +1292,39 @@ export function ConversationInput({
       createMessage,
       generate,
       latestAssistantMessage,
+      onIllustrate,
+      onGenerateSelfie,
+      availableCapabilityIds,
+      conversationGameSlashContributions,
       qc,
-      setInputDraft,
+      restoreSubmittedInput,
       syncInputState,
+      localizeUi,
     ],
   );
 
   const handlePostOnlyButton = useCallback(async () => {
-    if (!activeChatId || isStreaming) return;
+    if (!activeChatId || isSendBlocked) return;
     const submittingChatId = activeChatId;
     if (isReadingAttachments) {
-      toast.info("Still reading attached files. Post will be ready in a moment.");
+      toast.info(localizeUi("ui.chat.chatinput.stillReadingAttachedFilesPostWillBeReadyIn"));
       return;
     }
     const raw = textareaRef.current?.value.trim() ?? "";
     const hasText = raw.length > 0;
     const hasFiles = attachments.length > 0;
     if (!hasText && !hasFiles) return;
+
+    if (
+      shouldExecuteQuickPostAsCommand(raw, {
+        mode: "conversation",
+        availableCapabilityIds,
+        conversationGames: conversationGameSlashContributions,
+      })
+    ) {
+      await handleSend();
+      return;
+    }
 
     if (draftTimerRef.current) {
       clearTimeout(draftTimerRef.current);
@@ -1142,7 +1333,7 @@ export function ConversationInput({
 
     const activeChatData = useChatStore.getState().activeChat;
     const cachedCharacters = qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list());
-    const cachedPersonas = qc.getQueryData<Array<Record<string, unknown>>>(characterKeys.personas);
+    const cachedPersonas = qc.getQueryData<Persona[]>(characterKeys.personas);
     const resolveInputMacros = createInputMacroResolverForChat(activeChatData, cachedCharacters, cachedPersonas, raw);
     const chatMeta = parseChatMetadata(activeChatData?.metadata);
     let message = applyToUserInput(raw, {
@@ -1153,25 +1344,28 @@ export function ConversationInput({
     if (chatMeta.translateInput && message.trim()) {
       try {
         const { translateText } = await import("../../lib/translate-text");
-        const translated = await translateText(message);
+        const translated = await translateText(message, "input");
         if (translated.trim()) message = translated;
       } catch {
-        toast.error("Failed to translate message; posting original");
+        toast.error(localizeUi("ui.chat.chatinput.failedToTranslateMessagePostingOriginal"));
       }
     }
 
     message = resolveInputMacros(message);
-    const submittedDraft = raw;
-    const submittedHeight = textareaRef.current?.style.height ?? "auto";
-    const submittedAttachments = attachments;
-    const submittedCompletions = completions;
-    const submittedMentionQuery = _mentionQuery;
-    const submittedMentionCompletions = mentionCompletions;
-    const pendingAttachments = submittedAttachments.map((a) => ({
-      type: a.type,
-      data: a.data,
-      filename: a.name,
-      name: a.name,
+    const submittedInput: SubmittedConversationInput = {
+      chatId: submittingChatId,
+      draft: raw,
+      height: textareaRef.current?.style.height ?? "auto",
+      attachments,
+      completions,
+      mentionQuery: _mentionQuery,
+      mentionCompletions,
+    };
+    const pendingAttachments = submittedInput.attachments.map((attachment) => ({
+      type: attachment.type,
+      data: attachment.data,
+      filename: attachment.name,
+      name: attachment.name,
     }));
 
     if (textareaRef.current) {
@@ -1185,56 +1379,14 @@ export function ConversationInput({
     setMentionQuery(null);
     setMentionCompletions([]);
 
-    let createdMessageId: string | null = null;
-    try {
-      const created = await createMessage.mutateAsync({
-        role: "user",
-        content: message,
-        characterId: null,
-      });
-      createdMessageId = created.id;
-      if (pendingAttachments.length) {
-        await updateMessageExtra.mutateAsync({
-          messageId: created.id,
-          extra: { attachments: pendingAttachments },
-        });
-      }
-    } catch (error) {
-      let rollbackFailed = false;
-      if (createdMessageId) {
-        try {
-          await deleteMessage.mutateAsync(createdMessageId);
-        } catch {
-          rollbackFailed = true;
-        }
-      }
-      const activeChatIdAfterFailure = useChatStore.getState().activeChatId;
-      const currentValue = textareaRef.current?.value ?? "";
-      const canRestoreVisibleDraft = activeChatIdAfterFailure === submittingChatId && currentValue.length === 0;
-      if (canRestoreVisibleDraft && textareaRef.current) {
-        textareaRef.current.value = submittedDraft;
-        textareaRef.current.style.height = submittedHeight;
-        syncInputState(submittedDraft);
-        setCompletions(submittedCompletions);
-        setMentionQuery(submittedMentionQuery);
-        setMentionCompletions(submittedMentionCompletions);
-      }
-      if (submittedAttachments.length > 0) {
-        if (activeChatIdAfterFailure === submittingChatId) {
-          updateAttachments((current) => (current.length === 0 ? submittedAttachments : current));
-        } else {
-          pendingAttachmentDraftsRef.current.set(submittingChatId, submittedAttachments);
-        }
-      }
-      if (submittedDraft && (canRestoreVisibleDraft || activeChatIdAfterFailure !== submittingChatId)) {
-        setInputDraft(submittingChatId, submittedDraft);
-      }
-      const msg = error instanceof Error ? error.message : "Failed to post message";
-      toast.error(rollbackFailed ? `${msg}; the partial message may need to be removed before retrying.` : msg);
-    }
+    await createDurableMessageWithRollback({
+      content: message,
+      attachments: pendingAttachments,
+      submitted: submittedInput,
+    });
   }, [
     activeChatId,
-    isStreaming,
+    isSendBlocked,
     isReadingAttachments,
     attachments,
     completions,
@@ -1243,43 +1395,54 @@ export function ConversationInput({
     applyToUserInput,
     qc,
     clearInputDraft,
+    createDurableMessageWithRollback,
     syncInputState,
-    setInputDraft,
     replaceAttachments,
-    updateAttachments,
-    createMessage,
-    deleteMessage,
-    updateMessageExtra,
+    handleSend,
+    availableCapabilityIds,
+    conversationGameSlashContributions,
+    localizeUi,
   ]);
 
   const handleGuidedGenerationButton = useCallback(async () => {
-    if (!activeChatId || isStreaming) return;
-    if (requiresManualGuideTarget) {
-      toast.info("Choose a character from the reply picker to guide a specific reply.");
-      return;
-    }
+    if (!activeChatId || isSendBlocked || delayedCharacterInfo) return;
     if (hasPendingAttachments) {
-      toast.info("Clear or send attachments before using guided generation.");
+      toast.info(localizeUi("ui.chat.chatinput.clearOrSendAttachmentsBeforeUsingGuidedGeneration"));
       return;
     }
     const text = textareaRef.current?.value?.trim() ?? "";
     if (!text) return;
     await runQuickSlashCommand(`/guided ${text}`, "Guided generation failed");
-  }, [activeChatId, isStreaming, requiresManualGuideTarget, hasPendingAttachments, runQuickSlashCommand]);
+  }, [activeChatId, isSendBlocked, delayedCharacterInfo, hasPendingAttachments, runQuickSlashCommand, localizeUi]);
+
+  const sendCustomQuickReply = useCallback(
+    async (content: string) => {
+      const el = textareaRef.current;
+      if (!el || !activeChatId || isSendBlocked || isReadingAttachments) return;
+      el.value = content;
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+      syncInputState(content);
+      setInputDraft(activeChatId, content);
+      await handleSend();
+    },
+    [activeChatId, isSendBlocked, isReadingAttachments, syncInputState, setInputDraft, handleSend],
+  );
 
   const quickReplyActions = useMemo<QuickReplyAction[]>(() => {
     const actions: QuickReplyAction[] = [];
     const getPostOnlyDisabledReason = () => {
       if (!activeChatId) return "Select or create a chat first.";
-      if (isStreaming) return "Wait for the current stream to finish.";
+      if (isSendBlocked) return "Wait for the current agents to finish.";
       if (isReadingAttachments) return "Still reading attached files.";
       if (!hasInput && attachments.length === 0) return "Type a draft first.";
       return undefined;
     };
     const getGuideDisabledReason = () => {
       if (!activeChatId) return "Select or create a chat first.";
-      if (isStreaming) return "Wait for the current stream to finish.";
-      if (requiresManualGuideTarget) return "Choose a character from the reply picker.";
+      if (isSendBlocked || delayedCharacterInfo) {
+        return localizeUi("ui.chat.conversationinput.waitForTheCurrentResponseToBegin");
+      }
       if (hasPendingAttachments) return "Clear or post attachments first.";
       if (!hasInput) return "Type a direction first.";
       return undefined;
@@ -1290,7 +1453,7 @@ export function ConversationInput({
         label: "Post only",
         description: "Add your message without a reply",
         icon: <FileText size="0.875rem" />,
-        disabled: !activeChatId || isStreaming || isReadingAttachments || (!hasInput && attachments.length === 0),
+        disabled: !activeChatId || isSendBlocked || isReadingAttachments || (!hasInput && attachments.length === 0),
         disabledReason: getPostOnlyDisabledReason(),
         onSelect: handlePostOnlyButton,
       });
@@ -1301,24 +1464,50 @@ export function ConversationInput({
         label: "Guide reply",
         description: "Send as /guided direction",
         icon: <WandSparkles size="0.875rem" />,
-        disabled: !activeChatId || isStreaming || requiresManualGuideTarget || !hasInput || hasPendingAttachments,
+        disabled: !activeChatId || isSendBlocked || !!delayedCharacterInfo || !hasInput || hasPendingAttachments,
         disabledReason: getGuideDisabledReason(),
         onSelect: handleGuidedGenerationButton,
+      });
+    }
+    for (const entry of customQuickReplies) {
+      const label = entry.label.trim() || entry.content.trim().slice(0, 24) || "Quick reply";
+      if (!entry.content.trim()) continue;
+      actions.push({
+        id: `custom-${entry.id}`,
+        label,
+        description: "Send a saved custom quick reply",
+        icon: (
+          <span className="text-sm leading-none" aria-hidden="true">
+            {entry.icon?.trim() || "✨"}
+          </span>
+        ),
+        disabled: !activeChatId || isSendBlocked || isReadingAttachments,
+        disabledReason: !activeChatId
+          ? "Select or create a chat first."
+          : isSendBlocked
+            ? "Wait for the current agents to finish."
+            : isReadingAttachments
+              ? "Still reading attached files."
+              : undefined,
+        onSelect: () => sendCustomQuickReply(entry.content),
       });
     }
     return actions;
   }, [
     activeChatId,
-    isStreaming,
+    isSendBlocked,
+    delayedCharacterInfo,
     isReadingAttachments,
     hasInput,
     attachments.length,
     hasPendingAttachments,
-    requiresManualGuideTarget,
     showQuickReplyPostOnly,
     showQuickReplyGuide,
+    customQuickReplies,
+    sendCustomQuickReply,
     handlePostOnlyButton,
     handleGuidedGenerationButton,
+    localizeUi,
   ]);
 
   const handleKeyDown = useCallback(
@@ -1363,7 +1552,7 @@ export function ConversationInput({
         if (e.key === "Tab" || e.key === "Enter") {
           e.preventDefault();
           const em = emojiCompletions[selectedEmojiCompletion];
-          if (em) insertEmoji(em.name);
+          if (em) insertEmoji(em);
           return;
         }
         if (e.key === "Escape") {
@@ -1425,93 +1614,108 @@ export function ConversationInput({
     ],
   );
 
-  const handleInput = useCallback((event: FormEvent<HTMLTextAreaElement>) => {
-    const el = textareaRef.current;
-    if (!el) return;
-    const formatted = shouldFormatQuoteInput(event, el.value) ? applyTextareaQuoteFormat(el, quoteFormat) : el.value;
-    // Debounced resize to reduce layout reflows during fast typing
-    if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
-    resizeTimerRef.current = setTimeout(() => {
+  const handleInput = useCallback(
+    (event: FormEvent<HTMLTextAreaElement>) => {
+      const el = textareaRef.current;
       if (!el) return;
-      el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
-    }, 150);
-    syncInputState(formatted);
+      const formatted = applyTextareaQuoteFormat(el, quoteFormat, event.nativeEvent as InputEvent);
+      // Debounced resize to reduce layout reflows during fast typing
+      if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
+      resizeTimerRef.current = setTimeout(() => {
+        if (!el) return;
+        el.style.height = "auto";
+        el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+      }, 150);
+      syncInputState(formatted);
 
-    if (activeChatId) {
-      if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
-      const chatId = activeChatId;
-      const draft = formatted;
-      draftTimerRef.current = setTimeout(() => {
-        if (draft.trim()) {
-          setInputDraft(chatId, draft);
+      if (activeChatId) {
+        if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+        const chatId = activeChatId;
+        const draft = formatted;
+        draftTimerRef.current = setTimeout(() => {
+          if (draft.trim()) {
+            setInputDraft(chatId, draft);
+          } else {
+            clearInputDraft(chatId);
+          }
+        }, 300);
+      }
+
+      // Slash completions
+      if (formatted.startsWith("/")) {
+        const results = buildConversationSlashCompletions(
+          formatted,
+          activeChatCharacters,
+          availableCapabilityIds,
+          conversationGameSlashContributions,
+        );
+        setCompletions(results);
+        setSelectedCompletion(0);
+      } else {
+        setCompletions((current) => (current.length > 0 ? [] : current));
+      }
+
+      // @mention detection — look backwards from cursor for an @ trigger
+      const cursor = el.selectionStart;
+      const textBefore = formatted.slice(0, cursor);
+      // Find the last @ that isn't preceded by a word character
+      const atMatch = textBefore.match(/(^|[^\p{L}\p{N}_])@([^\n@]*)$/u);
+      if (atMatch && activeCharacterNames.length > 0) {
+        const queryText = atMatch[2] ?? "";
+        const query = normalizeTextForMatch(queryText);
+        const startPos = (atMatch.index ?? textBefore.length - atMatch[0].length) + (atMatch[1]?.length ?? 0);
+        const matches = activeCharacterNames.filter((name) => startsWithTextForMatch(name, query));
+        if (matches.length > 0) {
+          setMentionQuery(query);
+          setMentionCompletions(matches);
+          setSelectedMention(0);
+          setMentionStartPos(startPos);
         } else {
-          clearInputDraft(chatId);
+          setMentionQuery((current) => (current === null ? current : null));
+          setMentionCompletions((current) => (current.length > 0 ? [] : current));
         }
-      }, 300);
-    }
-
-    // Slash completions
-    if (formatted.startsWith("/")) {
-      const results = buildConversationSlashCompletions(formatted, activeChatCharacters);
-      setCompletions(results);
-      setSelectedCompletion(0);
-    } else {
-      setCompletions((current) => (current.length > 0 ? [] : current));
-    }
-
-    // @mention detection — look backwards from cursor for an @ trigger
-    const cursor = el.selectionStart;
-    const textBefore = formatted.slice(0, cursor);
-    // Find the last @ that isn't preceded by a word character
-    const atMatch = textBefore.match(/(^|[^\p{L}\p{N}_])@([^\n@]*)$/u);
-    if (atMatch && activeCharacterNames.length > 0) {
-      const queryText = atMatch[2] ?? "";
-      const query = normalizeTextForMatch(queryText);
-      const startPos = (atMatch.index ?? textBefore.length - atMatch[0].length) + (atMatch[1]?.length ?? 0);
-      const matches = activeCharacterNames.filter((name) => startsWithTextForMatch(name, query));
-      if (matches.length > 0) {
-        setMentionQuery(query);
-        setMentionCompletions(matches);
-        setSelectedMention(0);
-        setMentionStartPos(startPos);
       } else {
         setMentionQuery((current) => (current === null ? current : null));
         setMentionCompletions((current) => (current.length > 0 ? [] : current));
       }
-    } else {
-      setMentionQuery((current) => (current === null ? current : null));
-      setMentionCompletions((current) => (current.length > 0 ? [] : current));
-    }
 
-    // :emoji: detection — a `:partial` at a word boundary, just before the cursor
-    const emojiMatch = textBefore.match(/(?:^|\s):([a-z0-9_]+)$/);
-    if (emojiMatch && customEmojiList && customEmojiList.length > 0) {
-      const eq = emojiMatch[1]!.toLowerCase();
-      const matches = customEmojiList
-        .filter((em) => em.name.includes(eq))
-        .sort((a, b) => Number(b.name.startsWith(eq)) - Number(a.name.startsWith(eq)))
-        .slice(0, 10);
-      if (matches.length > 0) {
-        setEmojiCompletions(matches);
-        setSelectedEmojiCompletion(0);
-        setEmojiStartPos(cursor - eq.length - 1);
+      // :emoji: detection — a `:partial` at a word boundary, just before the cursor
+      const emojiMatch = textBefore.match(/(?:^|\s):([a-z0-9_]+)$/i);
+      if (emojiMatch) {
+        const eq = emojiMatch[1]!.toLowerCase();
+        const customMatches: EmojiCompletion[] = (customEmojiList ?? [])
+          .filter((em) => em.name.includes(eq))
+          .sort((a, b) => Number(b.name.startsWith(eq)) - Number(a.name.startsWith(eq)))
+          .map((em) => ({ ...em, kind: "custom" as const }));
+        const customNames = new Set(customMatches.map((em) => em.name));
+        const standardMatches: EmojiCompletion[] = searchStandardEmojiShortcodes(eq, 10)
+          .filter((em) => !customNames.has(em.name))
+          .map((em) => ({ ...em, kind: "standard" as const, source: "Standard" as const }));
+        const matches = [...customMatches, ...standardMatches].slice(0, 10);
+        if (matches.length > 0) {
+          setEmojiCompletions(matches);
+          setSelectedEmojiCompletion(0);
+          setEmojiStartPos(cursor - eq.length - 1);
+        } else {
+          setEmojiCompletions((current) => (current.length > 0 ? [] : current));
+        }
       } else {
         setEmojiCompletions((current) => (current.length > 0 ? [] : current));
       }
-    } else {
-      setEmojiCompletions((current) => (current.length > 0 ? [] : current));
-    }
-  }, [
-    activeChatId,
-    activeCharacterNames,
-    activeChatCharacters,
-    customEmojiList,
-    clearInputDraft,
-    quoteFormat,
-    setInputDraft,
-    syncInputState,
-  ]);
+    },
+    [
+      activeChatId,
+      activeCharacterNames,
+      activeChatCharacters,
+      customEmojiList,
+      clearInputDraft,
+      quoteFormat,
+      setInputDraft,
+      syncInputState,
+      availableCapabilityIds,
+      conversationGameSlashContributions,
+    ],
+  );
 
   useEffect(() => {
     if (hasInput && feedback) setFeedback(null);
@@ -1577,16 +1781,7 @@ export function ConversationInput({
         // If fetch fails (CORS etc.), send without attachment — still shows as image in chat
       }
 
-      // If already streaming for this chat, just save the message
-      if (isStreaming) {
-        createMessage.mutate({ role: "user", content: gifUrl, characterId: null });
-        return;
-      }
-
-      if (groupResponseOrder === "manual" && activeCharacterNames.length > 1) {
-        createMessage.mutate({ role: "user", content: gifUrl, characterId: null });
-        return;
-      }
+      if (isSendBlocked) return;
 
       await generate({
         chatId: activeChatId,
@@ -1595,7 +1790,7 @@ export function ConversationInput({
         ...(gifAttachments ? { attachments: gifAttachments } : {}),
       });
     },
-    [activeChatId, isStreaming, groupResponseOrder, activeCharacterNames.length, generate, createMessage],
+    [activeChatId, isSendBlocked, generate],
   );
 
   const handleStickerSelect = useCallback(
@@ -1617,88 +1812,28 @@ export function ConversationInput({
       }
       if (choice !== "send") return; // dismissed
 
-      // "Send & reply" — post the sticker as its own message (mirror the GIF send guards).
-      if (isStreaming) {
-        createMessage.mutate({ role: "user", content: token, characterId: null });
-        return;
-      }
-      if (groupResponseOrder === "manual" && activeCharacterNames.length > 1) {
-        createMessage.mutate({ role: "user", content: token, characterId: null });
-        return;
-      }
+      if (isSendBlocked) return;
       await generate({ chatId: activeChatId, connectionId: null, userMessage: token });
     },
-    [
-      activeChatId,
-      isStreaming,
-      groupResponseOrder,
-      activeCharacterNames.length,
-      generate,
-      createMessage,
-      insertStickerToken,
-    ],
+    [activeChatId, isSendBlocked, generate, insertStickerToken],
   );
-
-  const handleCharacterResponse = useCallback(
-    async (characterId: string) => {
-      if (!activeChatId || isStreaming) return;
-      setCharPickerOpen(false);
-      setCharPickerPos(null);
-      const guideText = textareaRef.current?.value ?? "";
-      try {
-        await generate(
-          guideGenerations && hasInput
-            ? {
-                chatId: activeChatId,
-                connectionId: null,
-                forCharacterId: characterId,
-                generationGuide: buildGuidedGenerationInstructionMessage(guideText),
-                generationGuideSource: "guide",
-              }
-            : { chatId: activeChatId, connectionId: null, forCharacterId: characterId },
-        );
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : "Generation failed";
-        toast.error(msg);
-      }
-    },
-    [activeChatId, isStreaming, generate, guideGenerations, hasInput],
-  );
-
-  useEffect(() => {
-    if (!charPickerOpen) return;
-    const handler = (e: MouseEvent) => {
-      if (
-        charPickerMenuRef.current &&
-        !charPickerMenuRef.current.contains(e.target as Node) &&
-        charPickerBtnRef.current &&
-        !charPickerBtnRef.current.contains(e.target as Node)
-      ) {
-        setCharPickerOpen(false);
-        setCharPickerPos(null);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [charPickerOpen]);
-
-  useEffect(() => {
-    if (!charPickerOpen || !charPickerBtnRef.current) return;
-    const rect = charPickerBtnRef.current.getBoundingClientRect();
-    const inputBox = charPickerBtnRef.current.closest(".rounded-2xl") as HTMLElement | null;
-    const anchorTop = inputBox ? inputBox.getBoundingClientRect().top : rect.top;
-    requestAnimationFrame(() => {
-      const menuEl = charPickerMenuRef.current;
-      const menuHeight = menuEl?.offsetHeight || 300;
-      const menuWidth = menuEl?.offsetWidth || 220;
-      let left = rect.right - menuWidth;
-      if (left < 8) left = 8;
-      setCharPickerPos({ left, top: Math.max(8, anchorTop - menuHeight - 4) });
-    });
-  }, [charPickerOpen]);
-
-  const showCharPicker = groupResponseOrder === "manual" && !!activeChatCharacters && activeChatCharacters.length > 1;
   const showDraftTranslateButton = chatMetadata.showInputTranslateButton === true;
+  const showMobileToolsTab =
+    showDraftTranslateButton || speechToTextEnabled || (showQuickRepliesMenu && quickReplyActions.length > 0);
+  const mobilePickerTabs = useMemo<ConversationMediaPickerTab[]>(() => {
+    const tabs: ConversationMediaPickerTab[] = [
+      { id: "emoji", label: "Emoji" },
+      { id: "kaomoji", label: "Kaomoji" },
+      { id: "gifs", label: "GIFs" },
+      { id: "stickers", label: "Stickers" },
+    ];
+    if (showMobileToolsTab) tabs.push({ id: "tools", label: "Tools" });
+    return tabs;
+  }, [showMobileToolsTab]);
+
+  useEffect(() => {
+    if (!showMobileToolsTab && mobilePickerTab === "tools") setMobilePickerTab("emoji");
+  }, [mobilePickerTab, showMobileToolsTab]);
 
   const handleTranslateDraft = useCallback(async () => {
     if (!activeChatId || isTranslatingDraft) return;
@@ -1771,16 +1906,84 @@ export function ConversationInput({
     window.setTimeout(focus, 120);
   }, [ensureInputVisible, mobileHistoryCollapsed]);
 
-  const statusDotClass = (status?: string) =>
-    status === "offline"
-      ? "bg-gray-400"
-      : status === "dnd"
-        ? "bg-red-500"
-        : status === "idle"
-          ? "bg-yellow-500"
-          : "bg-green-500";
-  const statusLabel = (status?: string) =>
-    status === "offline" ? "Offline" : status === "dnd" ? "Busy" : status === "idle" ? "Away" : null;
+  const mediaPickerToolsContent =
+    mobilePickerTab === "tools" ? (
+      <div className="flex h-full flex-col gap-3 overflow-y-auto p-3">
+        <div className="grid gap-2">
+          {showDraftTranslateButton && (
+            <button
+              type="button"
+              onClick={() => {
+                setMobilePickerOpen(false);
+                void handleTranslateDraft();
+              }}
+              disabled={!activeChatId || !hasInput || isTranslatingDraft}
+              className={cn(
+                "flex min-h-11 w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-colors",
+                activeChatId && hasInput && !isTranslatingDraft
+                  ? "text-foreground/80 hover:bg-foreground/10"
+                  : "cursor-not-allowed text-foreground/25",
+              )}
+            >
+              {isTranslatingDraft ? (
+                <Loader2 size="1rem" className="shrink-0 animate-spin" />
+              ) : (
+                <Languages size="1rem" className="shrink-0" />
+              )}
+              <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                {localizeUi("chat.input.translateDraft")}
+              </span>
+            </button>
+          )}
+
+          {speechToTextEnabled && (
+            <div className="flex min-h-11 items-center justify-between gap-2 rounded-lg px-3 py-2">
+              <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground/80">
+                {localizeUi("ui.chat.conversationinput.voiceInput")}
+              </span>
+              <SpeechToTextButton
+                disabled={!activeChatId}
+                onTranscript={(transcript) => {
+                  setMobilePickerOpen(false);
+                  handleSpeechTranscript(transcript);
+                }}
+                className="h-10 w-10 rounded-lg"
+                iconSize={16}
+              />
+            </div>
+          )}
+
+          {showQuickRepliesMenu &&
+            quickReplyActions.map((action) => (
+              <button
+                key={action.id}
+                type="button"
+                onClick={() => {
+                  if (action.disabled) return;
+                  setMobilePickerOpen(false);
+                  void action.onSelect();
+                }}
+                disabled={action.disabled}
+                title={action.disabled ? (action.disabledReason ?? action.description) : action.description}
+                className={cn(
+                  "flex min-h-11 w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-colors",
+                  action.disabled
+                    ? "cursor-not-allowed text-foreground/25"
+                    : "text-foreground/80 hover:bg-foreground/10",
+                )}
+              >
+                <span className="shrink-0">{action.icon}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium">{action.label}</span>
+                  <span className="block truncate text-xs text-foreground/45">
+                    {action.disabledReason ?? action.description}
+                  </span>
+                </span>
+              </button>
+            ))}
+        </div>
+      </div>
+    ) : null;
 
   if (shouldShowMobileCollapsedComposer) {
     return (
@@ -1795,9 +1998,9 @@ export function ConversationInput({
             getChatInputShellClass({ dragging: false, hasContent: false, layout: "conversation" }),
             "min-h-10 w-full justify-start text-left text-sm text-foreground/55",
           )}
-          aria-label="Show message input"
+          aria-label={t("chat.input.show")}
         >
-          <span className="truncate">Message… /cmds</span>
+          <span className="truncate">{t("chat.input.mobile.message")}</span>
         </button>
       </div>
     );
@@ -1875,14 +2078,24 @@ export function ConversationInput({
               key={em.name}
               onMouseDown={(e) => {
                 e.preventDefault();
-                insertEmoji(em.name);
+                insertEmoji(em);
               }}
               className={cn(
                 "flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm transition-colors",
                 i === selectedEmojiCompletion ? "bg-foreground/10 text-foreground" : "hover:bg-foreground/10",
               )}
             >
-              <img src={em.url} alt={`:${em.name}:`} className="h-5 w-5 shrink-0 object-contain" />
+              {em.kind === "custom" ? (
+                <img
+                  src={em.url}
+                  alt={localizeUi("ui.chat.conversationinput.value1", { value1: em.name })}
+                  className="h-5 w-5 shrink-0 object-contain"
+                />
+              ) : (
+                <span className="flex h-5 w-5 shrink-0 items-center justify-center text-base" aria-hidden="true">
+                  {em.emoji}
+                </span>
+              )}
               <span className="min-w-0 flex-1 truncate font-medium">:{em.name}:</span>
               <span className="hidden shrink-0 text-xs text-foreground/40 sm:inline">{em.source}</span>
             </button>
@@ -1890,48 +2103,19 @@ export function ConversationInput({
         </div>
       )}
 
-      {/* Mobile multipurpose picker sheet — Emoji / GIFs / Stickers (desktop uses the popovers) */}
+      {/* Multipurpose picker sheet — Emoji / GIFs / Stickers / Tools */}
       {mobilePickerOpen && (
-        <div className="absolute bottom-full left-0 right-0 z-20 mb-1 flex h-[22rem] max-h-[60vh] flex-col overflow-hidden rounded-xl border border-foreground/10 bg-[var(--card)] shadow-xl sm:hidden">
-          <div className="flex shrink-0 items-center gap-1 border-b border-foreground/10 px-2 py-1.5">
-            {(["emoji", "gifs", "stickers"] as const).map((tab) => (
-              <button
-                key={tab}
-                type="button"
-                onClick={() => setMobilePickerTab(tab)}
-                className={cn(
-                  "flex-1 rounded-md px-2 py-1 text-xs font-medium transition-colors",
-                  mobilePickerTab === tab
-                    ? "bg-foreground/10 text-foreground/80 ring-1 ring-foreground/15"
-                    : "text-foreground/45 hover:bg-foreground/10 hover:text-foreground/70",
-                )}
-              >
-                {tab === "gifs" ? "GIFs" : tab === "stickers" ? "Stickers" : "Emoji"}
-              </button>
-            ))}
-          </div>
-          <div className="min-h-0 flex-1">
-            {mobilePickerTab === "emoji" && (
-              <EmojiPicker
-                embedded
-                open
-                onClose={() => setMobilePickerOpen(false)}
-                onSelect={handleEmojiSelect}
-                customTab={{
-                  icon: "⭐",
-                  label: "Custom emojis",
-                  render: (query) => <CustomEmojiTab onInsert={handleEmojiSelect} query={query} />,
-                }}
-              />
-            )}
-            {mobilePickerTab === "gifs" && (
-              <GifPicker embedded open onClose={() => setMobilePickerOpen(false)} onSelect={handleGifSelect} />
-            )}
-            {mobilePickerTab === "stickers" && (
-              <StickerPicker embedded open onClose={() => setMobilePickerOpen(false)} onSelect={handleStickerSelect} />
-            )}
-          </div>
-        </div>
+        <ConversationMediaPickerPanel
+          tabs={mobilePickerTabs}
+          activeTab={mobilePickerTab}
+          onActiveTabChange={setMobilePickerTab}
+          onClose={() => setMobilePickerOpen(false)}
+          onEmojiSelect={handleEmojiSelect}
+          onGifSelect={handleGifSelect}
+          onStickerSelect={handleStickerSelect}
+          className="absolute bottom-full left-0 right-0 z-20 mb-3 sm:hidden"
+          toolsContent={mediaPickerToolsContent}
+        />
       )}
 
       {/* Feedback toast */}
@@ -1970,18 +2154,37 @@ export function ConversationInput({
           {isReadingAttachments && (
             <div className="flex items-center gap-1.5 rounded-lg bg-foreground/10 px-2.5 py-1.5 text-xs text-foreground/60 ring-1 ring-foreground/10">
               <Loader2 size="0.875rem" className="animate-spin" />
-              Reading file...
+              {localizeUi("ui.chat.chatinput.readingFile")}
             </div>
           )}
         </div>
       )}
 
+      {chipRowHint && (
+        <p className="mb-1 flex items-center gap-1.5 px-0.5 text-xs text-[var(--muted-foreground)]">
+          <Sparkles size="0.75rem" className="shrink-0 text-[var(--primary)]" />
+          <span>{chipRowHint}</span>
+        </p>
+      )}
+      <MariSuggestionChips chips={chipRowChips} onSelect={handleMariChipSelect} disabled={isSendBlocked} />
+
       {/* Input bar */}
       <div
         ref={inputBarRef}
+        data-chat-resource-drop-exclude
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
+        onPointerDown={(event) => {
+          const target = event.target as HTMLElement;
+          if (target.closest("button, input, textarea, select, a, [role='button']")) return;
+          event.preventDefault();
+          const textarea = textareaRef.current;
+          if (!textarea) return;
+          textarea.focus({ preventScroll: true });
+          const caret = textarea.value.length;
+          textarea.setSelectionRange(caret, caret);
+        }}
         className={getChatInputShellClass({
           dragging: isDragging,
           hasContent: hasInput || attachments.length > 0,
@@ -2008,7 +2211,7 @@ export function ConversationInput({
               ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20"
               : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
           )}
-          title="Attach file"
+          title={t("chat.input.attachFiles")}
         >
           <Paperclip size="1rem" />
         </button>
@@ -2026,6 +2229,7 @@ export function ConversationInput({
 
         <textarea
           ref={textareaRef}
+          data-chat-composer="true"
           placeholder={inputPlaceholder}
           rows={1}
           onInput={handleInput}
@@ -2040,12 +2244,10 @@ export function ConversationInput({
 
         {/* Right actions */}
         <div className="ml-0 flex shrink-0 flex-nowrap items-center justify-end gap-0 sm:ml-auto sm:gap-0.5">
-          {/* Mobile: one multipurpose button → Emoji/GIFs/Stickers sheet (desktop uses the separate buttons) */}
+          {/* Mobile: one multipurpose button → Emoji/GIFs/Stickers/Tools sheet */}
           <button
             type="button"
             onClick={() => {
-              setEmojiOpen(false);
-              setGifOpen(false);
               const next = !mobilePickerOpen;
               setMobilePickerOpen(next);
               if (next) textareaRef.current?.blur();
@@ -2057,117 +2259,56 @@ export function ConversationInput({
                 ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20"
                 : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
             )}
-            title={mobilePickerOpen ? "Show keyboard" : "Emoji, GIFs & stickers"}
-            aria-label={mobilePickerOpen ? "Show keyboard" : "Emoji, GIFs and stickers"}
+            title={
+              mobilePickerOpen
+                ? t("chat.input.showKeyboard")
+                : showMobileToolsTab
+                  ? t("chat.input.mediaAndTools")
+                  : t("chat.input.media")
+            }
+            aria-label={
+              mobilePickerOpen
+                ? t("chat.input.showKeyboard")
+                : showMobileToolsTab
+                  ? t("chat.input.mediaAndTools")
+                  : t("chat.input.media")
+            }
           >
             {mobilePickerOpen ? <Keyboard size="1.25rem" /> : <Smile size="1.25rem" />}
           </button>
 
           <div className="relative hidden sm:block">
             <button
-              ref={gifButtonRef}
+              type="button"
               onClick={() => {
-                setGifOpen((v) => !v);
-                setEmojiOpen(false);
-                setStickerOpen(false);
-              }}
-              className={cn(
-                "flex h-9 w-9 items-center justify-center rounded-xl transition-colors sm:h-8 sm:w-8 sm:rounded-full",
-                gifOpen
-                  ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20"
-                  : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
-              )}
-              title="GIF"
-            >
-              <ImagePlay size="1.25rem" />
-            </button>
-            <GifPicker
-              open={gifOpen}
-              onClose={() => setGifOpen(false)}
-              onSelect={handleGifSelect}
-              anchorRef={gifButtonRef}
-              containerRef={inputBarRef}
-            />
-          </div>
-
-          <div className="relative hidden sm:block">
-            <button
-              ref={emojiButtonRef}
-              onClick={() => {
-                setEmojiOpen((v) => !v);
-                setGifOpen(false);
-                setStickerOpen(false);
+                setMobilePickerOpen((value) => !value);
               }}
               className={cn(
                 "flex h-8 w-8 items-center justify-center rounded-full transition-colors",
-                emojiOpen
+                mobilePickerOpen
                   ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20"
                   : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
               )}
-              title="Emoji"
+              title={t(showMobileToolsTab ? "chat.input.mediaAndTools" : "chat.input.media")}
+              aria-label={t(showMobileToolsTab ? "chat.input.mediaAndTools" : "chat.input.media")}
+              aria-expanded={mobilePickerOpen}
             >
               <Smile size="1.25rem" />
             </button>
-            <EmojiPicker
-              open={emojiOpen}
-              onClose={() => setEmojiOpen(false)}
-              onSelect={handleEmojiSelect}
-              anchorRef={emojiButtonRef}
-              containerRef={inputBarRef}
-              customTab={{
-                icon: "⭐",
-                label: "Custom emojis",
-                render: (query) => <CustomEmojiTab onInsert={handleEmojiSelect} query={query} />,
-              }}
-            />
+            {mobilePickerOpen && (
+              <ConversationMediaPickerPanel
+                tabs={mobilePickerTabs}
+                activeTab={mobilePickerTab}
+                onActiveTabChange={setMobilePickerTab}
+                onClose={() => setMobilePickerOpen(false)}
+                onEmojiSelect={handleEmojiSelect}
+                onGifSelect={handleGifSelect}
+                onStickerSelect={handleStickerSelect}
+                className="absolute bottom-full right-0 z-30 mb-4 w-[min(24rem,calc(100vw-1.5rem))]"
+                toolsContent={mediaPickerToolsContent}
+              />
+            )}
           </div>
-
-          <div className="relative hidden sm:block">
-            <button
-              ref={stickerButtonRef}
-              onClick={() => {
-                setStickerOpen((v) => !v);
-                setEmojiOpen(false);
-                setGifOpen(false);
-              }}
-              className={cn(
-                "flex h-8 w-8 items-center justify-center rounded-full transition-colors",
-                stickerOpen
-                  ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20"
-                  : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
-              )}
-              title="Stickers"
-            >
-              <Sticker size="1.25rem" />
-            </button>
-            <StickerPicker
-              open={stickerOpen}
-              onClose={() => setStickerOpen(false)}
-              onSelect={handleStickerSelect}
-              anchorRef={stickerButtonRef}
-              containerRef={inputBarRef}
-            />
-          </div>
-
-          {showCharPicker && (
-            <button
-              ref={charPickerBtnRef}
-              onClick={() => setCharPickerOpen((v) => !v)}
-              className={cn(
-                "hidden h-11 w-11 items-center justify-center rounded-full transition-colors sm:flex sm:h-8 sm:w-8",
-                guideGenerations && hasInput
-                  ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20 hover:bg-foreground/15"
-                  : charPickerOpen
-                    ? "bg-foreground/10 text-foreground/75 ring-1 ring-foreground/20"
-                    : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
-              )}
-              title={
-                guideGenerations && hasInput ? "Trigger character response (guided)" : "Trigger character response"
-              }
-            >
-              <Users size="1rem" />
-            </button>
-          )}
 
           {showDraftTranslateButton && (
             <button
@@ -2180,7 +2321,7 @@ export function ConversationInput({
                   ? "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70"
                   : "text-foreground/25",
               )}
-              title="Translate draft"
+              title={t("chat.input.translateDraft")}
             >
               {isTranslatingDraft ? <Loader2 size="1rem" className="animate-spin" /> : <Languages size="1rem" />}
             </button>
@@ -2197,10 +2338,7 @@ export function ConversationInput({
 
           {showQuickRepliesMenu && quickReplyActions.length > 0 && (
             <div className="hidden sm:block">
-              <QuickReplyMenu
-                actions={quickReplyActions}
-                disabled={!activeChatId || isReadingAttachments || (!hasInput && attachments.length === 0)}
-              />
+              <QuickReplyMenu actions={quickReplyActions} disabled={!activeChatId || isReadingAttachments} />
             </div>
           )}
 
@@ -2210,13 +2348,13 @@ export function ConversationInput({
                 ? () => useChatStore.getState().stopGeneration(activeChatId ?? undefined)
                 : handleSend
             }
-            disabled={!isActuallyGenerating && (isReadingAttachments || !activeChatId || !canSubmit)}
+            disabled={!isActuallyGenerating && (isSendBlocked || isReadingAttachments || !activeChatId || !canSubmit)}
             aria-label={sendButtonTitle}
             className={cn(
               "flex h-9 w-9 items-center justify-center rounded-xl transition-all duration-200 sm:h-8 sm:w-8",
               isActuallyGenerating
                 ? "text-foreground/75 hover:bg-foreground/10 hover:text-foreground/90"
-                : canSubmit && !isReadingAttachments
+                : canSubmit && !isSendBlocked && !isReadingAttachments
                   ? "text-foreground/75 hover:bg-foreground/10 hover:text-foreground/90 active:scale-90"
                   : "text-foreground/20",
             )}
@@ -2232,65 +2370,6 @@ export function ConversationInput({
           </button>
         </div>
       </div>
-      {showCharPicker &&
-        charPickerOpen &&
-        createPortal(
-          <div
-            ref={charPickerMenuRef}
-            className="fixed z-[9999] flex max-h-[320px] min-w-[220px] max-w-[280px] flex-col overflow-hidden rounded-xl border border-foreground/10 bg-[var(--card)] shadow-2xl"
-            style={
-              charPickerPos ? { left: charPickerPos.left, top: charPickerPos.top } : { visibility: "hidden" as const }
-            }
-          >
-            <div className="flex items-center justify-center border-b border-foreground/10 px-3 py-2 text-[0.6875rem] font-semibold">
-              Trigger Response
-            </div>
-            <div className="overflow-y-auto p-1">
-              {activeChatCharacters!.map((char) => (
-                <button
-                  key={char.id}
-                  onClick={() => handleCharacterResponse(char.id)}
-                  className={cn(
-                    "flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-all hover:bg-foreground/10",
-                    (char.conversationStatus === "dnd" || char.conversationStatus === "offline") && "opacity-60",
-                  )}
-                >
-                  <div className="relative shrink-0">
-                    {char.avatarUrl ? (
-                      <span className="relative block h-7 w-7 overflow-hidden rounded-full">
-                        <img
-                          src={char.avatarUrl}
-                          alt={char.name}
-                          className="h-full w-full object-cover"
-                          style={getAvatarCropStyle(char.avatarCrop)}
-                        />
-                      </span>
-                    ) : (
-                      <div className="flex h-7 w-7 items-center justify-center rounded-full bg-foreground/10 text-[0.6875rem] font-semibold text-foreground/45">
-                        {(char.name || "?")[0].toUpperCase()}
-                      </div>
-                    )}
-                    <span
-                      className={cn(
-                        "absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-full ring-2 ring-[var(--card)]",
-                        statusDotClass(char.conversationStatus),
-                      )}
-                    />
-                  </div>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-xs">{char.name}</span>
-                    {(char.conversationActivity || statusLabel(char.conversationStatus)) && (
-                      <span className="block truncate text-[0.625rem] text-foreground/45">
-                        {char.conversationActivity || statusLabel(char.conversationStatus)}
-                      </span>
-                    )}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>,
-          document.body,
-        )}
     </div>
   );
 }

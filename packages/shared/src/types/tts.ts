@@ -3,17 +3,26 @@
 // ──────────────────────────────────────────────
 import { z } from "zod";
 
-export const ttsSourceSchema = z.enum(["openai", "elevenlabs", "pockettts"]);
+export const ttsSourceSchema = z.enum(["openai", "elevenlabs", "pockettts", "xai"]);
 export type TTSSource = z.infer<typeof ttsSourceSchema>;
 
 export const ttsAudioFormatSchema = z.enum(["mp3", "wav"]);
 export type TTSAudioFormat = z.infer<typeof ttsAudioFormatSchema>;
 
-export const ttsDialogueScopeSchema = z.enum(["all", "character"]);
-export type TTSDialogueScope = z.infer<typeof ttsDialogueScopeSchema>;
-
 export const ttsVoiceModeSchema = z.enum(["single", "per-character"]);
 export type TTSVoiceMode = z.infer<typeof ttsVoiceModeSchema>;
+
+export const TTS_DIALOGUE_PAUSE_MIN_SECONDS = 1;
+export const TTS_DIALOGUE_PAUSE_MAX_SECONDS = 60;
+export const TTS_DIALOGUE_PAUSE_DEFAULT_SECONDS = 1;
+
+function normalizeDialoguePauseMs(value: number): number {
+  const wholeSeconds = Math.round(value / 1000);
+  return Math.min(TTS_DIALOGUE_PAUSE_MAX_SECONDS, Math.max(TTS_DIALOGUE_PAUSE_MIN_SECONDS, wholeSeconds)) * 1000;
+}
+
+export const ttsConversationCallAudioInputModeSchema = z.enum(["system", "auto", "transcribe", "local_whisper"]);
+export type TTSConversationCallAudioInputMode = z.infer<typeof ttsConversationCallAudioInputModeSchema>;
 
 export const ttsVoiceAssignmentSchema = z.object({
   characterId: z.string().default(""),
@@ -100,7 +109,7 @@ export const ELEVENLABS_TTS_LANGUAGE_OPTIONS = [
   { code: "cy", label: "Welsh" },
 ] as const;
 
-export const ttsConfigSchema = z.object({
+const ttsConfigBaseSchema = z.object({
   enabled: z.boolean().default(false),
   source: ttsSourceSchema.default("openai"),
   baseUrl: z.string().default("https://api.openai.com/v1"),
@@ -114,6 +123,10 @@ export const ttsConfigSchema = z.object({
   elevenLabsStability: z.number().min(0).max(1).default(0.5),
   /** ElevenLabs only: optional language_code. Empty means automatic language detection. */
   elevenLabsLanguageCode: z.string().max(8).default(""),
+  /** ElevenLabs only: generate scene-specific Game Mode sound effects. */
+  elevenLabsGameSoundEffects: z.boolean().default(false),
+  /** ElevenLabs only: generate scene-specific Game Mode music. */
+  elevenLabsGameMusic: z.boolean().default(false),
   voiceMode: ttsVoiceModeSchema.default("single"),
   voiceAssignments: z.array(ttsVoiceAssignmentSchema).default([]),
   narratorVoiceEnabled: z.boolean().default(false),
@@ -126,12 +139,93 @@ export const ttsConfigSchema = z.object({
   autoplayGame: z.boolean().default(false),
   progressivePlayback: z.boolean().default(false),
   dialogueOnly: z.boolean().default(false),
+  /** Stored in milliseconds for backward compatibility; the setting is configured in whole seconds. */
+  dialoguePauseMs: z
+    .number()
+    .min(0)
+    .max(TTS_DIALOGUE_PAUSE_MAX_SECONDS * 1000)
+    .default(TTS_DIALOGUE_PAUSE_DEFAULT_SECONDS * 1000)
+    .transform(normalizeDialoguePauseMs),
   audioFormat: ttsAudioFormatSchema.default("mp3"),
-  dialogueScope: ttsDialogueScopeSchema.default("all"),
-  dialogueCharacterName: z.string().default(""),
+  /** Global gate for Conversation-mode calls. Individual chats opt in separately. */
+  callAudioEnabled: z.boolean().default(false),
+  /** Deprecated: call transcription now uses the active conversation connection. */
+  callSttConnectionId: z.string().default(""),
+  /** Deprecated: call transcription now follows the selected call audio input mode. */
+  callSttModel: z.string().default(""),
+  /** Conversation call mic path: local Whisper, browser speech, manual OS dictation, or provider-native media. */
+  callAudioInputMode: ttsConversationCallAudioInputModeSchema.default("local_whisper"),
+  /** UI gate for camera/screen controls. Provider-native video input remains capability-gated by the call pipeline. */
+  callVideoInputEnabled: z.boolean().default(false),
+  /** Generate and play cached character presence videos during Conversation Calls. */
+  callCharacterVideoEnabled: z.boolean().default(false),
+  /** Automatically generate the minimum idle/talking call-presence clips for call participants. */
+  callAutomaticVideoClipsEnabled: z.boolean().default(false),
+  /** Let characters sparsely generate custom call-presence clips on explicit user request. */
+  callCustomVideoClipsEnabled: z.boolean().default(false),
+  /** Deprecated: soundboard is always available during calls. */
+  callSoundboardEnabled: z.boolean().default(true),
+});
+
+export const ttsSourceProfileSchema = ttsConfigBaseSchema.pick({
+  baseUrl: true,
+  apiKey: true,
+  voice: true,
+  model: true,
+  speed: true,
+  elevenLabsStability: true,
+  elevenLabsLanguageCode: true,
+  elevenLabsGameSoundEffects: true,
+  elevenLabsGameMusic: true,
+  voiceMode: true,
+  voiceAssignments: true,
+  narratorVoiceEnabled: true,
+  narratorVoice: true,
+  npcDefaultVoicesEnabled: true,
+  npcDefaultMaleVoices: true,
+  npcDefaultFemaleVoices: true,
+  audioFormat: true,
+});
+export type TTSSourceProfile = z.infer<typeof ttsSourceProfileSchema>;
+
+export const ttsSourceProfilesSchema = z
+  .object({
+    openai: ttsSourceProfileSchema.optional(),
+    elevenlabs: ttsSourceProfileSchema.optional(),
+    pockettts: ttsSourceProfileSchema.optional(),
+    xai: ttsSourceProfileSchema.optional(),
+  })
+  .default({});
+export type TTSSourceProfiles = z.infer<typeof ttsSourceProfilesSchema>;
+
+export const ttsConfigSchema = ttsConfigBaseSchema.extend({
+  /** Encrypted-at-rest provider fields retained independently for each TTS source. */
+  sourceProfiles: ttsSourceProfilesSchema,
 });
 
 export type TTSConfig = z.infer<typeof ttsConfigSchema>;
+
+export function ttsSourceProfileFromConfig(config: TTSConfig): TTSSourceProfile {
+  return {
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    voice: config.voice,
+    model: config.model,
+    speed: config.speed,
+    elevenLabsStability: config.elevenLabsStability,
+    elevenLabsLanguageCode: config.elevenLabsLanguageCode,
+    elevenLabsGameSoundEffects: config.elevenLabsGameSoundEffects,
+    elevenLabsGameMusic: config.elevenLabsGameMusic,
+    voiceMode: config.voiceMode,
+    voiceAssignments: config.voiceAssignments,
+    narratorVoiceEnabled: config.narratorVoiceEnabled,
+    narratorVoice: config.narratorVoice,
+    npcDefaultVoicesEnabled: config.npcDefaultVoicesEnabled,
+    npcDefaultMaleVoices: config.npcDefaultMaleVoices,
+    npcDefaultFemaleVoices: config.npcDefaultFemaleVoices,
+    audioFormat: config.audioFormat,
+  };
+}
 
 export const TTS_SETTINGS_KEY = "tts";
 export const TTS_API_KEY_MASK = "••••••";
@@ -148,6 +242,17 @@ export interface TTSVoicesResponse {
     labels?: Record<string, string | number | boolean | null> | null;
   }>;
   /** True when the list came from the provider; false = local fallback or no provider voices */
+  fromProvider: boolean;
+  source: TTSSource;
+}
+
+/** Returned by GET /api/tts/models */
+export interface TTSModelsResponse {
+  models: Array<{
+    id: string;
+    name: string;
+  }>;
+  /** True when the list came from the provider; false = built-in fallback choices */
   fromProvider: boolean;
   source: TTSSource;
 }

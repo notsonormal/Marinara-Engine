@@ -6,16 +6,21 @@
 // ──────────────────────────────────────────────
 
 import {
+  CHARACTER_REFERENCE_ID_PATTERN,
+  formatRpgStatsForPrompt,
   resolveMacros,
   stripMacroComments,
   type CharacterMacroProfile,
   type CharacterData,
   type MacroContext,
+  type RPGStatsConfig,
   type ResolveMacroOptions,
   type WrapFormat,
 } from "@marinara-engine/shared";
 import type { DB } from "../../db/connection.js";
+import { processLorebooks, type LorebookScanResult } from "../lorebook/index.js";
 import { createCharactersStorage } from "../storage/characters.storage.js";
+import { createLorebooksStorage } from "../storage/lorebooks.storage.js";
 import { wrapContent } from "./format-engine.js";
 import { sanitizePromptLeaf } from "./prompt-escaping.js";
 
@@ -24,7 +29,10 @@ type PersonaFields = NonNullable<MacroContext["personaFields"]>;
 export interface BuildPromptMacroContextInput {
   db: DB;
   characterIds: string[];
+  /** Full active roster when characterIds is narrowed to one generation target. */
+  groupCharacterIds?: string[];
   personaName: string;
+  personaPhoneticName?: string;
   personaDescription?: string;
   personaFields?: PersonaFields;
   variables?: Record<string, string>;
@@ -39,6 +47,7 @@ export interface BuildPromptMacroContextInput {
 
 export interface CharacterMacroData {
   names: string[];
+  phoneticNames: string[];
   profiles: NonNullable<MacroContext["characterProfiles"]>;
   profilesById: Map<string, CharacterMacroProfile>;
   primaryFields?: NonNullable<MacroContext["characterFields"]>;
@@ -61,6 +70,214 @@ export interface MacroResolutionTransaction {
   content: string;
   commit: () => void;
   rollback: () => void;
+}
+
+export const MAX_REFERENCED_CHARACTERS = 8;
+const MAX_REFERENCED_FIELD_CHARS = 8_000;
+const MAX_REFERENCED_LOREBOOK_CHARS = 8_000;
+
+export function extractCharacterReferenceIds(sources: readonly string[]): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const source of sources) {
+    for (const match of source.matchAll(CHARACTER_REFERENCE_ID_PATTERN)) {
+      const id = match[1]!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+      if (ids.length >= MAX_REFERENCED_CHARACTERS) return ids;
+    }
+  }
+  return ids;
+}
+
+function referencedCharacterSourceFields(data: CharacterData): string[] {
+  const depthPrompt = data.extensions?.depth_prompt?.prompt;
+  const convoBehavior = data.extensions?.convoBehavior?.instruction;
+  return [
+    data.description,
+    data.personality,
+    data.scenario,
+    data.creator_notes,
+    data.system_prompt,
+    data.post_history_instructions,
+    data.extensions?.backstory,
+    data.extensions?.appearance,
+    depthPrompt,
+    data.extensions?.aboutMe,
+    convoBehavior,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function referencedCharacterProfile(data: CharacterData): CharacterMacroProfile {
+  return {
+    name: data.name || "Character",
+    phoneticName: data.extensions?.phoneticName ?? "",
+    description: data.description ?? "",
+    personality: data.personality ?? "",
+    backstory: data.extensions?.backstory ?? "",
+    appearance: data.extensions?.appearance ?? "",
+    scenario: data.scenario ?? "",
+    example: data.mes_example ?? "",
+    systemPrompt: data.system_prompt ?? "",
+    postHistoryInstructions: data.post_history_instructions ?? "",
+  };
+}
+
+function clipReferencedText(value: string, limit: number): string {
+  return value.length <= limit ? value : value.slice(0, limit);
+}
+
+function resolveReferencedField(value: string, macroCtx: MacroContext, wrapFormat: WrapFormat): string {
+  const resolved = resolveMacros(
+    clipReferencedText(stripMacroComments(value), MAX_REFERENCED_FIELD_CHARS),
+    { ...macroCtx, variables: { ...macroCtx.variables } },
+    { trimResult: false },
+  ).trim();
+  return resolved ? sanitizePromptLeaf(resolved, wrapFormat) : "";
+}
+
+function buildReferencedCharacterFields(
+  id: string,
+  data: CharacterData,
+  macroCtx: MacroContext,
+  wrapFormat: WrapFormat,
+  lorebookScan: LorebookScanResult | null,
+): string {
+  const scopedContext = scopePromptMacroContextToCharacter(macroCtx, referencedCharacterProfile(data));
+  const stats = formatRpgStatsForPrompt(data.extensions?.rpgStats as RPGStatsConfig | undefined);
+  const trackerDefaults = Array.isArray(data.extensions?.trackerCustomFieldDefaults)
+    ? data.extensions.trackerCustomFieldDefaults
+        .filter((field) => field?.name?.trim() && field?.value?.trim())
+        .map((field) => `${field.name}: ${field.value}`)
+        .join("\n")
+    : "";
+  const convoBehavior = data.extensions?.convoBehavior?.instruction ?? "";
+  const fields = [
+    { label: "character_id", value: id },
+    { label: "name", value: data.name },
+    { label: "description", value: data.description },
+    { label: "personality", value: data.personality },
+    { label: "backstory", value: data.extensions?.backstory },
+    { label: "appearance", value: data.extensions?.appearance },
+    { label: "scenario", value: data.scenario },
+    { label: "example_dialogue", value: data.mes_example },
+    { label: "creator", value: data.creator },
+    { label: "character_version", value: data.character_version },
+    { label: "creator_notes", value: data.creator_notes },
+    { label: "system_prompt", value: data.system_prompt },
+    { label: "post_history_instructions", value: data.post_history_instructions },
+    { label: "depth_prompt", value: data.extensions?.depth_prompt?.prompt },
+    { label: "about_me", value: data.extensions?.aboutMe },
+    { label: "conversation_behavior", value: convoBehavior },
+    { label: "tags", value: data.tags?.join(", ") },
+    { label: "rpg_attributes", value: stats },
+    { label: "tracker_defaults", value: trackerDefaults },
+  ].flatMap(({ label, value }) => {
+    if (typeof value !== "string" || !value.trim()) return [];
+    const content = resolveReferencedField(value, scopedContext, wrapFormat);
+    return content ? [wrapContent(content, label, wrapFormat, 2)] : [];
+  });
+
+  const lorebookContent = clipReferencedText(
+    (lorebookScan?.activatedEntries ?? [])
+      .map((entry) => entry.content.trim())
+      .filter(Boolean)
+      .join("\n\n"),
+    MAX_REFERENCED_LOREBOOK_CHARS,
+  );
+  if (lorebookContent) {
+    fields.push(
+      wrapContent(sanitizePromptLeaf(lorebookContent, wrapFormat), "attached_lorebook_context", wrapFormat, 2),
+    );
+  }
+
+  return wrapContent(fields.join("\n"), "referenced_character", wrapFormat, 1);
+}
+
+export async function buildReferencedCharacterContext(input: {
+  db: DB;
+  activeCharacterIds: string[];
+  sources: readonly string[];
+  chatMessages: Array<{ role: string; content: string }>;
+  macroCtx: MacroContext;
+  wrapFormat: WrapFormat;
+  chatId: string;
+  gameState?: Record<string, unknown> | null;
+  generationTriggers?: string[];
+  includeLorebooks?: boolean;
+  excludedLorebookIds?: string[];
+  excludedLorebookSourceAgentIds?: string[];
+  maxReferences?: number;
+}): Promise<{ content: string; references: Record<string, string> }> {
+  const characters = createCharactersStorage(input.db);
+  const activeIds = new Set(input.activeCharacterIds);
+  const sources = [...input.sources, ...input.chatMessages.map((message) => message.content)];
+
+  const activeRows = await Promise.all([...activeIds].map((id) => characters.getById(id)));
+  for (const row of activeRows) {
+    const data = parseCharacterData(row?.data);
+    if (data) sources.push(...referencedCharacterSourceFields(data));
+  }
+
+  const candidateIds = extractCharacterReferenceIds(sources)
+    .filter((id) => !activeIds.has(id))
+    .slice(0, Math.max(0, input.maxReferences ?? MAX_REFERENCED_CHARACTERS));
+  const referencedRows = await Promise.all(candidateIds.map((id) => characters.getById(id)));
+  const referenced = candidateIds.flatMap((id, index) => {
+    const data = parseCharacterData(referencedRows[index]?.data);
+    return data ? [{ id, data }] : [];
+  });
+  if (referenced.length === 0) return { content: "", references: {} };
+
+  const references = Object.fromEntries(referenced.map(({ id, data }) => [id, data.name || "Character"]));
+  const macroCtx = { ...input.macroCtx, characterReferences: references };
+  const lorebooks = createLorebooksStorage(input.db);
+  const allLorebooks = (await lorebooks.list()) as unknown as Array<{
+    id: string;
+    characterId?: string | null;
+    characterIds?: string[];
+  }>;
+  const excludedByRequest = new Set(input.excludedLorebookIds ?? []);
+  const scanMessages = input.chatMessages.map((message) => ({
+    ...message,
+    content: resolveMacros(
+      message.content,
+      { ...macroCtx, variables: { ...macroCtx.variables } },
+      { trimResult: false },
+    ),
+  }));
+  const blocks: string[] = [];
+
+  for (const { id, data } of referenced) {
+    const attachedIds = new Set(
+      allLorebooks.filter((book) => book.characterId === id || book.characterIds?.includes(id)).map((book) => book.id),
+    );
+    const excludedLorebookIds = allLorebooks
+      .filter((book) => !attachedIds.has(book.id) || excludedByRequest.has(book.id))
+      .map((book) => book.id);
+    const scopedContext = scopePromptMacroContextToCharacter(macroCtx, referencedCharacterProfile(data));
+    const lorebookScan =
+      input.includeLorebooks !== false && attachedIds.size > 0
+        ? await processLorebooks(input.db, scanMessages, input.gameState, {
+            chatId: input.chatId,
+            characterIds: [id],
+            activeLorebookIds: [],
+            excludedLorebookIds,
+            excludedSourceAgentIds: input.excludedLorebookSourceAgentIds,
+            previewOnly: true,
+            generationTriggers: input.generationTriggers,
+            resolveContent: (value) =>
+              resolveMacros(value, { ...scopedContext, variables: { ...scopedContext.variables } }),
+          })
+        : null;
+    blocks.push(buildReferencedCharacterFields(id, data, macroCtx, input.wrapFormat, lorebookScan));
+  }
+
+  return {
+    content: wrapContent(blocks.join("\n"), "referenced_characters", input.wrapFormat),
+    references,
+  };
 }
 
 export function resolveMacrosWithVariableSnapshot(
@@ -189,10 +406,11 @@ function parseCharacterData(raw: unknown): CharacterData | null {
 }
 
 export async function resolveCharacterMacroData(db: DB, characterIds: string[]): Promise<CharacterMacroData> {
-  if (characterIds.length === 0) return { names: [], profiles: [], profilesById: new Map() };
+  if (characterIds.length === 0) return { names: [], phoneticNames: [], profiles: [], profilesById: new Map() };
 
   const chars = createCharactersStorage(db);
   const names: string[] = [];
+  const phoneticNames: string[] = [];
   const profiles: CharacterMacroData["profiles"] = [];
   const profilesById = new Map<string, CharacterMacroProfile>();
   let primaryFields: CharacterMacroData["primaryFields"] | undefined;
@@ -203,10 +421,16 @@ export async function resolveCharacterMacroData(db: DB, characterIds: string[]):
     if (!data) continue;
 
     if (data.name) names.push(data.name);
+    const phoneticName =
+      typeof data.extensions?.phoneticName === "string" && data.extensions.phoneticName.trim()
+        ? data.extensions.phoneticName.trim()
+        : "";
+    phoneticNames.push(phoneticName || data.name || "Character");
 
     const description = data.description ?? "";
     const profile = {
       name: data.name ?? "Character",
+      phoneticName,
       description,
       personality: data.personality ?? "",
       backstory: data.extensions?.backstory ?? "",
@@ -222,6 +446,7 @@ export async function resolveCharacterMacroData(db: DB, characterIds: string[]):
 
     if (!primaryFields) {
       primaryFields = {
+        phoneticName: profile.phoneticName,
         description: profile.description,
         personality: profile.personality,
         backstory: profile.backstory,
@@ -234,17 +459,23 @@ export async function resolveCharacterMacroData(db: DB, characterIds: string[]):
     }
   }
 
-  return { names, profiles, profilesById, primaryFields };
+  return { names, phoneticNames, profiles, profilesById, primaryFields };
 }
 
 export async function buildPromptMacroContext(input: BuildPromptMacroContextInput): Promise<MacroContext> {
   const characterMacroData = await resolveCharacterMacroData(input.db, input.characterIds);
+  const groupCharacterMacroData = input.groupCharacterIds
+    ? await resolveCharacterMacroData(input.db, input.groupCharacterIds)
+    : characterMacroData;
   const variables = input.variables ?? {};
 
   return {
     user: input.personaName || "User",
+    userPhonetic: input.personaPhoneticName || input.personaFields?.phoneticName || input.personaName || "User",
     char: characterMacroData.names[0] || "Character",
+    charPhonetic: characterMacroData.phoneticNames[0] || characterMacroData.names[0] || "Character",
     characters: characterMacroData.names,
+    groupCharacters: groupCharacterMacroData.names,
     characterProfiles: characterMacroData.profiles,
     variables,
     lastInput: input.lastInput,
@@ -266,6 +497,7 @@ export async function buildPromptMacroContext(input: BuildPromptMacroContextInpu
 
 function characterFieldsFromProfile(profile: CharacterMacroProfile): NonNullable<MacroContext["characterFields"]> {
   return {
+    phoneticName: profile.phoneticName ?? "",
     description: profile.description ?? "",
     personality: profile.personality ?? "",
     backstory: profile.backstory ?? "",
@@ -277,6 +509,23 @@ function characterFieldsFromProfile(profile: CharacterMacroProfile): NonNullable
   };
 }
 
+/**
+ * Scope otherwise shared prompt macros to the character whose provider request
+ * is about to run. This is used by the final prompt pass so late injections
+ * resolve {{char}} and card-field macros against the actual responder.
+ */
+export function scopePromptMacroContextToCharacter(
+  macroCtx: MacroContext,
+  profile: CharacterMacroProfile,
+): MacroContext {
+  return {
+    ...macroCtx,
+    char: profile.name,
+    charPhonetic: profile.phoneticName || profile.name,
+    characterFields: characterFieldsFromProfile(profile),
+  };
+}
+
 function macroContextForMessage(
   message: PromptMacroMessage,
   macroCtx: MacroContext,
@@ -284,12 +533,7 @@ function macroContextForMessage(
 ): MacroContext {
   const profile = message.characterId ? profilesById?.get(message.characterId) : undefined;
   if (!profile) return macroCtx;
-
-  return {
-    ...macroCtx,
-    char: profile.name,
-    characterFields: characterFieldsFromProfile(profile),
-  };
+  return scopePromptMacroContextToCharacter(macroCtx, profile);
 }
 
 export function resolvePromptMessageMacros<T extends PromptMacroMessage>(
@@ -352,7 +596,9 @@ export async function collectCharacterDepthPromptEntries(
     const content = resolveMacros(depthPrompt.prompt, {
       ...macroCtx,
       char: data?.name ?? macroCtx.char,
+      charPhonetic: data?.extensions?.phoneticName ?? macroCtx.charPhonetic,
       characterFields: {
+        phoneticName: data?.extensions?.phoneticName ?? "",
         description: data?.description ?? "",
         personality: data?.personality ?? "",
         backstory: data?.extensions?.backstory ?? "",
@@ -393,7 +639,9 @@ export async function collectCharacterPostHistoryEntries(
     const content = resolveMacros(raw, {
       ...macroCtx,
       char: data.name ?? macroCtx.char,
+      charPhonetic: data.extensions?.phoneticName ?? macroCtx.charPhonetic,
       characterFields: {
+        phoneticName: data.extensions?.phoneticName ?? "",
         description: data.description ?? "",
         personality: data.personality ?? "",
         backstory: data.extensions?.backstory ?? "",
@@ -416,4 +664,36 @@ export async function collectCharacterPostHistoryEntries(
   }
 
   return entries;
+}
+
+export async function collectCharacterAdvancedPromptEntries(
+  db: DB,
+  characterIds: string[],
+  macroCtx: MacroContext,
+  wrapFormat: WrapFormat,
+): Promise<PromptDepthEntry[]> {
+  const [depthEntries, postHistoryEntries] = await Promise.all([
+    collectCharacterDepthPromptEntries(db, characterIds, macroCtx),
+    collectCharacterPostHistoryEntries(db, characterIds, macroCtx, wrapFormat),
+  ]);
+  return [...depthEntries, ...postHistoryEntries];
+}
+
+export function resolveCharacterAdvancedPromptIds(
+  characterIds: string[],
+  chatMode: string,
+  chatMetadata: Record<string, unknown>,
+): string[] {
+  const resolved = new Set(characterIds.filter((id) => id && !id.startsWith("npc:")));
+  if (chatMode !== "game") return [...resolved];
+
+  const partyIds = Array.isArray(chatMetadata.gamePartyCharacterIds)
+    ? chatMetadata.gamePartyCharacterIds
+    : [];
+  for (const id of partyIds) {
+    if (typeof id === "string" && id && !id.startsWith("npc:")) resolved.add(id);
+  }
+  const gmCharacterId = chatMetadata.gameGmCharacterId;
+  if (typeof gmCharacterId === "string" && gmCharacterId) resolved.add(gmCharacterId);
+  return [...resolved];
 }

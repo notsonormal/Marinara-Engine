@@ -1,9 +1,9 @@
 import { createPortal } from "react-dom";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { CalendarClock, ChevronDown, Eye, EyeOff, RefreshCw, Settings2, Trash2 } from "lucide-react";
+import { CalendarClock, ChevronDown, RefreshCw, Settings2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import type { ConversationPresenceStatus, ConversationStatusOverride } from "@marinara-engine/shared";
+import type { ConversationPresenceStatus, ConversationStatusOverride, WeekSchedule } from "@marinara-engine/shared";
 import type { Message } from "@marinara-engine/shared";
 import { useUpdateChatMetadata } from "../../hooks/use-chats";
 import { characterKeys } from "../../hooks/use-characters";
@@ -12,6 +12,7 @@ import { api } from "../../lib/api-client";
 import { cn, getAvatarCropStyle } from "../../lib/utils";
 import { useChatStore } from "../../stores/chat.store";
 import { useUIStore } from "../../stores/ui.store";
+import { isDesktopShellNavigationTarget } from "../../lib/chat-floating-ui-events";
 import type { CharacterMap } from "./chat-area.types";
 import {
   CHAT_TOOLBAR_IDENTITY_PILL_SIZE_CLASS,
@@ -25,27 +26,9 @@ import {
   ROLEPLAY_POPOVER_SUBTITLE,
   ROLEPLAY_POPOVER_TITLE,
 } from "./roleplay-popover-styles";
-
-type ScheduleBlock = {
-  time?: string;
-  activity?: string;
-  status?: ConversationPresenceStatus;
-};
-
-type WeekSchedule = {
-  weekStart?: string;
-  days?: Record<string, ScheduleBlock[]>;
-};
-
-const SCHEDULE_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-const UPCOMING_SCHEDULE_PREVIEW_COUNT = 4;
-
-type UpcomingScheduleBlock = {
-  label: string;
-  time: string;
-  activity: string;
-  status: ConversationPresenceStatus;
-};
+import { ConversationPresenceScheduleSection } from "./ConversationPresenceScheduleSection";
+import { formatRelativeContact } from "../../lib/relative-time";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 type StatusEntry = {
   status: ConversationPresenceStatus;
@@ -69,6 +52,7 @@ type ConversationPresenceCardProps = {
   characterMap: CharacterMap;
   messages?: Message[];
   onOpenSettings: (event?: ReactMouseEvent<HTMLElement>, options?: OpenSettingsOptions) => void;
+  onOpenScheduleEditor?: (characterId: string, options?: { initialDay?: string | null }) => void;
 };
 
 const STATUS_OPTIONS: Array<{ status: ConversationPresenceStatus; label: string }> = [
@@ -136,96 +120,10 @@ function buildOverrides(
   return next;
 }
 
-function formatRelativeContact(isoTimestamp: string, now = Date.now()) {
-  const timestamp = new Date(isoTimestamp).getTime();
-  if (!Number.isFinite(timestamp)) return null;
-
-  const diffMs = now - timestamp;
-  if (diffMs < 60_000) return "just now";
-
-  const minutes = Math.floor(diffMs / 60_000);
-  if (minutes < 60) return `${minutes}m ago`;
-
-  const hours = Math.floor(diffMs / 3_600_000);
-  if (hours < 24) return `${hours}h ago`;
-
-  const days = Math.floor(diffMs / 86_400_000);
-  if (days < 7) return `${days}d ago`;
-
-  const weeks = Math.floor(days / 7);
-  if (weeks < 5) return `${weeks}w ago`;
-
-  const months = Math.floor(days / 30);
-  if (months < 12) return `${months}mo ago`;
-
-  const years = Math.floor(days / 365);
-  return `${years}y ago`;
-}
-
 function resizeActivityField(field: HTMLTextAreaElement | null) {
   if (!field) return;
   field.style.height = "0px";
   field.style.height = `${Math.min(field.scrollHeight, 112)}px`;
-}
-
-function parseTimeToMinutes(value?: string) {
-  if (!value) return null;
-  const [hours, minutes] = value.split(":").map(Number);
-  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
-  return hours * 60 + minutes;
-}
-
-function formatScheduleTimeRange(value: string) {
-  const [start, end] = value.split("-");
-  const formatter = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
-
-  const formatPart = (part?: string) => {
-    const [hours, minutes] = (part ?? "").split(":").map(Number);
-    if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return part ?? "";
-    const date = new Date();
-    date.setHours(hours, minutes, 0, 0);
-    return formatter.format(date);
-  };
-
-  const formattedStart = formatPart(start);
-  const formattedEnd = formatPart(end);
-  return formattedStart && formattedEnd ? `${formattedStart} - ${formattedEnd}` : value;
-}
-
-function getUpcomingScheduleBlocks(schedule?: WeekSchedule, limit = UPCOMING_SCHEDULE_PREVIEW_COUNT): UpcomingScheduleBlock[] {
-  if (!schedule?.days) return [];
-
-  const now = new Date();
-  const todayIndex = (now.getDay() + 6) % 7;
-  const currentMinutes = now.getHours() * 60 + now.getMinutes();
-  const upcoming: UpcomingScheduleBlock[] = [];
-
-  for (let dayOffset = 0; dayOffset < SCHEDULE_DAYS.length; dayOffset += 1) {
-    const dayIndex = (todayIndex + dayOffset) % SCHEDULE_DAYS.length;
-    const dayName = SCHEDULE_DAYS[dayIndex];
-    const blocks = [...(schedule.days[dayName] ?? [])].sort((left, right) => {
-      const leftStart = parseTimeToMinutes(left.time?.split("-")[0]) ?? Number.MAX_SAFE_INTEGER;
-      const rightStart = parseTimeToMinutes(right.time?.split("-")[0]) ?? Number.MAX_SAFE_INTEGER;
-      return leftStart - rightStart;
-    });
-
-    for (const block of blocks) {
-      const startMinutes = parseTimeToMinutes(block.time?.split("-")[0]);
-      if (startMinutes == null) continue;
-      if (dayOffset === 0 && startMinutes <= currentMinutes) continue;
-
-      const dayPrefix = dayOffset === 0 ? "" : dayOffset === 1 ? "Next day" : dayName;
-      upcoming.push({
-        label: dayPrefix,
-        time: block.time ?? "",
-        activity: block.activity || statusLabel(block.status),
-        status: block.status ?? "online",
-      });
-      if (upcoming.length >= limit) return upcoming;
-    }
-  }
-
-  return upcoming;
 }
 
 export function ConversationPresenceCard({
@@ -235,12 +133,13 @@ export function ConversationPresenceCard({
   characterMap,
   messages,
   onOpenSettings,
+  onOpenScheduleEditor,
 }: ConversationPresenceCardProps) {
+  const { t: localizeUi } = useUiTranslation();
   const [open, setOpen] = useState(false);
   const [editingCharacterId, setEditingCharacterId] = useState<string | null>(null);
   const [statusMenuCharacterId, setStatusMenuCharacterId] = useState<string | null>(null);
   const [pendingStatuses, setPendingStatuses] = useState<Record<string, ConversationPresenceStatus>>({});
-  const [visibleNextSchedule, setVisibleNextSchedule] = useState<Record<string, boolean>>({});
   const [replyNowCharacterId, setReplyNowCharacterId] = useState<string | null>(null);
   const [draftActivity, setDraftActivity] = useState("");
   const buttonRef = useRef<HTMLButtonElement | null>(null);
@@ -267,12 +166,14 @@ export function ConversationPresenceCard({
   const setAbortController = useChatStore((s) => s.setAbortController);
   const setDelayedCharacterInfo = useChatStore((s) => s.setDelayedCharacterInfo);
   const setPerChatDelayed = useChatStore((s) => s.setPerChatDelayed);
-  const overrides = useMemo(() => parseOverrides(chatMeta.conversationStatusOverrides), [chatMeta.conversationStatusOverrides]);
+  const overrides = useMemo(
+    () => parseOverrides(chatMeta.conversationStatusOverrides),
+    [chatMeta.conversationStatusOverrides],
+  );
   const schedules = useMemo(() => parseSchedules(chatMeta.characterSchedules), [chatMeta.characterSchedules]);
-  const hasGeneratedSchedules =
-    typeof chatMeta.scheduleWeekStart === "string" &&
-    chatMeta.scheduleWeekStart.length > 0 &&
-    (chatMeta.conversationSchedulesEnabled === true || chatMeta.conversationSchedulesEnabled == null);
+  const schedulesEnabled =
+    chatMeta.conversationSchedulesEnabled === true ||
+    (chatMeta.conversationSchedulesEnabled == null && Object.keys(schedules).length > 0);
   const statusesQuery = useQuery({
     queryKey: ["conversation-status", chatId],
     queryFn: async ({ signal }) => api.get<StatusResponse>(`/conversation/status/${chatId}`, { signal }),
@@ -311,7 +212,7 @@ export function ConversationPresenceCard({
     const maxLeft = Math.max(viewportPadding, window.innerWidth - width - viewportPadding);
     setPosition({
       top: rect.bottom + (isMobile ? 0 : 8),
-      left: Math.max(viewportPadding, Math.min(rect.right - width, maxLeft)),
+      left: Math.max(viewportPadding, Math.min(rect.left, maxLeft)),
       width,
     });
   }, [open]);
@@ -346,11 +247,13 @@ export function ConversationPresenceCard({
   useEffect(() => {
     if (!open) return;
     const handleMouseDown = (event: MouseEvent) => {
+      if (isDesktopShellNavigationTarget(event.target)) return;
       const target = event.target as Node;
       if (
         buttonRef.current?.contains(target) ||
         popoverRef.current?.contains(target) ||
-        statusMenuRef.current?.contains(target)
+        statusMenuRef.current?.contains(target) ||
+        (target instanceof HTMLElement && target.closest('[data-component="Modal"]'))
       ) {
         return;
       }
@@ -391,7 +294,8 @@ export function ConversationPresenceCard({
 
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
-      if (statusButtonRefs.current[statusMenuCharacterId]?.contains(target) || statusMenuRef.current?.contains(target)) return;
+      if (statusButtonRefs.current[statusMenuCharacterId]?.contains(target) || statusMenuRef.current?.contains(target))
+        return;
       setStatusMenuCharacterId(null);
     };
 
@@ -412,11 +316,19 @@ export function ConversationPresenceCard({
           const statusEntry = statusesQuery.data?.statuses[id];
           const status = pendingStatuses[id] ?? statusEntry?.status ?? character.conversationStatus ?? "online";
           const activity = statusEntry?.activity ?? character.conversationActivity ?? "";
-          return { id, ...character, status, activity, schedule: statusEntry?.schedule ?? schedules[id], override: overrides[id] };
+          return {
+            id,
+            ...character,
+            status,
+            activity,
+            schedule: statusEntry?.schedule ?? schedules[id],
+            override: overrides[id],
+          };
         })
         .filter((value): value is NonNullable<typeof value> => value !== null),
     [characterMap, chatCharIds, overrides, pendingStatuses, schedules, statusesQuery.data?.statuses],
   );
+  const hasGeneratedSchedules = characters.some((character) => !!character.schedule);
   const lastContactByCharacterId = useMemo(() => {
     const latestByCharacterId: Record<string, string> = {};
 
@@ -437,7 +349,12 @@ export function ConversationPresenceCard({
     setIsRefreshing(true);
     try {
       if (statusesQuery.data?.needsRefresh) {
-        await api.post("/conversation/schedule/generate", { chatId, characterIds: chatCharIds });
+        await api.post("/conversation/schedule/generate", {
+          chatId,
+          characterIds: chatCharIds,
+          scheduleGenerationPreferences: useUIStore.getState().scheduleGenerationPreferences,
+          timeZone: useUIStore.getState().conversationTimeZone,
+        });
         await queryClient.refetchQueries({ queryKey: ["chat", chatId] });
       }
       await statusesQuery.refetch();
@@ -461,7 +378,11 @@ export function ConversationPresenceCard({
     "flex h-5 w-5 items-center justify-center rounded-full bg-[var(--foreground)]/10 text-[0.5rem] font-bold text-[var(--foreground)]/70 ring-1 ring-[var(--border)]/80 max-md:h-6 max-md:w-6 max-md:text-[0.5625rem]";
   const title = characters.map((c) => `${c.name}: ${c.activity || statusLabel(c.status)}`).join(", ");
 
-  const saveOverride = async (characterId: string, status: ConversationPresenceStatus, activity?: string | null): Promise<boolean> => {
+  const saveOverride = async (
+    characterId: string,
+    status: ConversationPresenceStatus,
+    activity?: string | null,
+  ): Promise<boolean> => {
     setPendingStatuses((current) => ({ ...current, [characterId]: status }));
     try {
       await updateMeta.mutateAsync({
@@ -486,7 +407,7 @@ export function ConversationPresenceCard({
         delete next[characterId];
         return next;
       });
-      toast.error(error instanceof Error ? error.message : "Failed to save presence override");
+      toast.error(error instanceof Error ? error.message :localizeUi("ui.chat.conversationpresencecard.failedToSavePresenceOverride"));
       return false;
     }
   };
@@ -498,10 +419,13 @@ export function ConversationPresenceCard({
       return next;
     });
     try {
-      await updateMeta.mutateAsync({ id: chatId, conversationStatusOverrides: buildOverrides(overrides, characterId, null) });
+      await updateMeta.mutateAsync({
+        id: chatId,
+        conversationStatusOverrides: buildOverrides(overrides, characterId, null),
+      });
       void statusesQuery.refetch();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to clear presence override");
+      toast.error(error instanceof Error ? error.message :localizeUi("ui.chat.conversationpresencecard.failedToClearPresenceOverride"));
     }
   };
 
@@ -514,10 +438,15 @@ export function ConversationPresenceCard({
       setPerChatDelayed(chatId, null);
       setDelayedCharacterInfo(null);
       await api.post("/generate/abort", { chatId }).catch(() => undefined);
-      const produced = await generate({ chatId, connectionId: null, forCharacterId: characterId, skipPresenceDelay: true });
-      if (!produced) toast.info("No reply was generated.");
+      const produced = await generate({
+        chatId,
+        connectionId: null,
+        forCharacterId: characterId,
+        skipPresenceDelay: true,
+      });
+      if (!produced) toast.info(localizeUi("ui.chat.conversationpresencecard.noReplyWasGenerated"));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to reply now");
+      toast.error(error instanceof Error ? error.message :localizeUi("ui.chat.conversationpresencecard.failedToReplyNow"));
     } finally {
       setReplyNowCharacterId(null);
     }
@@ -550,7 +479,10 @@ export function ConversationPresenceCard({
   };
 
   const selectStatus = async (character: (typeof characters)[number], status: ConversationPresenceStatus) => {
-    const nextActivity = editingCharacterId === character.id ? draftActivity.trim() || null : character.override?.activity ?? character.activity ?? null;
+    const nextActivity =
+      editingCharacterId === character.id
+        ? draftActivity.trim() || null
+        : (character.override?.activity ?? character.activity ?? null);
     const currentActivity = character.override?.activity?.trim() || character.activity?.trim() || null;
 
     if (status === character.status && nextActivity === currentActivity) {
@@ -604,7 +536,9 @@ export function ConversationPresenceCard({
               />
             </div>
             <div className="flex min-w-0 flex-1 flex-col items-start text-left leading-tight">
-              <span className="truncate text-[0.75rem] font-semibold text-[var(--foreground)]/90">{characters[0].name}</span>
+              <span className="truncate text-[0.75rem] font-semibold text-[var(--foreground)]/90">
+                {characters[0].name}
+              </span>
               <span className="block w-full truncate text-[0.5625rem] text-[var(--foreground)]/50">
                 {characters[0].activity || statusLabel(characters[0].status)}
               </span>
@@ -612,7 +546,10 @@ export function ConversationPresenceCard({
           </>
         ) : (
           <>
-            <div className="relative flex-shrink-0" style={{ width: `${Math.min(characters.length, 3) * 12 + 8}px`, height: 20 }}>
+            <div
+              className="relative flex-shrink-0"
+              style={{ width: `${Math.min(characters.length, 3) * 12 + 8}px`, height: 20 }}
+            >
               {characters.slice(0, 3).map((character, index) => (
                 <div key={character.id} className="absolute top-0" style={{ left: index * 12 }}>
                   {character.avatarUrl ? (
@@ -639,65 +576,71 @@ export function ConversationPresenceCard({
             <span className="min-w-0 truncate text-[0.75rem] font-semibold text-[var(--foreground)]/90">
               {characters.length <= 2
                 ? characters.map((character) => character.name).join(" & ")
-                : `${characters[0].name} + ${characters.length - 1}`}
+                :localizeUi("ui.chat.conversationpresencecard.value1Value2", { value1: characters[0].name, value2: characters.length - 1 })}
             </span>
           </>
         )}
       </button>
 
-      {open && (
+      {open &&
         createPortal(
           <div
             ref={popoverRef}
             className={cn(ROLEPLAY_POPOVER_SHELL, "fixed z-[9999] overflow-hidden")}
-            style={{ top: position.top, left: position.left, width: position.width }}
+            style={{
+              top: position.top,
+              left: `max(calc(var(--mari-chat-ui-inset-left, 0px) + 0.75rem), min(${position.left}px, calc(100vw - var(--mari-chat-ui-inset-right, 0px) - ${position.width}px - 0.75rem)))`,
+              width: position.width,
+            }}
           >
             <div className={ROLEPLAY_POPOVER_HEADER}>
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className={ROLEPLAY_POPOVER_TITLE}>
-                    <CalendarClock size="0.75rem" className="shrink-0 text-[var(--muted-foreground)]" />
-                    Conversation Presence
-                  </div>
-                  <div className={ROLEPLAY_POPOVER_SUBTITLE}>
-                    See who is following schedule and step in manually only when needed.
-                  </div>
+                    <CalendarClock size="0.75rem" className="shrink-0 text-[var(--muted-foreground)]" />{localizeUi("ui.chat.conversationpresencecard.conversationPresence")}</div>
+                  <div className={ROLEPLAY_POPOVER_SUBTITLE}>{localizeUi("ui.chat.conversationpresencecard.seeWhoIsFollowingScheduleAndStepInManually")}</div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
-                    <button
-                      type="button"
-                      className="rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
-                      title="Open autonomous settings"
-                      onClick={() => {
-                        setOpen(false);
-                        onOpenSettings(undefined, { initialSection: "autonomous" });
-                      }}
-                    >
+                  <button
+                    type="button"
+                    className="rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
+                    title={localizeUi("ui.chat.conversationpresencecard.openAutonomousSettings")}
+                    onClick={() => {
+                      setOpen(false);
+                      onOpenSettings(undefined, { initialSection: "autonomous" });
+                    }}
+                  >
                     <Settings2 size="0.8125rem" />
                   </button>
                   <button
                     type="button"
                     className="rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
-                    title="Refresh status"
+                    title={localizeUi("ui.chat.conversationpresencecard.refreshStatus")}
                     onClick={() => void refreshStatuses()}
                   >
-                    <RefreshCw size="0.8125rem" className={cn((statusesQuery.isFetching || isRefreshing) && "animate-spin")} />
+                    <RefreshCw
+                      size="0.8125rem"
+                      className={cn((statusesQuery.isFetching || isRefreshing) && "animate-spin")}
+                    />
                   </button>
                 </div>
               </div>
             </div>
 
-            <div className={cn(ROLEPLAY_POPOVER_SCROLL_AREA, "max-h-[min(28rem,calc(100vh-12rem))] space-y-2 overflow-y-auto p-2")}>
+            <div
+              className={cn(
+                ROLEPLAY_POPOVER_SCROLL_AREA,
+                "max-h-[min(28rem,calc(100vh-12rem))] space-y-2 overflow-y-auto p-2",
+              )}
+            >
               {characters.map((character) => {
                 const activity = character.override?.activity ?? character.activity;
                 const isManual = !!character.override;
                 const isEditing = editingCharacterId === character.id;
                 const primaryText = activity || statusLabel(character.status);
-                const upcomingScheduleBlocks = hasGeneratedSchedules ? getUpcomingScheduleBlocks(character.schedule) : [];
-                const hasUpcomingScheduleBlocks = upcomingScheduleBlocks.length > 0;
-                const isNextScheduleVisible = !!visibleNextSchedule[character.id];
                 const isStatusMenuOpen = statusMenuCharacterId === character.id;
-                const lastContact = statusesQuery.data?.statuses[character.id]?.lastContact ?? lastContactByCharacterId[character.id];
+                const lastContact =
+                  statusesQuery.data?.statuses[character.id]?.lastContact ?? lastContactByCharacterId[character.id];
                 const lastContactLabel = lastContact ? formatRelativeContact(lastContact) : null;
                 const canReplyNow = !!activeAbortController && !!delayedInfo?.characterIds?.includes(character.id);
                 const isReplyNowPending = replyNowCharacterId === character.id;
@@ -706,8 +649,8 @@ export function ConversationPresenceCard({
                   <div
                     key={character.id}
                     className={cn(
-                      "rounded-2xl bg-[var(--accent)]/10 px-3 py-3 ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)]/16",
-                      isEditing && "bg-[var(--accent)]/22",
+                      "rounded-xl bg-[var(--secondary)]/70 px-3 py-3 ring-1 ring-[var(--border)] transition-colors",
+                      isEditing && "bg-[var(--accent)]/18",
                     )}
                   >
                     <div className="min-w-0">
@@ -732,32 +675,30 @@ export function ConversationPresenceCard({
                             <button
                               type="button"
                               className="min-w-0 flex-1 truncate text-left text-sm font-medium text-[var(--foreground)] transition-colors hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--background)]"
-                              title={`Open ${character.name} profile`}
+                              title={localizeUi("ui.chat.conversationpresencecard.openValue1Profile", { value1: character.name })}
                               onClick={() => openCharacterDetail(character.id)}
                             >
                               {character.name}
                             </button>
                             {isManual && (
-                              <span className="shrink-0 rounded-full bg-[var(--foreground)]/10 px-2 py-0.5 text-[0.625rem] font-medium text-[var(--foreground)]/75 ring-1 ring-[var(--border)]/70">
-                                Override
-                              </span>
+                              <span className="shrink-0 rounded-full bg-[var(--foreground)]/10 px-2 py-0.5 text-[0.625rem] font-medium text-[var(--foreground)]/75 ring-1 ring-[var(--border)]/70">{localizeUi("ui.chat.conversationpresencecard.override")}</span>
                             )}
                           </div>
 
                           <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
                             <span className="text-[0.625rem] text-[var(--muted-foreground)]">
-                              {isManual ? "Manual override" : "Following schedule"}
+                              {isManual ?localizeUi("ui.chat.conversationpresencecard.manualOverride") :localizeUi("ui.chat.conversationpresencecard.followingSchedule")}
                             </span>
                             {lastContactLabel && (
-                              <span className="text-[0.625rem] text-[var(--muted-foreground)]/90">
-                                Last contact {lastContactLabel}
+                              <span className="text-[0.625rem] text-[var(--muted-foreground)]/90">{localizeUi("ui.chat.conversationpresencecard.lastContact")} {lastContactLabel}
                               </span>
                             )}
                           </div>
                         </div>
                       </div>
 
-                      <div className="mt-2 flex w-full min-w-0 items-stretch overflow-hidden rounded-md bg-[var(--background)] ring-1 ring-[var(--border)] transition-colors hover:ring-[var(--border)]/80">
+                      <div className="mt-2 text-xs">
+                        <div className="flex w-full min-w-0 items-stretch overflow-hidden rounded-md bg-[var(--background)] ring-1 ring-[var(--border)] transition-colors hover:ring-[var(--border)]/80 focus-within:ring-[var(--primary)]/50">
                           <div className="flex shrink-0 flex-col border-r border-[var(--border)]">
                             <button
                               ref={(node) => {
@@ -770,7 +711,9 @@ export function ConversationPresenceCard({
                                 "inline-flex min-h-[2rem] items-center justify-center gap-1 px-2 text-[0.6875rem] font-medium transition-colors hover:bg-[var(--accent)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]",
                                 isStatusMenuOpen && "bg-[var(--accent)]",
                               )}
-                              onClick={() => setStatusMenuCharacterId((current) => (current === character.id ? null : character.id))}
+                              onClick={() =>
+                                setStatusMenuCharacterId((current) => (current === character.id ? null : character.id))
+                              }
                             >
                               <span className={cn("h-2 w-2 rounded-full", statusDotClass(character.status))} />
                               <ChevronDown size="0.625rem" className="shrink-0 opacity-60" />
@@ -785,7 +728,7 @@ export function ConversationPresenceCard({
                             disabled={updateMeta.isPending}
                             rows={1}
                             className="min-h-[2rem] max-h-28 w-full min-w-0 flex-1 resize-none overflow-y-auto bg-transparent px-2.5 py-1.5 text-[0.75rem] leading-5 text-[var(--foreground)]/88 outline-none placeholder:text-[var(--muted-foreground)]/55 disabled:opacity-60"
-                            placeholder="Manual activity"
+                            placeholder={localizeUi("ui.chat.conversationpresencecard.manualActivity")}
                             onFocus={() => {
                               beginEditing(character);
                               resizeActivityField(activityFieldRefs.current[character.id]);
@@ -813,73 +756,22 @@ export function ConversationPresenceCard({
                               type="button"
                               disabled={updateMeta.isPending}
                               className="shrink-0 border-l border-[var(--border)] px-2.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)]/20 hover:text-[var(--foreground)] disabled:opacity-60"
-                              title="Clear manual override"
+                              title={localizeUi("ui.chat.conversationpresencecard.clearManualOverride")}
                               onClick={() => void restoreSchedule(character.id)}
                             >
                               <Trash2 size="0.75rem" />
                             </button>
                           )}
+                        </div>
                       </div>
 
-                      {hasUpcomingScheduleBlocks && (
-                        <div className="mt-1.5">
-                          <button
-                            type="button"
-                            className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[0.625rem] leading-4 text-[var(--muted-foreground)]/72 transition-colors hover:bg-[var(--accent)]/12 hover:text-[var(--muted-foreground)]/90"
-                            title={isNextScheduleVisible ? "Hide upcoming schedule" : "Show upcoming schedule"}
-                            onClick={() =>
-                              setVisibleNextSchedule((current) => ({
-                                ...current,
-                                [character.id]: !current[character.id],
-                              }))
-                            }
-                          >
-                            <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--muted-foreground)]/70">
-                              {isNextScheduleVisible ? <EyeOff size="0.75rem" /> : <Eye size="0.75rem" />}
-                            </span>
-                            <span className="min-w-0 flex-1">
-                              {isNextScheduleVisible ? "Hide upcoming schedule" : `Upcoming schedule (${upcomingScheduleBlocks.length})`}
-                            </span>
-                          </button>
-
-                          {isNextScheduleVisible ? (
-                            <div className="mt-2 w-full rounded-lg bg-[var(--foreground)]/[0.03] px-2.5 py-2">
-                              <div className="space-y-2">
-                                {upcomingScheduleBlocks.map((block, index) => {
-                                  const previousBlock = index > 0 ? upcomingScheduleBlocks[index - 1] : null;
-                                  const showLabel = !!block.label && block.label !== previousBlock?.label;
-
-                                  return (
-                                    <div key={`${block.label}-${block.time}-${block.activity}`} className="min-w-0">
-                                      {showLabel ? (
-                                        <div className="mb-1 text-[0.5625rem] font-medium uppercase tracking-[0.08em] text-[var(--muted-foreground)]/52">
-                                          {block.label}
-                                        </div>
-                                      ) : null}
-                                      <div className="grid min-w-0 grid-cols-[auto_6.75rem_minmax(0,1fr)] items-start gap-x-2">
-                                        <span
-                                          className={cn(
-                                            "mt-[0.4rem] h-1.5 w-1.5 shrink-0 rounded-full",
-                                            statusDotClass(block.status),
-                                          )}
-                                        />
-                                          <span className="justify-self-start rounded-full bg-[var(--foreground)]/6 px-1.5 py-0.5 text-center text-[0.5625rem] tabular-nums text-[var(--muted-foreground)]/78 ring-1 ring-[var(--border)]/45">
-                                            {formatScheduleTimeRange(block.time)}
-                                          </span>
-                                        <div className="min-w-0 flex-1 whitespace-pre-wrap break-words pt-[0.05rem] text-[0.625rem] leading-4 text-[var(--muted-foreground)]/82">
-                                          {block.activity}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          ) : (
-                            <></>
-                          )}
-                        </div>
-                      )}
+                      <ConversationPresenceScheduleSection
+                        characterId={character.id}
+                        schedule={character.schedule}
+                        schedulesEnabled={schedulesEnabled}
+                        hasGeneratedSchedules={hasGeneratedSchedules}
+                        onOpenScheduleEditor={onOpenScheduleEditor}
+                      />
 
                       {canReplyNow && (
                         <button
@@ -888,7 +780,7 @@ export function ConversationPresenceCard({
                           className="mt-2 inline-flex w-full items-center justify-center rounded-md bg-[var(--foreground)]/8 px-2.5 py-1.5 text-[0.6875rem] font-medium text-[var(--foreground)]/78 ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--foreground)]/12 hover:text-[var(--foreground)] disabled:cursor-wait disabled:opacity-60"
                           onClick={() => void replyNow(character.id)}
                         >
-                          {isReplyNowPending ? "Replying now..." : "Reply now"}
+                          {isReplyNowPending ?localizeUi("ui.chat.conversationpresencecard.replyingNow") :localizeUi("ui.chat.conversationpresencecard.replyNow")}
                         </button>
                       )}
                     </div>
@@ -898,7 +790,7 @@ export function ConversationPresenceCard({
                         <div
                           ref={statusMenuRef}
                           role="menu"
-                          aria-label="Choose conversation status"
+                          aria-label={localizeUi("ui.chat.conversationpresencecard.chooseConversationStatus")}
                           className="fixed z-[10000] rounded-lg border border-[var(--border)] bg-[var(--popover)] p-1 text-[var(--popover-foreground)] shadow-xl ring-1 ring-[var(--border)]"
                           style={{
                             left: statusMenuPosition.left,
@@ -939,8 +831,7 @@ export function ConversationPresenceCard({
             </div>
           </div>,
           document.body,
-        )
-      )}
+        )}
     </>
   );
 }

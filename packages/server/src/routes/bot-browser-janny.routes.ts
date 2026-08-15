@@ -2,7 +2,9 @@
 // Routes: Browser — JannyAI provider
 // ──────────────────────────────────────────────
 import type { FastifyInstance } from "fastify";
-import { isAllowedImageBuffer, safeFetch } from "../utils/security.js";
+import { logger } from "../lib/logger.js";
+import { fetchJannyCharacterCard } from "../services/bot-browser/janny-character-card.js";
+import { resolveValidatedImage, safeFetch } from "../utils/security.js";
 
 const JANNY_SEARCH_URL = "https://search.jannyai.com/multi-search";
 const JANNY_IMAGE_BASE = "https://image.jannyai.com/bot-avatars/";
@@ -22,12 +24,9 @@ async function fetchAvatarImage(url: string, signal: AbortSignal) {
   });
   if (!res.ok) return null;
   const buf = Buffer.from(await res.arrayBuffer());
-  const contentType = res.headers.get("content-type")?.toLowerCase() ?? "";
-  const imageInfo = isAllowedImageBuffer(buf);
-  if (!contentType.startsWith("image/") || !imageInfo) {
-    throw new Error("Unsupported avatar image content");
-  }
-  return { buf, mimeType: imageInfo.mimeType };
+  const image = resolveValidatedImage(buf);
+  if (!image) throw new Error("Unsupported avatar image content");
+  return { buf, mimeType: image.mimeType };
 }
 
 function jannySearchHeaders(token: string): Record<string, string> {
@@ -58,6 +57,7 @@ let cachedTokenIsFallback = false;
 let cachedTokenAt = 0;
 const FALLBACK_TOKEN_TTL_MS = 60_000;
 const SCRAPED_TOKEN_TTL_MS = 5 * 60_000;
+const CHARACTER_PAGE_MAX_BYTES = 8 * 1024 * 1024;
 let inFlightTokenFetch: Promise<string> | null = null;
 
 async function fetchJannyPage(path: string): Promise<string | null> {
@@ -161,6 +161,55 @@ interface JannyMeiliHit {
   tagIds?: number[];
   creatorId?: string;
   creatorUsername?: string;
+}
+
+function readDoubleQuotedHtmlAttribute(tag: string, name: string): string | null {
+  const prefix = `${name}="`;
+  let searchIndex = 0;
+  while (searchIndex < tag.length) {
+    const start = tag.indexOf(prefix, searchIndex);
+    if (start < 0) return null;
+    if (start > 0 && !/\s/u.test(tag[start - 1]!)) {
+      searchIndex = start + prefix.length;
+      continue;
+    }
+    const valueStart = start + prefix.length;
+    const end = tag.indexOf('"', valueStart);
+    return end < 0 ? null : tag.slice(valueStart, end);
+  }
+  return null;
+}
+
+export function decodeAstroPropsAttribute(value: string): string {
+  const entities: Record<string, string> = {
+    "&quot;": '"',
+    "&amp;": "&",
+    "&lt;": "<",
+    "&gt;": ">",
+    "&#39;": "'",
+  };
+  return value.replace(/&(?:quot|amp|lt|gt|#39);/g, (entity) => entities[entity] ?? entity);
+}
+
+/** Find Astro character props without backtracking across the fetched page. */
+export function extractJannyAstroCharacterProps(html: string): string | null {
+  const openingTag = "<astro-island";
+  let searchIndex = 0;
+  let fallback: string | null = null;
+  while (searchIndex < html.length) {
+    const start = html.indexOf(openingTag, searchIndex);
+    if (start < 0) break;
+    const end = html.indexOf(">", start + openingTag.length);
+    if (end < 0) break;
+    const tag = html.slice(start, end + 1);
+    const props = readDoubleQuotedHtmlAttribute(tag, "props");
+    if (props !== null) {
+      if (readDoubleQuotedHtmlAttribute(tag, "component-export") === "CharacterButtons") return props;
+      if (fallback === null && props.includes("character")) fallback = props;
+    }
+    searchIndex = end + 1;
+  }
+  return fallback;
 }
 
 async function backfillFromSearch(name: string, charId: string): Promise<JannyMeiliHit | null> {
@@ -313,7 +362,27 @@ export async function botBrowserJannyRoutes(app: FastifyInstance) {
     }
   });
 
-  // ── Proxy JannyAI avatar images ──
+  // ── Download the complete PNG character card through JannyAI's supported API ──
+  app.get<{ Params: { id: string } }>("/janny/download/:id", async (req, reply) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45_000);
+    try {
+      const card = await fetchJannyCharacterCard(req.params.id, { signal: controller.signal });
+      return reply
+        .header("Content-Type", card.mimeType)
+        .header("Content-Disposition", 'attachment; filename="character.png"')
+        .send(card.buffer);
+    } catch (err) {
+      logger.warn(err, "[bot-browser] JannyAI character-card download failed");
+      const statusCode = (err as Error).name === "AbortError" ? 504 : 502;
+      return reply.status(statusCode).send({
+        error: "JannyAI could not provide the complete character card. Please try again later.",
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  });
+
   // ── Fetch full character details by scraping JannyAI page ──
   app.get<{ Params: { id: string } }>("/janny/character/:id", async (req, reply) => {
     const charId = req.params.id;
@@ -339,14 +408,17 @@ export async function botBrowserJannyRoutes(app: FastifyInstance) {
       // it serves the same Astro payload with fewer bot gates than the main site.
       for (const url of [apiPageUrl, pageUrl]) {
         try {
-          const directRes = await fetch(url, {
+          const directRes = await safeFetch(url, {
             headers: {
               Accept: "text/html,application/xhtml+xml,*/*",
               "User-Agent": BROWSER_UA,
               Referer: "https://jannyai.com/",
             },
             signal: controller.signal,
-            redirect: "follow",
+            policy: { allowedProtocols: ["https:"] },
+            allowedContentTypes: ["text/html", "application/xhtml+xml"],
+            allowMissingContentType: true,
+            maxResponseBytes: CHARACTER_PAGE_MAX_BYTES,
           });
           if (directRes.ok) {
             const directHtml = await directRes.text();
@@ -363,12 +435,16 @@ export async function botBrowserJannyRoutes(app: FastifyInstance) {
       // Strategy 2: corsproxy.io
       if (!html) {
         try {
-          const proxyRes = await fetch(`https://corsproxy.io/?url=${encodeURIComponent(pageUrl)}`, {
+          const proxyRes = await safeFetch(`https://corsproxy.io/?url=${encodeURIComponent(pageUrl)}`, {
             headers: {
               Accept: "text/html,application/xhtml+xml,*/*",
               Origin: "https://jannyai.com",
             },
             signal: controller.signal,
+            policy: { allowedProtocols: ["https:"] },
+            allowedContentTypes: ["text/html", "application/xhtml+xml"],
+            allowMissingContentType: true,
+            maxResponseBytes: CHARACTER_PAGE_MAX_BYTES,
           });
           if (proxyRes.ok) {
             html = await proxyRes.text();
@@ -386,20 +462,12 @@ export async function botBrowserJannyRoutes(app: FastifyInstance) {
       }
 
       // Parse Astro island props containing character data
-      let astroMatch = html.match(/astro-island[^>]*component-export="CharacterButtons"[^>]*props="([^"]+)"/);
-      if (!astroMatch) {
-        astroMatch = html.match(/astro-island[^>]*props="([^"]*character[^"]*)"/);
-      }
-      if (!astroMatch) {
+      const astroProps = extractJannyAstroCharacterProps(html);
+      if (astroProps === null) {
         return reply.status(404).send({ error: "Could not parse character data from page" });
       }
 
-      const propsDecoded = astroMatch[1]!
-        .replace(/&quot;/g, '"')
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&#39;/g, "'");
+      const propsDecoded = decodeAstroPropsAttribute(astroProps);
 
       const propsJson = JSON.parse(propsDecoded);
 
@@ -456,6 +524,7 @@ export async function botBrowserJannyRoutes(app: FastifyInstance) {
     }
   });
 
+  // ── Proxy JannyAI avatar images ──
   app.get<{ Params: { "*": string } }>("/janny/avatar/*", async (req, reply) => {
     const avatarPath = (req.params as Record<string, string>)["*"];
     if (!avatarPath) throw new Error("Missing avatar path");

@@ -10,16 +10,18 @@
 #   • Local sidecar model (llama-server / Gemma)
 #   • Local embedding model (onnxruntime + all-MiniLM-L6-v2)
 #   • Memory recall (semantic search)
+#   • Local Whisper voice input (Conversation call speech-to-text)
 # ──────────────────────────────────────────────
 
 # ── Stage 1: Build ──
 # Uses wolfi-base + nodejs-24 + npm so Node ABI matches across all stages.
-FROM cgr.dev/chainguard/wolfi-base AS builder
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:07e60ff6586b56f03c625e27b604f9f7d29498fef32f099f6560f0d207b4a056 AS builder
 ARG BUILD_COMMIT
+ARG BUILD_BRANCH
 WORKDIR /app
 
 RUN apk add --no-cache nodejs-24 npm && \
-    npm install -g pnpm@10.33.2
+    npm install -g pnpm@10.34.5
 
 ENV MARINARA_LITE=true
 ENV VITE_MARINARA_LITE=true
@@ -50,18 +52,16 @@ COPY packages/client/ packages/client/
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 RUN pnpm build
 
-# Bake the git commit into build-meta.json so the app can display it.
-RUN if [ -n "$BUILD_COMMIT" ]; then \
-      echo "{\"commit\":\"$BUILD_COMMIT\"}" > packages/server/dist/config/build-meta.json; \
-    fi
+# Bake the git ref into build-meta.json because the runtime image has no .git directory.
+RUN BUILD_COMMIT="$BUILD_COMMIT" BUILD_BRANCH="$BUILD_BRANCH" node -e 'const fs = require("node:fs"); const meta = {}; if (process.env.BUILD_COMMIT) meta.commit = process.env.BUILD_COMMIT; if (process.env.BUILD_BRANCH) meta.branch = process.env.BUILD_BRANCH; if (Object.keys(meta).length > 0) fs.writeFileSync("packages/server/dist/config/build-meta.json", JSON.stringify(meta));'
 
 # ── Stage 2: Production dependencies ──
 # Separate stage keeps builder cache warm while allowing aggressive dep stripping.
-FROM cgr.dev/chainguard/wolfi-base AS deps
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:07e60ff6586b56f03c625e27b604f9f7d29498fef32f099f6560f0d207b4a056 AS deps
 WORKDIR /app
 
 RUN apk add --no-cache nodejs-24 npm && \
-    npm install -g pnpm@10.33.2
+    npm install -g pnpm@10.34.5
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY packages/shared/package.json packages/shared/
@@ -77,7 +77,9 @@ COPY packages/client/package.json packages/client/
 RUN --mount=type=cache,target=/app/.pnpm-store \
     pnpm install --frozen-lockfile --prod --ignore-scripts && \
     pnpm rebuild sharp && \
-    rm -rf node_modules/.pnpm/onnxruntime-node@* \
+    rm -rf .pnpm/onnxruntime-node@* \
+           .pnpm/onnxruntime-web@* \
+           node_modules/.pnpm/onnxruntime-node@* \
            node_modules/.pnpm/onnxruntime-web@* \
            packages/server/node_modules/onnxruntime-node \
            packages/server/node_modules/onnxruntime-web
@@ -85,13 +87,14 @@ RUN --mount=type=cache,target=/app/.pnpm-store \
 # Archive node_modules preserving pnpm symlinks — Docker COPY
 # dereferences them which would break module resolution.
 RUN tar cf /tmp/node_modules.tar \
+    .pnpm \
     node_modules \
     packages/shared/node_modules \
     packages/server/node_modules 2>/dev/null; true
 
 # ── Stage 3: Minimal Wolfi runtime ──
 # Only the Node.js 24 binary — no npm, no build tools, no shell bloat.
-FROM cgr.dev/chainguard/wolfi-base AS production
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:07e60ff6586b56f03c625e27b604f9f7d29498fef32f099f6560f0d207b4a056 AS production
 WORKDIR /app
 
 RUN apk add --no-cache nodejs-24-minimal && \
@@ -109,12 +112,22 @@ COPY packages/shared/package.json packages/shared/
 COPY packages/server/package.json packages/server/
 COPY packages/client/package.json packages/client/
 
+# Fail the image build if pnpm's symlinked virtual store is incomplete.
+RUN node -e "for (const dep of ['fastify', '@fastify/cors', 'sharp']) require.resolve(dep, { paths: ['/app/packages/server'] })"
+
 # Copy built artifacts from builder
 COPY --from=builder /app/packages/shared/dist packages/shared/dist
 COPY --from=builder /app/packages/server/dist packages/server/dist
 COPY --from=builder /app/packages/client/dist packages/client/dist
 COPY scripts/docker-entrypoint.mjs /usr/local/bin/marinara-docker-entrypoint.mjs
 COPY scripts/install-backgroundremover.mjs scripts/install-backgroundremover.mjs
+# The storage downgrade escape hatch (#4708) — docs/TROUBLESHOOTING.md tells
+# Docker users to run it in a one-off container, so it must ship in the image.
+COPY scripts/protect-launcher-data.mjs scripts/protect-launcher-data.mjs
+
+# User guides served by the in-app documentation viewer (/api/docs)
+COPY README.md README.md
+COPY docs/ docs/
 
 # Ensure data directory exists
 RUN mkdir -p /app/data && \

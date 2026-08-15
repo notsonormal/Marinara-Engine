@@ -6,71 +6,61 @@
 // so the character naturally "remembers" what's happening elsewhere.
 // ──────────────────────────────────────────────
 
-import { eq } from "drizzle-orm";
+import type { WrapFormat } from "@marinara-engine/shared";
+
+import { eq } from "../../db/file-query.js";
 import type { DB } from "../../db/connection.js";
 import { chats, messages } from "../../db/schema/index.js";
+import { wrapContent } from "../prompt/format-engine.js";
+import { sanitizePromptLeaf } from "../prompt/prompt-escaping.js";
 import { createCharactersStorage } from "../storage/characters.storage.js";
-import { formatZonedConversationDate, formatZonedConversationTime, isSameZonedLogicalDay } from "./timezone.js";
-import { escapeXmlText } from "../prompt/prompt-escaping.js";
+import {
+  formatZonedConversationDate,
+  formatZonedConversationTime,
+  getZonedDayBounds,
+  isSameZonedLogicalDay,
+} from "./timezone.js";
 
 // ── Temporal keyword patterns ──
 // Maps regex patterns in the user's message to time windows to pull from.
-const TEMPORAL_PATTERNS: Array<{ pattern: RegExp; getWindow: () => { start: Date; end: Date } }> = [
+const TEMPORAL_PATTERNS: Array<{
+  pattern: RegExp;
+  getWindow: (now: Date, timeZone?: string) => { start: Date; end: Date };
+}> = [
   {
     pattern: /\byesterday\b|\blast\s+night\b/i,
-    getWindow: () => {
-      const d = new Date();
-      d.setDate(d.getDate() - 1);
-      d.setHours(0, 0, 0, 0);
-      const end = new Date(d);
-      end.setHours(23, 59, 59, 999);
-      return { start: d, end };
-    },
+    getWindow: (now, timeZone) => getZonedDayBounds(now, timeZone, -1),
   },
   {
     pattern: /\bearlier\s+today\b|\bthis\s+morning\b|\bthis\s+afternoon\b|\btoday\b/i,
-    getWindow: () => {
-      const d = new Date();
-      d.setHours(0, 0, 0, 0);
-      return { start: d, end: new Date() };
-    },
+    getWindow: (now, timeZone) => ({ start: getZonedDayBounds(now, timeZone).start, end: now }),
   },
   {
     pattern: /\blast\s+week\b|\bthis\s+week\b/i,
-    getWindow: () => {
-      const d = new Date();
-      d.setDate(d.getDate() - 7);
-      d.setHours(0, 0, 0, 0);
-      return { start: d, end: new Date() };
-    },
+    getWindow: (now, timeZone) => ({ start: getZonedDayBounds(now, timeZone, -7).start, end: now }),
   },
   {
     pattern: /\bthe\s+other\s+day\b|\brecently\b|\bfew\s+days\s+ago\b/i,
-    getWindow: () => {
-      const d = new Date();
-      d.setDate(d.getDate() - 3);
-      d.setHours(0, 0, 0, 0);
-      return { start: d, end: new Date() };
-    },
+    getWindow: (now, timeZone) => ({ start: getZonedDayBounds(now, timeZone, -3).start, end: now }),
   },
 ];
 
 /** Default window: last 1 hour */
-function defaultWindow(): { start: Date; end: Date } {
-  const end = new Date();
+function defaultWindow(now = new Date()): { start: Date; end: Date } {
+  const end = now;
   const start = new Date(end.getTime() - 1 * 60 * 60 * 1000);
   return { start, end };
 }
 
 /**
  * Detect temporal keywords in a user message and return
- * all matching time windows (plus the default 2h window).
+ * all matching time windows (plus the default 1h window).
  */
-function detectTimeWindows(userMessage: string): Array<{ start: Date; end: Date }> {
-  const windows: Array<{ start: Date; end: Date }> = [defaultWindow()];
+function detectTimeWindows(userMessage: string, now = new Date(), timeZone?: string): Array<{ start: Date; end: Date }> {
+  const windows: Array<{ start: Date; end: Date }> = [defaultWindow(now)];
   for (const { pattern, getWindow } of TEMPORAL_PATTERNS) {
     if (pattern.test(userMessage)) {
-      windows.push(getWindow());
+      windows.push(getWindow(now, timeZone));
     }
   }
   return windows;
@@ -110,6 +100,24 @@ interface MessageRow {
   characterId: string | null;
   content: string;
   createdAt: string;
+  extra?: unknown;
+}
+
+function parseMessageExtra(extra: unknown): Record<string, unknown> {
+  if (!extra) return {};
+  if (typeof extra === "string") {
+    try {
+      const parsed = JSON.parse(extra) as unknown;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+  return typeof extra === "object" && !Array.isArray(extra) ? (extra as Record<string, unknown>) : {};
+}
+
+function isMessageHiddenFromAI(message: { extra?: unknown }): boolean {
+  return parseMessageExtra(message.extra).hiddenFromAI === true;
 }
 
 /**
@@ -147,6 +155,21 @@ function groupIntoBursts(msgs: MessageRow[]): MessageRow[][] {
   return bursts;
 }
 
+const AWARENESS_INTRODUCTION =
+  "These are your other active conversations. You naturally remember what happens in them — reference or react to them as a real person would.";
+
+export function formatAwarenessConversationBlock(lines: string[], wrapFormat: WrapFormat): string {
+  return wrapContent(lines.join("\n"), "Conversation", wrapFormat, 1);
+}
+
+export function formatAwarenessContextBlock(conversationBlocks: string[], wrapFormat: WrapFormat): string {
+  return wrapContent(
+    [AWARENESS_INTRODUCTION, ...conversationBlocks].filter(Boolean).join("\n\n"),
+    "Awareness",
+    wrapFormat,
+  );
+}
+
 /**
  * Build the <awareness> context block for a specific chat.
  *
@@ -157,6 +180,7 @@ function groupIntoBursts(msgs: MessageRow[]): MessageRow[][] {
  * @param userName - The user/persona name
  * @param userMessage - The user's latest message (for temporal keyword scanning)
  * @param maxTokenEstimate - Rough token budget (chars / 4). Default ~1500 tokens.
+ * @param wrapFormat - Structural format selected by the active prompt preset.
  */
 export async function buildAwarenessBlock(
   db: DB,
@@ -167,6 +191,7 @@ export async function buildAwarenessBlock(
   userMessage: string,
   maxTokenEstimate = 1500,
   timeZone?: string,
+  wrapFormat: WrapFormat = "xml",
 ): Promise<string | null> {
   if (characterIds.length === 0) return null;
 
@@ -200,7 +225,7 @@ export async function buildAwarenessBlock(
   if (siblingChats.length === 0) return null;
 
   // 2. Detect time windows from user message
-  const rawWindows = detectTimeWindows(userMessage);
+  const rawWindows = detectTimeWindows(userMessage, new Date(), timeZone);
   const windows = mergeWindows(rawWindows);
 
   const isWithinRequestedWindow = (createdAt: string) => {
@@ -236,11 +261,12 @@ export async function buildAwarenessBlock(
         characterId: messages.characterId,
         content: messages.content,
         createdAt: messages.createdAt,
+        extra: messages.extra,
       })
       .from(messages)
       .where(eq(messages.chatId, chat.id))
       .orderBy(messages.createdAt)) as MessageRow[];
-    const filteredRows = rows.filter((row) => isWithinRequestedWindow(row.createdAt));
+    const filteredRows = rows.filter((row) => !isMessageHiddenFromAI(row) && isWithinRequestedWindow(row.createdAt));
 
     if (filteredRows.length > 0) {
       chatMessages.set(chat.id, {
@@ -254,34 +280,42 @@ export async function buildAwarenessBlock(
 
   if (chatMessages.size === 0) return null;
 
-  // 4. Format into the awareness block
+  // 4. Format into the awareness block using the active preset's structure.
   const maxChars = maxTokenEstimate * 4; // rough token → char estimate
-  let block =
-    "These are your other active conversations. You naturally remember what happens in them — reference or react to them as a real person would.\n";
-  let charCount = block.length;
+  const conversationBlocks: string[] = [];
+  const renderAwareness = (blocks: string[]) => formatAwarenessContextBlock(blocks, wrapFormat);
 
   for (const [, data] of chatMessages) {
     const bursts = groupIntoBursts(data.messages);
-    const header = `\n## ${escapeXmlText(data.chatName)} (${data.members.map(escapeXmlText).join(", ")})\n`;
+    const safeChatName = sanitizePromptLeaf(data.chatName, wrapFormat);
+    const safeMembers = data.members.map((member) => sanitizePromptLeaf(member, wrapFormat)).join(", ");
+    const conversationLines = [`Chat: ${safeChatName} (${safeMembers})`];
+    let reachedBudget = false;
+    const appendWithinBudget = (line: string): boolean => {
+      const candidateBlock = formatAwarenessConversationBlock([...conversationLines, line], wrapFormat);
+      if (renderAwareness([...conversationBlocks, candidateBlock]).length > maxChars) return false;
+      conversationLines.push(line);
+      return true;
+    };
 
-    if (charCount + header.length > maxChars) break;
-    block += header;
-    charCount += header.length;
+    const headerOnly = formatAwarenessConversationBlock(conversationLines, wrapFormat);
+    if (renderAwareness([...conversationBlocks, headerOnly]).length > maxChars) break;
 
     for (const burst of bursts) {
+      const burstStartLength = conversationLines.length;
+      let appendedBurstMessages = 0;
       // Check if this burst from a different day than the previous needs a date header
       const burstDate = fmtDate(burst[0]!.createdAt, timeZone);
       const dateHeader = `[${burstDate}]\n`;
-      if (charCount + dateHeader.length > maxChars) break;
 
       // Only add date header if the burst is not from today
       const today = new Date();
       const burstDay = new Date(burst[0]!.createdAt);
       const isToday = isSameZonedLogicalDay(burstDay, today, timeZone);
 
-      if (!isToday) {
-        block += dateHeader;
-        charCount += dateHeader.length;
+      if (!isToday && !appendWithinBudget(dateHeader.trimEnd())) {
+        reachedBudget = true;
+        break;
       }
 
       for (const msg of burst) {
@@ -291,14 +325,22 @@ export async function buildAwarenessBlock(
             : msg.characterId
               ? (characterNames.get(msg.characterId) ?? "Unknown")
               : "Unknown";
-        const line = `[${fmtTime(msg.createdAt, timeZone)}] ${escapeXmlText(senderName)}: ${escapeXmlText(msg.content)}\n`;
+        const line = `[${fmtTime(msg.createdAt, timeZone)}] ${sanitizePromptLeaf(senderName, wrapFormat)}: ${sanitizePromptLeaf(msg.content, wrapFormat)}`;
 
-        if (charCount + line.length > maxChars) break;
-        block += line;
-        charCount += line.length;
+        if (!appendWithinBudget(line)) {
+          if (appendedBurstMessages === 0) conversationLines.length = burstStartLength;
+          reachedBudget = true;
+          break;
+        }
+        appendedBurstMessages += 1;
       }
+      if (reachedBudget) break;
     }
+
+    if (conversationLines.length === 1) break;
+    conversationBlocks.push(formatAwarenessConversationBlock(conversationLines, wrapFormat));
+    if (reachedBudget) break;
   }
 
-  return `<awareness>\n${block}</awareness>`;
+  return conversationBlocks.length > 0 ? renderAwareness(conversationBlocks) : null;
 }

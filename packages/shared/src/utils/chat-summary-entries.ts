@@ -9,7 +9,6 @@ const VALID_KINDS = new Set<ChatSummaryEntryKind>(["rolling"]);
 const VALID_ORIGINS = new Set<ChatSummaryEntryOrigin>(["manual", "automated", "legacy"]);
 const VALID_SOURCES = new Set<ChatSummaryEntrySource>(["last", "range", "agent"]);
 
-export const COMPILED_CHAT_SUMMARY_MAX_BYTES = 64 * 1024;
 export const MAX_AUTOMATED_CHAT_SUMMARY_ENTRIES = 200;
 
 export type ChatSummaryEntryInput = Partial<ChatSummaryEntry> & {
@@ -37,49 +36,6 @@ function fallbackId(prefix: string, seed: string) {
 
 function trimString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
-}
-
-function utf8ByteLength(text: string): number {
-  let bytes = 0;
-  for (let i = 0; i < text.length; i += 1) {
-    const code = text.charCodeAt(i);
-    if (code < 0x80) {
-      bytes += 1;
-    } else if (code < 0x800) {
-      bytes += 2;
-    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
-      const next = text.charCodeAt(i + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        bytes += 4;
-        i += 1;
-      } else {
-        bytes += 3;
-      }
-    } else {
-      bytes += 3;
-    }
-  }
-  return bytes;
-}
-
-function trimToUtf8Bytes(text: string, maxBytes: number, fromStart = true): string {
-  if (maxBytes <= 0) return "";
-  if (utf8ByteLength(text) <= maxBytes) return text;
-
-  let low = 0;
-  let high = text.length;
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
-    const candidate = fromStart ? text.slice(text.length - mid) : text.slice(0, mid);
-    if (utf8ByteLength(candidate) <= maxBytes) {
-      low = mid;
-    } else {
-      high = mid - 1;
-    }
-  }
-
-  const trimmed = fromStart ? text.slice(text.length - low) : text.slice(0, low);
-  return fromStart ? trimmed.replace(/^[\uDC00-\uDFFF]/, "") : trimmed.replace(/[\uD800-\uDBFF]$/, "");
 }
 
 function normalizeIsoTimestamp(value: unknown, fallback: string) {
@@ -110,14 +66,10 @@ export function estimateChatSummaryTokens(content: string): number {
 
 /** Generate a concise default title from an entry's origin and source metadata. */
 export function generateChatSummaryEntryTitle(
-  entry: Pick<ChatSummaryEntry, "origin" | "sourceMode" | "messageCount" | "rangeStartIndex" | "rangeEndIndex">,
+  entry: Pick<ChatSummaryEntry, "origin">,
 ): string {
   if (entry.origin === "legacy") return "Legacy summary";
   if (entry.origin === "automated") return "Automated summary";
-  if (entry.sourceMode === "range" && entry.rangeStartIndex && entry.rangeEndIndex) {
-    return `Summary messages ${entry.rangeStartIndex}-${entry.rangeEndIndex}`;
-  }
-  if (entry.messageCount) return `Summary of ${entry.messageCount} messages`;
   return "Manual summary";
 }
 
@@ -215,47 +167,24 @@ export function createChatSummaryEntry(
 }
 
 export function sortChatSummaryEntries(entries: ChatSummaryEntry[]): ChatSummaryEntry[] {
-  return entries
-    .map((entry, index) => ({ entry, index }))
-    .sort((a, b) => {
-      const aRange = a.entry.rangeStartIndex ?? Number.MAX_SAFE_INTEGER;
-      const bRange = b.entry.rangeStartIndex ?? Number.MAX_SAFE_INTEGER;
-      if (aRange !== bRange) return aRange - bRange;
-      const created = Date.parse(a.entry.createdAt) - Date.parse(b.entry.createdAt);
-      if (created !== 0) return created;
-      return a.index - b.index;
-    })
-    .map(({ entry }) => entry);
+  // Array order is persisted user intent. New summaries append to this order,
+  // while combine/reorder operations deliberately place entries within it.
+  return [...entries];
 }
 
 function pruneAutomatedChatSummaryEntries(entries: ChatSummaryEntry[]): ChatSummaryEntry[] {
-  let prunableAutomatedCount = 0;
-  for (const entry of entries) {
-    if (
-      entry.origin === "automated" &&
-      entry.enabled &&
-      !(entry.hiddenMessageIds && entry.hiddenMessageIds.length > 0)
-    ) {
-      prunableAutomatedCount += 1;
-    }
-  }
-  let removable = prunableAutomatedCount - MAX_AUTOMATED_CHAT_SUMMARY_ENTRIES;
-  if (removable <= 0) return entries;
-
-  const pruned: ChatSummaryEntry[] = [];
-  for (const entry of entries) {
-    if (
-      removable > 0 &&
-      entry.origin === "automated" &&
-      entry.enabled &&
-      !(entry.hiddenMessageIds && entry.hiddenMessageIds.length > 0)
-    ) {
-      removable -= 1;
-      continue;
-    }
-    pruned.push(entry);
-  }
-  return pruned;
+  const prunable = entries
+    .filter(
+      (entry) =>
+        entry.origin === "automated" &&
+        entry.enabled &&
+        !(entry.hiddenMessageIds && entry.hiddenMessageIds.length > 0),
+    )
+    .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+  const removeCount = prunable.length - MAX_AUTOMATED_CHAT_SUMMARY_ENTRIES;
+  if (removeCount <= 0) return entries;
+  const removedIds = new Set(prunable.slice(0, removeCount).map((entry) => entry.id));
+  return entries.filter((entry) => !removedIds.has(entry.id));
 }
 
 export function normalizeChatSummaryEntries(
@@ -292,7 +221,21 @@ export function compileChatSummaryEntries(entries: ChatSummaryEntry[]): string |
     .join("\n\n")
     .trim();
   if (!compiled) return null;
-  return trimToUtf8Bytes(compiled, COMPILED_CHAT_SUMMARY_MAX_BYTES, true).trim() || null;
+  return compiled;
+}
+
+export function combineChatSummaryEntryHistory(
+  entries: ChatSummaryEntry[],
+  sourceEntryIds: ReadonlySet<string>,
+  combinedEntry: ChatSummaryEntry,
+  now: string,
+): ChatSummaryEntry[] {
+  const firstIndex = entries.findIndex((entry) => sourceEntryIds.has(entry.id));
+  const nextEntries = entries.map((entry) =>
+    sourceEntryIds.has(entry.id) ? { ...entry, enabled: false, updatedAt: now } : entry,
+  );
+  nextEntries.splice(Math.max(0, firstIndex), 0, combinedEntry);
+  return normalizeChatSummaryEntries(nextEntries);
 }
 
 export function appendChatSummaryEntryToMetadata(

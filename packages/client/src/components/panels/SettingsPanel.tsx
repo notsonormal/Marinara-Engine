@@ -2,56 +2,73 @@
 // Panel: Settings (polished)
 // ──────────────────────────────────────────────
 import {
-  APP_LANGUAGE_OPTIONS,
   TRACKER_DATA_PANEL_SECTIONS,
   TRACKER_PANEL_DEFAULT_BACKGROUND_COLOR,
-  DEFAULT_ROLEPLAY_BACKGROUND_URL,
+  QUICK_REPLIES_SETTINGS_CONTROL_ID,
   useUIStore,
   getDefaultAppAccentColor,
   getDefaultAppBackgroundColor,
   getDefaultChatChromeTextColor,
   getDefaultChatTextColor,
   getTrackerPanelWidthForProfile,
+  type ConversationAvatarShape,
   type ConversationMessageStyle,
   type GameDialogueDisplayMode,
+  type ChatListBackgroundMode,
   type RoleplayAvatarStyle,
   type TrackerDataPanelSection,
   type TrackerPanelSizeProfile,
-  type TrackerTemperatureUnit,
+  type TrackerStatDisplayMode,
   type TrackerThoughtBubbleDisplay,
   type VisualTheme,
 } from "../../stores/ui.store";
-import { cn } from "../../lib/utils";
-import { useExtensions, useCreateExtension, useDeleteExtension, useUpdateExtension } from "../../hooks/use-extensions";
+import { APP_LANGUAGE_OPTIONS } from "../../localization/locale-loader";
+import { useLocalizedUiText } from "../../localization/use-localized-ui-text";
+import { cn, copyToClipboard } from "../../lib/utils";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import {
-  ADMIN_SECRET_STORAGE_KEY,
-  ApiError,
-  api,
-  getAdminSecretHeader,
-  getPrivilegedActionErrorMessage,
-} from "../../lib/api-client";
+import { ADMIN_SECRET_STORAGE_KEY, ApiError, api, getPrivilegedActionErrorMessage } from "../../lib/api-client";
+import { ANDROID_BRIDGE_READY_EVENT, getAndroidBridgeToken } from "../../lib/android-bridge";
 import { chatBackgroundUrlToMetadata } from "../../lib/backgrounds";
 import { normalizeThemeCss, sanitizeAppCss } from "../../lib/theme-css";
 import { forceRefreshSpa } from "@/lib/browser-runtime";
+import {
+  formatProfileImportWarningDetails,
+  formatProfileImportWarningSummary,
+  normalizeProfileImportWarnings,
+  type ProfileImportWarningCopy,
+  type ProfileImportWarning,
+} from "@/lib/profile-import-warnings";
 import React, { useRef, useState, useCallback, useEffect, useMemo } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation, useTranslation as useUiTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
   APP_VERSION,
+  CONVERSATION_CALL_CHARACTER_VIDEO_CLIP_KINDS,
   DEFAULT_IMAGE_STYLE_PROFILES,
+  VIDEO_ANIMATED_EXPRESSION_CLIP_DURATION_MAX,
+  VIDEO_ANIMATED_EXPRESSION_CLIP_DURATION_MIN,
+  VIDEO_CALL_CLIP_DURATION_MAX,
+  VIDEO_CALL_CLIP_DURATION_MIN,
+  VIDEO_GENERATION_SETTINGS_KEY,
+  VIDEO_SCENE_DURATION_MAX,
+  VIDEO_SCENE_DURATION_MIN,
   compileImagePrompt,
   normalizeImageStyleProfileSettings,
+  normalizeVideoGenerationUserSettings,
   createFolderEntry,
   getFolderImportEntries,
   getFolderManifestConfig,
-  isJsonRecord,
+  type AppSettingsResponse,
+  type APIConnection,
+  type ConversationCallCharacterVideoClipKind,
   type ImagePromptKind,
   type ImagePromptMode,
   type ImageStyleProfile,
   type ImageStyleProfileSettings,
-  type InstalledExtension,
   type QuoteFormat,
   type Theme,
+  type VideoGenerationUserSettings,
 } from "@marinara-engine/shared";
 import {
   findDuplicateTheme,
@@ -72,18 +89,16 @@ import {
   ChevronDown,
   Loader2,
   Search,
-  Star,
   Palette,
   Puzzle,
   CloudRain,
   FileCode2,
   FileText,
   Power,
-  PowerOff,
   Paintbrush,
   AlertTriangle,
+  ShieldAlert,
   Tag,
-  Pencil,
   Code,
   Plus,
   Save,
@@ -100,17 +115,34 @@ import {
   UserCheck,
   WandSparkles,
   Terminal,
+  Film,
+  Settings2,
+  Bell,
+  Copy,
+  BookOpen,
+  BarChart3,
+  Gauge,
+  LifeBuoy,
+  SlidersHorizontal,
 } from "lucide-react";
-import { useClearAllData, useExpungeData, useUpdateChatMetadata, type ExpungeScope } from "../../hooks/use-chats";
+import {
+  useChat,
+  useClearAllData,
+  useExpungeData,
+  useUpdateChatMetadata,
+  type ExpungeScope,
+} from "../../hooks/use-chats";
+import { useConnections } from "../../hooks/use-connections";
 import { useChatStore } from "../../stores/chat.store";
-import { useGameAssetStore } from "../../stores/game-asset.store";
-import { useOpenGameAssetsFolder } from "../../hooks/use-game-assets";
+import { useOpenGameAssetsFolder, useRescanGameAssets } from "../../hooks/use-game-assets";
 import { chatKeys } from "../../hooks/use-chats";
+import { useInstalledCapabilityPackages } from "../../hooks/use-capability-packages";
+import { useDocsLanguage, useFixDocsLanguage, useSetDocsLanguage } from "../../hooks/use-docs-language";
 import { HelpTooltip } from "../ui/HelpTooltip";
 import { ColorPicker } from "../ui/ColorPicker";
+import { EmojiPicker } from "../ui/EmojiPicker";
 import { TrackerPanelIcon } from "../ui/TrackerPanelIcon";
 import { TrackerSizeTierIcon } from "../ui/TrackerSizeTierIcon";
-import { ImageUploadDropzone } from "../ui/ImageUploadDropzone";
 import {
   ConversationSoundSetting,
   SettingsIntro,
@@ -120,26 +152,22 @@ import {
 } from "./settings/SettingControls";
 import { TrackerCardColorSettings } from "./settings/TrackerCardColorSettings";
 import { PromptOverridesEditor } from "./settings/PromptOverridesEditor";
+import { BackgroundPicker } from "./settings/BackgroundPicker";
+import { CustomGenerationParametersSettings } from "./settings/CustomGenerationParametersSettings";
+import { ExternalExtensionsSettings, PersonalExtensionsSettings } from "./settings/PersonalExtensionsSettings";
+import { usePersonalExtensionPolicy, useSetExternalExtensionsEnabled } from "../../hooks/use-personal-extensions";
+import { useAgentImportPolicy, useSetAgentImportsEnabled } from "../../hooks/use-agents";
 import { DraftNumberInput } from "../ui/DraftNumberInput";
 import { ExportFormatDialog, type ExportFormatChoice } from "../ui/ExportFormatDialog";
 import { inspectCharacterFilesForEmbeddedLorebooks } from "../../lib/character-import";
+import { detectBrowserGpu, formatSupportDiagnostics, resolveClientOs } from "../../lib/support-diagnostics";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { downloadJsonFile, sanitizeExportFilenamePart } from "../../lib/download-json";
-import { downloadZipFile } from "../../lib/download-zip";
 import {
-  createExtensionFolderPackageFilename,
-  createExtensionFolderPackageFiles,
-} from "../../lib/extension-transfer";
-import {
-  collectFolderPackageEntries,
-  getPackagePathBasename,
-  readTextFilesFromFileList,
-  resolvePackageTextPaths,
-  type FolderPackageImportEntry,
-  type PackageTextFile,
-} from "../../lib/folder-package-transfer";
-import { HOST_DEVICE_FILE_MANAGER_MESSAGE } from "../../lib/host-device";
-import { isZipFile as isZipArchiveFile, readTextFilesFromZip } from "../../lib/read-zip-text";
+  HOST_DEVICE_FILE_MANAGER_MESSAGE,
+  HostDeviceFileManagerError,
+  isHostDeviceBrowser,
+} from "../../lib/host-device";
 
 type CustomFontFace = {
   filename: string;
@@ -151,23 +179,1154 @@ type CustomFontFace = {
 };
 
 const TABS = [
-  { id: "general", label: "General" },
-  { id: "appearance", label: "Appearance" },
-  { id: "themes", label: "Themes" },
-  { id: "extensions", label: "Extensions" },
-  { id: "import", label: "Import" },
-  { id: "advanced", label: "Advanced" },
+  {
+    id: "general",
+    label: "General",
+    labelKey: "settings.tabs.general.label",
+    icon: Settings2,
+    description: "App behavior, responses, input, and playback.",
+    descriptionKey: "settings.tabs.general.description",
+  },
+  {
+    id: "appearance",
+    label: "Appearance",
+    labelKey: "settings.tabs.appearance.label",
+    icon: Palette,
+    description: "Theme, chat display, art, motion, and backgrounds.",
+    descriptionKey: "settings.tabs.appearance.description",
+  },
+  {
+    id: "generations",
+    label: "Generations",
+    labelKey: "settings.tabs.generations.label",
+    icon: WandSparkles,
+    description: "Image/video defaults and prompt templates.",
+    descriptionKey: "settings.tabs.generations.description",
+  },
+  {
+    id: "addons",
+    label: "Addons",
+    labelKey: "settings.tabs.addons.label",
+    icon: Puzzle,
+    description: "Personal Extensions and custom themes.",
+    descriptionKey: "settings.tabs.addons.description",
+  },
+  {
+    id: "import",
+    label: "Imports",
+    labelKey: "settings.tabs.imports.label",
+    icon: Download,
+    description: "Imports, asset folders, and data transfer.",
+    descriptionKey: "settings.tabs.imports.description",
+  },
+  {
+    id: "advanced",
+    label: "Advanced",
+    labelKey: "settings.tabs.advanced.label",
+    icon: Terminal,
+    description: "Admin access, updates, tools, backups, and danger zone.",
+    descriptionKey: "settings.tabs.advanced.description",
+  },
+] as const;
+
+type SettingsTabId = (typeof TABS)[number]["id"];
+type SettingsSectionId =
+  | "application"
+  | "notifications"
+  | "responses"
+  | "input-editing"
+  | "text-rules"
+  | "game-playback"
+  | "overall-generations"
+  | "image-generation"
+  | "video-generation"
+  | "game-assets"
+  | "app-style"
+  | "text-scale"
+  | "chat-display"
+  | "roleplay-tracker"
+  | "roleplay-messages"
+  | "game-presentation"
+  | "motion-backgrounds"
+  | "conversation-theme"
+  | "chat-backgrounds"
+  | "prompt-overrides"
+  | "personal-extensions"
+  | "theme-library"
+  | "profile-marinara"
+  | "sillytavern-import"
+  | "admin-access"
+  | "updates"
+  | "support-diagnostics"
+  | "parameters"
+  | "message-tools"
+  | "backup-export"
+  | "danger-zone";
+
+type SettingsSectionMeta = {
+  id: SettingsSectionId;
+  tab: SettingsTabId;
+  label: string;
+  description: string;
+  aliases: string[];
+};
+
+type SettingsControlKind = "Toggle" | "Slider" | "Select" | "Input" | "Picker" | "Button group";
+
+type SettingsSearchableControlMeta = {
+  id: string;
+  sectionId: SettingsSectionId;
+  label: string;
+  description: string;
+  aliases: string[];
+  kind: SettingsControlKind;
+};
+
+type SettingsSearchResult =
+  | { type: "section"; section: SettingsSectionMeta }
+  | { type: "control"; control: SettingsSearchableControlMeta; section: SettingsSectionMeta };
+
+const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
+  {
+    id: "application",
+    tab: "general",
+    label: "App Behavior",
+    description: "Language, safety confirmations, achievements, music, and playful extras.",
+    aliases: ["language", "delete", "confirm", "music", "achievements", "mini mari", "app"],
+  },
+  {
+    id: "notifications",
+    tab: "general",
+    label: "Notifications",
+    description: "Notification sounds and background notifications by mode.",
+    aliases: ["notifications", "sound", "ping", "browser", "background replies", "conversation", "roleplay", "game"],
+  },
+  {
+    id: "responses",
+    tab: "general",
+    label: "Responses",
+    description: "How replies arrive, save, and paginate.",
+    aliases: ["streaming", "speed", "messages", "pagination", "trim", "model endings"],
+  },
+  {
+    id: "input-editing",
+    tab: "general",
+    label: "Input & Editing",
+    description: "Message input behavior and fast edit controls.",
+    aliases: [
+      "enter",
+      "send",
+      "microphone",
+      "speech",
+      "swipe",
+      "reroll",
+      "double click",
+      "arrow up",
+      "quick replies",
+      "post only",
+      "guide reply",
+      "impersonate",
+    ],
+  },
+  {
+    id: "text-rules",
+    tab: "general",
+    label: "Text Rules",
+    description: "Formatting applied to chat text.",
+    aliases: ["quotes", "bold", "dialogue", "latex", "symbols", "typographic"],
+  },
+  {
+    id: "game-playback",
+    tab: "general",
+    label: "Game Playback",
+    description: "Game mode reading and navigation.",
+    aliases: ["game", "text speed", "auto play", "middle mouse", "navigation", "vn"],
+  },
+  {
+    id: "overall-generations",
+    tab: "generations",
+    label: "Overall Generations",
+    description: "Shared behavior for image and video generation requests.",
+    aliases: ["media", "image", "video", "queue", "prompt review", "generation"],
+  },
+  {
+    id: "image-generation",
+    tab: "generations",
+    label: "Image Generation",
+    description: "Image canvas defaults and style profiles.",
+    aliases: ["image", "background", "portrait", "selfie", "style profiles"],
+  },
+  {
+    id: "video-generation",
+    tab: "generations",
+    label: "Video Generation",
+    description: "Video duration, clip behavior, and reusable video settings.",
+    aliases: ["video", "clip", "duration", "conversation call", "animated", "scene"],
+  },
+  {
+    id: "game-assets",
+    tab: "generations",
+    label: "Game Assets",
+    description: "Asset folders for music, ambience, sprites, and backgrounds.",
+    aliases: ["assets", "music", "ambient", "sfx", "sprites", "backgrounds", "folder"],
+  },
+  {
+    id: "app-style",
+    tab: "appearance",
+    label: "App Style",
+    description: "Theme family, color scheme, accent, and app chrome controls.",
+    aliases: ["theme", "accent", "rgb", "cursor", "background", "style", "color scheme"],
+  },
+  {
+    id: "text-scale",
+    tab: "appearance",
+    label: "Text & Scale",
+    description: "Fonts, display size, chat text colors, and legibility controls.",
+    aliases: [
+      "font",
+      "google fonts",
+      "display size",
+      "chat font",
+      "text",
+      "stroke",
+      "outline",
+      "chrome text",
+      "legibility",
+    ],
+  },
+  {
+    id: "chat-display",
+    tab: "appearance",
+    label: "Conversation Display",
+    description: "Conversation layout and shared message text presentation.",
+    aliases: ["chat", "conversation", "messages", "timestamps", "token", "model", "grouping"],
+  },
+  {
+    id: "roleplay-tracker",
+    tab: "appearance",
+    label: "Tracker Panel",
+    description: "Roleplay HUD tracker panel, card layout, and tracker portrait behavior.",
+    aliases: ["roleplay", "tracker", "hud", "cards", "thoughts", "temperature", "portrait"],
+  },
+  {
+    id: "roleplay-messages",
+    tab: "appearance",
+    label: "Roleplay Messages",
+    description: "Roleplay bubbles, avatars, sprite scale, and message opacity.",
+    aliases: ["roleplay", "avatar", "sprite", "message", "bubble", "opacity", "portrait"],
+  },
+  {
+    id: "game-presentation",
+    tab: "appearance",
+    label: "Game Presentation",
+    description: "Game VN art scale and dialogue display.",
+    aliases: ["game", "vn", "dialogue", "portrait", "sprite", "full body", "presentation"],
+  },
+  {
+    id: "motion-backgrounds",
+    tab: "appearance",
+    label: "Atmosphere",
+    description: "Roleplay weather and atmospheric effects.",
+    aliases: ["motion", "weather", "effects", "atmosphere", "rain", "snow", "fog", "roleplay"],
+  },
+  {
+    id: "conversation-theme",
+    tab: "appearance",
+    label: "Conversation Theme",
+    description: "Conversation-mode background gradient by color scheme.",
+    aliases: ["conversation", "gradient", "theme", "dark", "light"],
+  },
+  {
+    id: "chat-backgrounds",
+    tab: "appearance",
+    label: "Backgrounds",
+    description: "Chat background images, blur, and default roleplay background.",
+    aliases: ["background", "blur", "scene", "image", "roleplay background", "chat background"],
+  },
+  {
+    id: "prompt-overrides",
+    tab: "generations",
+    label: "Prompt Overrides",
+    description: "Reusable image and video prompt templates.",
+    aliases: ["prompt", "template", "override", "video prompt", "image prompt"],
+  },
+  {
+    id: "personal-extensions",
+    tab: "addons",
+    label: "Personal Extensions",
+    description: "Sandboxed extension drafts authored by Professor Mari.",
+    aliases: ["extensions", "addons", "local code", "browser", "server", "professor mari"],
+  },
+  {
+    id: "theme-library",
+    tab: "addons",
+    label: "Theme Library",
+    description: "Synced themes and custom theme CSS.",
+    aliases: ["themes", "custom css", "css", "library", "export theme"],
+  },
+  {
+    id: "profile-marinara",
+    tab: "import",
+    label: "Profile & Marinara",
+    description: "Restore full profiles or import individual Marinara files.",
+    aliases: ["profile", "import", "restore", "marinara", "json", "zip"],
+  },
+  {
+    id: "sillytavern-import",
+    tab: "import",
+    label: "SillyTavern Import",
+    description: "Bring over characters, chats, presets, and lorebooks.",
+    aliases: ["sillytavern", "st", "character", "chat", "preset", "lorebook", "import"],
+  },
+  {
+    id: "admin-access",
+    tab: "advanced",
+    label: "Admin Access",
+    description: "Admin authorization for privileged actions.",
+    aliases: ["admin", "secret", "access", "authorization"],
+  },
+  {
+    id: "updates",
+    tab: "advanced",
+    label: "Updates",
+    description: "Version and update controls.",
+    aliases: ["update", "version", "refresh", "release"],
+  },
+  {
+    id: "support-diagnostics",
+    tab: "advanced",
+    label: "Support Diagnostics",
+    description: "Copy technical details for support tickets.",
+    aliases: ["support", "diagnostics", "system info", "gpu", "model", "ticket", "bug report"],
+  },
+  {
+    id: "parameters",
+    tab: "advanced",
+    label: "Parameters",
+    description: "Reusable numeric controls for provider-specific request fields.",
+    aliases: ["custom parameters", "generation", "provider", "min p", "min_p"],
+  },
+  {
+    id: "message-tools",
+    tab: "advanced",
+    label: "Message Tools",
+    description: "Message maintenance and repair utilities.",
+    aliases: ["messages", "tools", "repair", "cleanup"],
+  },
+  {
+    id: "backup-export",
+    tab: "advanced",
+    label: "Backup & Export",
+    description: "Backups and manual export tools.",
+    aliases: ["backup", "export", "download", "archive", "automatic", "scheduled"],
+  },
+  {
+    id: "danger-zone",
+    tab: "advanced",
+    label: "Danger Zone",
+    description: "Destructive reset and expunge actions.",
+    aliases: ["danger", "reset", "delete", "clear", "expunge", "destructive"],
+  },
+] as const;
+
+const SETTINGS_SECTION_BY_ID = new Map(SETTINGS_SECTIONS.map((section) => [section.id, section]));
+
+const SETTINGS_SEARCHABLE_CONTROLS: readonly SettingsSearchableControlMeta[] = [
+  {
+    id: "language",
+    sectionId: "application",
+    label: "Language",
+    description: "Choose the app language.",
+    aliases: ["locale", "translation"],
+    kind: "Select",
+  },
+  {
+    id: "docs-language",
+    sectionId: "application",
+    label: "Documentation Language",
+    description: "Choose the language for Marinara's built-in guides.",
+    aliases: [
+      "documentation",
+      "guides",
+      "docs",
+      "manual",
+      "spanish",
+      "español",
+      "german",
+      "deutsch",
+      "french",
+      "français",
+      "portuguese",
+      "português",
+      "brazilian",
+      "polish",
+      "polski",
+      "russian",
+      "русский",
+      "japanese",
+      "日本語",
+      "korean",
+      "한국어",
+      "chinese",
+      "simplified",
+      "简体中文",
+      "中文",
+      "hindi",
+      "हिन्दी",
+    ],
+    kind: "Select",
+  },
+  {
+    id: "confirm-before-delete",
+    sectionId: "application",
+    label: "Confirm before deleting",
+    description: "Ask before permanently deleting chats, characters, or other items.",
+    aliases: ["delete", "confirmation", "safety"],
+    kind: "Toggle",
+  },
+  {
+    id: "android-status-bar",
+    sectionId: "application",
+    label: "Android status bar",
+    description: "Show the time, battery level, and notification icons in the Android app.",
+    aliases: ["android", "battery", "clock", "time", "notifications", "fullscreen"],
+    kind: "Toggle",
+  },
+  {
+    id: "achievements",
+    sectionId: "application",
+    label: "Achievements",
+    description: "Show the Home achievements button and unlock notifications.",
+    aliases: ["home", "badges", "unlock"],
+    kind: "Toggle",
+  },
+  {
+    id: "music-player",
+    sectionId: "application",
+    label: "Music Player",
+    description: "Show the compact Music Player.",
+    aliases: ["spotify", "youtube", "music dj"],
+    kind: "Toggle",
+  },
+  {
+    id: "mini-mari",
+    sectionId: "application",
+    label: "Mini Mari surprise visits",
+    description: "Allow rare Chibi Professor Mari messages while scrolling.",
+    aliases: ["chibi", "professor", "surprise"],
+    kind: "Toggle",
+  },
+  {
+    id: "professor-mari-navigation",
+    sectionId: "application",
+    label: "Professor Mari navigation",
+    description: "Show Professor Mari's deterministic navigator on Home.",
+    aliases: ["home", "helper", "navigation", "navigator", "where is", "find"],
+    kind: "Toggle",
+  },
+  {
+    id: "notification-conversation-sound",
+    sectionId: "notifications",
+    label: "Conversation mode notification sound",
+    description: "Play a ping for Conversation replies.",
+    aliases: ["sound", "ping", "convo"],
+    kind: "Toggle",
+  },
+  {
+    id: "notification-roleplay-sound",
+    sectionId: "notifications",
+    label: "Roleplay mode notification sound",
+    description: "Play a ping for Roleplay replies.",
+    aliases: ["sound", "ping", "rp"],
+    kind: "Toggle",
+  },
+  {
+    id: "notification-game-sound",
+    sectionId: "notifications",
+    label: "Game mode notification sound",
+    description: "Play a ping for Game replies.",
+    aliases: ["sound", "ping"],
+    kind: "Toggle",
+  },
+  {
+    id: "notification-unfocused-only",
+    sectionId: "notifications",
+    label: "Only when Marinara is unfocused",
+    description: "Play notification sounds only while Marinara is not focused.",
+    aliases: ["sound", "background", "unfocused"],
+    kind: "Toggle",
+  },
+  {
+    id: "browser-background-notifications",
+    sectionId: "notifications",
+    label: "Background replies browser notifications",
+    description: "Show browser notifications for background Conversation replies.",
+    aliases: ["browser", "notifications", "conversation"],
+    kind: "Toggle",
+  },
+  {
+    id: "mobile-background-notifications",
+    sectionId: "notifications",
+    label: "Background replies mobile notifications",
+    description: "Show native Android notifications for background Conversation replies.",
+    aliases: ["mobile", "android", "notifications", "conversation"],
+    kind: "Toggle",
+  },
+  {
+    id: "enable-streaming",
+    sectionId: "responses",
+    label: "Enable streaming",
+    description: "Show AI responses as they generate.",
+    aliases: ["stream", "typewriter", "response"],
+    kind: "Toggle",
+  },
+  {
+    id: "streaming-speed",
+    sectionId: "responses",
+    label: "Streaming speed",
+    description: "Tune how fast streamed tokens appear.",
+    aliases: ["speed", "typewriter", "tokens"],
+    kind: "Slider",
+  },
+  {
+    id: "trim-incomplete-output",
+    sectionId: "responses",
+    label: "Trim incomplete sentences from the response",
+    description: "Trim trailing unfinished sentences from AI responses.",
+    aliases: ["trim", "unfinished", "sentence"],
+    kind: "Toggle",
+  },
+  {
+    id: "messages-per-page",
+    sectionId: "responses",
+    label: "Messages per page",
+    description: "Control how many messages load at once.",
+    aliases: ["pagination", "load more", "history"],
+    kind: "Input",
+  },
+  {
+    id: "speech-to-text",
+    sectionId: "input-editing",
+    label: "Speech-to-text microphone",
+    description: "Show a microphone button in chat inputs.",
+    aliases: ["microphone", "dictation", "speech"],
+    kind: "Toggle",
+  },
+  {
+    id: "intuitive-swipe-navigation",
+    sectionId: "input-editing",
+    label: "Intuitive swipe navigation",
+    description: "Use keyboard arrows or touch swipes to move between generations.",
+    aliases: ["swipes", "arrows", "alternate generations"],
+    kind: "Toggle",
+  },
+  {
+    id: "reroll-past-newest-swipe",
+    sectionId: "input-editing",
+    label: "Reroll past the newest swipe",
+    description: "Create a reroll when swiping past the newest assistant message.",
+    aliases: ["swipe", "reroll", "regenerate"],
+    kind: "Toggle",
+  },
+  {
+    id: "up-arrow-edits-last-message",
+    sectionId: "input-editing",
+    label: "Up Arrow edits last message",
+    description: "Open the most recent message for editing with Up Arrow.",
+    aliases: ["keyboard", "edit", "shortcut"],
+    kind: "Toggle",
+  },
+  {
+    id: "double-click-edits-messages",
+    sectionId: "input-editing",
+    label: "Double-click edits messages",
+    description: "Edit Roleplay messages with double-click or double-tap.",
+    aliases: ["double tap", "edit", "roleplay"],
+    kind: "Toggle",
+  },
+  {
+    id: "bold-dialogue",
+    sectionId: "text-rules",
+    label: "Bold dialogue in quotes",
+    description: "Bold quoted dialogue text in chat display.",
+    aliases: ["quotes", "dialogue", "formatting"],
+    kind: "Toggle",
+  },
+  {
+    id: "convert-latex-symbols",
+    sectionId: "text-rules",
+    label: "Convert LaTeX symbols",
+    description: "Display common LaTeX commands as regular symbols.",
+    aliases: ["math", "symbols", "formatting"],
+    kind: "Toggle",
+  },
+  {
+    id: "quote-style",
+    sectionId: "text-rules",
+    label: "Quote style",
+    description: "Choose how quotation marks are unified.",
+    aliases: ["quotes", "dialogue", "punctuation"],
+    kind: "Button group",
+  },
+  {
+    id: "game-instant-text-reveal",
+    sectionId: "game-playback",
+    label: "Instantly reveal game text",
+    description: "Skip the Game mode narration typewriter effect.",
+    aliases: ["game", "typewriter", "instant"],
+    kind: "Toggle",
+  },
+  {
+    id: "game-middle-mouse-navigation",
+    sectionId: "game-playback",
+    label: "Mouse-wheel + click navigation",
+    description: "Navigate Game mode with mouse wheel and background clicks.",
+    aliases: ["middle mouse", "scroll", "game navigation"],
+    kind: "Toggle",
+  },
+  {
+    id: "game-narration-speed",
+    sectionId: "game-playback",
+    label: "Game narration speed",
+    description: "Tune the Game mode narration typewriter speed.",
+    aliases: ["game", "typewriter", "speed"],
+    kind: "Slider",
+  },
+  {
+    id: "game-auto-play-delay",
+    sectionId: "game-playback",
+    label: "Game auto-play segment delay",
+    description: "Pause between Game mode auto-play narration segments.",
+    aliases: ["autoplay", "game", "delay"],
+    kind: "Slider",
+  },
+  {
+    id: "queue-media-generation",
+    sectionId: "overall-generations",
+    label: "Queue media generation requests",
+    description: "Send image and video generation jobs one at a time per connection.",
+    aliases: ["media", "image", "video", "queue", "generation"],
+    kind: "Toggle",
+  },
+  {
+    id: "image-prompt-review",
+    sectionId: "overall-generations",
+    label: "Expose media prompts before sending",
+    description: "Review generated image and Gallery video prompts before sending.",
+    aliases: [
+      "image",
+      "video",
+      "media",
+      "prompt",
+      "review",
+      "selfie",
+      "noodle",
+      "avatar",
+      "portrait",
+      "sprite",
+      "animated expression",
+    ],
+    kind: "Toggle",
+  },
+  {
+    id: "image-background-size",
+    sectionId: "image-generation",
+    label: "Background image size",
+    description: "Set default generated background dimensions.",
+    aliases: ["image", "resolution", "canvas"],
+    kind: "Input",
+  },
+  {
+    id: "image-illustration-size",
+    sectionId: "image-generation",
+    label: "Illustration image size",
+    description: "Set default generated illustration dimensions.",
+    aliases: ["image", "resolution", "canvas", "illustrator"],
+    kind: "Input",
+  },
+  {
+    id: "image-noodle-size",
+    sectionId: "image-generation",
+    label: "Noodle image size",
+    description: "Set default Noodle timeline image dimensions.",
+    aliases: ["image", "resolution", "canvas", "noodle", "timeline"],
+    kind: "Input",
+  },
+  {
+    id: "image-game-size",
+    sectionId: "image-generation",
+    label: "Game scene image size",
+    description: "Set the default dimensions for generated Game scene illustrations.",
+    aliases: ["image", "resolution", "canvas", "game", "illustrator"],
+    kind: "Input",
+  },
+  {
+    id: "image-portrait-size",
+    sectionId: "image-generation",
+    label: "Portrait image size",
+    description: "Set default generated portrait dimensions.",
+    aliases: ["image", "resolution", "canvas", "character"],
+    kind: "Input",
+  },
+  {
+    id: "image-selfie-size",
+    sectionId: "image-generation",
+    label: "Selfie image size",
+    description: "Set default generated selfie dimensions.",
+    aliases: ["image", "resolution", "canvas", "conversation"],
+    kind: "Input",
+  },
+  {
+    id: "image-style-profiles",
+    sectionId: "image-generation",
+    label: "Style Profiles",
+    description: "Tune reusable image prompt style profiles.",
+    aliases: ["image", "style", "danbooru", "anime", "realistic"],
+    kind: "Select",
+  },
+  {
+    id: "video-scene-duration",
+    sectionId: "video-generation",
+    label: "Scene video fallback length",
+    description: "Set fallback duration for generated scene videos.",
+    aliases: ["video", "duration", "length"],
+    kind: "Input",
+  },
+  {
+    id: "video-animated-expression-duration",
+    sectionId: "video-generation",
+    label: "Animated expression length",
+    description: "Set animated expression clip duration.",
+    aliases: ["video", "expression", "sprite", "duration"],
+    kind: "Input",
+  },
+  {
+    id: "visual-theme",
+    sectionId: "app-style",
+    label: "Visual Style",
+    description: "Switch between Marinara and SillyTavern visual themes.",
+    aliases: ["theme", "style", "sillytavern", "marinara"],
+    kind: "Button group",
+  },
+  {
+    id: "theme-mode",
+    sectionId: "app-style",
+    label: "Color Scheme",
+    description: "Switch between dark and light mode.",
+    aliases: ["theme", "dark", "light", "mode"],
+    kind: "Select",
+  },
+  {
+    id: "custom-cursor",
+    sectionId: "app-style",
+    label: "Custom Mouse Pointer",
+    description: "Use Marinara's accent-colored cursor.",
+    aliases: ["cursor", "mouse", "pointer"],
+    kind: "Toggle",
+  },
+  {
+    id: "app-background-color",
+    sectionId: "app-style",
+    label: "Background Color",
+    description: "Set the main app shell background color.",
+    aliases: ["background", "theme", "gradient"],
+    kind: "Picker",
+  },
+  {
+    id: "app-accent-color",
+    sectionId: "app-style",
+    label: "Accent Color",
+    description: "Set the shared app accent color.",
+    aliases: ["primary", "theme", "highlight"],
+    kind: "Picker",
+  },
+  {
+    id: "accent-pulse",
+    sectionId: "app-style",
+    label: "Accent Pulse",
+    description: "Animate the selected accent color.",
+    aliases: ["accent", "animation", "motion"],
+    kind: "Toggle",
+  },
+  {
+    id: "rgb-mode",
+    sectionId: "app-style",
+    label: "RGB Mode",
+    description: "Cycle the app accent through Marinara's rainbow palette.",
+    aliases: ["rainbow", "accent", "color"],
+    kind: "Toggle",
+  },
+  {
+    id: "font-family",
+    sectionId: "text-scale",
+    label: "Font",
+    description: "Choose the font used across the app.",
+    aliases: ["typography", "typeface"],
+    kind: "Select",
+  },
+  {
+    id: "display-size",
+    sectionId: "text-scale",
+    label: "Display Size",
+    description: "Adjust the base font size across the app.",
+    aliases: ["font size", "scale", "readability"],
+    kind: "Select",
+  },
+  {
+    id: "chat-font-size",
+    sectionId: "text-scale",
+    label: "Chat Font Size",
+    description: "Adjust the font size of chat messages.",
+    aliases: ["text size", "message size", "readability"],
+    kind: "Slider",
+  },
+  {
+    id: "chat-text-color",
+    sectionId: "text-scale",
+    label: "Chat Text Color",
+    description: "Control the main chat message text color.",
+    aliases: ["font color", "message color"],
+    kind: "Picker",
+  },
+  {
+    id: "default-dialogue-color",
+    sectionId: "text-scale",
+    label: "Default Dialogue Color",
+    description: "Choose the dialogue highlight used by cards without their own dialogue color.",
+    aliases: ["quote color", "character dialogue", "persona dialogue"],
+    kind: "Toggle",
+  },
+  {
+    id: "chat-chrome-text-color",
+    sectionId: "text-scale",
+    label: "Chat Chrome Text Color",
+    description: "Control ordinary chrome copy color in chat-adjacent UI.",
+    aliases: ["chrome", "text color", "tracker"],
+    kind: "Picker",
+  },
+  {
+    id: "text-outline-width",
+    sectionId: "text-scale",
+    label: "Text Outline / Stroke",
+    description: "Tune chat text outline width and color.",
+    aliases: ["stroke", "outline", "readability"],
+    kind: "Slider",
+  },
+  {
+    id: "conversation-layout",
+    sectionId: "chat-display",
+    label: "Chat Layout",
+    description: "Switch Conversation messages between linear rows and bubbles.",
+    aliases: ["conversation", "bubbles", "linear"],
+    kind: "Button group",
+  },
+  {
+    id: "conversation-avatar-shape",
+    sectionId: "chat-display",
+    label: "Avatar Shape",
+    description: "Choose circular or square avatars in Conversation mode.",
+    aliases: ["conversation", "avatar", "circle", "square"],
+    kind: "Button group",
+  },
+  {
+    id: "tracker-panel",
+    sectionId: "roleplay-tracker",
+    label: "Tracker Panel",
+    description: "Show or hide the Roleplay HUD tracker panel.",
+    aliases: ["tracker", "hud", "roleplay"],
+    kind: "Toggle",
+  },
+  {
+    id: "tracker-replace-hud-icons",
+    sectionId: "roleplay-tracker",
+    label: "Replace tracker HUD icons",
+    description: "Hide the old world/player tracker icon strip.",
+    aliases: ["tracker", "hud", "icons"],
+    kind: "Toggle",
+  },
+  {
+    id: "tracker-expression-sprites",
+    sectionId: "roleplay-tracker",
+    label: "Use expression sprites for tracker portraits",
+    description: "Allow tracker portraits to use Expression Engine sprites.",
+    aliases: ["tracker", "sprites", "portraits"],
+    kind: "Toggle",
+  },
+  {
+    id: "tracker-panel-background",
+    sectionId: "roleplay-tracker",
+    label: "Panel background",
+    description: "Pick the Tracker panel background.",
+    aliases: ["tracker", "background", "color"],
+    kind: "Picker",
+  },
+  {
+    id: "tracker-desktop-size",
+    sectionId: "roleplay-tracker",
+    label: "Desktop size",
+    description: "Choose the Tracker panel desktop width.",
+    aliases: ["tracker", "width", "compact", "expanded"],
+    kind: "Button group",
+  },
+  {
+    id: "tracker-thought-display-mode",
+    sectionId: "roleplay-tracker",
+    label: "Thought display mode",
+    description: "Choose how featured character thoughts open.",
+    aliases: ["tracker", "thoughts", "dock", "floating"],
+    kind: "Button group",
+  },
+  {
+    id: "tracker-stat-display-mode",
+    sectionId: "roleplay-tracker",
+    label: "Stat display mode",
+    description: "Choose whether persona and character stats use compact bars or circular gauges.",
+    aliases: ["tracker", "stats", "bars", "gauges", "circular"],
+    kind: "Button group",
+  },
+  {
+    id: "tracker-docked-thoughts",
+    sectionId: "roleplay-tracker",
+    label: "Always show Docked thoughts",
+    description: "Keep docked tracker thoughts visible inside character cards.",
+    aliases: ["tracker", "thoughts", "dock"],
+    kind: "Toggle",
+  },
+  {
+    id: "tracker-temperature-unit",
+    sectionId: "roleplay-tracker",
+    label: "Temperature unit",
+    description: "Switch tracker temperature displays between Celsius and Fahrenheit.",
+    aliases: ["tracker", "weather", "celsius", "fahrenheit"],
+    kind: "Toggle",
+  },
+  {
+    id: "roleplay-message-opacity",
+    sectionId: "roleplay-messages",
+    label: "Roleplay Messages Background Opacity",
+    description: "Adjust roleplay bubble background opacity.",
+    aliases: ["roleplay", "opacity", "messages"],
+    kind: "Slider",
+  },
+  {
+    id: "roleplay-reduced-paint-effects",
+    sectionId: "roleplay-messages",
+    label: "Reduced paint effects",
+    description: "Flatten costly Roleplay transparency, shadows, and scene overlays.",
+    aliases: ["roleplay", "performance", "firefox", "slow", "paint", "effects"],
+    kind: "Toggle",
+  },
+  {
+    id: "scrollable-avatars",
+    sectionId: "roleplay-messages",
+    label: "Scrollable Avatars",
+    description: "Keep roleplay avatars visible while scrolling long messages.",
+    aliases: ["roleplay", "avatars", "sticky"],
+    kind: "Toggle",
+  },
+  {
+    id: "narrator-cycling-avatars",
+    sectionId: "roleplay-messages",
+    label: "Narrator's Cycling Avatars",
+    description: "Cycle Narrator avatars or show active characters together.",
+    aliases: ["roleplay", "narrator", "avatars", "cycle", "group"],
+    kind: "Toggle",
+  },
+  {
+    id: "roleplay-avatar-style",
+    sectionId: "roleplay-messages",
+    label: "Roleplay Avatars",
+    description: "Choose how avatars sit next to roleplay messages.",
+    aliases: ["avatar", "portrait", "circles", "rectangles"],
+    kind: "Button group",
+  },
+  {
+    id: "roleplay-avatar-scale",
+    sectionId: "roleplay-messages",
+    label: "Message avatar scale",
+    description: "Adjust the default roleplay message avatar scale.",
+    aliases: ["avatar", "portrait", "scale"],
+    kind: "Slider",
+  },
+  {
+    id: "roleplay-sprite-scale",
+    sectionId: "roleplay-messages",
+    label: "Default sprite scale",
+    description: "Adjust the default roleplay sprite scale.",
+    aliases: ["sprite", "scale", "roleplay"],
+    kind: "Slider",
+  },
+  {
+    id: "game-dialogue-portrait-scale",
+    sectionId: "game-presentation",
+    label: "Dialogue portrait scale",
+    description: "Adjust Game mode dialogue portrait scale.",
+    aliases: ["game", "avatar", "portrait", "scale"],
+    kind: "Slider",
+  },
+  {
+    id: "game-full-body-sprite-scale",
+    sectionId: "game-presentation",
+    label: "Full-body sprite scale",
+    description: "Adjust Game mode full-body sprite scale.",
+    aliases: ["game", "sprite", "scale"],
+    kind: "Slider",
+  },
+  {
+    id: "chat-list-backgrounds",
+    sectionId: "chat-backgrounds",
+    label: "Chat list backgrounds",
+    description: "Show each chat's background as a banner behind its row in the chat list.",
+    aliases: ["sidebar", "chat list", "banner", "background", "row"],
+    kind: "Button group",
+  },
+  {
+    id: "game-dialogue-display",
+    sectionId: "game-presentation",
+    label: "Game Dialogue Display",
+    description: "Choose a classic dialogue box or segment history display.",
+    aliases: ["game", "vn", "history"],
+    kind: "Button group",
+  },
+  {
+    id: "game-text-effects",
+    sectionId: "game-presentation",
+    label: "Game text effects",
+    description: "Animate dramatic words and explicit text-effect tags in Game mode.",
+    aliases: ["game", "text", "animation", "effects", "accessibility", "motion"],
+    kind: "Toggle",
+  },
+  {
+    id: "weather-effects",
+    sectionId: "motion-backgrounds",
+    label: "Dynamic weather effects",
+    description: "Show animated weather particles from story context.",
+    aliases: ["weather", "rain", "snow", "fog"],
+    kind: "Toggle",
+  },
+  {
+    id: "release-channel",
+    sectionId: "updates",
+    label: "Release Channel",
+    description: "Choose which release channel update checks follow.",
+    aliases: ["updates", "branch", "version"],
+    kind: "Select",
+  },
+  {
+    id: "copy-support-diagnostics",
+    sectionId: "support-diagnostics",
+    label: "Copy Diagnostics",
+    description: "Copy version, build, system, GPU, and active model details for support.",
+    aliases: ["support", "diagnostics", "system info", "gpu", "model", "clipboard"],
+    kind: "Button group",
+  },
+  {
+    id: "custom-generation-parameters",
+    sectionId: "parameters",
+    label: "Custom generation parameters",
+    description: "Create reusable numeric provider parameters for chats and connections.",
+    aliases: ["parameter", "provider", "min p", "min_p", "range", "tooltip"],
+    kind: "Input",
+  },
+  {
+    id: QUICK_REPLIES_SETTINGS_CONTROL_ID,
+    sectionId: "input-editing",
+    label: "Quick replies",
+    description: "Show alternate draft actions beside Send.",
+    aliases: ["post only", "guide reply", "impersonate"],
+    kind: "Toggle",
+  },
+  {
+    id: "show-message-timestamps",
+    sectionId: "message-tools",
+    label: "Show message timestamps",
+    description: "Display date and time on chat messages.",
+    aliases: ["time", "date", "metadata"],
+    kind: "Toggle",
+  },
+  {
+    id: "show-model-name",
+    sectionId: "message-tools",
+    label: "Show model name on messages",
+    description: "Display which AI model generated each response.",
+    aliases: ["model", "metadata"],
+    kind: "Toggle",
+  },
+  {
+    id: "show-token-usage",
+    sectionId: "message-tools",
+    label: "Show token usage on messages",
+    description: "Display prompt and completion token counts.",
+    aliases: ["tokens", "context", "cost"],
+    kind: "Toggle",
+  },
+  {
+    id: "show-message-numbers",
+    sectionId: "message-tools",
+    label: "Show message numbers",
+    description: "Display message numbers in chats.",
+    aliases: ["metadata", "index"],
+    kind: "Toggle",
+  },
+  {
+    id: "guide-generations",
+    sectionId: "message-tools",
+    label: "Guide swipes/regens with chat input",
+    description: "Use the current draft as regeneration direction.",
+    aliases: ["guided", "regenerate", "swipes"],
+    kind: "Toggle",
+  },
+  {
+    id: "include-reasoning-in-exports",
+    sectionId: "message-tools",
+    label: "Include reasoning in exports",
+    description: "Include hidden thinking metadata in chat exports.",
+    aliases: ["reasoning", "thinking", "exports"],
+    kind: "Toggle",
+  },
+  {
+    id: "debug-mode",
+    sectionId: "message-tools",
+    label: "Debug mode",
+    description: "Log model payloads in the server console.",
+    aliases: ["debug", "logs", "prompt", "console"],
+    kind: "Toggle",
+  },
+  {
+    id: "automatic-backups",
+    sectionId: "backup-export",
+    label: "Automatic backups",
+    description: "Schedule full backups and choose how many automatic archives to retain.",
+    aliases: ["backup", "daily", "weekly", "monthly", "scheduled"],
+    kind: "Toggle",
+  },
+  {
+    id: "automatic-backups-kept",
+    sectionId: "backup-export",
+    label: "Automatic backups kept",
+    description: "Retain between 1 and 9999 automatic backup archives without affecting manual backups.",
+    aliases: ["backup", "retention", "history", "rotate", "automatic"],
+    kind: "Input",
+  },
 ] as const;
 
 const SETTINGS_BUTTON_CLASS = "mari-chrome-control mari-chrome-control--small text-[0.6875rem]";
 const SETTINGS_PRIMARY_BUTTON_CLASS = "mari-chrome-control mari-chrome-control--primary text-xs";
 const SETTINGS_COMPACT_PRIMARY_BUTTON_CLASS =
   "mari-chrome-control mari-chrome-control--compact mari-chrome-control--selected text-[0.625rem]";
-const SETTINGS_INLINE_ACCENT_BUTTON_CLASS =
-  "shrink-0 rounded-md border border-[var(--marinara-chat-chrome-button-border-active)] bg-[var(--marinara-chat-chrome-button-bg-active)] px-1.5 py-0.5 text-[0.5625rem] font-semibold text-[var(--marinara-chat-chrome-button-text-active)] transition-colors hover:bg-[var(--marinara-chat-chrome-button-bg-hover)] disabled:cursor-not-allowed disabled:opacity-45";
-
 type MarinaraAndroidBridge = {
-  openConsole?: () => void;
+  openConsole?: {
+    (token: string): void;
+    (): void;
+  };
+  isStatusBarVisible?: {
+    (token: string): boolean;
+    (): boolean;
+  };
+  setStatusBarVisible?: {
+    (token: string, visible: boolean): void;
+    (visible: boolean): void;
+  };
 };
 
 function getMarinaraAndroidBridge(): MarinaraAndroidBridge | null {
@@ -178,6 +1337,78 @@ function getMarinaraAndroidBridge(): MarinaraAndroidBridge | null {
 
 function isMarinaraAndroidShell(): boolean {
   return typeof navigator !== "undefined" && /\bMarinaraEngine\/Android\b/u.test(navigator.userAgent);
+}
+
+function readAndroidStatusBarVisibility(): boolean | null {
+  const bridge = getMarinaraAndroidBridge();
+  if (typeof bridge?.isStatusBarVisible !== "function") return null;
+  try {
+    const token = getAndroidBridgeToken();
+    return token ? bridge.isStatusBarVisible(token) : bridge.isStatusBarVisible();
+  } catch {
+    return null;
+  }
+}
+
+function updateAndroidStatusBarVisibility(visible: boolean): boolean {
+  const bridge = getMarinaraAndroidBridge();
+  if (typeof bridge?.setStatusBarVisible !== "function") return false;
+  try {
+    const token = getAndroidBridgeToken();
+    if (token) bridge.setStatusBarVisible(token, visible);
+    else bridge.setStatusBarVisible(visible);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function AndroidStatusBarSetting() {
+  const { t } = useTranslation();
+  const initialVisibility = readAndroidStatusBarVisibility();
+  const [visible, setVisible] = useState(initialVisibility ?? false);
+  const [supported, setSupported] = useState(initialVisibility !== null);
+
+  useEffect(() => {
+    const refreshBridge = () => {
+      const nextVisibility = readAndroidStatusBarVisibility();
+      if (nextVisibility === null) return;
+      setVisible(nextVisibility);
+      setSupported(true);
+    };
+    window.addEventListener(ANDROID_BRIDGE_READY_EVENT, refreshBridge);
+    refreshBridge();
+    return () => window.removeEventListener(ANDROID_BRIDGE_READY_EVENT, refreshBridge);
+  }, []);
+
+  const handleChange = useCallback(
+    (nextVisible: boolean) => {
+      if (!updateAndroidStatusBarVisibility(nextVisible)) {
+        toast.error(t("settings.application.androidStatusBar.error"));
+        return;
+      }
+      setVisible(nextVisible);
+    },
+    [t],
+  );
+
+  let help = t("settings.application.androidStatusBar.unavailable");
+  if (supported) {
+    help = t("settings.application.androidStatusBar.help");
+  } else if (isMarinaraAndroidShell()) {
+    help = t("settings.application.androidStatusBar.updateRequired");
+  }
+
+  return (
+    <ToggleSetting
+      anchorId={getSettingsControlAnchorId("android-status-bar")}
+      label={t("settings.application.androidStatusBar.label")}
+      checked={visible}
+      onChange={handleChange}
+      help={help}
+      disabled={!supported}
+    />
+  );
 }
 
 function isStandaloneIosInstall(): boolean {
@@ -205,11 +1436,90 @@ function getNativeConsoleShortcutHelp(): string {
 const SETTINGS_COMPONENTS: Record<(typeof TABS)[number]["id"], React.FC> = {
   general: React.memo(GeneralSettings),
   appearance: React.memo(AppearanceSettings),
-  themes: React.memo(ThemesSettings),
-  extensions: React.memo(ExtensionsSettings),
+  generations: React.memo(GenerationsSettings),
+  addons: React.memo(AddonsSettings),
   import: React.memo(ImportSettings),
   advanced: React.memo(AdvancedSettings),
 };
+
+function normalizeSettingsTab(tab: string): (typeof TABS)[number]["id"] {
+  if (tab === "themes") return "addons";
+  if (tab === "extensions") return "addons";
+  if (tab === "import") return "import";
+  return TABS.some((entry) => entry.id === tab) ? (tab as (typeof TABS)[number]["id"]) : "general";
+}
+
+function getSettingsSectionAnchorId(sectionId: SettingsSectionId) {
+  return `settings-section-${sectionId}`;
+}
+
+function getSettingsControlAnchorId(controlId: string) {
+  return `settings-control-${controlId}`;
+}
+
+function SearchableSettingTarget({
+  controlId,
+  className,
+  children,
+}: {
+  controlId: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div id={getSettingsControlAnchorId(controlId)} className={cn("scroll-mt-3", className)}>
+      {children}
+    </div>
+  );
+}
+
+function searchSettings(query: string, localize: (englishText: string) => string): SettingsSearchResult[] {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return [];
+  const parts = normalized.split(/\s+/u).filter(Boolean);
+
+  const controlResults = SETTINGS_SEARCHABLE_CONTROLS.flatMap((control) => {
+    const section = SETTINGS_SECTION_BY_ID.get(control.sectionId);
+    if (!section) return [];
+    const haystack = [
+      control.label,
+      localize(control.label),
+      control.description,
+      localize(control.description),
+      control.kind,
+      localize(control.kind),
+      section.label,
+      localize(section.label),
+      section.description,
+      localize(section.description),
+      ...control.aliases,
+    ]
+      .join(" ")
+      .toLowerCase();
+    return parts.every((part) => haystack.includes(part)) ? [{ type: "control" as const, control, section }] : [];
+  });
+
+  const sectionResults = SETTINGS_SECTIONS.filter((section) => {
+    const haystack = [
+      section.label,
+      localize(section.label),
+      section.description,
+      localize(section.description),
+      ...section.aliases,
+    ]
+      .join(" ")
+      .toLowerCase();
+    return parts.every((part) => haystack.includes(part));
+  }).map((section) => ({ type: "section" as const, section }));
+
+  return [...controlResults, ...sectionResults];
+}
+
+function getSettingsSectionAnchorProps(sectionId: SettingsSectionId) {
+  return {
+    anchorId: getSettingsSectionAnchorId(sectionId),
+  };
+}
 
 type SettingsArtPreviewSize = { width: number; height: number };
 
@@ -256,7 +1566,7 @@ const EXPUNGE_SCOPE_OPTIONS: Array<{ id: ExpungeScope; label: string; descriptio
   { id: "connections", label: "Connections", description: "API connections and model endpoints." },
   {
     id: "automation",
-    label: "Automation & Themes",
+    label: "Automation & Addons",
     description: "Agents, tools, regex scripts, synced themes, and automation state.",
   },
   {
@@ -306,16 +1616,30 @@ const ROLEPLAY_AVATAR_STYLE_OPTIONS: Array<{ id: RoleplayAvatarStyle; label: str
   },
 ];
 
+const CHAT_LIST_BACKGROUND_OPTIONS: Array<{ id: ChatListBackgroundMode; label: string; desc: string }> = [
+  {
+    id: "hover",
+    label: "Active & Hovered",
+    desc: "Banner on the chat you are in and the one under the pointer. On touch devices, the active chat only.",
+  },
+  {
+    id: "always",
+    label: "Every Row",
+    desc: "Banner behind every chat in the list. Loads one downscaled image per chat.",
+  },
+  { id: "off", label: "Off", desc: "No banners. Chat rows keep the plain sidebar background." },
+];
+
 const GAME_DIALOGUE_DISPLAY_OPTIONS: Array<{ id: GameDialogueDisplayMode; label: string; desc: string }> = [
   {
     id: "classic",
-    label: "Classic VN",
-    desc: "One active segment in the VN box, with logs available from the Logs button.",
+    label: "Classic Dialogue Box",
+    desc: "One active segment in the dialogue box, with logs available from the Logs button.",
   },
   {
     id: "stacked",
-    label: "History Above VN",
-    desc: "Shows prior segments above the VN box and keeps the full session scrollable there.",
+    label: "History Above Dialogue Box",
+    desc: "Shows prior segments above the dialogue box and keeps the full session scrollable there.",
   },
 ];
 
@@ -335,6 +1659,8 @@ const TRACKER_THOUGHT_BUBBLE_DISPLAY_OPTIONS: Array<{
     desc: "Thoughts open as a bubble beside the portrait.",
   },
 ];
+
+const TRACKER_STAT_DISPLAY_OPTIONS: TrackerStatDisplayMode[] = ["bars", "gauges"];
 
 const TRACKER_PANEL_SIZE_PROFILE_OPTIONS: Array<{
   id: TrackerPanelSizeProfile;
@@ -382,7 +1708,7 @@ const TRACKER_PANEL_CARD_OPTIONS: Record<TrackerDataPanelSection, { label: strin
 };
 
 const QUOTE_FORMAT_OPTIONS: Array<{ id: QuoteFormat; label: string; sample: string }> = [
-  { id: "straight", label: "Straight", sample: '"Hello", it\'s me.' },
+  { id: "straight", label: "Straight", sample: '"Hello," it\'s me.' },
   { id: "typographic", label: "Typographic", sample: "\u201cHello,\u201d it\u2019s me." },
 ];
 
@@ -419,7 +1745,27 @@ const GAME_ASSET_CATEGORIES = [
   },
 ] as const;
 
-const GAME_IMAGE_PROMPT_TEMPLATE_KEYS = ["game.npcPortrait", "game.background", "game.sceneIllustration"] as const;
+const VIDEO_PROMPT_TEMPLATE_KEYS = [
+  "game.video",
+  "roleplay.galleryVideoDirector",
+  "conversation.callVideo.idle",
+  "conversation.callVideo.talking",
+  "conversation.callVideo.laughing",
+  "conversation.callVideo.angry",
+  "conversation.callVideo.crying",
+  "conversation.callVideo.sighing",
+  "conversation.callVideo.custom",
+  "sprites.animatedPortrait",
+] as const;
+
+const CONVERSATION_CALL_VIDEO_CLIP_LABELS: Record<ConversationCallCharacterVideoClipKind, string> = {
+  idle: "Idle loop",
+  talking: "Talking loop",
+  laughing: "Laughing",
+  angry: "Angry",
+  crying: "Crying",
+  sighing: "Sighing",
+};
 
 type GameAssetCategoryId = (typeof GAME_ASSET_CATEGORIES)[number]["id"];
 const GAME_ASSET_CATEGORY_BY_ID = new Map(GAME_ASSET_CATEGORIES.map((category) => [category.id, category]));
@@ -447,21 +1793,29 @@ function ImageDimensionRow({
   width,
   height,
   onCommit,
+  controlId,
 }: {
   label: string;
   help: string;
   width: number;
   height: number;
   onCommit: (width: number, height: number) => void;
+  controlId?: string;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   return (
-    <div className="grid gap-2 rounded-lg bg-[var(--background)]/55 p-3 ring-1 ring-[var(--border)] sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+    <div
+      id={controlId ? getSettingsControlAnchorId(controlId) : undefined}
+      className="grid scroll-mt-3 gap-2 rounded-lg bg-[var(--background)]/55 p-3 ring-1 ring-[var(--border)] sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+    >
       <div className="min-w-0">
         <div className="inline-flex items-center gap-1 text-xs font-medium text-[var(--foreground)]">
           {label}
           <HelpTooltip text={help} />
         </div>
-        <div className="mt-1 text-[0.625rem] text-[var(--muted-foreground)]">Pixels, clamped from 64 to 4096.</div>
+        <div className="mt-1 text-[0.625rem] text-[var(--muted-foreground)]">
+          {localizeUi("ui.panels.imagedimensionrow.pixelsClampedFrom64To4096")}
+        </div>
       </div>
       <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-1.5 sm:w-40">
         <DraftNumberInput
@@ -472,7 +1826,9 @@ function ImageDimensionRow({
           onCommit={(nextWidth) => onCommit(nextWidth, height)}
           className="min-w-0 rounded-md border border-[var(--border)] bg-[var(--secondary)] px-2 py-1 text-xs"
         />
-        <span className="text-[0.625rem] text-[var(--muted-foreground)]">x</span>
+        <span className="text-[0.625rem] text-[var(--muted-foreground)]">
+          {localizeUi("ui.panels.imagedimensionrow.x")}
+        </span>
         <DraftNumberInput
           value={height}
           min={64}
@@ -493,6 +1849,7 @@ function ImageStyleProfilesEditor({
   value: ImageStyleProfileSettings;
   onChange: (settings: ImageStyleProfileSettings) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const settings = normalizeImageStyleProfileSettings(value);
   const [selectedId, setSelectedId] = useState(settings.defaultProfileId);
   const [previewKind, setPreviewKind] = useState<ImagePromptKind>("portrait");
@@ -589,7 +1946,7 @@ function ImageStyleProfilesEditor({
         <div className="grid gap-2">
           <label className="min-w-0">
             <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">
-              Default style
+              {localizeUi("ui.panels.imagestyleprofileseditor.defaultStyle")}
             </span>
             <select
               value={settings.defaultProfileId}
@@ -605,7 +1962,9 @@ function ImageStyleProfilesEditor({
           </label>
 
           <label className="min-w-0">
-            <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Editing</span>
+            <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">
+              {localizeUi("ui.panels.imagestyleprofileseditor.editing")}
+            </span>
             <select
               value={selected.id}
               onChange={(event) => setSelectedId(event.target.value)}
@@ -627,7 +1986,7 @@ function ImageStyleProfilesEditor({
             className="inline-flex h-8 items-center gap-1 rounded-md bg-[var(--secondary)] px-2.5 text-xs ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)]"
           >
             <Plus size="0.75rem" />
-            Clone
+            {localizeUi("ui.panels.imagestyleprofileseditor.clone")}
           </button>
           <button
             type="button"
@@ -636,23 +1995,25 @@ function ImageStyleProfilesEditor({
             className="inline-flex h-8 items-center gap-1 rounded-md bg-[var(--secondary)] px-2.5 text-xs ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-45"
           >
             <RotateCcw size="0.75rem" />
-            Reset
+            {localizeUi("ui.panels.imagestyleprofileseditor.reset")}
           </button>
           <button
             type="button"
             onClick={deleteSelected}
             disabled={selected.builtIn || settings.profiles.length <= 1}
-            className="inline-flex h-8 items-center gap-1 rounded-md bg-[var(--secondary)] px-2.5 text-xs text-[var(--destructive)] ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-45"
+            className="inline-flex h-8 items-center gap-1 rounded-md bg-[var(--secondary)] px-2.5 text-xs text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-45"
           >
             <Trash2 size="0.75rem" />
-            Delete
+            {localizeUi("lorebook.editor.batch.delete")}
           </button>
         </div>
       </div>
 
       <div className="mt-4 grid gap-3">
         <label className="min-w-0">
-          <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Name</span>
+          <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">
+            {localizeUi("ui.panels.imagestyleprofileseditor.name")}
+          </span>
           <input
             value={selected.name}
             onChange={(event) => updateSelected({ name: event.target.value })}
@@ -660,7 +2021,9 @@ function ImageStyleProfilesEditor({
           />
         </label>
         <label className="min-w-0">
-          <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Prompt grammar</span>
+          <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">
+            {localizeUi("ui.panels.imagestyleprofileseditor.promptGrammar")}
+          </span>
           <select
             value={selected.promptMode}
             onChange={(event) => updateSelected({ promptMode: event.target.value as ImagePromptMode })}
@@ -676,7 +2039,9 @@ function ImageStyleProfilesEditor({
       </div>
 
       <label className="mt-3 block">
-        <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Style text</span>
+        <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">
+          {localizeUi("ui.panels.imagestyleprofileseditor.styleText")}
+        </span>
         <textarea
           value={selected.styleText}
           onChange={(event) => updateSelected({ styleText: event.target.value })}
@@ -686,7 +2051,9 @@ function ImageStyleProfilesEditor({
 
       <div className="mt-3 grid gap-3">
         <label className="block">
-          <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Positive tags</span>
+          <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">
+            {localizeUi("ui.panels.imagestyleprofileseditor.positiveTags")}
+          </span>
           <textarea
             value={selected.positiveTags}
             onChange={(event) => updateSelected({ positiveTags: event.target.value })}
@@ -694,7 +2061,9 @@ function ImageStyleProfilesEditor({
           />
         </label>
         <label className="block">
-          <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">Negative tags</span>
+          <span className="mb-1 block text-[0.6875rem] font-medium text-[var(--muted-foreground)]">
+            {localizeUi("ui.panels.imagestyleprofileseditor.negativeTags")}
+          </span>
           <textarea
             value={selected.negativeTags}
             onChange={(event) => updateSelected({ negativeTags: event.target.value })}
@@ -704,7 +2073,9 @@ function ImageStyleProfilesEditor({
       </div>
 
       <details className="mt-3 rounded-md bg-[var(--secondary)]/55 p-2.5 ring-1 ring-[var(--border)]">
-        <summary className="cursor-pointer text-xs font-medium text-[var(--foreground)]">Per-image tags</summary>
+        <summary className="cursor-pointer text-xs font-medium text-[var(--foreground)]">
+          {localizeUi("ui.panels.imagestyleprofileseditor.perImageTags")}
+        </summary>
         <div className="mt-2 grid gap-2">
           {IMAGE_STYLE_SUBJECT_KINDS.map((kind) => (
             <label key={kind} className="block">
@@ -721,12 +2092,16 @@ function ImageStyleProfilesEditor({
         </div>
       </details>
 
-      <details className="mt-2 rounded-md bg-[var(--secondary)]/55 p-2 ring-1 ring-[var(--border)]" open>
-        <summary className="cursor-pointer text-xs font-medium text-[var(--foreground)]">Test bench</summary>
+      <details className="mt-2 rounded-md bg-[var(--secondary)]/55 p-2 ring-1 ring-[var(--border)]">
+        <summary className="cursor-pointer text-xs font-medium text-[var(--foreground)]">
+          {localizeUi("ui.panels.imagestyleprofileseditor.testBench")}
+        </summary>
         <div className="mt-2 grid gap-2 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
           <div className="space-y-2">
             <label className="block">
-              <span className="mb-1 block text-[0.625rem] font-medium text-[var(--muted-foreground)]">Image kind</span>
+              <span className="mb-1 block text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+                {localizeUi("ui.panels.imagestyleprofileseditor.imageKind")}
+              </span>
               <select
                 value={previewKind}
                 onChange={(event) => setPreviewKind(event.target.value as ImagePromptKind)}
@@ -741,7 +2116,7 @@ function ImageStyleProfilesEditor({
             </label>
             <label className="block">
               <span className="mb-1 block text-[0.625rem] font-medium text-[var(--muted-foreground)]">
-                Sample input
+                {localizeUi("ui.panels.imagestyleprofileseditor.sampleInput")}
               </span>
               <textarea
                 value={previewPrompt}
@@ -752,14 +2127,17 @@ function ImageStyleProfilesEditor({
             </label>
             <div className="text-[0.625rem] text-[var(--muted-foreground)]">
               {cleanupCount > 0
-                ? `${cleanupCount} duplicate or misplaced fragment${cleanupCount === 1 ? "" : "s"} cleaned.`
-                : "No cleanup needed for this sample."}
+                ? localizeUi("ui.panels.imagestyleprofileseditor.value1DuplicateOrMisplacedFragmentValue2Cleaned", {
+                    value1: cleanupCount,
+                    value2: cleanupCount === 1 ? "" : localizeUi("ui.noodle.stageprofileview.s"),
+                  })
+                : localizeUi("ui.panels.imagestyleprofileseditor.noCleanupNeededForThisSample")}
             </div>
           </div>
           <div className="grid gap-2">
             <label className="block">
               <span className="mb-1 block text-[0.625rem] font-medium text-[var(--muted-foreground)]">
-                Final positive prompt
+                {localizeUi("ui.panels.imagestyleprofileseditor.finalPositivePrompt")}
               </span>
               <textarea
                 value={preview.prompt}
@@ -770,7 +2148,7 @@ function ImageStyleProfilesEditor({
             </label>
             <label className="block">
               <span className="mb-1 block text-[0.625rem] font-medium text-[var(--muted-foreground)]">
-                Final negative prompt
+                {localizeUi("ui.panels.imagestyleprofileseditor.finalNegativePrompt")}
               </span>
               <textarea
                 value={preview.negativePrompt}
@@ -787,6 +2165,7 @@ function ImageStyleProfilesEditor({
 }
 
 function TrackerPanelCardOrderSetting() {
+  const { t: localizeUi } = useUiTranslation();
   const trackerPanelSectionOrder = useUIStore((s) => s.trackerPanelSectionOrder);
   const setTrackerPanelSectionOrder = useUIStore((s) => s.setTrackerPanelSectionOrder);
   const orderedSections = [
@@ -821,18 +2200,22 @@ function TrackerPanelCardOrderSetting() {
             size="0.6875rem"
             className={cn("shrink-0 text-[var(--muted-foreground)] transition-transform", !orderOpen && "-rotate-90")}
           />
-          <span className="truncate">Card order</span>
+          <span className="truncate">{localizeUi("ui.panels.trackerpanelcardordersetting.cardOrder")}</span>
           <span className="shrink-0 rounded-full bg-[var(--secondary)] px-1.5 py-0.5 text-[0.5625rem] font-normal text-[var(--muted-foreground)]">
-            {isDefaultOrder ? "Default" : "Custom"}
+            {isDefaultOrder
+              ? localizeUi("ui.noodle.noodlehome.default")
+              : localizeUi("settings.notifications.customSound.status.custom")}
           </span>
         </button>
-        <HelpTooltip text="Controls the top-to-bottom order of tracker cards when their matching tracker agents are enabled for a chat." />
+        <HelpTooltip
+          text={localizeUi("ui.panels.trackerpanelcardordersetting.controlsTheTopToBottomOrderOfTrackerCards")}
+        />
         <button
           type="button"
           onClick={() => setTrackerPanelSectionOrder([...TRACKER_DATA_PANEL_SECTIONS])}
           disabled={isDefaultOrder}
-          title="Reset tracker card order"
-          aria-label="Reset tracker card order"
+          title={localizeUi("settings.actions.resetTrackerOrder")}
+          aria-label={localizeUi("settings.actions.resetTrackerOrder")}
           className="flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--secondary)] hover:text-[var(--foreground)] active:scale-95 disabled:cursor-default disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-[var(--muted-foreground)]"
         >
           <RotateCcw size="0.6875rem" />
@@ -858,8 +2241,10 @@ function TrackerPanelCardOrderSetting() {
                     type="button"
                     onClick={() => moveCard(section, -1)}
                     disabled={index === 0}
-                    title={`Move ${option.label} up`}
-                    aria-label={`Move ${option.label} up`}
+                    title={localizeUi("ui.panels.trackerpanelcardordersetting.moveValue1Up", { value1: option.label })}
+                    aria-label={localizeUi("ui.panels.trackerpanelcardordersetting.moveValue1Up", {
+                      value1: option.label,
+                    })}
                     className="flex h-5 w-5 items-center justify-center rounded-sm text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--background)] hover:text-[var(--primary)] active:scale-95 disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[var(--muted-foreground)]"
                   >
                     <ArrowUp size="0.6875rem" />
@@ -868,8 +2253,12 @@ function TrackerPanelCardOrderSetting() {
                     type="button"
                     onClick={() => moveCard(section, 1)}
                     disabled={index === orderedSections.length - 1}
-                    title={`Move ${option.label} down`}
-                    aria-label={`Move ${option.label} down`}
+                    title={localizeUi("ui.panels.trackerpanelcardordersetting.moveValue1Down", {
+                      value1: option.label,
+                    })}
+                    aria-label={localizeUi("ui.panels.trackerpanelcardordersetting.moveValue1Down", {
+                      value1: option.label,
+                    })}
                     className="flex h-5 w-5 items-center justify-center rounded-sm text-[var(--muted-foreground)] ring-1 ring-[var(--border)] transition-all hover:bg-[var(--background)] hover:text-[var(--primary)] active:scale-95 disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[var(--muted-foreground)]"
                   >
                     <ArrowDown size="0.6875rem" />
@@ -884,41 +2273,28 @@ function TrackerPanelCardOrderSetting() {
   );
 }
 
-function TrackerPanelAppearanceDrawer({
-  trackerPanelEnabled,
-  setTrackerPanelEnabled,
-  trackerPanelHideHudWidgets,
-  setTrackerPanelHideHudWidgets,
-  trackerPanelUseExpressionSprites,
-  setTrackerPanelUseExpressionSprites,
-  trackerPanelThoughtBubbleDisplay,
-  setTrackerPanelThoughtBubbleDisplay,
-  trackerPanelDockedThoughtsAlwaysVisible,
-  setTrackerPanelDockedThoughtsAlwaysVisible,
-  trackerPanelSizeProfile,
-  setTrackerPanelSizeProfile,
-  trackerPanelBackgroundColor,
-  setTrackerPanelBackgroundColor,
-  trackerTemperatureUnit,
-  setTrackerTemperatureUnit,
-}: {
-  trackerPanelEnabled: boolean;
-  setTrackerPanelEnabled: (enabled: boolean) => void;
-  trackerPanelHideHudWidgets: boolean;
-  setTrackerPanelHideHudWidgets: (hidden: boolean) => void;
-  trackerPanelUseExpressionSprites: boolean;
-  setTrackerPanelUseExpressionSprites: (enabled: boolean) => void;
-  trackerPanelThoughtBubbleDisplay: TrackerThoughtBubbleDisplay;
-  setTrackerPanelThoughtBubbleDisplay: (display: TrackerThoughtBubbleDisplay) => void;
-  trackerPanelDockedThoughtsAlwaysVisible: boolean;
-  setTrackerPanelDockedThoughtsAlwaysVisible: (visible: boolean) => void;
-  trackerPanelSizeProfile: TrackerPanelSizeProfile;
-  setTrackerPanelSizeProfile: (profile: TrackerPanelSizeProfile) => void;
-  trackerPanelBackgroundColor: string;
-  setTrackerPanelBackgroundColor: (color: string) => void;
-  trackerTemperatureUnit: TrackerTemperatureUnit;
-  setTrackerTemperatureUnit: (unit: TrackerTemperatureUnit) => void;
-}) {
+function TrackerPanelAppearanceDrawer() {
+  const { t: localizeUi } = useUiTranslation();
+  const trackerPanelEnabled = useUIStore((state) => state.trackerPanelEnabled);
+  const setTrackerPanelEnabled = useUIStore((state) => state.setTrackerPanelEnabled);
+  const trackerPanelHideHudWidgets = useUIStore((state) => state.trackerPanelHideHudWidgets);
+  const setTrackerPanelHideHudWidgets = useUIStore((state) => state.setTrackerPanelHideHudWidgets);
+  const trackerPanelUseExpressionSprites = useUIStore((state) => state.trackerPanelUseExpressionSprites);
+  const setTrackerPanelUseExpressionSprites = useUIStore((state) => state.setTrackerPanelUseExpressionSprites);
+  const trackerPanelThoughtBubbleDisplay = useUIStore((state) => state.trackerPanelThoughtBubbleDisplay);
+  const setTrackerPanelThoughtBubbleDisplay = useUIStore((state) => state.setTrackerPanelThoughtBubbleDisplay);
+  const trackerPanelDockedThoughtsAlwaysVisible = useUIStore((state) => state.trackerPanelDockedThoughtsAlwaysVisible);
+  const setTrackerPanelDockedThoughtsAlwaysVisible = useUIStore(
+    (state) => state.setTrackerPanelDockedThoughtsAlwaysVisible,
+  );
+  const trackerPanelSizeProfile = useUIStore((state) => state.trackerPanelSizeProfile);
+  const setTrackerPanelSizeProfile = useUIStore((state) => state.setTrackerPanelSizeProfile);
+  const trackerPanelBackgroundColor = useUIStore((state) => state.trackerPanelBackgroundColor);
+  const setTrackerPanelBackgroundColor = useUIStore((state) => state.setTrackerPanelBackgroundColor);
+  const trackerTemperatureUnit = useUIStore((state) => state.trackerTemperatureUnit);
+  const setTrackerTemperatureUnit = useUIStore((state) => state.setTrackerTemperatureUnit);
+  const trackerStatDisplayMode = useUIStore((state) => state.trackerStatDisplayMode);
+  const setTrackerStatDisplayMode = useUIStore((state) => state.setTrackerStatDisplayMode);
   const [drawerOpen, setDrawerOpen] = useState(true);
   const drawerId = React.useId();
 
@@ -927,20 +2303,25 @@ function TrackerPanelAppearanceDrawer({
       <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 px-3 py-2.5">
         <div className="flex min-w-0 items-center gap-2">
           <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-[var(--secondary)]/70 text-[var(--primary)] ring-1 ring-[var(--border)]">
-            <TrackerPanelIcon size="0.9rem" strokeWidth={1.95} />
+            <TrackerPanelIcon size="0.9rem" />
           </span>
           <span className="min-w-0">
             <span className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--foreground)]">
-              Tracker Panel
-              <HelpTooltip text="Controls the Roleplay HUD side panel for the fixed tracker board." />
+              {localizeUi("ui.panels.trackerpanelappearancedrawer.trackerPanel")}
+              <HelpTooltip
+                text={localizeUi("ui.panels.trackerpanelappearancedrawer.controlsTheRoleplayHudSidePanelForTheFixed")}
+              />
             </span>
             <span className="block truncate text-[0.625rem] text-[var(--muted-foreground)]">
-              {trackerPanelEnabled ? "Shown in the Roleplay HUD" : "Hidden from the Roleplay HUD"}
+              {trackerPanelEnabled
+                ? localizeUi("ui.panels.trackerpanelappearancedrawer.shownInTheRoleplayHud")
+                : localizeUi("ui.panels.trackerpanelappearancedrawer.hiddenFromTheRoleplayHud")}
             </span>
           </span>
         </div>
 
         <SettingsSwitch
+          anchorId={getSettingsControlAnchorId("tracker-panel")}
           checked={trackerPanelEnabled}
           onChange={(enabled) => {
             setTrackerPanelEnabled(enabled);
@@ -955,7 +2336,11 @@ function TrackerPanelAppearanceDrawer({
           onClick={() => setDrawerOpen((open) => !open)}
           aria-expanded={drawerOpen}
           aria-controls={drawerId}
-          aria-label={drawerOpen ? "Collapse Tracker Panel settings" : "Expand Tracker Panel settings"}
+          aria-label={
+            drawerOpen
+              ? localizeUi("ui.panels.trackerpanelappearancedrawer.collapseTrackerPanelSettings")
+              : localizeUi("ui.panels.trackerpanelappearancedrawer.expandTrackerPanelSettings")
+          }
           className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--muted-foreground)] transition-all hover:bg-[var(--secondary)] hover:text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--primary)] active:scale-95"
         >
           <ChevronDown
@@ -975,33 +2360,41 @@ function TrackerPanelAppearanceDrawer({
           )}
         >
           <ToggleSetting
-            label="Replace tracker HUD icons"
+            anchorId={getSettingsControlAnchorId("tracker-replace-hud-icons")}
+            label={localizeUi("settings.controls.replaceTrackerIcons.label")}
             checked={trackerPanelHideHudWidgets}
             onChange={setTrackerPanelHideHudWidgets}
-            help="Hides the old world/player tracker icon strip so the Tracker panel can dock to the edge. The Agents button stays visible."
+            help={localizeUi("settings.controls.replaceTrackerIcons.help")}
           />
           <ToggleSetting
-            label="Use expression sprites for tracker portraits"
+            anchorId={getSettingsControlAnchorId("tracker-expression-sprites")}
+            label={localizeUi("settings.controls.useExpressionSprites.label")}
             checked={trackerPanelUseExpressionSprites}
             onChange={setTrackerPanelUseExpressionSprites}
-            help="When on, tracker portraits can switch to Expression Engine sprites if that agent is enabled for the chat and the character has matching sprite images."
+            help={localizeUi("settings.controls.useExpressionSprites.help")}
           />
-          <div className="mt-2">
+          <div id={getSettingsControlAnchorId("tracker-panel-background")} className="mt-2 scroll-mt-3">
             <ColorPicker
               value={trackerPanelBackgroundColor}
               onChange={setTrackerPanelBackgroundColor}
               gradient
               compact
-              label="Panel background"
+              label={localizeUi("settings.controls.panelBackground.label")}
               helpText="Pick the Tracker panel and tracker section background. CSS colors and gradients are accepted."
-              emptyText={`Default ${TRACKER_PANEL_DEFAULT_BACKGROUND_COLOR}`}
+              emptyText={localizeUi("ui.panels.trackerpanelappearancedrawer.defaultValue1", {
+                value1: TRACKER_PANEL_DEFAULT_BACKGROUND_COLOR,
+              })}
               clearLabel="Reset"
             />
           </div>
-          <div className="mt-2 grid gap-1.5">
+          <div id={getSettingsControlAnchorId("tracker-desktop-size")} className="mt-2 grid scroll-mt-3 gap-1.5">
             <span className="inline-flex items-center gap-1 text-[0.6875rem] font-medium">
-              Desktop size
-              <HelpTooltip text="Choose the designed desktop width for the Tracker panel. Compact favors quick scanning, Standard balances density, and Expanded gives character cards more room." />
+              {localizeUi("ui.panels.trackerpanelappearancedrawer.desktopSize")}
+              <HelpTooltip
+                text={localizeUi(
+                  "ui.panels.trackerpanelappearancedrawer.chooseTheDesignedDesktopWidthForTheTrackerPanel",
+                )}
+              />
             </span>
             <div className="grid grid-cols-3 gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--secondary)]/45 p-0.5">
               {TRACKER_PANEL_SIZE_PROFILE_OPTIONS.map((opt) => {
@@ -1012,7 +2405,11 @@ function TrackerPanelAppearanceDrawer({
                     type="button"
                     onClick={() => setTrackerPanelSizeProfile(opt.id)}
                     aria-pressed={selected}
-                    title={`${opt.label}: ${getTrackerPanelWidthForProfile(opt.id)}px. ${opt.desc}`}
+                    title={localizeUi("ui.panels.trackerpanelappearancedrawer.value1Value2PxValue3", {
+                      value1: opt.label,
+                      value2: getTrackerPanelWidthForProfile(opt.id),
+                      value3: opt.desc,
+                    })}
                     className={cn(
                       "flex min-h-8 min-w-0 items-center justify-center rounded-md px-1.5 text-[0.6875rem] transition-all disabled:cursor-not-allowed",
                       selected
@@ -1031,10 +2428,17 @@ function TrackerPanelAppearanceDrawer({
               })}
             </div>
           </div>
-          <div className="mt-2 grid gap-1.5">
+          <div
+            id={getSettingsControlAnchorId("tracker-thought-display-mode")}
+            className="mt-2 grid scroll-mt-3 gap-1.5"
+          >
             <span className="inline-flex items-center gap-1 text-[0.6875rem] font-medium">
-              Thought display mode
-              <HelpTooltip text="Choose whether featured character thoughts open inside the tracker card or float beside the portrait. This no longer changes automatically when the panel width changes." />
+              {localizeUi("ui.panels.trackerpanelappearancedrawer.thoughtDisplayMode")}
+              <HelpTooltip
+                text={localizeUi(
+                  "ui.panels.trackerpanelappearancedrawer.chooseWhetherFeaturedCharacterThoughtsOpenInsideTheTracker",
+                )}
+              />
             </span>
             <div className="grid grid-cols-2 gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--secondary)]/45 p-0.5">
               {TRACKER_THOUGHT_BUBBLE_DISPLAY_OPTIONS.map((opt) => {
@@ -1063,26 +2467,83 @@ function TrackerPanelAppearanceDrawer({
               })}
             </div>
           </div>
+          <div id={getSettingsControlAnchorId("tracker-stat-display-mode")} className="mt-2 grid scroll-mt-3 gap-1.5">
+            <span className="inline-flex items-center gap-1 text-[0.6875rem] font-medium">
+              {localizeUi("ui.panels.trackerpanelappearancedrawer.statDisplayMode")}
+              <HelpTooltip
+                text={localizeUi("ui.panels.trackerpanelappearancedrawer.chooseBarsOrGaugesForTrackerStats")}
+              />
+            </span>
+            <div className="grid grid-cols-2 gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--secondary)]/45 p-0.5">
+              {TRACKER_STAT_DISPLAY_OPTIONS.map((option) => {
+                const selected = trackerStatDisplayMode === option;
+                const Icon = option === "bars" ? BarChart3 : Gauge;
+                const label = localizeUi(
+                  option === "bars"
+                    ? "ui.panels.trackerpanelappearancedrawer.bars"
+                    : "ui.panels.trackerpanelappearancedrawer.gauges",
+                );
+                const description = localizeUi(
+                  option === "bars"
+                    ? "ui.panels.trackerpanelappearancedrawer.barsDescription"
+                    : "ui.panels.trackerpanelappearancedrawer.gaugesDescription",
+                );
+                return (
+                  <button
+                    key={option}
+                    type="button"
+                    onClick={() => setTrackerStatDisplayMode(option)}
+                    aria-pressed={selected}
+                    title={description}
+                    className={cn(
+                      "flex min-h-8 min-w-0 items-center justify-center gap-1.5 rounded-md px-2 text-[0.6875rem] transition-all",
+                      selected
+                        ? "bg-[var(--primary)]/12 text-[var(--foreground)] ring-1 ring-[var(--primary)]/45"
+                        : "text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
+                    )}
+                  >
+                    <span className="inline-flex items-center gap-1.5 font-semibold">
+                      <Icon size="0.75rem" className={selected ? "text-[var(--primary)]" : ""} />
+                      {label}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
           <ToggleSetting
-            label="Always show Docked thoughts"
+            anchorId={getSettingsControlAnchorId("tracker-docked-thoughts")}
+            label={localizeUi("settings.controls.alwaysShowDockedThoughts.label")}
             checked={trackerPanelDockedThoughtsAlwaysVisible}
             onChange={setTrackerPanelDockedThoughtsAlwaysVisible}
-            help="When Thought display mode is Docked, every featured character's thought stays visible inside the tracker card instead of waiting for the per-card thought button."
+            help={localizeUi("settings.controls.alwaysShowDockedThoughts.help")}
           />
-          <div className="mt-2 flex min-h-8 items-center justify-between gap-2">
+          <div
+            id={getSettingsControlAnchorId("tracker-temperature-unit")}
+            className="mt-2 flex scroll-mt-3 min-h-8 items-center justify-between gap-2"
+          >
             <span className="inline-flex items-center gap-1 text-[0.6875rem] font-medium">
-              Temperature unit
-              <HelpTooltip text="Changes Tracker Panel and roleplay HUD temperature displays without rewriting the saved world-state temperature." />
+              {localizeUi("ui.panels.trackerpanelappearancedrawer.temperatureUnit")}
+              <HelpTooltip
+                text={localizeUi(
+                  "ui.panels.trackerpanelappearancedrawer.changesTrackerPanelAndRoleplayHudTemperatureDisplaysWithout",
+                )}
+              />
             </span>
             <button
               type="button"
               role="switch"
               aria-checked={trackerTemperatureUnit === "fahrenheit"}
-              aria-label={`Tracker temperature unit: ${trackerTemperatureUnit === "celsius" ? "Celsius" : "Fahrenheit"}`}
+              aria-label={localizeUi("ui.panels.trackerpanelappearancedrawer.trackerTemperatureUnitValue1", {
+                value1:
+                  trackerTemperatureUnit === "celsius"
+                    ? localizeUi("ui.panels.trackerpanelappearancedrawer.celsius")
+                    : localizeUi("ui.panels.trackerpanelappearancedrawer.fahrenheit"),
+              })}
               title={
                 trackerTemperatureUnit === "celsius"
-                  ? "Showing tracker temperatures as °C. Click for °F."
-                  : "Showing tracker temperatures as °F. Click for °C."
+                  ? localizeUi("ui.panels.trackerpanelappearancedrawer.showingTrackerTemperaturesAsCClickForF")
+                  : localizeUi("ui.panels.trackerpanelappearancedrawer.showingTrackerTemperaturesAsFClickForC")
               }
               onClick={() => setTrackerTemperatureUnit(trackerTemperatureUnit === "celsius" ? "fahrenheit" : "celsius")}
               className="relative grid h-7 w-[4.75rem] shrink-0 grid-cols-2 items-center rounded-full border border-[var(--border)] bg-[var(--secondary)]/55 p-0.5 text-[0.625rem] font-semibold transition-colors hover:bg-[var(--accent)]/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--primary)]"
@@ -1099,7 +2560,7 @@ function TrackerPanelAppearanceDrawer({
                   trackerTemperatureUnit === "celsius" ? "text-[var(--foreground)]" : "text-[var(--muted-foreground)]",
                 )}
               >
-                °C
+                {localizeUi("ui.panels.trackerpanelappearancedrawer.c")}
               </span>
               <span
                 className={cn(
@@ -1109,7 +2570,7 @@ function TrackerPanelAppearanceDrawer({
                     : "text-[var(--muted-foreground)]",
                 )}
               >
-                °F
+                {localizeUi("ui.panels.trackerpanelappearancedrawer.f")}
               </span>
             </button>
           </div>
@@ -1122,31 +2583,237 @@ function TrackerPanelAppearanceDrawer({
 }
 
 export function SettingsPanel() {
-  const settingsTab = useUIStore((s) => s.settingsTab);
+  const { t: localizeUi } = useUiTranslation();
+  const { t } = useTranslation();
+  const localize = useLocalizedUiText();
+  const rawSettingsTab = useUIStore((s) => s.settingsTab);
   const setSettingsTab = useUIStore((s) => s.setSettingsTab);
+  const settingsTargetControlId = useUIStore((s) => s.settingsTargetControlId);
+  const setSettingsTargetControlId = useUIStore((s) => s.setSettingsTargetControlId);
+  const settingsTab = normalizeSettingsTab(rawSettingsTab);
+  const [settingsSearch, setSettingsSearch] = useState("");
+  const [quickAccessOpen, setQuickAccessOpen] = useState(false);
+  const activePanelRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (rawSettingsTab !== settingsTab) {
+      setSettingsTab(settingsTab);
+    }
+  }, [rawSettingsTab, setSettingsTab, settingsTab]);
+
   mountedSettingsTabs.add(settingsTab);
 
+  const activeSections = SETTINGS_SECTIONS.filter((section) => section.tab === settingsTab);
+  const searchResults = searchSettings(settingsSearch, localize);
+
+  const jumpToSection = useCallback(
+    (section: SettingsSectionMeta) => {
+      setSettingsTab(section.tab);
+      mountedSettingsTabs.add(section.tab);
+      window.requestAnimationFrame(() => {
+        const panel = activePanelRef.current;
+        const target = document.getElementById(getSettingsSectionAnchorId(section.id));
+        if (!panel || !target) return;
+        panel.scrollTo({ top: Math.max(0, target.offsetTop - 12), behavior: "smooth" });
+      });
+    },
+    [setSettingsTab],
+  );
+
+  const jumpToSearchResult = useCallback(
+    (result: SettingsSearchResult) => {
+      const section = result.section;
+      const targetId =
+        result.type === "control"
+          ? getSettingsControlAnchorId(result.control.id)
+          : getSettingsSectionAnchorId(section.id);
+      setSettingsTab(section.tab);
+      mountedSettingsTabs.add(section.tab);
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          const panel = activePanelRef.current;
+          const target =
+            document.getElementById(targetId) ?? document.getElementById(getSettingsSectionAnchorId(section.id));
+          if (!panel || !target) return;
+          panel.scrollTo({ top: Math.max(0, target.offsetTop - 12), behavior: "smooth" });
+          const focusTarget = target.querySelector<HTMLElement>(
+            'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          );
+          focusTarget?.focus({ preventScroll: true });
+        });
+      });
+    },
+    [setSettingsTab],
+  );
+
+  useEffect(() => {
+    if (!settingsTargetControlId) return;
+    const control = SETTINGS_SEARCHABLE_CONTROLS.find((entry) => entry.id === settingsTargetControlId);
+    const section = control ? SETTINGS_SECTION_BY_ID.get(control.sectionId) : null;
+    if (control && section) {
+      jumpToSearchResult({ type: "control", control, section });
+    }
+    setSettingsTargetControlId(null);
+  }, [jumpToSearchResult, setSettingsTargetControlId, settingsTargetControlId]);
+
   return (
-    <div className="mari-settings-panel-chrome flex h-full flex-col">
-      <div role="tablist" className="grid flex-shrink-0 grid-cols-2 gap-2 p-3 pb-2 md:grid-cols-3">
-        {TABS.map((tab) => (
-          <button
-            key={tab.id}
-            id={`settings-tab-${tab.id}`}
-            type="button"
-            role="tab"
-            aria-selected={settingsTab === tab.id}
-            aria-controls={`settings-panel-${tab.id}`}
-            tabIndex={settingsTab === tab.id ? 0 : -1}
-            onClick={() => setSettingsTab(tab.id)}
-            className={cn(
-              "mari-chrome-control mari-settings-tab-button min-h-[2.5rem] w-full min-w-0 px-2 py-2 text-[0.625rem] leading-tight sm:text-[0.6875rem]",
-              settingsTab === tab.id && "mari-chrome-control--selected",
+    <div className="mari-settings-panel-chrome flex h-full flex-col overflow-hidden">
+      <div className="mari-editor-header mari-settings-search-header">
+        <div className="flex w-full items-center gap-2">
+          <label className="relative min-w-0 flex-1">
+            <Search
+              size="0.875rem"
+              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)]"
+            />
+            <input
+              value={settingsSearch}
+              onChange={(event) => setSettingsSearch(event.target.value)}
+              placeholder={localize("Search settings")}
+              className="mari-chrome-field h-9 w-full rounded-lg pl-8 pr-8 text-xs"
+            />
+            {settingsSearch && (
+              <button
+                type="button"
+                onClick={() => setSettingsSearch("")}
+                aria-label={localize("Clear settings search")}
+                className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-md text-[var(--muted-foreground)] hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
+              >
+                <X size="0.75rem" />
+              </button>
             )}
-          >
-            <span className="mari-settings-tab-label min-w-0 max-w-full text-center">{tab.label}</span>
-          </button>
-        ))}
+          </label>
+        </div>
+        {settingsSearch.trim() && (
+          <div className="mt-2 max-h-40 overflow-y-auto rounded-lg border border-[var(--border)]/70 bg-[var(--background)]/40 p-1.5">
+            {searchResults.length ? (
+              <div className="grid gap-1">
+                {searchResults.map((result) => {
+                  const section = result.section;
+                  const tab = TABS.find((entry) => entry.id === section.tab);
+                  const label = localize(result.type === "control" ? result.control.label : section.label);
+                  const description = localize(
+                    result.type === "control" ? result.control.description : section.description,
+                  );
+                  return (
+                    <button
+                      key={`${result.type}-${result.type === "control" ? result.control.id : section.id}`}
+                      type="button"
+                      onClick={() => jumpToSearchResult(result)}
+                      className="grid min-w-0 gap-0.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--secondary)]/70"
+                    >
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className="truncate text-xs font-semibold text-[var(--foreground)]">{label}</span>
+                        <span className="shrink-0 rounded-full border border-[var(--border)]/70 px-1.5 py-px text-[0.5625rem] font-medium text-[var(--muted-foreground)]">
+                          {localize(result.type === "control" ? result.control.kind : "Section")}
+                        </span>
+                      </span>
+                      <span className="truncate text-[0.625rem] text-[var(--muted-foreground)]">
+                        {tab ? t(tab.labelKey) : localize("Settings")} / {localize(section.label)} / {description}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="px-2 py-2 text-[0.625rem] text-[var(--muted-foreground)]">
+                {localize("No matching settings.")}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="flex shrink-0 flex-col gap-1.5 border-b border-[var(--border)]/70 px-2.5 py-1.5">
+        <div
+          role="tablist"
+          aria-label={localize("Settings categories")}
+          className="grid grid-cols-3 gap-x-1.5 gap-y-1 rounded-xl border border-[var(--border)]/70 bg-[var(--background)]/32 p-1 shadow-[inset_0_1px_0_color-mix(in_srgb,var(--foreground)_7%,transparent)]"
+        >
+          {TABS.map((tab) => {
+            const Icon = tab.icon;
+            const active = settingsTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                id={`settings-tab-${tab.id}`}
+                type="button"
+                role="tab"
+                aria-selected={settingsTab === tab.id}
+                aria-controls={`settings-panel-${tab.id}`}
+                tabIndex={settingsTab === tab.id ? 0 : -1}
+                onClick={() => setSettingsTab(tab.id)}
+                className={cn(
+                  "group relative isolate flex min-h-8 min-w-0 flex-col items-center justify-center gap-0.5 overflow-hidden rounded-lg border px-1 py-0.5 text-center text-[0.625rem] font-semibold leading-tight transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]/40",
+                  active
+                    ? "border-[var(--primary)]/35 bg-[var(--primary)]/10 text-[var(--foreground)] shadow-[inset_0_1px_0_color-mix(in_srgb,var(--foreground)_11%,transparent)]"
+                    : "border-transparent text-[var(--muted-foreground)] hover:border-[var(--border)]/80 hover:bg-[var(--secondary)]/60 hover:text-[var(--foreground)]",
+                )}
+                title={t(tab.descriptionKey)}
+              >
+                {active && (
+                  <>
+                    <span className="pointer-events-none absolute inset-0 -z-10 bg-[linear-gradient(135deg,color-mix(in_srgb,var(--primary)_18%,transparent),color-mix(in_srgb,var(--primary)_7%,transparent)_62%,transparent)]" />
+                    <span className="pointer-events-none absolute inset-x-3 bottom-0 h-px rounded-full bg-[var(--primary)]/60" />
+                  </>
+                )}
+                <span
+                  className={cn(
+                    "flex h-4 w-4 shrink-0 items-center justify-center rounded-md border transition-colors",
+                    active
+                      ? "border-[var(--primary)]/35 bg-[var(--primary)]/16 text-[var(--primary)]"
+                      : "border-[var(--border)]/55 bg-[var(--secondary)]/45 text-[var(--muted-foreground)] group-hover:text-[var(--foreground)]",
+                  )}
+                >
+                  <Icon size="0.6875rem" />
+                </span>
+                <span className="w-full min-w-0 break-words px-0.5">{t(tab.labelKey)}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {activeSections.length > 1 && (
+          <div className="min-w-0 rounded-xl border border-[var(--border)]/60 bg-[var(--background)]/24 p-0.5 shadow-[inset_0_1px_0_color-mix(in_srgb,var(--foreground)_6%,transparent)]">
+            <div className="flex max-w-full flex-wrap items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setQuickAccessOpen((open) => !open)}
+                aria-expanded={quickAccessOpen}
+                className={cn(
+                  "flex min-h-6 max-w-full items-center gap-1 rounded-lg border px-1.5 py-0.5 text-[0.625rem] font-semibold transition-colors",
+                  quickAccessOpen
+                    ? "border-[var(--primary)]/30 bg-[var(--primary)]/10 text-[var(--foreground)]"
+                    : "border-transparent text-[var(--muted-foreground)] hover:bg-[var(--secondary)]/60 hover:text-[var(--foreground)]",
+                )}
+                title={localize(quickAccessOpen ? "Collapse Quick Access" : "Expand Quick Access")}
+              >
+                <Tag size="0.6875rem" className="shrink-0" />
+                <span className="max-w-full truncate">
+                  {localize("Quick Access")} ({activeSections.length})
+                </span>
+                <ChevronDown
+                  size="0.625rem"
+                  className={cn("shrink-0 transition-transform", quickAccessOpen ? "rotate-180" : "")}
+                />
+              </button>
+              {quickAccessOpen &&
+                activeSections.map((section) => (
+                  <button
+                    key={section.id}
+                    type="button"
+                    onClick={() => jumpToSection(section)}
+                    className="flex min-h-6 max-w-full min-w-0 items-center rounded-lg border border-[var(--border)]/65 bg-[var(--secondary)]/38 px-1.5 py-0.5 text-[0.625rem] font-semibold leading-tight text-[var(--muted-foreground)] shadow-[inset_0_1px_0_color-mix(in_srgb,var(--foreground)_7%,transparent)] transition-all hover:border-[var(--primary)]/35 hover:bg-[var(--primary)]/11 hover:text-[var(--foreground)]"
+                    title={localizeUi("ui.panels.settingspanel.value1Value2", {
+                      value1: localize(section.label),
+                      value2: localize(section.description),
+                    })}
+                  >
+                    <span className="block max-w-full break-words">{localize(section.label)}</span>
+                  </button>
+                ))}
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="relative min-h-0 flex-1">
@@ -1161,6 +2828,7 @@ export function SettingsPanel() {
               role="tabpanel"
               aria-labelledby={`settings-tab-${tab.id}`}
               hidden={!active}
+              ref={active ? activePanelRef : undefined}
               className="absolute inset-0 overflow-y-auto p-3"
               style={active ? undefined : { clipPath: "inset(100%)", pointerEvents: "none" }}
             >
@@ -1172,7 +2840,449 @@ export function SettingsPanel() {
     </div>
   );
 }
+
+function QuickRepliesSetting() {
+  const localize = useLocalizedUiText();
+  const showQuickRepliesMenu = useUIStore((s) => s.showQuickRepliesMenu);
+  const setShowQuickRepliesMenu = useUIStore((s) => s.setShowQuickRepliesMenu);
+  const showQuickReplyPostOnly = useUIStore((s) => s.showQuickReplyPostOnly);
+  const setShowQuickReplyPostOnly = useUIStore((s) => s.setShowQuickReplyPostOnly);
+  const showQuickReplyGuide = useUIStore((s) => s.showQuickReplyGuide);
+  const setShowQuickReplyGuide = useUIStore((s) => s.setShowQuickReplyGuide);
+  const showQuickReplyImpersonate = useUIStore((s) => s.showQuickReplyImpersonate);
+  const setShowQuickReplyImpersonate = useUIStore((s) => s.setShowQuickReplyImpersonate);
+  const [drawerOpen, setDrawerOpen] = useState(true);
+
+  const handleEnabledChange = (enabled: boolean) => {
+    setShowQuickRepliesMenu(enabled);
+    if (enabled) setDrawerOpen(true);
+  };
+
+  return (
+    <div
+      id={getSettingsControlAnchorId(QUICK_REPLIES_SETTINGS_CONTROL_ID)}
+      className={cn(
+        "scroll-mt-3 overflow-hidden rounded-xl border transition-colors",
+        showQuickRepliesMenu
+          ? "border-[var(--primary)]/30 bg-[var(--secondary)]/15"
+          : "border-transparent bg-transparent hover:bg-[var(--secondary)]/30",
+      )}
+    >
+      <div className="flex min-h-9 items-stretch">
+        <div className="flex min-w-0 items-center gap-1.5 py-2 pl-1.5 pr-2">
+          <label className="flex min-w-0 cursor-pointer items-center gap-2.5">
+            <input
+              type="checkbox"
+              checked={showQuickRepliesMenu}
+              onChange={(event) => handleEnabledChange(event.target.checked)}
+              className="h-3.5 w-3.5 shrink-0 rounded border-[var(--border)] accent-[var(--primary)]"
+            />
+            <span className="min-w-0 text-xs">{localize("Quick replies")}</span>
+          </label>
+          <span className="shrink-0" onClick={(event) => event.preventDefault()}>
+            <HelpTooltip
+              text={localize(
+                "Adds alternate draft actions beside Send. One action appears directly; multiple actions open from the ellipsis.",
+              )}
+            />
+          </span>
+        </div>
+        <button
+          type="button"
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            if (!showQuickRepliesMenu) return;
+            setDrawerOpen((open) => !open);
+          }}
+          aria-disabled={!showQuickRepliesMenu}
+          aria-controls="quick-replies-actions-drawer"
+          aria-expanded={showQuickRepliesMenu && drawerOpen}
+          aria-label={localize(
+            !showQuickRepliesMenu
+              ? "Quick replies options disabled"
+              : drawerOpen
+                ? "Collapse Quick replies options"
+                : "Expand Quick replies options",
+          )}
+          title={localize(
+            !showQuickRepliesMenu
+              ? "Enable Quick replies to configure options"
+              : drawerOpen
+                ? "Collapse options"
+                : "Expand options",
+          )}
+          className={cn(
+            "flex min-w-10 flex-1 items-center justify-end py-2 pl-2 pr-2 text-[var(--muted-foreground)] transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]",
+            showQuickRepliesMenu && drawerOpen ? "rounded-tr-xl" : "rounded-r-xl",
+            showQuickRepliesMenu
+              ? "cursor-pointer hover:bg-[var(--secondary)]/35 hover:text-[var(--foreground)] active:scale-[0.99]"
+              : "cursor-not-allowed opacity-35",
+          )}
+          tabIndex={showQuickRepliesMenu ? 0 : -1}
+        >
+          <span className="flex h-7 w-7 items-center justify-center rounded-lg">
+            <ChevronDown
+              size="0.875rem"
+              aria-hidden="true"
+              className={cn("transition-transform", showQuickRepliesMenu && drawerOpen ? "" : "-rotate-90")}
+            />
+          </span>
+        </button>
+      </div>
+      {showQuickRepliesMenu && drawerOpen && (
+        <div
+          id="quick-replies-actions-drawer"
+          className="grid min-w-0 max-w-full gap-1 overflow-hidden border-t border-[var(--border)]/60 bg-[var(--background)]/25 p-1"
+          role="group"
+          aria-label={localize("Quick replies actions to include")}
+        >
+          {[
+            {
+              label: "Post only",
+              checked: showQuickReplyPostOnly,
+              onChange: setShowQuickReplyPostOnly,
+              description: "Add persona message without triggering a reply.",
+              icon: FileText,
+            },
+            {
+              label: "Guide reply",
+              checked: showQuickReplyGuide,
+              onChange: setShowQuickReplyGuide,
+              description: "Use draft as /guided direction.",
+              icon: WandSparkles,
+            },
+            {
+              label: "Impersonate",
+              checked: showQuickReplyImpersonate,
+              onChange: setShowQuickReplyImpersonate,
+              description: "Generate a persona-side user reply.",
+              icon: UserCheck,
+            },
+          ].map((option) => {
+            const Icon = option.icon;
+            return (
+              <button
+                type="button"
+                key={option.label}
+                aria-pressed={option.checked}
+                onClick={() => option.onChange(!option.checked)}
+                className={cn(
+                  "group flex min-h-10 min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-1.5 text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] active:scale-[0.99]",
+                  option.checked
+                    ? "bg-[var(--primary)]/8 text-[var(--foreground)] ring-1 ring-[var(--primary)]/30"
+                    : "text-[var(--muted-foreground)] ring-1 ring-transparent hover:bg-[var(--secondary)]/45 hover:text-[var(--foreground)]",
+                )}
+              >
+                <span
+                  className={cn(
+                    "flex h-7 w-7 shrink-0 items-center justify-center rounded-md ring-1 transition-colors",
+                    option.checked
+                      ? "bg-[var(--primary)]/12 text-[var(--primary)] ring-[var(--primary)]/30"
+                      : "bg-[var(--secondary)]/35 text-[var(--muted-foreground)] ring-[var(--border)]/60 group-hover:text-[var(--foreground)]",
+                  )}
+                >
+                  <Icon size="0.8125rem" aria-hidden="true" />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-xs font-semibold">{localize(option.label)}</span>
+                  <span className="block text-[0.65rem] leading-tight text-[var(--muted-foreground)]">
+                    {localize(option.description)}
+                  </span>
+                </span>
+                <span
+                  className={cn(
+                    "flex h-4 w-4 shrink-0 items-center justify-center rounded-full ring-1 transition-colors",
+                    option.checked
+                      ? "mari-accent-animated bg-[var(--accent)] text-[var(--primary)] ring-[var(--primary)]/35"
+                      : "bg-[var(--background)]/45 text-transparent ring-[var(--border)]/70 group-hover:text-[var(--muted-foreground)]",
+                  )}
+                  aria-hidden="true"
+                >
+                  <Check size="0.625rem" strokeWidth={3} />
+                </span>
+              </button>
+            );
+          })}
+          <CustomQuickRepliesManager />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CustomQuickReplyIconButton({
+  icon,
+  onSelect,
+}: {
+  icon: string | undefined;
+  onSelect: (icon: string) => void;
+}) {
+  const localize = useLocalizedUiText();
+  const [open, setOpen] = useState(false);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+
+  return (
+    <>
+      <button
+        ref={buttonRef}
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-[var(--secondary)]/60 text-sm leading-none outline-none ring-1 ring-transparent transition-colors hover:bg-[var(--secondary)] focus-visible:ring-[var(--primary)]/40"
+        title={localize("Choose quick reply icon")}
+        aria-label={localize("Choose quick reply icon")}
+        aria-expanded={open}
+      >
+        {icon?.trim() || "✨"}
+      </button>
+      <EmojiPicker
+        open={open}
+        onClose={() => setOpen(false)}
+        onSelect={(emoji) => {
+          onSelect(emoji);
+          setOpen(false);
+        }}
+        anchorRef={buttonRef}
+      />
+    </>
+  );
+}
+
+function CustomQuickRepliesManager() {
+  const localize = useLocalizedUiText();
+  const customQuickReplies = useUIStore((s) => s.customQuickReplies);
+  const addCustomQuickReply = useUIStore((s) => s.addCustomQuickReply);
+  const updateCustomQuickReply = useUIStore((s) => s.updateCustomQuickReply);
+  const removeCustomQuickReply = useUIStore((s) => s.removeCustomQuickReply);
+
+  return (
+    <div className="mt-1 min-w-0 max-w-full overflow-hidden border-t border-[var(--border)]/60 pt-2">
+      <div className="mb-1 flex min-w-0 items-center justify-between gap-2 px-1">
+        <span className="min-w-0 truncate text-[0.65rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
+          {localize("Custom quick replies")}
+        </span>
+        <button
+          type="button"
+          onClick={() => addCustomQuickReply("", "")}
+          className="flex shrink-0 items-center gap-1 rounded-md bg-[var(--secondary)]/50 px-2 py-1 text-[0.65rem] font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)] active:scale-[0.98]"
+          title={localize("Add a custom quick reply")}
+        >
+          <Plus size="0.75rem" aria-hidden="true" />
+          {localize("Add")}
+        </button>
+      </div>
+      {customQuickReplies.length === 0 ? (
+        <p className="px-1 pb-1 text-[0.65rem] leading-tight text-[var(--muted-foreground)]">
+          {localize(
+            "Add buttons that send a fixed message, macro, or slash command from the quick replies menu beside Send.",
+          )}
+        </p>
+      ) : (
+        <div className="grid min-w-0 max-w-full gap-1.5">
+          {customQuickReplies.map((entry) => (
+            <div
+              key={entry.id}
+              className="grid min-w-0 max-w-full gap-1 overflow-hidden rounded-md border border-[var(--border)]/60 bg-[var(--background)]/30 p-1.5"
+            >
+              <div className="flex min-w-0 max-w-full items-center gap-1.5">
+                <CustomQuickReplyIconButton
+                  icon={entry.icon}
+                  onSelect={(icon) => updateCustomQuickReply(entry.id, { icon })}
+                />
+                <input
+                  value={entry.label}
+                  onChange={(event) => updateCustomQuickReply(entry.id, { label: event.target.value })}
+                  placeholder={localize("Button label")}
+                  className="min-w-0 flex-1 rounded bg-[var(--secondary)]/60 px-2 py-1 text-xs outline-none ring-1 ring-transparent focus:ring-[var(--primary)]/40"
+                />
+                <button
+                  type="button"
+                  onClick={() => removeCustomQuickReply(entry.id)}
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-[var(--primary)] transition-colors hover:bg-[var(--primary)]/10 active:scale-90"
+                  title={localize("Remove quick reply")}
+                  aria-label={localize("Remove quick reply")}
+                >
+                  <Trash2 size="0.75rem" aria-hidden="true" />
+                </button>
+              </div>
+              <textarea
+                value={entry.content}
+                onChange={(event) => updateCustomQuickReply(entry.id, { content: event.target.value })}
+                placeholder={localize("Message, macro, or /slash command to send")}
+                rows={2}
+                className="min-w-0 max-w-full resize-y rounded bg-[var(--secondary)]/60 px-2 py-1 text-xs outline-none ring-1 ring-transparent focus:ring-[var(--primary)]/40"
+              />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Documentation Language row (Settings › General › App Behavior). Separate from
+ * the UI-language selector above it: this controls which docs/i18n/<code> tree
+ * the in-app guides are served from. The choice is server-authoritative (a
+ * data-dir app-setting), so it survives updates and applies to every device.
+ */
+function DocsLanguageSetting() {
+  const { t: localizeUi } = useUiTranslation();
+  const { data: status, isLoading: statusLoading } = useDocsLanguage();
+  const setDocsLanguage = useSetDocsLanguage();
+  const fixDocsLanguage = useFixDocsLanguage();
+  // null = "no pending pick"; the select then mirrors the server-active language.
+  const [pickedLanguage, setPickedLanguage] = useState<string | null>(null);
+
+  const active = status?.active ?? "en";
+  const options = status?.available ?? [];
+  const selection = pickedLanguage ?? active;
+  const pendingSwitch = selection !== active;
+  const selectionInfo = options.find((option) => option.code === selection);
+  const activeInfo = options.find((option) => option.code === active);
+  const integrityOk = status ? status.integrity.ok : true;
+  // A language without a downloaded pack needs a download first — the button
+  // becomes "Download & Replace" and the switch may take a short while.
+  const needsDownload = pendingSwitch && selection !== "en" && !(selectionInfo?.installed ?? false);
+  const installProgress = status?.install ?? null;
+
+  const handleSwitch = async () => {
+    try {
+      const result = await setDocsLanguage.mutateAsync(selection);
+      setPickedLanguage(null);
+      const label = result.available.find((option) => option.code === result.active)?.label ?? result.active;
+      toast.success(localizeUi("settings.application.docsLanguage.switched", { language: label }));
+    } catch (err) {
+      const reason =
+        err instanceof ApiError && err.status === 409
+          ? localizeUi("settings.application.docsLanguage.installInProgress")
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      toast.error(localizeUi("settings.application.docsLanguage.switchFailed", { reason }));
+    }
+  };
+
+  const handleFix = async () => {
+    try {
+      const result = await fixDocsLanguage.mutateAsync();
+      setPickedLanguage(null);
+      // Say what the fix actually did: re-downloaded the pack, reset to
+      // English, or just swept leftovers — the outcomes are very different.
+      const message = !result.repaired
+        ? "settings.application.docsLanguage.healthy"
+        : result.actions.includes("reinstalled-pack")
+          ? "settings.application.docsLanguage.fixedReinstalled"
+          : result.actions.some((action) => action.startsWith("reset"))
+            ? "settings.application.docsLanguage.fixed"
+            : "settings.application.docsLanguage.fixedCleaned";
+      toast.success(localizeUi(message));
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <div id={getSettingsControlAnchorId("docs-language")} className="flex scroll-mt-3 flex-col gap-1">
+      <label className="flex flex-col gap-1">
+        <span className="inline-flex items-center gap-1 text-xs font-medium">
+          {localizeUi("settings.application.docsLanguage.label")}
+          <HelpTooltip text={localizeUi("settings.application.docsLanguage.help")} />
+        </span>
+        <select
+          value={selection}
+          onChange={(event) => setPickedLanguage(event.target.value)}
+          disabled={statusLoading || setDocsLanguage.isPending}
+          className="rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]"
+        >
+          {(options.length > 0 ? options : [{ code: "en", label: "English" }]).map((option) => (
+            <option key={option.code} value={option.code}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      {activeInfo && active !== "en" ? (
+        <p className="text-[0.625rem] text-[var(--muted-foreground)]">
+          {localizeUi("settings.application.docsLanguage.active", {
+            language: activeInfo.label,
+            translated: activeInfo.translated,
+            total: activeInfo.total,
+          })}
+        </p>
+      ) : null}
+      {(pendingSwitch && selection !== "en") || active !== "en" ? (
+        <p className="text-[0.625rem] text-[var(--muted-foreground)]">
+          {localizeUi("settings.application.docsLanguage.fallbackNote")}
+        </p>
+      ) : null}
+      {needsDownload ? (
+        <p className="text-[0.625rem] text-[var(--muted-foreground)]">
+          {localizeUi("settings.application.docsLanguage.downloadNote")}
+        </p>
+      ) : null}
+      {pendingSwitch ? (
+        <button
+          type="button"
+          onClick={() => void handleSwitch()}
+          disabled={setDocsLanguage.isPending}
+          className={SETTINGS_PRIMARY_BUTTON_CLASS}
+        >
+          {setDocsLanguage.isPending ? (
+            <>
+              <Loader2 size="0.8125rem" className="animate-spin" />
+              {installProgress && installProgress.filesTotal > 0
+                ? localizeUi("settings.application.docsLanguage.downloading", {
+                    done: installProgress.filesDone,
+                    total: installProgress.filesTotal,
+                  })
+                : localizeUi("settings.application.docsLanguage.switching")}
+            </>
+          ) : (
+            <>
+              <BookOpen size="0.8125rem" />
+              {needsDownload
+                ? localizeUi("settings.application.docsLanguage.downloadAndReplace")
+                : localizeUi("settings.application.docsLanguage.switch", {
+                    language: selectionInfo?.label ?? selection,
+                  })}
+            </>
+          )}
+        </button>
+      ) : null}
+      {!integrityOk ? (
+        <div className="flex flex-col gap-1.5 rounded-lg bg-[var(--background)]/60 p-2 ring-1 ring-[var(--border)]">
+          <div className="flex items-start gap-1.5">
+            <AlertTriangle size="0.8125rem" className="mt-0.5 shrink-0 text-amber-500" />
+            <span className="text-[0.6875rem] text-[var(--muted-foreground)]">
+              {localizeUi("settings.application.docsLanguage.fixNeeded")}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleFix()}
+            disabled={fixDocsLanguage.isPending}
+            className={SETTINGS_PRIMARY_BUTTON_CLASS}
+          >
+            {fixDocsLanguage.isPending ? (
+              <>
+                <Loader2 size="0.8125rem" className="animate-spin" />
+                {localizeUi("settings.application.docsLanguage.fixing")}
+              </>
+            ) : (
+              localizeUi("settings.application.docsLanguage.fix")
+            )}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function GeneralSettings() {
+  const { t: localizeUi } = useUiTranslation();
+  const { t, i18n: localization } = useTranslation();
+  const localize = useLocalizedUiText();
   const language = useUIStore((s) => s.language);
   const setLanguage = useUIStore((s) => s.setLanguage);
   const enableStreaming = useUIStore((s) => s.enableStreaming);
@@ -1193,6 +3303,8 @@ function GeneralSettings() {
   const setEnterToSendConvo = useUIStore((s) => s.setEnterToSendConvo);
   const enterToSendGame = useUIStore((s) => s.enterToSendGame);
   const setEnterToSendGame = useUIStore((s) => s.setEnterToSendGame);
+  const enterToSendProfessorMari = useUIStore((s) => s.enterToSendProfessorMari);
+  const setEnterToSendProfessorMari = useUIStore((s) => s.setEnterToSendProfessorMari);
   const confirmBeforeDelete = useUIStore((s) => s.confirmBeforeDelete);
   const setConfirmBeforeDelete = useUIStore((s) => s.setConfirmBeforeDelete);
   const achievementsEnabled = useUIStore((s) => s.achievementsEnabled);
@@ -1207,10 +3319,16 @@ function GeneralSettings() {
   const setConvertLatexSymbols = useUIStore((s) => s.setConvertLatexSymbols);
   const trimIncompleteModelOutput = useUIStore((s) => s.trimIncompleteModelOutput);
   const setTrimIncompleteModelOutput = useUIStore((s) => s.setTrimIncompleteModelOutput);
+  const continueAddsNewline = useUIStore((s) => s.continueAddsNewline);
+  const setContinueAddsNewline = useUIStore((s) => s.setContinueAddsNewline);
   const speechToTextEnabled = useUIStore((s) => s.speechToTextEnabled);
   const setSpeechToTextEnabled = useUIStore((s) => s.setSpeechToTextEnabled);
   const chibiProfessorMariEnabled = useUIStore((s) => s.chibiProfessorMariEnabled);
   const setChibiProfessorMariEnabled = useUIStore((s) => s.setChibiProfessorMariEnabled);
+  const professorMariSuggestionsEnabled = useUIStore((s) => s.professorMariSuggestionsEnabled);
+  const setProfessorMariSuggestionsEnabled = useUIStore((s) => s.setProfessorMariSuggestionsEnabled);
+  const professorMariNavigationEnabled = useUIStore((s) => s.professorMariNavigationEnabled);
+  const setProfessorMariNavigationEnabled = useUIStore((s) => s.setProfessorMariNavigationEnabled);
   const musicPlayerEnabled = useUIStore((s) => s.musicPlayerEnabled);
   const setMusicPlayerEnabled = useUIStore((s) => s.setMusicPlayerEnabled);
   const intuitiveSwipeNavigation = useUIStore((s) => s.intuitiveSwipeNavigation);
@@ -1224,22 +3342,23 @@ function GeneralSettings() {
 
   return (
     <div className="flex flex-col gap-3">
-      <SettingsIntro>Core app behavior, ordered from daily controls to mode-specific tuning.</SettingsIntro>
+      <SettingsIntro>{t("settings.application.intro")}</SettingsIntro>
 
       <SettingsSection
-        title="Application"
-        description="Global preferences that affect the whole app."
+        title={t("settings.application.title")}
+        description={t("settings.application.description")}
         icon={<Power size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("application")}
       >
         <div className="flex flex-col gap-2.5">
-          <label className="flex flex-col gap-1">
+          <label id={getSettingsControlAnchorId("language")} className="flex scroll-mt-3 flex-col gap-1">
             <span className="inline-flex items-center gap-1 text-xs font-medium">
-              Language
-              <HelpTooltip text="Choose the app language. Only English is available right now, but this setting is persisted so future translation PRs can extend it cleanly." />
+              {t("settings.application.language.label")}
+              <HelpTooltip text={t("settings.application.language.help")} />
             </span>
             <select
               value={language}
-              onChange={(e) => setLanguage(e.target.value as (typeof APP_LANGUAGE_OPTIONS)[number]["id"])}
+              onChange={(e) => setLanguage(e.target.value)}
               className="rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]"
             >
               {APP_LANGUAGE_OPTIONS.map((option) => (
@@ -1249,62 +3368,97 @@ function GeneralSettings() {
               ))}
             </select>
             <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-              English is the only bundled language for now. Future translations can add more options here without
-              changing the settings shape.
+              {t("settings.application.language.fallback")}
             </p>
           </label>
 
+          <DocsLanguageSetting />
+
           <ToggleSetting
-            label="Confirm before deleting"
+            anchorId={getSettingsControlAnchorId("confirm-before-delete")}
+            label={localizeUi("settings.controls.confirmBeforeDelete.label")}
             checked={confirmBeforeDelete}
             onChange={setConfirmBeforeDelete}
-            help="Shows a confirmation dialog before permanently deleting chats, characters, or other items. Recommended to keep on."
+            help={localizeUi("settings.controls.confirmBeforeDelete.help")}
           />
+          <AndroidStatusBarSetting />
           <ToggleSetting
-            label="Achievements"
+            anchorId={getSettingsControlAnchorId("achievements")}
+            label={localizeUi("home.achievements.title")}
             checked={achievementsEnabled}
             onChange={setAchievementsEnabled}
-            help="Shows the Home achievements button and unlock notifications. Tracking stays silent in the current profile when this is off."
+            help={localizeUi("settings.controls.achievements.help")}
           />
           <ToggleSetting
-            label="Music Player"
+            anchorId={getSettingsControlAnchorId("music-player")}
+            label={localizeUi("settings.controls.musicPlayer.label")}
             checked={musicPlayerEnabled}
             onChange={setMusicPlayerEnabled}
-            help="Shows the compact Music Player. Switch between Spotify and YouTube from the player itself or the Music DJ agent settings."
+            help={localizeUi("settings.controls.musicPlayer.help")}
           />
           <ToggleSetting
-            label="Mini Mari surprise visits"
+            anchorId={getSettingsControlAnchorId("mini-mari")}
+            label={localizeUi("settings.controls.miniMari.label")}
             checked={chibiProfessorMariEnabled}
             onChange={setChibiProfessorMariEnabled}
-            help="Allows the rare Chibi Professor Mari message to appear while scrolling. Turn this off if it gets in the way of settings or other workflows."
+            help={localizeUi("settings.controls.miniMari.help")}
           />
-          <ConversationSoundSetting />
+          <ToggleSetting
+            anchorId={getSettingsControlAnchorId("professor-mari-suggestions")}
+            label={localizeUi("settings.controls.professorMariSuggestions.label")}
+            checked={professorMariSuggestionsEnabled}
+            onChange={setProfessorMariSuggestionsEnabled}
+            help={localizeUi("settings.controls.professorMariSuggestions.help")}
+          />
+          <ToggleSetting
+            anchorId={getSettingsControlAnchorId("professor-mari-navigation")}
+            label={localizeUi("settings.controls.professorMariNavigation.label")}
+            checked={professorMariNavigationEnabled}
+            onChange={setProfessorMariNavigationEnabled}
+            help={localizeUi("settings.controls.professorMariNavigation.help")}
+          />
         </div>
       </SettingsSection>
 
       <SettingsSection
-        title="Responses"
-        description="How replies arrive, save, and paginate."
+        title={localizeUi("settings.sections.notifications.title")}
+        description={localizeUi("settings.sections.notifications.description")}
+        icon={<Bell size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("notifications")}
+      >
+        <ConversationSoundSetting />
+      </SettingsSection>
+
+      <SettingsSection
+        title={localizeUi("settings.sections.responses.title")}
+        description={localizeUi("settings.sections.responses.description")}
         icon={<MessageCircle size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("responses")}
       >
         <div className="flex flex-col gap-2.5">
           <ToggleSetting
-            label="Enable streaming"
+            anchorId={getSettingsControlAnchorId("enable-streaming")}
+            label={localizeUi("settings.controls.enableStreaming.label")}
             checked={enableStreaming}
             onChange={setEnableStreaming}
-            help="When on, AI responses appear word-by-word as they're generated. When off, the full response appears at once after completion."
+            help={localizeUi("settings.controls.enableStreaming.help")}
           />
 
           <label
+            id={getSettingsControlAnchorId("streaming-speed")}
             className={cn(
-              "flex flex-col gap-1.5 rounded-lg p-1 transition-colors",
+              "flex scroll-mt-3 flex-col gap-1.5 rounded-lg p-1 transition-colors",
               enableStreaming ? "hover:bg-[var(--secondary)]/50" : "opacity-40 pointer-events-none",
             )}
           >
             <div className="flex items-center gap-2">
-              <span className="text-xs">Streaming speed</span>
+              <span className="text-xs">{localize("Streaming speed")}</span>
               <span className="text-xs tabular-nums text-[var(--muted-foreground)]">{streamingSpeed}</span>
-              <HelpTooltip text="How fast streaming tokens appear on screen. Lower values give a slower typewriter effect so you can read along. Higher values show text almost instantly." />
+              <HelpTooltip
+                text={localize(
+                  "How fast streaming tokens appear on screen. Lower values give a slower typewriter effect so you can read along. Higher values show text almost instantly.",
+                )}
+              />
             </div>
             <input
               type="range"
@@ -1316,21 +3470,37 @@ function GeneralSettings() {
               className="w-full accent-[var(--primary)]"
             />
             <div className="flex justify-between text-[0.625rem] text-[var(--muted-foreground)]">
-              <span>Slow</span>
-              <span>Fast</span>
+              <span>{localize("Slow")}</span>
+              <span>{localize("Fast")}</span>
             </div>
           </label>
 
           <ToggleSetting
-            label="Trim incomplete model endings"
+            anchorId={getSettingsControlAnchorId("trim-incomplete-output")}
+            label={localizeUi("settings.controls.trimIncomplete.label")}
             checked={trimIncompleteModelOutput}
             onChange={setTrimIncompleteModelOutput}
-            help="When on, Marinara trims a trailing unfinished sentence from AI responses before saving the message. It leaves complete responses and command-only endings alone."
+            help={localizeUi("settings.controls.trimIncomplete.help")}
           />
 
-          <label className="flex flex-wrap items-center gap-2.5 rounded-lg p-1 transition-colors hover:bg-[var(--secondary)]/50">
-            <span className="text-xs">Messages per page</span>
-            <HelpTooltip text="How many messages to load at a time. Click 'Load More' in the chat to see older messages. Set to 0 to load all messages at once." />
+          <ToggleSetting
+            anchorId={getSettingsControlAnchorId("continue-adds-newline")}
+            label={localizeUi("settings.controls.continueAddsNewline.label")}
+            checked={continueAddsNewline}
+            onChange={setContinueAddsNewline}
+            help={localizeUi("settings.controls.continueAddsNewline.help")}
+          />
+
+          <label
+            id={getSettingsControlAnchorId("messages-per-page")}
+            className="flex scroll-mt-3 flex-wrap items-center gap-2.5 rounded-lg p-1 transition-colors hover:bg-[var(--secondary)]/50"
+          >
+            <span className="text-xs">{localize("Messages per page")}</span>
+            <HelpTooltip
+              text={localize(
+                "How many messages to load at a time. Click 'Load More' in the chat to see older messages. Set to 0 to load all messages at once.",
+              )}
+            />
             <DraftNumberInput
               value={messagesPerPage}
               min={0}
@@ -1344,19 +3514,22 @@ function GeneralSettings() {
       </SettingsSection>
 
       <SettingsSection
-        title="Input & Editing"
-        description="Message input behavior and fast edit controls."
+        title={localizeUi("settings.sections.inputEditing.title")}
+        description={localizeUi("settings.sections.inputEditing.description")}
         icon={<UserCheck size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("input-editing")}
       >
         <div className="flex flex-col gap-2.5">
           <div className="flex flex-col gap-1.5 rounded-lg p-1 transition-colors hover:bg-[var(--secondary)]/50">
             <div className="flex items-center gap-2">
-              <span className="text-xs">Send on Enter</span>
-              <HelpTooltip text="Choose which chat modes send on Enter. When off, Enter creates a new line and you have to press the send button manually." />
+              <span className="text-xs">{localizeUi("settings.controls.sendOnEnter.label")}</span>
+              <HelpTooltip text={localizeUi("settings.controls.sendOnEnter.help")} />
             </div>
             <div className="flex flex-wrap items-center gap-1.5">
               <button
+                type="button"
                 onClick={() => setEnterToSendRP(!enterToSendRP)}
+                aria-pressed={enterToSendRP}
                 className={cn(
                   "rounded-md px-2 py-1 text-[0.625rem] font-medium transition-all",
                   enterToSendRP
@@ -1364,10 +3537,12 @@ function GeneralSettings() {
                     : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] hover:bg-[var(--accent)]",
                 )}
               >
-                Roleplay
+                {localizeUi("settings.modes.roleplay")}
               </button>
               <button
+                type="button"
                 onClick={() => setEnterToSendConvo(!enterToSendConvo)}
+                aria-pressed={enterToSendConvo}
                 className={cn(
                   "rounded-md px-2 py-1 text-[0.625rem] font-medium transition-all",
                   enterToSendConvo
@@ -1375,10 +3550,12 @@ function GeneralSettings() {
                     : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] hover:bg-[var(--accent)]",
                 )}
               >
-                Conversations
+                {localizeUi("settings.modes.conversations")}
               </button>
               <button
+                type="button"
                 onClick={() => setEnterToSendGame(!enterToSendGame)}
+                aria-pressed={enterToSendGame}
                 className={cn(
                   "rounded-md px-2 py-1 text-[0.625rem] font-medium transition-all",
                   enterToSendGame
@@ -1386,70 +3563,98 @@ function GeneralSettings() {
                     : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] hover:bg-[var(--accent)]",
                 )}
               >
-                Game
+                {localizeUi("settings.modes.game")}
+              </button>
+              <button
+                type="button"
+                onClick={() => setEnterToSendProfessorMari(!enterToSendProfessorMari)}
+                aria-pressed={enterToSendProfessorMari}
+                className={cn(
+                  "rounded-md px-2 py-1 text-[0.625rem] font-medium transition-all",
+                  enterToSendProfessorMari
+                    ? "bg-[var(--primary)]/15 text-[var(--primary)] ring-1 ring-[var(--primary)]/30"
+                    : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] hover:bg-[var(--accent)]",
+                )}
+              >
+                {localizeUi("settings.modes.professorMari")}
               </button>
             </div>
           </div>
 
+          <QuickRepliesSetting />
+
           <ToggleSetting
-            label="Speech-to-text microphone"
+            anchorId={getSettingsControlAnchorId("speech-to-text")}
+            label={localizeUi("settings.controls.speechToText.label")}
             checked={speechToTextEnabled}
             onChange={setSpeechToTextEnabled}
-            help="When on, chat input bars show a microphone button for browser dictation. Handy still works independently by pasting into the focused input field."
+            help={localizeUi("settings.controls.speechToText.help")}
           />
           <ToggleSetting
-            label="Intuitive swipe navigation"
+            anchorId={getSettingsControlAnchorId("intuitive-swipe-navigation")}
+            label={localizeUi("settings.controls.intuitiveSwipes.label")}
             checked={intuitiveSwipeNavigation}
             onChange={setIntuitiveSwipeNavigation}
-            help="In Conversation and Roleplay modes, use Left/Right Arrow on desktop or horizontal touch swipes on mobile to move between alternate generations on the latest assistant message."
+            help={localizeUi("settings.controls.intuitiveSwipes.help")}
           />
           <ToggleSetting
-            label="Reroll past the newest swipe"
+            anchorId={getSettingsControlAnchorId("reroll-past-newest-swipe")}
+            label={localizeUi("settings.controls.rerollLatest.label")}
             checked={intuitiveSwipeRerollLatest}
             onChange={setIntuitiveSwipeRerollLatest}
             disabled={!intuitiveSwipeNavigation}
-            help="When intuitive swipes are enabled, pressing Right Arrow or swiping left on the newest swipe of the latest assistant message creates a new reroll."
+            help={localizeUi("settings.controls.rerollLatest.help")}
           />
           <ToggleSetting
-            label="Up Arrow edits last message"
+            anchorId={getSettingsControlAnchorId("up-arrow-edits-last-message")}
+            label={localizeUi("settings.controls.upArrowEdit.label")}
             checked={editLastMessageOnArrowUp}
             onChange={setEditLastMessageOnArrowUp}
-            help="In Conversation and Roleplay modes, press Up Arrow while the chat input is empty to open the most recent message in the chat for editing — whether it's yours or the AI's."
+            help={localizeUi("settings.controls.upArrowEdit.help")}
           />
           <ToggleSetting
-            label="Double-click edits messages"
+            anchorId={getSettingsControlAnchorId("double-click-edits-messages")}
+            label={localizeUi("settings.controls.doubleClickEdit.label")}
             checked={editMessageOnDoubleClick}
             onChange={setEditMessageOnDoubleClick}
-            help="When on, double-click or double-tap a Roleplay message to open it for editing. Turn it off to avoid accidental edits; edit buttons and keyboard shortcuts still work."
+            help={localizeUi("settings.controls.doubleClickEdit.help")}
           />
         </div>
       </SettingsSection>
 
       <SettingsSection
-        title="Text Rules"
-        description="Formatting applied to chat text."
+        title={localizeUi("settings.sections.textRules.title")}
+        description={localizeUi("settings.sections.textRules.description")}
         icon={<FileText size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("text-rules")}
       >
         <div className="flex flex-col gap-2.5">
           <ToggleSetting
-            label="Bold dialogue in quotes"
+            anchorId={getSettingsControlAnchorId("bold-dialogue")}
+            label={localizeUi("settings.controls.boldDialogue.label")}
             checked={boldDialogue ?? true}
             onChange={setBoldDialogue}
-            help={
-              'When on, text inside dialogue quotation marks ("like this", 「like this」, or 『like this』) is bolded in addition to its dialogue highlight color. Turn it off to keep the color without bold.'
-            }
+            help={localizeUi("settings.controls.boldDialogue.help")}
           />
           <ToggleSetting
-            label="Convert LaTeX symbols"
+            anchorId={getSettingsControlAnchorId("convert-latex-symbols")}
+            label={localizeUi("settings.controls.convertLatex.label")}
             checked={convertLatexSymbols}
             onChange={setConvertLatexSymbols}
-            help="Turns common model-written LaTeX commands like \\rightarrow, \\neq, \\times, and \\alpha into regular symbols while leaving code snippets alone. This is display-only; saved messages keep their original text."
+            help={localizeUi("ui.panels.generalsettings.turnsCommonModelWrittenLatexCommandsLikeRightarrowNeq")}
           />
 
-          <div className="flex flex-col gap-1.5 rounded-lg p-1 transition-colors hover:bg-[var(--secondary)]/50">
+          <div
+            id={getSettingsControlAnchorId("quote-style")}
+            className="flex scroll-mt-3 flex-col gap-1.5 rounded-lg p-1 transition-colors hover:bg-[var(--secondary)]/50"
+          >
             <div className="flex items-center gap-2">
-              <span className="text-xs">Quote style</span>
-              <HelpTooltip text="Choose how straight and smart quotation marks are unified in chat inputs and displayed AI output." />
+              <span className="text-xs">{localize("Quote style")}</span>
+              <HelpTooltip
+                text={localize(
+                  "Choose how straight and smart quotation marks are unified in chat inputs and displayed AI output.",
+                )}
+              />
             </div>
             <div className="grid grid-cols-2 gap-1.5">
               {QUOTE_FORMAT_OPTIONS.map((option) => {
@@ -1467,7 +3672,7 @@ function GeneralSettings() {
                         : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-[var(--border)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
                     )}
                   >
-                    <span className="font-medium">{option.label}</span>
+                    <span className="font-medium">{localize(option.label)}</span>
                     <span className="max-w-full truncate text-[0.625rem] opacity-80">{option.sample}</span>
                   </button>
                 );
@@ -1478,30 +3683,40 @@ function GeneralSettings() {
       </SettingsSection>
 
       <SettingsSection
-        title="Game Playback"
-        description="Game mode reading and navigation."
+        title={localizeUi("settings.sections.gamePlayback.title")}
+        description={localizeUi("settings.sections.gamePlayback.description")}
         icon={<ScrollText size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("game-playback")}
       >
         <div className="flex flex-col gap-2.5">
           <ToggleSetting
-            label="Instantly reveal game text"
+            anchorId={getSettingsControlAnchorId("game-instant-text-reveal")}
+            label={localizeUi("settings.controls.gameInstantText.label")}
             checked={gameInstantTextReveal}
             onChange={setGameInstantTextReveal}
-            help="When enabled, Game mode narration segments appear fully as soon as you enter them. This skips the typewriter effect and hides the narration speed control."
+            help={localizeUi("settings.controls.gameInstantText.help")}
           />
           <ToggleSetting
-            label="Mouse-wheel + click navigation"
+            anchorId={getSettingsControlAnchorId("game-middle-mouse-navigation")}
+            label={localizeUi("settings.controls.gameMouseNavigation.label")}
             checked={gameMiddleMouseNav}
             onChange={setGameMiddleMouseNav}
-            help="In Game mode, scroll the mouse wheel up to step back through past assistant turns and down to step forward. Clicking the scene background acts like the Next button. While reviewing the past, Next becomes Return — clicking the background or pressing Return jumps you back to where you were reading."
+            help={localizeUi("settings.controls.gameMouseNavigation.help")}
           />
 
           {!gameInstantTextReveal && (
-            <label className="flex flex-col gap-1.5 rounded-lg p-1 transition-colors hover:bg-[var(--secondary)]/50">
+            <label
+              id={getSettingsControlAnchorId("game-narration-speed")}
+              className="flex scroll-mt-3 flex-col gap-1.5 rounded-lg p-1 transition-colors hover:bg-[var(--secondary)]/50"
+            >
               <div className="flex items-center gap-2">
-                <span className="text-xs">Game narration speed</span>
+                <span className="text-xs">{localize("Game narration speed")}</span>
                 <span className="text-xs tabular-nums text-[var(--muted-foreground)]">{gameTextSpeed}</span>
-                <HelpTooltip text="How fast the typewriter effect displays narration text in Game mode. Lower values give a slower cinematic reveal. Higher values show text almost instantly." />
+                <HelpTooltip
+                  text={localize(
+                    "How fast the typewriter effect displays narration text in Game mode. Lower values give a slower cinematic reveal. Higher values show text almost instantly.",
+                  )}
+                />
               </div>
               <input
                 type="range"
@@ -1513,19 +3728,31 @@ function GeneralSettings() {
                 className="w-full accent-[var(--primary)]"
               />
               <div className="flex justify-between text-[0.625rem] text-[var(--muted-foreground)]">
-                <span>Slow</span>
-                <span>Fast</span>
+                <span>{localize("Slow")}</span>
+                <span>{localize("Fast")}</span>
               </div>
             </label>
           )}
 
-          <label className="flex flex-col gap-1.5 rounded-lg p-1 transition-colors hover:bg-[var(--secondary)]/50">
+          <label
+            id={getSettingsControlAnchorId("game-auto-play-delay")}
+            className="flex scroll-mt-3 flex-col gap-1.5 rounded-lg p-1 transition-colors hover:bg-[var(--secondary)]/50"
+          >
             <div className="flex items-center gap-2">
-              <span className="text-xs">Game auto-play segment delay</span>
+              <span className="text-xs">{localize("Game auto-play segment delay")}</span>
               <span className="text-xs tabular-nums text-[var(--muted-foreground)]">
-                {(gameAutoPlayDelay / 1000).toFixed(1)}s
+                {t("settings.units.secondsShort", {
+                  value: new Intl.NumberFormat(localization.resolvedLanguage ?? localization.language, {
+                    minimumFractionDigits: 1,
+                    maximumFractionDigits: 1,
+                  }).format(gameAutoPlayDelay / 1000),
+                })}
               </span>
-              <HelpTooltip text="Pause between each narration segment when auto-play is enabled in Game mode. Enable auto-play via the ▶ button next to Next." />
+              <HelpTooltip
+                text={localize(
+                  "Pause between each narration segment when auto-play is enabled in Game mode. Enable auto-play via the ▶ button next to Next.",
+                )}
+              />
             </div>
             <input
               type="range"
@@ -1537,8 +3764,8 @@ function GeneralSettings() {
               className="w-full accent-[var(--primary)]"
             />
             <div className="flex justify-between text-[0.625rem] text-[var(--muted-foreground)]">
-              <span>Short</span>
-              <span>Long</span>
+              <span>{t("settings.common.short")}</span>
+              <span>{t("settings.common.long")}</span>
             </div>
           </label>
         </div>
@@ -1547,17 +3774,54 @@ function GeneralSettings() {
   );
 }
 
-function ImageGenerationSettings() {
+function OverallGenerationSettings() {
+  const { t: localizeUi } = useUiTranslation();
   const queueImageGenerationRequests = useUIStore((s) => s.queueImageGenerationRequests);
   const setQueueImageGenerationRequests = useUIStore((s) => s.setQueueImageGenerationRequests);
   const reviewImagePromptsBeforeSend = useUIStore((s) => s.reviewImagePromptsBeforeSend);
   const setReviewImagePromptsBeforeSend = useUIStore((s) => s.setReviewImagePromptsBeforeSend);
+
+  return (
+    <SettingsSection
+      title={localizeUi("settings.sections.overallGenerations.title")}
+      description={localizeUi("settings.sections.overallGenerations.componentDescription")}
+      icon={<WandSparkles size="0.875rem" />}
+      {...getSettingsSectionAnchorProps("overall-generations")}
+    >
+      <div className="flex flex-col gap-2.5">
+        <ToggleSetting
+          anchorId={getSettingsControlAnchorId("queue-media-generation")}
+          label={localizeUi("settings.controls.queueMedia.label")}
+          checked={queueImageGenerationRequests}
+          onChange={setQueueImageGenerationRequests}
+          help={localizeUi("settings.controls.queueMedia.help")}
+        />
+        <ToggleSetting
+          anchorId={getSettingsControlAnchorId("image-prompt-review")}
+          label={localizeUi("settings.controls.reviewMediaPrompts.label")}
+          checked={reviewImagePromptsBeforeSend}
+          onChange={setReviewImagePromptsBeforeSend}
+          help={localizeUi("settings.controls.reviewMediaPrompts.help")}
+        />
+      </div>
+    </SettingsSection>
+  );
+}
+
+function ImageGenerationSettings() {
+  const { t: localizeUi } = useUiTranslation();
   const imageBackgroundWidth = useUIStore((s) => s.imageBackgroundWidth);
   const imageBackgroundHeight = useUIStore((s) => s.imageBackgroundHeight);
   const setImageBackgroundDimensions = useUIStore((s) => s.setImageBackgroundDimensions);
   const imageIllustrationWidth = useUIStore((s) => s.imageIllustrationWidth);
   const imageIllustrationHeight = useUIStore((s) => s.imageIllustrationHeight);
   const setImageIllustrationDimensions = useUIStore((s) => s.setImageIllustrationDimensions);
+  const imageNoodleWidth = useUIStore((s) => s.imageNoodleWidth);
+  const imageNoodleHeight = useUIStore((s) => s.imageNoodleHeight);
+  const setImageNoodleDimensions = useUIStore((s) => s.setImageNoodleDimensions);
+  const imageGameWidth = useUIStore((s) => s.imageGameWidth);
+  const imageGameHeight = useUIStore((s) => s.imageGameHeight);
+  const setImageGameDimensions = useUIStore((s) => s.setImageGameDimensions);
   const imagePortraitWidth = useUIStore((s) => s.imagePortraitWidth);
   const imagePortraitHeight = useUIStore((s) => s.imagePortraitHeight);
   const setImagePortraitDimensions = useUIStore((s) => s.setImagePortraitDimensions);
@@ -1569,57 +3833,69 @@ function ImageGenerationSettings() {
 
   return (
     <SettingsSection
-      title="Image Generation"
-      description="Review generated prompts, set image canvas defaults, and tune prompt style profiles."
+      title={localizeUi("settings.sections.imageGeneration.title")}
+      description={localizeUi("settings.sections.imageGeneration.componentDescription")}
       icon={<Image size="0.875rem" />}
+      {...getSettingsSectionAnchorProps("image-generation")}
     >
       <div className="flex flex-col gap-2.5">
-        <ToggleSetting
-          label="Queue image generation requests"
-          checked={queueImageGenerationRequests}
-          onChange={setQueueImageGenerationRequests}
-          help="Sends image generation jobs one at a time. Keep this on for providers that reject simultaneous background, illustration, or portrait requests."
-        />
-        <ToggleSetting
-          label="Expose image prompts before sending"
-          checked={reviewImagePromptsBeforeSend}
-          onChange={setReviewImagePromptsBeforeSend}
-          help="Shows generated image prompts for review before sending Game assets, character or persona avatars, and sprite generations to the image provider."
-        />
-
         <ImageDimensionRow
-          label="Backgrounds"
-          help="Used for Roleplay and Game generated scene backgrounds."
+          controlId="image-background-size"
+          label={localizeUi("settings.controls.backgroundGeneration.label")}
+          help={localizeUi("settings.controls.backgroundGeneration.help")}
           width={imageBackgroundWidth}
           height={imageBackgroundHeight}
           onCommit={setImageBackgroundDimensions}
         />
         <ImageDimensionRow
-          label="Illustrations"
-          help="Used for Illustrator agent images saved to chat galleries, including comic pages and scene illustrations."
+          controlId="image-illustration-size"
+          label={localizeUi("settings.controls.illustrations.label")}
+          help={localizeUi("settings.controls.illustrations.help")}
           width={imageIllustrationWidth}
           height={imageIllustrationHeight}
           onCommit={setImageIllustrationDimensions}
         />
         <ImageDimensionRow
-          label="Portraits"
-          help="Used for generated character and NPC portraits."
+          controlId="image-noodle-size"
+          label={localizeUi("settings.controls.noodleGeneration.label")}
+          help={localizeUi("settings.controls.noodleGeneration.help")}
+          width={imageNoodleWidth}
+          height={imageNoodleHeight}
+          onCommit={setImageNoodleDimensions}
+        />
+        <ImageDimensionRow
+          controlId="image-game-size"
+          label={localizeUi("settings.controls.gameGeneration.label")}
+          help={localizeUi("settings.controls.gameGeneration.help")}
+          width={imageGameWidth}
+          height={imageGameHeight}
+          onCommit={setImageGameDimensions}
+        />
+        <ImageDimensionRow
+          controlId="image-portrait-size"
+          label={localizeUi("settings.controls.portraits.label")}
+          help={localizeUi("settings.controls.portraits.help")}
           width={imagePortraitWidth}
           height={imagePortraitHeight}
           onCommit={setImagePortraitDimensions}
         />
         <ImageDimensionRow
-          label="Selfies"
-          help="Default selfie canvas for Roleplay and Conversation image commands when a chat does not override selfie resolution."
+          controlId="image-selfie-size"
+          label={localizeUi("settings.controls.selfies.label")}
+          help={localizeUi("settings.controls.selfies.help")}
           width={imageSelfieWidth}
           height={imageSelfieHeight}
           onCommit={setImageSelfieDimensions}
         />
 
-        <div className="mt-1">
+        <div id={getSettingsControlAnchorId("image-style-profiles")} className="mt-1 scroll-mt-3">
           <div className="mb-2 flex items-center gap-1 text-xs font-medium text-[var(--foreground)]">
-            Style Profiles
-            <HelpTooltip text="Defines what Anime, Danbooru, Realistic, and custom styles mean when Marinara compiles image prompts. Profiles merge with per-chat and connection settings, then clean duplicate tags before sending." />
+            {localizeUi("ui.panels.imagegenerationsettings.styleProfiles")}
+            <HelpTooltip
+              text={localizeUi(
+                "ui.panels.imagegenerationsettings.definesWhatAnimeDanbooruRealisticAndCustomStylesMean",
+              )}
+            />
           </div>
           <ImageStyleProfilesEditor value={imageStyleProfiles} onChange={setImageStyleProfiles} />
         </div>
@@ -1628,8 +3904,232 @@ function ImageGenerationSettings() {
   );
 }
 
+const VIDEO_GENERATION_SETTINGS_QUERY_KEY = ["app-settings", VIDEO_GENERATION_SETTINGS_KEY] as const;
+
+function serializeVideoGenerationSettings(settings: VideoGenerationUserSettings): string {
+  return JSON.stringify(normalizeVideoGenerationUserSettings(settings));
+}
+
+function VideoGenerationSettings() {
+  const { t: localizeUi } = useUiTranslation();
+  const qc = useQueryClient();
+  const videoSettingsQuery = useQuery<AppSettingsResponse>({
+    queryKey: VIDEO_GENERATION_SETTINGS_QUERY_KEY,
+    queryFn: () => api.get(`/app-settings/${VIDEO_GENERATION_SETTINGS_KEY}`),
+    staleTime: 60_000,
+  });
+  const savedSettings = useMemo(
+    () => normalizeVideoGenerationUserSettings(videoSettingsQuery.data?.value ?? null),
+    [videoSettingsQuery.data?.value],
+  );
+  const [draft, setDraft] = useState<VideoGenerationUserSettings>(savedSettings);
+
+  useEffect(() => {
+    setDraft(savedSettings);
+  }, [savedSettings]);
+
+  const saveVideoSettings = useMutation<AppSettingsResponse, Error, VideoGenerationUserSettings>({
+    mutationFn: (next) =>
+      api.put<AppSettingsResponse>(`/app-settings/${VIDEO_GENERATION_SETTINGS_KEY}`, {
+        value: serializeVideoGenerationSettings(next),
+      }),
+    onSuccess: (data) => {
+      qc.setQueryData(VIDEO_GENERATION_SETTINGS_QUERY_KEY, data);
+    },
+    onError: (err) => {
+      setDraft(savedSettings);
+      toast.error(err.message || localizeUi("ui.panels.videogenerationsettings.failedToSaveVideoGenerationSettings"));
+    },
+  });
+
+  const commitSettings = useCallback(
+    (next: VideoGenerationUserSettings) => {
+      const normalized = normalizeVideoGenerationUserSettings(next);
+      setDraft(normalized);
+      saveVideoSettings.mutate(normalized);
+    },
+    [saveVideoSettings],
+  );
+
+  const handleSceneDurationChange = (duration: number) => {
+    commitSettings({ ...draft, sceneVideoDurationSeconds: duration });
+  };
+
+  const handleCallClipDurationChange = (kind: ConversationCallCharacterVideoClipKind, duration: number) => {
+    commitSettings({
+      ...draft,
+      callClipDurations: {
+        ...draft.callClipDurations,
+        [kind]: duration,
+      },
+    });
+  };
+
+  const handleCustomClipDurationChange = (duration: number) => {
+    commitSettings({ ...draft, callCustomClipDurationSeconds: duration });
+  };
+
+  const handleAnimatedExpressionDurationChange = (duration: number) => {
+    commitSettings({ ...draft, animatedExpressionClipDurationSeconds: duration });
+  };
+
+  return (
+    <SettingsSection
+      title={localizeUi("settings.sections.videoGeneration.title")}
+      description={localizeUi("settings.sections.videoGeneration.componentDescription")}
+      icon={<Film size="0.875rem" />}
+      {...getSettingsSectionAnchorProps("video-generation")}
+    >
+      {videoSettingsQuery.isLoading ? (
+        <div className="flex items-center gap-2 rounded-lg bg-[var(--background)]/55 px-3 py-2 text-xs text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
+          <Loader2 size="0.8125rem" className="animate-spin" />
+          {localizeUi("ui.panels.videogenerationsettings.loadingVideoSettings")}
+        </div>
+      ) : videoSettingsQuery.isError ? (
+        <div className="flex items-center gap-1.5 rounded-lg bg-[var(--destructive)]/10 px-2.5 py-2 text-xs text-[var(--destructive)] ring-1 ring-[var(--destructive)]/20">
+          <AlertTriangle size="0.8125rem" className="shrink-0" />
+          {localizeUi("ui.panels.videogenerationsettings.couldNotLoadVideoSettings")}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3">
+          <div
+            id={getSettingsControlAnchorId("video-scene-duration")}
+            className="grid scroll-mt-3 gap-2 rounded-lg bg-[var(--background)]/55 p-3 ring-1 ring-[var(--border)] sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+          >
+            <div className="min-w-0">
+              <div className="inline-flex items-center gap-1 text-xs font-medium text-[var(--foreground)]">
+                {localizeUi("ui.panels.videogenerationsettings.sceneVideoFallbackLength")}
+                <HelpTooltip
+                  text={localizeUi("ui.panels.videogenerationsettings.usedByGameAndGallerySceneVideosWhenThe")}
+                />
+              </div>
+              <div className="mt-1 text-[0.625rem] text-[var(--muted-foreground)]">
+                {localizeUi("ui.panels.videogenerationsettings.secondsClampedFrom")} {VIDEO_SCENE_DURATION_MIN}{" "}
+                {localizeUi("ui.noodle.wizardfooter.to")} {VIDEO_SCENE_DURATION_MAX}.
+              </div>
+            </div>
+            <div className="grid grid-cols-[minmax(0,4rem)_auto] items-center gap-1.5 sm:w-28">
+              <DraftNumberInput
+                value={draft.sceneVideoDurationSeconds}
+                min={VIDEO_SCENE_DURATION_MIN}
+                max={VIDEO_SCENE_DURATION_MAX}
+                onCommit={handleSceneDurationChange}
+                className="min-w-0 rounded-md border border-[var(--border)] bg-[var(--secondary)] px-2 py-1 text-xs"
+                ariaLabel="Scene video fallback length in seconds"
+              />
+              <span className="text-[0.625rem] text-[var(--muted-foreground)]">
+                {localizeUi("ui.noodle.stageprofileview.s")}
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-lg bg-[var(--background)]/55 p-3 ring-1 ring-[var(--border)]">
+            <div className="mb-2 flex items-center gap-1 text-xs font-medium text-[var(--foreground)]">
+              {localizeUi("ui.panels.videogenerationsettings.conversationCallClips")}
+              <HelpTooltip
+                text={localizeUi(
+                  "ui.panels.videogenerationsettings.lengthsForGeneratedCharacterVideoCallPresenceClipsIdle",
+                )}
+              />
+            </div>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,10rem),1fr))] gap-2">
+              {CONVERSATION_CALL_CHARACTER_VIDEO_CLIP_KINDS.map((kind) => (
+                <label
+                  key={kind}
+                  className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-md bg-[var(--secondary)]/60 px-2.5 py-2 ring-1 ring-[var(--border)]/80"
+                >
+                  <span className="truncate text-xs text-[var(--foreground)]">
+                    {CONVERSATION_CALL_VIDEO_CLIP_LABELS[kind]}
+                  </span>
+                  <span className="grid w-[3.75rem] grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
+                    <DraftNumberInput
+                      value={draft.callClipDurations[kind]}
+                      min={VIDEO_CALL_CLIP_DURATION_MIN}
+                      max={VIDEO_CALL_CLIP_DURATION_MAX}
+                      onCommit={(duration) => handleCallClipDurationChange(kind, duration)}
+                      className="min-w-0 rounded-md border border-[var(--border)] bg-[var(--background)] px-1.5 py-1 text-xs"
+                      ariaLabel={`${CONVERSATION_CALL_VIDEO_CLIP_LABELS[kind]} length in seconds`}
+                    />
+                    <span className="text-[0.625rem] text-[var(--muted-foreground)]">
+                      {localizeUi("ui.noodle.stageprofileview.s")}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            <label className="mt-2 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-md bg-[var(--secondary)]/60 px-2.5 py-2 ring-1 ring-[var(--border)]/80">
+              <span className="flex min-w-0 flex-col gap-0.5">
+                <span className="truncate text-xs text-[var(--foreground)]">
+                  {localizeUi("ui.panels.videogenerationsettings.customRequest")}
+                </span>
+                <span className="text-[0.55rem] leading-snug text-[var(--muted-foreground)]">
+                  {localizeUi("ui.panels.videogenerationsettings.usedForOneOffClipsCharactersGenerateFromExplicit")}
+                </span>
+              </span>
+              <span className="grid w-[3.75rem] grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
+                <DraftNumberInput
+                  value={draft.callCustomClipDurationSeconds}
+                  min={VIDEO_CALL_CLIP_DURATION_MIN}
+                  max={VIDEO_CALL_CLIP_DURATION_MAX}
+                  onCommit={handleCustomClipDurationChange}
+                  className="min-w-0 rounded-md border border-[var(--border)] bg-[var(--background)] px-1.5 py-1 text-xs"
+                  ariaLabel="Custom call clip length in seconds"
+                />
+                <span className="text-[0.625rem] text-[var(--muted-foreground)]">
+                  {localizeUi("ui.noodle.stageprofileview.s")}
+                </span>
+              </span>
+            </label>
+            <div className="mt-2 text-[0.625rem] text-[var(--muted-foreground)]">
+              {localizeUi("ui.panels.videogenerationsettings.callClipsAreClampedFrom")} {VIDEO_CALL_CLIP_DURATION_MIN}{" "}
+              {localizeUi("ui.noodle.wizardfooter.to")} {VIDEO_CALL_CLIP_DURATION_MAX}{" "}
+              {localizeUi("ui.panels.videogenerationsettings.seconds")}
+              {saveVideoSettings.isPending ? localizeUi("chat.settings.inlineEditor.saving") : ""}
+            </div>
+          </div>
+
+          <div
+            id={getSettingsControlAnchorId("video-animated-expression-duration")}
+            className="grid scroll-mt-3 gap-2 rounded-lg bg-[var(--background)]/55 p-3 ring-1 ring-[var(--border)] sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+          >
+            <div className="min-w-0">
+              <div className="inline-flex items-center gap-1 text-xs font-medium text-[var(--foreground)]">
+                {localizeUi("ui.panels.videogenerationsettings.animatedExpressionLength")}
+                <HelpTooltip
+                  text={localizeUi(
+                    "ui.panels.videogenerationsettings.usedByExpressionEngineAnimatedPortraitGenerationBeforeThe",
+                  )}
+                />
+              </div>
+              <div className="mt-1 text-[0.625rem] text-[var(--muted-foreground)]">
+                {localizeUi("ui.panels.videogenerationsettings.secondsClampedFrom")}{" "}
+                {VIDEO_ANIMATED_EXPRESSION_CLIP_DURATION_MIN} {localizeUi("ui.noodle.wizardfooter.to")}{" "}
+                {VIDEO_ANIMATED_EXPRESSION_CLIP_DURATION_MAX}.
+              </div>
+            </div>
+            <div className="grid grid-cols-[minmax(0,4rem)_auto] items-center gap-1.5 sm:w-28">
+              <DraftNumberInput
+                value={draft.animatedExpressionClipDurationSeconds}
+                min={VIDEO_ANIMATED_EXPRESSION_CLIP_DURATION_MIN}
+                max={VIDEO_ANIMATED_EXPRESSION_CLIP_DURATION_MAX}
+                onCommit={handleAnimatedExpressionDurationChange}
+                className="min-w-0 rounded-md border border-[var(--border)] bg-[var(--secondary)] px-2 py-1 text-xs"
+                ariaLabel="Animated expression clip length in seconds"
+              />
+              <span className="text-[0.625rem] text-[var(--muted-foreground)]">
+                {localizeUi("ui.noodle.stageprofileview.s")}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+    </SettingsSection>
+  );
+}
+
 function GameAssetsSettings() {
-  const rescanGameAssets = useGameAssetStore((s) => s.rescanAssets);
+  const { t: localizeUi } = useUiTranslation();
+  const rescanGameAssets = useRescanGameAssets();
   const openGameAssetsFolder = useOpenGameAssetsFolder();
   const openGameAssetsBrowser = useUIStore((s) => s.openGameAssetsBrowser);
   const assetFileRef = useRef<HTMLInputElement>(null);
@@ -1651,8 +4151,13 @@ function GameAssetsSettings() {
   const handleOpenGameAssetFolder = (subfolder: string) => {
     openGameAssetsFolder.mutate(subfolder, {
       onError: (error) => {
-        if (error instanceof Error && error.message === HOST_DEVICE_FILE_MANAGER_MESSAGE) return;
-        toast.error("Failed to open game assets folder.");
+        if (error instanceof HostDeviceFileManagerError) return;
+        toast.error(
+          getPrivilegedActionErrorMessage(
+            error,
+            localizeUi("ui.panels.gameassetssettings.failedToOpenGameAssetsFolder"),
+          ),
+        );
       },
     });
   };
@@ -1660,18 +4165,20 @@ function GameAssetsSettings() {
   const handleGameAssetUpload = async () => {
     if (assetUploading) return;
     if (assetFiles.length === 0) {
-      toast.error("Choose at least one asset file first.");
+      toast.error(localizeUi("ui.panels.gameassetssettings.chooseAtLeastOneAssetFileFirst"));
       return;
     }
     const folder = assetSubcategory.trim().replace(/^\/+|\/+$/g, "") || assetCategoryMeta.defaultFolder;
     if (folder.includes("..") || folder.includes("\\") || folder.startsWith("/")) {
-      toast.error("Folder names cannot contain path traversal.");
+      toast.error(localizeUi("ui.panels.gameassetssettings.folderNamesCannotContainPathTraversal"));
       return;
     }
 
     const tooLarge = assetFiles.find((file) => file.size > 50 * 1024 * 1024);
     if (tooLarge) {
-      toast.error(`${tooLarge.name} is too large. Game assets are limited to 50 MB each.`);
+      toast.error(
+        localizeUi("ui.panels.gameassetssettings.value1IsTooLargeGameAssetsAreLimitedTo", { value1: tooLarge.name }),
+      );
       return;
     }
 
@@ -1688,16 +4195,24 @@ function GameAssetsSettings() {
       );
       const succeeded = uploads.filter((result) => result.status === "fulfilled").length;
       const failed = uploads.length - succeeded;
-      await rescanGameAssets();
+      await rescanGameAssets.mutateAsync();
       if (succeeded > 0) {
-        toast.success(`Uploaded ${succeeded} game asset${succeeded === 1 ? "" : "s"}.`);
+        toast.success(
+          localizeUi("ui.panels.gameassetssettings.uploadedValue1GameAssetValue2", {
+            value1: succeeded,
+            value2: succeeded === 1 ? "" : localizeUi("ui.noodle.stageprofileview.s"),
+          }),
+        );
       }
       if (failed > 0) {
         const reason = uploads.find((result) => result.status === "rejected");
         toast.error(
           reason?.status === "rejected" && reason.reason instanceof Error
             ? reason.reason.message
-            : `${failed} asset upload${failed === 1 ? "" : "s"} failed.`,
+            : localizeUi("ui.panels.gameassetssettings.value1AssetUploadValue2Failed", {
+                value1: failed,
+                value2: failed === 1 ? "" : localizeUi("ui.noodle.stageprofileview.s"),
+              }),
         );
       }
       setAssetFiles([]);
@@ -1709,30 +4224,32 @@ function GameAssetsSettings() {
 
   return (
     <SettingsSection
-      title="Game Assets"
-      description="Open existing asset folders, import new files, and refresh the server manifest."
+      title={localizeUi("settings.sections.gameAssets.title")}
+      description={localizeUi("settings.sections.gameAssets.componentDescription")}
       icon={<FolderOpen size="0.875rem" />}
+      {...getSettingsSectionAnchorProps("game-assets")}
     >
       <div className="flex flex-col gap-3">
         <div className="flex flex-col gap-2">
           <button
             onClick={openGameAssetsBrowser}
             className="mari-chrome-control mari-chrome-control--primary w-full gap-2 text-xs"
-            title="Open Asset Browser"
+            title={localizeUi("settings.actions.openAssetBrowser")}
           >
             <Image size="0.75rem" />
-            Asset Browser
+            {localizeUi("ui.panels.gameassetssettings.assetBrowser")}
           </button>
           <button
             onClick={() => {
-              rescanGameAssets()
-                .then(() => toast.success("Game assets rescanned."))
-                .catch(() => toast.error("Failed to rescan game assets."));
+              rescanGameAssets
+                .mutateAsync()
+                .then(() => toast.success(localizeUi("ui.panels.gameassetssettings.gameAssetsRescanned")))
+                .catch(() => toast.error(localizeUi("ui.panels.gameassetssettings.failedToRescanGameAssets")));
             }}
             className={cn(SETTINGS_BUTTON_CLASS, "w-full justify-center")}
           >
             <RefreshCw size="0.75rem" />
-            Rescan
+            {localizeUi("ui.panels.gameassetssettings.rescan")}
           </button>
         </div>
 
@@ -1751,7 +4268,9 @@ function GameAssetsSettings() {
 
         <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
           <label className="flex min-w-0 flex-col gap-1">
-            <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">Type</span>
+            <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+              {localizeUi("ui.panels.gameassetssettings.type")}
+            </span>
             <select
               value={assetCategory}
               onChange={(e) => handleAssetCategoryChange(e.target.value as GameAssetCategoryId)}
@@ -1765,7 +4284,9 @@ function GameAssetsSettings() {
             </select>
           </label>
           <label className="flex min-w-0 flex-col gap-1">
-            <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">Folder</span>
+            <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+              {localizeUi("ui.panels.gameassetssettings.folder")}
+            </span>
             <input
               value={assetSubcategory}
               onChange={(e) => setAssetSubcategory(e.target.value)}
@@ -1784,12 +4305,9 @@ function GameAssetsSettings() {
             className="hidden"
             onChange={(e) => setAssetFiles(Array.from(e.target.files ?? []))}
           />
-          <button
-            onClick={() => assetFileRef.current?.click()}
-            className={cn(SETTINGS_BUTTON_CLASS, "justify-center")}
-          >
+          <button onClick={() => assetFileRef.current?.click()} className={cn(SETTINGS_BUTTON_CLASS, "justify-center")}>
             <Upload size="0.875rem" />
-            Choose Files
+            {localizeUi("ui.panels.gameassetssettings.chooseFiles")}
           </button>
           <button
             onClick={handleGameAssetUpload}
@@ -1801,18 +4319,19 @@ function GameAssetsSettings() {
             )}
           >
             {assetUploading ? <Loader2 size="0.875rem" className="animate-spin" /> : <Upload size="0.875rem" />}
-            Upload to Server
+            {localizeUi("ui.panels.gameassetssettings.uploadToServer")}
           </button>
           {assetFiles.length > 0 && (
             <span className="truncate text-[0.625rem] text-[var(--muted-foreground)]">
-              {assetFiles.length === 1 ? assetFiles[0]?.name : `${assetFiles.length} files selected`}
+              {assetFiles.length === 1
+                ? assetFiles[0]?.name
+                : localizeUi("ui.panels.gameassetssettings.value1FilesSelected", { value1: assetFiles.length })}
             </span>
           )}
         </div>
 
         <p className="text-[0.625rem] leading-relaxed text-[var(--muted-foreground)]">
-          Audio supports MP3, OGG, WAV, FLAC, M4A, AAC, and WebM. Images support PNG, JPG, GIF, WebP, AVIF, and SVG for
-          sprites. Music folders use state/genre/intensity, such as exploration/fantasy/calm.
+          {localizeUi("ui.panels.gameassetssettings.audioSupportsMp3OggWavFlacM4aAacAnd")}
         </p>
       </div>
     </SettingsSection>
@@ -1820,6 +4339,7 @@ function GameAssetsSettings() {
 }
 
 function AppearanceSettings() {
+  const { t: localizeUi } = useUiTranslation();
   const theme = useUIStore((s) => s.theme);
   const setTheme = useUIStore((s) => s.setTheme);
   const appBackgroundColor = useUIStore((s) => s.appBackgroundColor);
@@ -1832,6 +4352,8 @@ function AppearanceSettings() {
   const setAppAccentRgbMode = useUIStore((s) => s.setAppAccentRgbMode);
   const customCursorEnabled = useUIStore((s) => s.customCursorEnabled);
   const setCustomCursorEnabled = useUIStore((s) => s.setCustomCursorEnabled);
+  const reduceAmbientEffects = useUIStore((s) => s.reduceAmbientEffects);
+  const setReduceAmbientEffects = useUIStore((s) => s.setReduceAmbientEffects);
   const defaultAppBackgroundColor = getDefaultAppBackgroundColor(theme);
   const displayedAppBackgroundColor =
     appBackgroundColor.trim().toLowerCase() === defaultAppBackgroundColor.toLowerCase() ? "" : appBackgroundColor;
@@ -1850,6 +4372,19 @@ function AppearanceSettings() {
   const activeChatId = useChatStore((s) => s.activeChatId);
   const updateMeta = useUpdateChatMetadata();
   const setActiveSyncedTheme = useSetActiveTheme();
+  const handleOpenFontsFolder = async () => {
+    if (!isHostDeviceBrowser()) {
+      toast.info(HOST_DEVICE_FILE_MANAGER_MESSAGE);
+      return;
+    }
+    try {
+      await api.post("/fonts/open-folder");
+    } catch (error) {
+      toast.error(
+        getPrivilegedActionErrorMessage(error, localizeUi("ui.panels.appearancesettings.couldNotOpenFontsFolder")),
+      );
+    }
+  };
   const handleAppBackgroundColorChange = useCallback(
     (color: string) => {
       const normalized = color.trim();
@@ -1987,55 +4522,50 @@ function AppearanceSettings() {
     void setActiveSyncedTheme
       .mutateAsync(null)
       .then(() => {
-        toast.success("Appearance reset to Marinara defaults.");
+        toast.success(localizeUi("ui.panels.appearancesettings.appearanceResetToMarinaraDefaults"));
       })
       .catch((err) => {
         console.error("[AppearanceSettings] Failed to clear active synced theme:", err);
-        toast.warning("Appearance reset locally, but the active synced theme could not be cleared.");
+        toast.warning(localizeUi("ui.panels.appearancesettings.appearanceResetLocallyButTheActiveSyncedThemeCould"));
       });
-  }, [activeChatId, resetAppearanceSettings, setActiveSyncedTheme, updateMeta]);
+  }, [activeChatId, resetAppearanceSettings, setActiveSyncedTheme, updateMeta, localizeUi]);
   const fontSize = useUIStore((s) => s.fontSize);
   const setFontSize = useUIStore((s) => s.setFontSize);
   const chatFontSize = useUIStore((s) => s.chatFontSize);
   const setChatFontSize = useUIStore((s) => s.setChatFontSize);
   const conversationMessageStyle = useUIStore((s) => s.conversationMessageStyle);
   const setConversationMessageStyle = useUIStore((s) => s.setConversationMessageStyle);
+  const conversationAvatarShape = useUIStore((s) => s.conversationAvatarShape);
+  const setConversationAvatarShape = useUIStore((s) => s.setConversationAvatarShape);
   const weatherEffects = useUIStore((s) => s.weatherEffects);
   const setWeatherEffects = useUIStore((s) => s.setWeatherEffects);
-  const trackerPanelEnabled = useUIStore((s) => s.trackerPanelEnabled);
-  const setTrackerPanelEnabled = useUIStore((s) => s.setTrackerPanelEnabled);
-  const trackerPanelHideHudWidgets = useUIStore((s) => s.trackerPanelHideHudWidgets);
-  const setTrackerPanelHideHudWidgets = useUIStore((s) => s.setTrackerPanelHideHudWidgets);
-  const trackerPanelUseExpressionSprites = useUIStore((s) => s.trackerPanelUseExpressionSprites);
-  const setTrackerPanelUseExpressionSprites = useUIStore((s) => s.setTrackerPanelUseExpressionSprites);
-  const trackerPanelThoughtBubbleDisplay = useUIStore((s) => s.trackerPanelThoughtBubbleDisplay);
-  const setTrackerPanelThoughtBubbleDisplay = useUIStore((s) => s.setTrackerPanelThoughtBubbleDisplay);
-  const trackerPanelDockedThoughtsAlwaysVisible = useUIStore((s) => s.trackerPanelDockedThoughtsAlwaysVisible);
-  const setTrackerPanelDockedThoughtsAlwaysVisible = useUIStore((s) => s.setTrackerPanelDockedThoughtsAlwaysVisible);
-  const trackerPanelSizeProfile = useUIStore((s) => s.trackerPanelSizeProfile);
-  const setTrackerPanelSizeProfile = useUIStore((s) => s.setTrackerPanelSizeProfile);
-  const trackerPanelBackgroundColor = useUIStore((s) => s.trackerPanelBackgroundColor);
-  const setTrackerPanelBackgroundColor = useUIStore((s) => s.setTrackerPanelBackgroundColor);
-  const trackerTemperatureUnit = useUIStore((s) => s.trackerTemperatureUnit);
-  const setTrackerTemperatureUnit = useUIStore((s) => s.setTrackerTemperatureUnit);
-
   // Text appearance
   const chatFontColor = useUIStore((s) => s.chatFontColor);
   const setChatFontColor = useUIStore((s) => s.setChatFontColor);
+  const defaultDialogueColor = useUIStore((s) => s.defaultDialogueColor);
+  const setDefaultDialogueColor = useUIStore((s) => s.setDefaultDialogueColor);
   const chatChromeTextColor = useUIStore((s) => s.chatChromeTextColor);
   const setChatChromeTextColor = useUIStore((s) => s.setChatChromeTextColor);
   const chatFontOpacity = useUIStore((s) => s.chatFontOpacity);
   const setChatFontOpacity = useUIStore((s) => s.setChatFontOpacity);
+  const roleplayReducedPaintEffects = useUIStore((s) => s.roleplayReducedPaintEffects);
+  const setRoleplayReducedPaintEffects = useUIStore((s) => s.setRoleplayReducedPaintEffects);
   const roleplayAvatarStyle = useUIStore((s) => s.roleplayAvatarStyle);
   const setRoleplayAvatarStyle = useUIStore((s) => s.setRoleplayAvatarStyle);
   const roleplayAvatarScale = useUIStore((s) => s.roleplayAvatarScale);
   const setRoleplayAvatarScale = useUIStore((s) => s.setRoleplayAvatarScale);
   const roleplayAvatarsScrollable = useUIStore((s) => s.roleplayAvatarsScrollable);
   const setRoleplayAvatarsScrollable = useUIStore((s) => s.setRoleplayAvatarsScrollable);
+  const roleplayNarratorAvatarCycling = useUIStore((s) => s.roleplayNarratorAvatarCycling);
+  const setRoleplayNarratorAvatarCycling = useUIStore((s) => s.setRoleplayNarratorAvatarCycling);
   const roleplaySpriteScale = useUIStore((s) => s.roleplaySpriteScale);
   const setRoleplaySpriteScale = useUIStore((s) => s.setRoleplaySpriteScale);
   const gameDialogueDisplayMode = useUIStore((s) => s.gameDialogueDisplayMode);
   const setGameDialogueDisplayMode = useUIStore((s) => s.setGameDialogueDisplayMode);
+  const chatListBackgrounds = useUIStore((s) => s.chatListBackgrounds);
+  const setChatListBackgrounds = useUIStore((s) => s.setChatListBackgrounds);
+  const gameTextEffectsEnabled = useUIStore((s) => s.gameTextEffectsEnabled);
+  const setGameTextEffectsEnabled = useUIStore((s) => s.setGameTextEffectsEnabled);
   const gameAvatarScale = useUIStore((s) => s.gameAvatarScale);
   const setGameAvatarScale = useUIStore((s) => s.setGameAvatarScale);
   const gameFullBodySpriteScale = useUIStore((s) => s.gameFullBodySpriteScale);
@@ -2070,12 +4600,12 @@ function AppearanceSettings() {
         family,
       }),
     onSuccess: (data) => {
-      toast.success(`Installed "${data.family}"`);
+      toast.success(localizeUi("ui.panels.appearancesettings.installedValue1", { value1: data.family }));
       setGoogleFontName("");
       queryClient.invalidateQueries({ queryKey: ["custom-fonts"] });
     },
     onError: (err: Error) => {
-      toast.error(err.message || "Failed to download font");
+      toast.error(err.message || localizeUi("ui.panels.appearancesettings.failedToDownloadFont"));
     },
   });
 
@@ -2115,12 +4645,15 @@ function AppearanceSettings() {
 
   return (
     <div className="flex flex-col gap-3">
-      <SettingsIntro>Visual preferences, grouped from global app chrome to chat-specific presentation.</SettingsIntro>
+      <SettingsIntro>
+        {localizeUi("ui.panels.appearancesettings.visualPreferencesGroupedByGlobalChromeTextConversationRoleplay")}
+      </SettingsIntro>
 
       <SettingsSection
-        title="App Style"
-        description="Theme family, color scheme, fonts, and reading scale."
+        title={localizeUi("settings.sections.appStyle.title")}
+        description={localizeUi("settings.sections.appStyle.componentDescription")}
         icon={<Paintbrush size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("app-style")}
       >
         <div className="flex flex-col gap-3">
           <div className="flex justify-start">
@@ -2129,22 +4662,22 @@ function AppearanceSettings() {
               onClick={handleResetAppearance}
               disabled={setActiveSyncedTheme.isPending}
               className={SETTINGS_BUTTON_CLASS}
-              title="Reset all Appearance settings to Marinara defaults"
+              title={localizeUi("settings.actions.resetAppearance")}
             >
               {setActiveSyncedTheme.isPending ? (
                 <Loader2 size="0.75rem" className="animate-spin" />
               ) : (
                 <RotateCcw size="0.75rem" />
               )}
-              Reset Appearance
+              {localizeUi("ui.panels.appearancesettings.resetAppearance")}
             </button>
           </div>
           {/* ── Visual Style ── */}
-          <div className="flex flex-col gap-2">
+          <div id={getSettingsControlAnchorId("visual-theme")} className="flex scroll-mt-3 flex-col gap-2">
             <div className="flex items-center gap-1.5">
               <Paintbrush size="0.75rem" className="text-[var(--marinara-chat-chrome-button-text-active)]" />
-              <span className="text-xs font-medium">Visual Style</span>
-              <HelpTooltip text="Choose how the entire app looks. 'Marinara' uses a retro Y2K aesthetic with glow effects. 'SillyTavern' uses a clean, minimal look inspired by the original SillyTavern." />
+              <span className="text-xs font-medium">{localizeUi("ui.panels.appearancesettings.visualStyle")}</span>
+              <HelpTooltip text={localizeUi("ui.panels.appearancesettings.chooseHowTheEntireAppLooksMarinaraUsesA")} />
             </div>
             <div className="grid grid-cols-2 gap-2">
               {(
@@ -2178,82 +4711,112 @@ function AppearanceSettings() {
             </div>
           </div>
 
-          <label className="flex flex-col gap-1">
+          <label id={getSettingsControlAnchorId("theme-mode")} className="flex scroll-mt-3 flex-col gap-1">
             <span className="text-xs font-medium inline-flex items-center gap-1">
-              Color Scheme{" "}
-              <HelpTooltip text="Switch between dark and light mode. Dark mode is easier on the eyes in low-light environments." />
+              {localizeUi("ui.panels.appearancesettings.colorScheme")}{" "}
+              <HelpTooltip text={localizeUi("ui.panels.appearancesettings.switchBetweenDarkAndLightModeDarkModeIs")} />
             </span>
             <select
               value={theme}
               onChange={(e) => setTheme(e.target.value as "dark" | "light")}
               className="rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]"
             >
-              <option value="dark">Dark</option>
-              <option value="light">Light</option>
+              <option value="dark">{localizeUi("ui.panels.appearancesettings.dark")}</option>
+              <option value="light">{localizeUi("ui.panels.appearancesettings.light")}</option>
             </select>
           </label>
 
           <ToggleSetting
-            label="Custom Mouse Pointer"
+            anchorId={getSettingsControlAnchorId("custom-cursor")}
+            label={localizeUi("settings.controls.customPointer.label")}
             checked={customCursorEnabled}
             onChange={setCustomCursorEnabled}
-            help="Uses Marinara's accent-colored cursor across the app. Turn this off to use the system cursor or let a custom CSS theme control cursor styles."
-          />
-
-          <ColorPicker
-            value={displayedAppBackgroundColor}
-            onChange={handleAppBackgroundColorChange}
-            gradient
-            compact
-            label="Background Color"
-            helpText="Colors the main app shell background. Leave it on the scheme default to follow Dark and Light mode automatically. Gradients are supported for the shell paint."
-            emptyText={`Default ${defaultAppBackgroundColor}`}
-            emptyPreviewValue={defaultAppBackgroundColor}
-            clearLabel="Reset to default"
-          />
-
-          <ColorPicker
-            value={displayedAppAccentColor}
-            onChange={handleAppAccentColorChange}
-            gradient
-            compact
-            label="Accent Color"
-            helpText="Colors the shared app accent layer: buttons, active icons, focus rings, highlights, panel outlines, and chat chrome. Accent Pulse animates this selected color."
-            emptyText={`Default ${defaultAppAccentColor}`}
-            emptyPreviewValue={defaultAppAccentColor}
-            clearLabel="Reset to default"
+            help={localizeUi("settings.controls.customPointer.help")}
           />
 
           <ToggleSetting
-            label="Accent Pulse"
+            anchorId={getSettingsControlAnchorId("reduce-ambient-effects")}
+            label={localizeUi("settings.controls.reduceAmbientEffects.label")}
+            checked={reduceAmbientEffects}
+            onChange={setReduceAmbientEffects}
+            help={localizeUi("settings.controls.reduceAmbientEffects.help")}
+          />
+
+          <SearchableSettingTarget controlId="app-background-color">
+            <ColorPicker
+              value={displayedAppBackgroundColor}
+              onChange={handleAppBackgroundColorChange}
+              gradient
+              compact
+              label={localizeUi("settings.controls.backgroundColor.label")}
+              helpText="Colors the main app shell background. Leave it on the scheme default to follow Dark and Light mode automatically. Gradients are supported for the shell paint."
+              emptyText={localizeUi("ui.panels.trackerpanelappearancedrawer.defaultValue1", {
+                value1: defaultAppBackgroundColor,
+              })}
+              emptyPreviewValue={defaultAppBackgroundColor}
+              clearLabel="Reset to default"
+            />
+          </SearchableSettingTarget>
+
+          <SearchableSettingTarget controlId="app-accent-color">
+            <ColorPicker
+              value={displayedAppAccentColor}
+              onChange={handleAppAccentColorChange}
+              gradient
+              compact
+              label={localizeUi("settings.controls.accentColor.label")}
+              helpText="Colors the shared app accent layer: buttons, active icons, focus rings, highlights, panel outlines, and chat chrome. Accent Pulse animates this selected color."
+              emptyText={localizeUi("ui.panels.trackerpanelappearancedrawer.defaultValue1", {
+                value1: defaultAppAccentColor,
+              })}
+              emptyPreviewValue={defaultAppAccentColor}
+              clearLabel="Reset to default"
+            />
+          </SearchableSettingTarget>
+
+          <ToggleSetting
+            anchorId={getSettingsControlAnchorId("accent-pulse")}
+            label={localizeUi("settings.controls.accentPulse.label")}
             checked={appAccentPulseMode}
             onChange={handleAppAccentPulseModeChange}
-            help="Animates the selected Accent Color. Solid colors gently brighten and darken; gradients cycle through their selected colors. Custom CSS themes can also request it with --marinara-theme-accent-pulse: enabled. Reduced-motion preferences are respected."
+            help={localizeUi("settings.controls.accentPulse.help")}
           />
 
           <ToggleSetting
+            anchorId={getSettingsControlAnchorId("rgb-mode")}
             label={
               <span className={cn(appAccentRgbMode && "mari-logo-gradient-text mari-logo-gradient-text--active")}>
-                RGB Mode
+                {localizeUi("ui.panels.appearancesettings.rgbMode")}
               </span>
             }
             checked={appAccentRgbMode}
             onChange={handleAppAccentRgbModeChange}
             switchClassName={appAccentRgbMode ? "mari-rgb-toggle-track" : undefined}
-            help="Cycles the app accent through Marinara's rainbow palette while enabled. Your saved Accent Color stays unchanged. Reduced-motion preferences are respected."
+            help={localizeUi("settings.controls.rainbowAccent.help")}
           />
+        </div>
+      </SettingsSection>
 
-          <label className="flex flex-col gap-1">
+      <SettingsSection
+        title={localizeUi("settings.sections.textScale.title")}
+        description={localizeUi("settings.sections.textScale.description")}
+        icon={<FileText size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("text-scale")}
+      >
+        <div className="flex flex-col gap-3">
+          <label id={getSettingsControlAnchorId("font-family")} className="flex scroll-mt-3 flex-col gap-1">
             <span className="text-xs font-medium inline-flex items-center gap-1">
-              Font{" "}
-              <HelpTooltip text="Choose the font used across the app. 'Default (Inter)' is optimized for screen readability. Drop .ttf, .otf, .woff, or .woff2 font files into the data/fonts/ folder to add custom fonts." />
+              {localizeUi("ui.panels.appearancesettings.font")}{" "}
+              <HelpTooltip
+                text={localizeUi("ui.panels.appearancesettings.chooseTheFontUsedAcrossTheAppDefaultInter")}
+              />
             </span>
             <select
               value={fontFamily}
               onChange={(e) => setFontFamily(e.target.value)}
               className="rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]"
             >
-              <option value="">Default (Inter)</option>
+              <option value="">{localizeUi("ui.panels.appearancesettings.defaultInter")}</option>
               {customFontOptions.map((f) => (
                 <option key={f.family} value={f.family}>
                   {f.family}
@@ -2262,24 +4825,23 @@ function AppearanceSettings() {
             </select>
             {(!customFonts || customFonts.length === 0) && (
               <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-                Drop font files (.ttf, .otf, .woff, .woff2) into the <span className="font-medium">data/fonts/</span>{" "}
-                folder to add custom fonts.
+                {localizeUi("ui.panels.appearancesettings.dropFontFilesTtfOtfWoffWoff2IntoThe")}{" "}
+                <span className="font-medium">{localizeUi("ui.panels.appearancesettings.dataFonts")}</span>{" "}
+                {localizeUi("ui.panels.appearancesettings.folderToAddCustomFonts")}
               </p>
             )}
-            <button
-              onClick={() => api.post("/fonts/open-folder").catch(() => {})}
-              className={cn(SETTINGS_BUTTON_CLASS, "mt-1 self-start")}
-            >
+            <button onClick={handleOpenFontsFolder} className={cn(SETTINGS_BUTTON_CLASS, "mt-1 self-start")}>
               <FolderOpen size="0.75rem" />
-              Open Fonts Folder
+              {localizeUi("ui.panels.appearancesettings.openFontsFolder")}
             </button>
           </label>
 
-          {/* ── Google Fonts ── */}
           <div className="flex flex-col gap-1.5">
             <span className="text-xs font-medium inline-flex items-center gap-1">
-              Google Fonts{" "}
-              <HelpTooltip text="Download a font directly from Google Fonts by name. Browse available fonts at fonts.google.com and type the exact name here." />
+              {localizeUi("ui.panels.appearancesettings.googleFonts")}{" "}
+              <HelpTooltip
+                text={localizeUi("ui.panels.appearancesettings.downloadAFontDirectlyFromGoogleFontsByName")}
+              />
             </span>
             <div className="flex gap-1.5">
               <input
@@ -2291,7 +4853,7 @@ function AppearanceSettings() {
                     googleFontMutation.mutate(googleFontName.trim());
                   }
                 }}
-                placeholder="e.g. Fira Code, Lora, Poppins…"
+                placeholder={localizeUi("settings.placeholders.fontFamily")}
                 className="flex-1 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-xs outline-none ring-1 ring-transparent transition-shadow placeholder:text-[var(--muted-foreground)]/50 focus:ring-[var(--primary)]"
               />
               <button
@@ -2304,7 +4866,9 @@ function AppearanceSettings() {
                 ) : (
                   <Download size="0.75rem" />
                 )}
-                {googleFontMutation.isPending ? "Downloading…" : "Add"}
+                {googleFontMutation.isPending
+                  ? localizeUi("ui.panels.appearancesettings.downloading")
+                  : localizeUi("ui.panels.appearancesettings.add")}
               </button>
             </div>
             <a
@@ -2313,33 +4877,33 @@ function AppearanceSettings() {
               rel="noopener noreferrer"
               className="text-[0.625rem] text-[var(--muted-foreground)] hover:text-[var(--primary)] transition-colors inline-flex items-center gap-1"
             >
-              Browse fonts at fonts.google.com →
+              {localizeUi("ui.panels.appearancesettings.browseFontsAtFontsGoogleCom")}
             </a>
           </div>
 
-          <label className="flex flex-col gap-1">
+          <label id={getSettingsControlAnchorId("display-size")} className="flex scroll-mt-3 flex-col gap-1">
             <span className="text-xs font-medium inline-flex items-center gap-1">
-              Display Size{" "}
-              <HelpTooltip text="Adjusts the base font size across the whole app on this device. Larger sizes improve readability. Default is 17px." />
+              {localizeUi("ui.panels.appearancesettings.displaySize")}{" "}
+              <HelpTooltip text={localizeUi("ui.panels.appearancesettings.adjustsTheBaseFontSizeAcrossTheWholeApp")} />
             </span>
             <select
               value={String(fontSize)}
               onChange={(e) => setFontSize(Number(e.target.value) as 12 | 14 | 16 | 17 | 19 | 22)}
               className="rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]"
             >
-              <option value="12">Tiny</option>
-              <option value="14">Small</option>
-              <option value="16">Medium</option>
-              <option value="17">Default</option>
-              <option value="19">Large</option>
-              <option value="22">Huge</option>
+              <option value="12">{localizeUi("ui.panels.appearancesettings.tiny")}</option>
+              <option value="14">{localizeUi("ui.panels.appearancesettings.small")}</option>
+              <option value="16">{localizeUi("ui.panels.appearancesettings.medium")}</option>
+              <option value="17">{localizeUi("ui.noodle.noodlehome.default")}</option>
+              <option value="19">{localizeUi("ui.panels.appearancesettings.large")}</option>
+              <option value="22">{localizeUi("ui.panels.appearancesettings.huge")}</option>
             </select>
           </label>
 
-          <label className="flex flex-col gap-1">
+          <label id={getSettingsControlAnchorId("chat-font-size")} className="flex scroll-mt-3 flex-col gap-1">
             <span className="text-xs font-medium inline-flex items-center gap-1">
-              Chat Font Size{" "}
-              <HelpTooltip text="Adjusts the font size of chat messages on this device. Drag the slider to find your preferred reading size. Default is 16px." />
+              {localizeUi("ui.panels.appearancesettings.chatFontSize")}{" "}
+              <HelpTooltip text={localizeUi("ui.panels.appearancesettings.adjustsTheFontSizeOfChatMessagesOnThis")} />
             </span>
             <div className="flex items-center gap-3">
               <input
@@ -2352,23 +4916,122 @@ function AppearanceSettings() {
                 className="flex-1 accent-[var(--primary)]"
               />
               <span className="text-xs tabular-nums text-[var(--muted-foreground)] w-8 text-right">
-                {chatFontSize}px
+                {chatFontSize}
+                {localizeUi("ui.panels.appearancesettings.px")}
               </span>
             </div>
           </label>
+
+          <SearchableSettingTarget controlId="chat-text-color">
+            <ColorPicker
+              value={chatFontColor}
+              onChange={setChatFontColor}
+              gradient
+              compact
+              label={localizeUi("settings.colors.chatText")}
+              helpText="Controls the main chat message text color. Leave it on the scheme default to keep dark and light mode readable. Gradients are accepted for layouts that support them."
+              emptyText={localizeUi("ui.panels.appearancesettings.schemeDefaultValue1", {
+                value1: getDefaultChatTextColor(theme),
+              })}
+              emptyPreviewValue={getDefaultChatTextColor(theme)}
+              clearLabel="Reset to default"
+            />
+          </SearchableSettingTarget>
+
+          <SearchableSettingTarget controlId="default-dialogue-color">
+            <ColorPicker
+              value={defaultDialogueColor}
+              onChange={setDefaultDialogueColor}
+              compact
+              label={localizeUi("settings.colors.defaultDialogue")}
+              helpText="Colors dialogue for character and persona cards that do not have their own Dialogue Highlight Color. A card's own dialogue color always overrides it."
+              emptyText={localizeUi("ui.panels.appearancesettings.schemeDefaultValue1", {
+                value1: getDefaultChatTextColor(theme),
+              })}
+              emptyPreviewValue={getDefaultChatTextColor(theme)}
+              clearLabel="Reset to scheme default"
+            />
+          </SearchableSettingTarget>
+
+          <SearchableSettingTarget controlId="chat-chrome-text-color">
+            <ColorPicker
+              value={chatChromeTextColor}
+              onChange={setChatChromeTextColor}
+              gradient
+              compact
+              label={localizeUi("settings.colors.chatChrome")}
+              helpText="Controls ordinary chrome copy in tracker widgets, folder labels, settings descriptors, and windows opened from chat buttons. Accent-colored button text and active icons follow Accent Color instead. Gradients use a compatible fallback where plain CSS color is required."
+              emptyText={localizeUi("ui.panels.appearancesettings.schemeDefaultValue1", {
+                value1: getDefaultChatChromeTextColor(theme),
+              })}
+              emptyPreviewValue={getDefaultChatChromeTextColor(theme)}
+              clearLabel="Reset to default"
+            />
+          </SearchableSettingTarget>
+
+          <div id={getSettingsControlAnchorId("text-outline-width")} className="flex scroll-mt-3 flex-col gap-1.5">
+            <span className="text-[0.6875rem] font-medium inline-flex items-center gap-1">
+              {localizeUi("ui.panels.appearancesettings.textOutlineStroke")}
+              <HelpTooltip
+                text={localizeUi("ui.panels.appearancesettings.addsAnOutlineAroundChatTextForBetterReadability")}
+              />
+            </span>
+            <ColorPicker
+              value={textStrokeColor || "#000000"}
+              onChange={(value) => setTextStrokeColor(value || "#000000")}
+              compact
+              label={localizeUi("settings.colors.textOutline")}
+              helpText="Controls the outline color used when text stroke width is above 0."
+              clearLabel="Reset to default"
+              clearValue="#000000"
+            />
+            <label className="flex flex-col gap-1">
+              <span className="text-[0.625rem] text-[var(--muted-foreground)]">
+                {localizeUi("ui.panels.appearancesettings.width")}
+              </span>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min={0}
+                  max={5}
+                  step={0.5}
+                  value={textStrokeWidth}
+                  onChange={(e) => setTextStrokeWidth(Number(e.target.value))}
+                  className="flex-1 accent-[var(--primary)]"
+                />
+                <span className="w-10 text-right text-xs tabular-nums text-[var(--muted-foreground)]">
+                  {textStrokeWidth}
+                  {localizeUi("ui.panels.appearancesettings.px")}
+                </span>
+              </div>
+            </label>
+            <button
+              onClick={() => {
+                setTextStrokeWidth(0.5);
+                setTextStrokeColor("#000000");
+              }}
+              className="text-[0.625rem] text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors self-start"
+            >
+              {localizeUi("ui.panels.appearancesettings.resetToDefault")}
+            </button>
+          </div>
         </div>
       </SettingsSection>
 
       <SettingsSection
-        title="Chat Display"
-        description="Conversation layout, message text styling, and chat gradients."
+        title={localizeUi("settings.sections.conversationDisplay.title")}
+        description={localizeUi("settings.sections.conversationDisplay.componentDescription")}
         icon={<MessageCircle size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("chat-display")}
       >
         <div className="flex flex-col gap-3">
-          <div className="flex flex-col gap-2 rounded-lg border border-[var(--border)]/70 bg-[var(--secondary)]/25 p-3">
+          <div
+            id={getSettingsControlAnchorId("conversation-layout")}
+            className="flex scroll-mt-3 flex-col gap-2 rounded-lg border border-[var(--border)]/70 bg-[var(--secondary)]/25 p-3"
+          >
             <div className="flex items-center gap-1.5">
               <MessageCircle size="0.75rem" className="text-[var(--muted-foreground)]" />
-              <span className="text-xs font-medium">Chat Layout</span>
+              <span className="text-xs font-medium">{localizeUi("ui.panels.appearancesettings.chatLayout")}</span>
             </div>
             <div className="grid grid-cols-2 gap-2">
               {(
@@ -2399,179 +5062,170 @@ function AppearanceSettings() {
                 <div className="space-y-1.5">
                   <div className="flex justify-end">
                     <div className="mari-message-bubble texting-bubble texting-bubble-user max-w-[78%] rounded-2xl px-3 py-1.5 text-xs shadow-sm">
-                      Hey, how's it going?
+                      {localizeUi("ui.panels.appearancesettings.heyHowSItGoing")}
                     </div>
                   </div>
                   <div className="flex items-end gap-1.5 justify-start">
-                    <div className="h-5 w-5 shrink-0 rounded-full bg-[var(--accent)]" />
+                    <div
+                      className={cn(
+                        "h-5 w-5 shrink-0 bg-[var(--accent)]",
+                        conversationAvatarShape === "square" ? "rounded-[0.2rem]" : "rounded-full",
+                      )}
+                    />
                     <div className="mari-message-bubble texting-bubble texting-bubble-other max-w-[78%] rounded-2xl px-3 py-1.5 text-xs shadow-sm">
-                      Pretty good, thanks!
+                      {localizeUi("ui.panels.appearancesettings.prettyGoodThanks")}
                     </div>
                   </div>
                 </div>
               ) : (
                 <div className="flex gap-2 text-xs">
-                  <div className="h-6 w-6 shrink-0 rounded-full bg-[var(--accent)]" />
+                  <div
+                    className={cn(
+                      "h-6 w-6 shrink-0 bg-[var(--accent)]",
+                      conversationAvatarShape === "square" ? "rounded-[0.2rem]" : "rounded-full",
+                    )}
+                  />
                   <div className="min-w-0 flex-1">
                     <div className="mb-0.5 flex items-baseline gap-2">
-                      <span className="font-semibold">Character</span>
+                      <span className="font-semibold">{localizeUi("ui.panels.appearancesettings.character")}</span>
                       <span className="text-[0.625rem] text-[var(--muted-foreground)]">12:45</span>
                     </div>
                     <div className="space-y-0.5 text-[var(--foreground)]/90">
-                      <div>Messages appear as rows,</div>
-                      <div>grouped by sender.</div>
+                      <div>{localizeUi("ui.panels.appearancesettings.messagesAppearAsRows")}</div>
+                      <div>{localizeUi("ui.panels.appearancesettings.groupedBySender")}</div>
                     </div>
                   </div>
                 </div>
               )}
             </div>
           </div>
-
-          {/* ── Text Appearance ── */}
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center gap-1.5">
-              <Paintbrush size="0.75rem" className="text-[var(--muted-foreground)]" />
-              <span className="text-xs font-medium">Text Appearance</span>
-              <HelpTooltip text="Customize the look of chat message text. Chat Text Color sets the default font color for all non-dialogue text. Background Opacity controls the transparency of roleplay message bubbles." />
-            </div>
-
-            {/* Chat Text Color */}
-            <ColorPicker
-              value={chatFontColor}
-              onChange={setChatFontColor}
-              gradient
-              compact
-              label="Chat Text Color"
-              helpText="Controls the main chat message text color. Leave it on the scheme default to keep dark and light mode readable. Gradients are accepted for layouts that support them."
-              emptyText={`Scheme default ${getDefaultChatTextColor(theme)}`}
-              emptyPreviewValue={getDefaultChatTextColor(theme)}
-              clearLabel="Reset to default"
-            />
-
-            {/* Chat Chrome Text Color */}
-            <ColorPicker
-              value={chatChromeTextColor}
-              onChange={setChatChromeTextColor}
-              gradient
-              compact
-              label="Chat Chrome Text Color"
-              helpText="Controls ordinary chrome copy in tracker widgets, folder labels, settings descriptors, and windows opened from chat buttons. Accent-colored button text and active icons follow Accent Color instead. Gradients use a compatible fallback where plain CSS color is required."
-              emptyText={`Scheme default ${getDefaultChatChromeTextColor(theme)}`}
-              emptyPreviewValue={getDefaultChatChromeTextColor(theme)}
-              clearLabel="Reset to default"
-            />
-
-            {/* Roleplay Messages Background Opacity */}
-            <label className="flex flex-col gap-1">
-              <span className="text-[0.6875rem] font-medium">Roleplay Messages Background Opacity</span>
-              <div className="flex items-center gap-3">
-                <input
-                  type="range"
-                  min={0}
-                  max={100}
-                  step={5}
-                  value={chatFontOpacity}
-                  onChange={(e) => setChatFontOpacity(Number(e.target.value))}
-                  className="flex-1 accent-[var(--primary)]"
-                />
-                <span className="text-xs tabular-nums text-[var(--muted-foreground)] w-8 text-right">
-                  {chatFontOpacity}%
-                </span>
+          <div
+            id={getSettingsControlAnchorId("conversation-avatar-shape")}
+            className="flex scroll-mt-3 flex-col gap-2 rounded-lg border border-[var(--border)]/70 bg-[var(--secondary)]/25 p-3"
+          >
+            <div>
+              <div className="text-xs font-medium">
+                {localizeUi("ui.panels.appearancesettings.conversationAvatarShape")}
               </div>
-              <button
-                type="button"
-                onClick={() => setChatFontOpacity(90)}
-                disabled={chatFontOpacity === 90}
-                className="self-start text-[0.625rem] text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] disabled:pointer-events-none disabled:opacity-45"
-              >
-                Reset opacity to default
-              </button>
-            </label>
-
-            {/* Text Stroke */}
-            <div className="flex flex-col gap-1.5">
-              <span className="text-[0.6875rem] font-medium inline-flex items-center gap-1">
-                Text Outline / Stroke
-                <HelpTooltip text="Adds an outline around chat text for better readability over backgrounds. Set width to 0 to disable." />
-              </span>
-              <ColorPicker
-                value={textStrokeColor || "#000000"}
-                onChange={(value) => setTextStrokeColor(value || "#000000")}
-                compact
-                label="Text Outline Color"
-                helpText="Controls the outline color used when text stroke width is above 0."
-                clearLabel="Reset to default"
-                clearValue="#000000"
-              />
-              <label className="flex flex-col gap-1">
-                <span className="text-[0.625rem] text-[var(--muted-foreground)]">Width</span>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="range"
-                    min={0}
-                    max={5}
-                    step={0.5}
-                    value={textStrokeWidth}
-                    onChange={(e) => setTextStrokeWidth(Number(e.target.value))}
-                    className="flex-1 accent-[var(--primary)]"
+              <p className="mt-0.5 text-[0.625rem] text-[var(--muted-foreground)]">
+                {localizeUi("ui.panels.appearancesettings.conversationAvatarShapeDescription")}
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {(
+                [
+                  {
+                    id: "circle" as ConversationAvatarShape,
+                    label: localizeUi("ui.panels.appearancesettings.circularAvatars"),
+                    cornerClass: "rounded-full",
+                  },
+                  {
+                    id: "square" as ConversationAvatarShape,
+                    label: localizeUi("ui.panels.appearancesettings.squareAvatars"),
+                    cornerClass: "rounded-[0.2rem]",
+                  },
+                ] as const
+              ).map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => setConversationAvatarShape(option.id)}
+                  className={cn(
+                    "flex min-h-10 items-center justify-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition-all",
+                    conversationAvatarShape === option.id
+                      ? "border-[var(--primary)] bg-[var(--primary)]/10 ring-1 ring-[var(--primary)]"
+                      : "border-[var(--border)] bg-[var(--background)]/35 hover:border-[var(--primary)]/40",
+                  )}
+                  aria-pressed={conversationAvatarShape === option.id}
+                >
+                  <span
+                    className={cn("h-5 w-5 border border-current bg-[var(--accent)]", option.cornerClass)}
+                    data-avatar-shape-preview={option.id}
                   />
-                  <span className="w-10 text-right text-xs tabular-nums text-[var(--muted-foreground)]">
-                    {textStrokeWidth}px
-                  </span>
-                </div>
-              </label>
-              <button
-                onClick={() => {
-                  setTextStrokeWidth(0.5);
-                  setTextStrokeColor("#000000");
-                }}
-                className="text-[0.625rem] text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors self-start"
-              >
-                Reset to default
-              </button>
+                  {option.label}
+                </button>
+              ))}
             </div>
           </div>
         </div>
       </SettingsSection>
 
-      <TrackerPanelAppearanceDrawer
-        trackerPanelEnabled={trackerPanelEnabled}
-        setTrackerPanelEnabled={setTrackerPanelEnabled}
-        trackerPanelHideHudWidgets={trackerPanelHideHudWidgets}
-        setTrackerPanelHideHudWidgets={setTrackerPanelHideHudWidgets}
-        trackerPanelUseExpressionSprites={trackerPanelUseExpressionSprites}
-        setTrackerPanelUseExpressionSprites={setTrackerPanelUseExpressionSprites}
-        trackerPanelThoughtBubbleDisplay={trackerPanelThoughtBubbleDisplay}
-        setTrackerPanelThoughtBubbleDisplay={setTrackerPanelThoughtBubbleDisplay}
-        trackerPanelDockedThoughtsAlwaysVisible={trackerPanelDockedThoughtsAlwaysVisible}
-        setTrackerPanelDockedThoughtsAlwaysVisible={setTrackerPanelDockedThoughtsAlwaysVisible}
-        trackerPanelSizeProfile={trackerPanelSizeProfile}
-        setTrackerPanelSizeProfile={setTrackerPanelSizeProfile}
-        trackerPanelBackgroundColor={trackerPanelBackgroundColor}
-        setTrackerPanelBackgroundColor={setTrackerPanelBackgroundColor}
-        trackerTemperatureUnit={trackerTemperatureUnit}
-        setTrackerTemperatureUnit={setTrackerTemperatureUnit}
-      />
+      <div id={getSettingsSectionAnchorId("roleplay-tracker")} className="flex scroll-mt-3 flex-col gap-3">
+        <TrackerPanelAppearanceDrawer />
+      </div>
 
       <SettingsSection
-        title="Character Art"
-        description="Roleplay avatars, Game mode art scale, and VN dialogue presentation."
+        title={localizeUi("settings.sections.roleplayMessages.title")}
+        description={localizeUi("settings.sections.roleplayMessages.description")}
         icon={<Image size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("roleplay-messages")}
       >
         <div className="flex flex-col gap-3">
+          <label
+            id={getSettingsControlAnchorId("roleplay-message-opacity")}
+            className="flex scroll-mt-3 flex-col gap-1"
+          >
+            <span className="text-[0.6875rem] font-medium">
+              {localizeUi("ui.panels.appearancesettings.roleplayMessagesBackgroundOpacity")}
+            </span>
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={chatFontOpacity}
+                onChange={(e) => setChatFontOpacity(Number(e.target.value))}
+                className="flex-1 accent-[var(--primary)]"
+              />
+              <span className="text-xs tabular-nums text-[var(--muted-foreground)] w-8 text-right">
+                {chatFontOpacity}%
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setChatFontOpacity(90)}
+              disabled={chatFontOpacity === 90}
+              className="self-start text-[0.625rem] text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] disabled:pointer-events-none disabled:opacity-45"
+            >
+              {localizeUi("ui.panels.appearancesettings.resetOpacityToDefault")}
+            </button>
+          </label>
+
+          <ToggleSetting
+            anchorId={getSettingsControlAnchorId("roleplay-reduced-paint-effects")}
+            label={localizeUi("settings.controls.reducedPaintEffects.label")}
+            checked={roleplayReducedPaintEffects}
+            onChange={setRoleplayReducedPaintEffects}
+            help={localizeUi("settings.controls.reducedPaintEffects.help")}
+          />
+
           <div className="flex flex-col gap-2">
             <div className="flex items-center gap-1.5">
               <Image size="0.75rem" className="text-[var(--muted-foreground)]" />
-              <span className="text-xs font-medium">Roleplay Avatars</span>
-              <HelpTooltip text="Choose how avatars sit next to roleplay messages. None hides message avatars. Small Circles keeps the current compact layout. Small Rectangles gives portraits a taller frame. Glued Side Panel embeds a larger portrait strip into the message bubble itself." />
+              <span className="text-xs font-medium">{localizeUi("ui.panels.appearancesettings.roleplayAvatars")}</span>
+              <HelpTooltip
+                text={localizeUi("ui.panels.appearancesettings.chooseHowAvatarsSitNextToRoleplayMessagesNone")}
+              />
             </div>
             <ToggleSetting
-              label="Scrollable Avatars"
+              anchorId={getSettingsControlAnchorId("scrollable-avatars")}
+              label={localizeUi("settings.controls.scrollableAvatars.label")}
               checked={roleplayAvatarsScrollable}
               onChange={setRoleplayAvatarsScrollable}
-              help="When enabled, roleplay avatars stay visible while you scroll through long messages and stop at the bottom of their own message."
+              help={localizeUi("settings.controls.scrollableAvatars.help")}
             />
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <ToggleSetting
+              anchorId={getSettingsControlAnchorId("narrator-cycling-avatars")}
+              label={localizeUi("settings.controls.narratorCyclingAvatars.label")}
+              checked={roleplayNarratorAvatarCycling}
+              onChange={setRoleplayNarratorAvatarCycling}
+              help={localizeUi("settings.controls.narratorCyclingAvatars.help")}
+            />
+            <div
+              id={getSettingsControlAnchorId("roleplay-avatar-style")}
+              className="grid scroll-mt-3 grid-cols-1 gap-2 sm:grid-cols-2"
+            >
               {ROLEPLAY_AVATAR_STYLE_OPTIONS.map((opt) => (
                 <button
                   key={opt.id}
@@ -2630,7 +5284,7 @@ function AppearanceSettings() {
               ))}
             </div>
             <div className="rounded-lg border border-[var(--border)] bg-[var(--secondary)]/45 p-3">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
                 <div className="flex h-20 w-full shrink-0 items-end justify-center gap-3 overflow-hidden rounded-md bg-black/30 p-2 ring-1 ring-[var(--border)]/70 sm:w-28">
                   {roleplayAvatarStyle === "none" ? (
                     <div
@@ -2640,7 +5294,7 @@ function AppearanceSettings() {
                         height: toPreviewRem(roleplayAvatarPreview.height),
                       }}
                     >
-                      No avatars
+                      {localizeUi("ui.panels.appearancesettings.noAvatars")}
                     </div>
                   ) : (
                     <div
@@ -2666,9 +5320,14 @@ function AppearanceSettings() {
                     }}
                   />
                 </div>
-                <div className="grid min-w-0 flex-1 gap-3">
-                  <label className="flex min-w-0 flex-col gap-1">
-                    <span className="text-[0.6875rem] font-medium text-[var(--foreground)]">Message avatar scale</span>
+                <div className="grid min-w-0 flex-1 gap-3 sm:min-w-[9rem]">
+                  <label
+                    id={getSettingsControlAnchorId("roleplay-avatar-scale")}
+                    className="flex scroll-mt-3 min-w-0 flex-col gap-1"
+                  >
+                    <span className="text-[0.6875rem] font-medium text-[var(--foreground)]">
+                      {localizeUi("ui.panels.appearancesettings.messageAvatarScale")}
+                    </span>
                     <div className="flex items-center gap-2">
                       <input
                         type="range"
@@ -2684,8 +5343,13 @@ function AppearanceSettings() {
                       </span>
                     </div>
                   </label>
-                  <label className="flex min-w-0 flex-col gap-1">
-                    <span className="text-[0.6875rem] font-medium text-[var(--foreground)]">Default sprite scale</span>
+                  <label
+                    id={getSettingsControlAnchorId("roleplay-sprite-scale")}
+                    className="flex scroll-mt-3 min-w-0 flex-col gap-1"
+                  >
+                    <span className="text-[0.6875rem] font-medium text-[var(--foreground)]">
+                      {localizeUi("ui.panels.appearancesettings.defaultSpriteScale")}
+                    </span>
                     <div className="flex items-center gap-2">
                       <input
                         type="range"
@@ -2705,20 +5369,29 @@ function AppearanceSettings() {
               </div>
             </div>
             <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-              Rectangles keep the compact side slot but give portraits a bit more vertical room. The larger panel crops
-              portraits from the top on short messages and fades them back into the bubble background on taller ones.
-              Per-chat sprite sizing still overrides the default sprite scale here.
+              {localizeUi("ui.panels.appearancesettings.rectanglesKeepTheCompactSideSlotButGivePortraits")}
             </p>
           </div>
+        </div>
+      </SettingsSection>
 
+      <SettingsSection
+        title={localizeUi("settings.sections.gamePresentation.title")}
+        description={localizeUi("settings.sections.gamePresentation.description")}
+        icon={<ScrollText size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("game-presentation")}
+      >
+        <div className="flex flex-col gap-3">
           <div className="flex flex-col gap-2">
             <div className="flex items-center gap-1.5">
               <Image size="0.75rem" className="text-[var(--muted-foreground)]" />
-              <span className="text-xs font-medium">Game VN Art</span>
-              <HelpTooltip text="Scales Game mode dialogue portraits separately from the center full-body sprites. Oversized art is still clamped per viewport." />
+              <span className="text-xs font-medium">{localizeUi("ui.panels.appearancesettings.gameVnArt")}</span>
+              <HelpTooltip
+                text={localizeUi("ui.panels.appearancesettings.scalesGameModeDialoguePortraitsSeparatelyFromTheCenter")}
+              />
             </div>
             <div className="rounded-lg border border-[var(--border)] bg-[var(--secondary)]/45 p-3">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
                 <div className="flex h-20 w-full shrink-0 items-end justify-center gap-3 overflow-hidden rounded-md bg-black/30 p-2 ring-1 ring-[var(--border)]/70 sm:w-28">
                   <div
                     className="shrink-0 rounded-lg border border-white/20 bg-gradient-to-b from-sky-300/80 via-cyan-200/65 to-slate-800/90 shadow-lg transition-all"
@@ -2735,10 +5408,13 @@ function AppearanceSettings() {
                     }}
                   />
                 </div>
-                <div className="grid min-w-0 flex-1 gap-3">
-                  <label className="flex min-w-0 flex-col gap-1">
+                <div className="grid min-w-0 flex-1 gap-3 sm:min-w-[9rem]">
+                  <label
+                    id={getSettingsControlAnchorId("game-dialogue-portrait-scale")}
+                    className="flex scroll-mt-3 min-w-0 flex-col gap-1"
+                  >
                     <span className="text-[0.6875rem] font-medium text-[var(--foreground)]">
-                      Dialogue portrait scale
+                      {localizeUi("ui.panels.appearancesettings.dialoguePortraitScale")}
                     </span>
                     <div className="flex items-center gap-2">
                       <input
@@ -2755,9 +5431,12 @@ function AppearanceSettings() {
                       </span>
                     </div>
                   </label>
-                  <label className="flex min-w-0 flex-col gap-1">
+                  <label
+                    id={getSettingsControlAnchorId("game-full-body-sprite-scale")}
+                    className="flex scroll-mt-3 min-w-0 flex-col gap-1"
+                  >
                     <span className="text-[0.6875rem] font-medium text-[var(--foreground)]">
-                      Full-body sprite scale
+                      {localizeUi("ui.panels.appearancesettings.fullBodySpriteScale")}
                     </span>
                     <div className="flex items-center gap-2">
                       <input
@@ -2782,10 +5461,17 @@ function AppearanceSettings() {
           <div className="flex flex-col gap-2">
             <div className="flex items-center gap-1.5">
               <ScrollText size="0.75rem" className="text-[var(--muted-foreground)]" />
-              <span className="text-xs font-medium">Game Dialogue Display</span>
-              <HelpTooltip text="Choose whether Game mode uses the classic VN box or shows a scrollable segment history directly above it." />
+              <span className="text-xs font-medium">
+                {localizeUi("ui.panels.appearancesettings.gameDialogueDisplay")}
+              </span>
+              <HelpTooltip
+                text={localizeUi("ui.panels.appearancesettings.chooseWhetherGameModeUsesAClassicDialogueBox")}
+              />
             </div>
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <div
+              id={getSettingsControlAnchorId("game-dialogue-display")}
+              className="grid scroll-mt-3 grid-cols-1 gap-2 sm:grid-cols-2"
+            >
               {GAME_DIALOGUE_DISPLAY_OPTIONS.map((opt) => (
                 <button
                   key={opt.id}
@@ -2804,41 +5490,64 @@ function AppearanceSettings() {
               ))}
             </div>
           </div>
+
+          <ToggleSetting
+            anchorId={getSettingsControlAnchorId("game-text-effects")}
+            label={localizeUi("settings.controls.gameTextEffects.label")}
+            checked={gameTextEffectsEnabled}
+            onChange={setGameTextEffectsEnabled}
+            help={localizeUi("settings.controls.gameTextEffects.help")}
+          />
         </div>
       </SettingsSection>
 
       <SettingsSection
-        title="Motion & Backgrounds"
-        description="Atmospheric effects, Conversation gradients, and chat background images."
+        title={localizeUi("settings.sections.atmosphere.title")}
+        description={localizeUi("settings.sections.atmosphere.description")}
         icon={<CloudRain size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("motion-backgrounds")}
       >
-        <div className="flex flex-col gap-3">
-          {/* ── Effects ── */}
+        <div className="flex flex-col gap-2">
           <div className="flex flex-col gap-2">
             <div className="flex items-center gap-1.5">
               <CloudRain size="0.75rem" className="text-[var(--muted-foreground)]" />
-              <span className="text-xs font-medium">Effects</span>
-              <HelpTooltip text="Visual effects that enhance the roleplay atmosphere. Weather particles like rain, snow, and fog appear based on the story context." />
+              <span className="text-xs font-medium">{localizeUi("ui.panels.appearancesettings.effects")}</span>
+              <HelpTooltip
+                text={localizeUi(
+                  "ui.panels.appearancesettings.visualEffectsThatEnhanceTheRoleplayAtmosphereWeatherParticles",
+                )}
+              />
             </div>
             <ToggleSetting
-              label="Dynamic weather effects (rain, snow, fog, etc.)"
+              anchorId={getSettingsControlAnchorId("weather-effects")}
+              label={localizeUi("settings.controls.weatherEffects.label")}
               checked={weatherEffects}
               onChange={setWeatherEffects}
             />
             <p className="text-[0.625rem] text-[var(--muted-foreground)] pl-6">
-              Shows animated weather particles based on in-story weather and time of day. Requires the{" "}
-              <span className="font-medium">World State</span> agent to be enabled so weather data is extracted from the
-              narrative.
+              {localizeUi("ui.panels.appearancesettings.showsAnimatedWeatherParticlesBasedOnInStoryWeather")}{" "}
+              <span className="font-medium">{localizeUi("ui.panels.appearancesettings.worldState")}</span>{" "}
+              {localizeUi("ui.panels.appearancesettings.agentToBeEnabledSoWeatherDataIsExtracted")}
             </p>
           </div>
+        </div>
+      </SettingsSection>
 
-          {/* ── Conversation Gradient (per color-scheme) ── */}
+      <SettingsSection
+        title={localizeUi("settings.sections.conversationTheme.title")}
+        description={localizeUi("settings.sections.conversationTheme.description")}
+        icon={<Palette size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("conversation-theme")}
+      >
+        <div className="flex flex-col gap-3">
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-1.5">
                 <Palette size="0.75rem" className="text-[var(--muted-foreground)]" />
-                <span className="text-xs font-medium">Conversation Theme</span>
-                <HelpTooltip text="Set a background gradient for all Conversation-mode chats, separately for dark and light color schemes." />
+                <span className="text-xs font-medium">{localizeUi("settings.sections.conversationTheme.title")}</span>
+                <HelpTooltip
+                  text={localizeUi("ui.panels.appearancesettings.setABackgroundGradientForAllConversationModeChats")}
+                />
               </div>
               {/* Scheme tabs */}
               <div className="flex rounded-lg bg-[var(--secondary)] p-0.5 text-[0.625rem]">
@@ -2852,7 +5561,7 @@ function AppearanceSettings() {
                       : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]",
                   )}
                 >
-                  Dark
+                  {localizeUi("ui.panels.appearancesettings.dark")}
                 </button>
                 <button
                   type="button"
@@ -2864,7 +5573,7 @@ function AppearanceSettings() {
                       : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]",
                   )}
                 >
-                  Light
+                  {localizeUi("ui.panels.appearancesettings.light")}
                 </button>
               </div>
             </div>
@@ -2939,30 +5648,36 @@ function AppearanceSettings() {
               }}
               className="text-[0.625rem] text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors self-start"
             >
-              Reset {activeGradientScheme === "dark" ? "Dark" : "Light"} to default
+              {localizeUi("ui.panels.imagestyleprofileseditor.reset")}{" "}
+              {activeGradientScheme === "dark"
+                ? localizeUi("ui.panels.appearancesettings.dark")
+                : localizeUi("ui.panels.appearancesettings.light")}{" "}
+              {localizeUi("ui.panels.appearancesettings.toDefault")}
             </button>
           </div>
+        </div>
+      </SettingsSection>
 
-          {/* ── Chat Background Picker ── */}
+      <SettingsSection
+        title={localizeUi("settings.controls.backgroundGeneration.label")}
+        description={localizeUi("settings.sections.backgrounds.componentDescription")}
+        icon={<Image size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("chat-backgrounds")}
+      >
+        <div className="flex flex-col gap-3">
           <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium inline-flex items-center gap-1">
-                Chat Background{" "}
-                <HelpTooltip text="Import one or more custom images, or choose from your game asset backgrounds. Supports JPG, PNG, GIF, WebP, and AVIF. Remove to use the default background." />
-              </span>
-              {chatBackground && (
-                <button
-                  onClick={() => setChatBackground(null)}
-                  className="flex items-center gap-1 rounded-md px-2 py-0.5 text-[0.625rem] text-[var(--destructive)] transition-colors hover:bg-[var(--destructive)]/10"
-                >
-                  <X size="0.625rem" /> Remove
-                </button>
-              )}
-            </div>
+            <span className="text-xs font-medium inline-flex items-center gap-1">
+              {localizeUi("ui.panels.appearancesettings.chatBackground")}{" "}
+              <HelpTooltip text={localizeUi("ui.panels.appearancesettings.importOneOrMoreCustomImagesOrChooseFrom")} />
+            </span>
             <label className="flex flex-col gap-1 rounded-lg bg-[var(--secondary)]/45 p-3 ring-1 ring-[var(--border)]/70">
               <span className="inline-flex items-center gap-1 text-[0.6875rem] font-medium">
-                Background Blur
-                <HelpTooltip text="Softens selected Roleplay and Game mode background images behind the chat UI. Set to 0px to keep backgrounds sharp." />
+                {localizeUi("ui.panels.appearancesettings.backgroundBlur")}
+                <HelpTooltip
+                  text={localizeUi(
+                    "ui.panels.appearancesettings.softensSelectedRoleplayAndGameModeBackgroundImagesBehind",
+                  )}
+                />
               </span>
               <div className="flex items-center gap-3">
                 <input
@@ -2975,9 +5690,31 @@ function AppearanceSettings() {
                   className="min-w-0 flex-1 accent-[var(--primary)]"
                 />
                 <span className="w-12 text-right text-xs tabular-nums text-[var(--muted-foreground)]">
-                  {chatBackgroundBlur === 0 ? "Off" : `${chatBackgroundBlur}px`}
+                  {chatBackgroundBlur === 0
+                    ? localizeUi("ui.panels.appearancesettings.off")
+                    : localizeUi("ui.panels.appearancesettings.value1Px", { value1: chatBackgroundBlur })}
                 </span>
               </div>
+            </label>
+            <label className="flex items-center gap-2">
+              <span className="inline-flex shrink-0 items-center gap-1 text-[0.6875rem] font-medium">
+                {localizeUi("ui.panels.appearancesettings.chatListBackgrounds")}
+                <HelpTooltip
+                  text={localizeUi("ui.panels.appearancesettings.showsEachChatsOwnBackgroundAsAMutedBanner")}
+                />
+              </span>
+              <select
+                id={getSettingsControlAnchorId("chat-list-backgrounds")}
+                value={chatListBackgrounds}
+                onChange={(e) => setChatListBackgrounds(e.target.value as ChatListBackgroundMode)}
+                className="h-7 min-w-0 flex-1 scroll-mt-3 rounded-md border border-[var(--border)] bg-[var(--secondary)] px-2 text-xs"
+              >
+                {CHAT_LIST_BACKGROUND_OPTIONS.map((opt) => (
+                  <option key={opt.id} value={opt.id}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
             </label>
             <BackgroundPicker
               selected={chatBackground}
@@ -2992,456 +5729,95 @@ function AppearanceSettings() {
   );
 }
 
-type BackgroundLibraryItem = {
-  id?: string;
-  filename: string;
-  url: string;
-  originalName: string | null;
-  tags: string[];
-  source?: "user" | "game_asset";
-  tag?: string;
-  editable?: boolean;
-  deletable?: boolean;
-  renameable?: boolean;
-};
-
-type BackgroundUploadResponse = {
-  success: boolean;
-  filename: string;
-  url: string;
-  originalName: string;
-  tags: string[];
-};
-
-function BackgroundPicker({
-  selected,
-  onSelect,
-  defaultRoleplayBackground,
-  onDefaultChange,
-}: {
-  selected: string | null;
-  onSelect: (url: string | null) => void;
-  defaultRoleplayBackground: string;
-  onDefaultChange: (url: string) => void;
-}) {
-  const [uploading, setUploading] = useState(false);
-  const [editingTags, setEditingTags] = useState<string | null>(null);
-  const [tagInput, setTagInput] = useState("");
-  const [renamingFile, setRenamingFile] = useState<string | null>(null);
-  const [renameInput, setRenameInput] = useState("");
-  const [searchQuery, setSearchQuery] = useState("");
-  const refreshGameAssetManifest = useGameAssetStore((s) => s.fetchManifest);
-  const qc = useQueryClient();
-
-  const { data: backgrounds } = useQuery({
-    queryKey: ["backgrounds"],
-    queryFn: () => api.get<BackgroundLibraryItem[]>("/backgrounds"),
-  });
-
-  const { data: allTags } = useQuery({
-    queryKey: ["background-tags"],
-    queryFn: () => api.get<string[]>("/backgrounds/tags"),
-  });
-
-  const deleteBg = useMutation({
-    mutationFn: (filename: string) => api.delete(`/backgrounds/${filename}`),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["backgrounds"] });
-      qc.invalidateQueries({ queryKey: ["background-tags"] });
-    },
-  });
-
-  const updateTags = useMutation({
-    mutationFn: ({ filename, tags }: { filename: string; tags: string[] }) =>
-      api.patch(`/backgrounds/${filename}/tags`, { tags }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["backgrounds"] });
-      qc.invalidateQueries({ queryKey: ["background-tags"] });
-    },
-  });
-
-  const renameBg = useMutation({
-    mutationFn: ({ filename, name }: { filename: string; name: string }) =>
-      api.patch<{ success: boolean; oldFilename: string; filename: string; url: string }>(
-        `/backgrounds/${filename}/rename`,
-        { name },
-      ),
-    onSuccess: (data) => {
-      const oldUrl = `/api/backgrounds/file/${encodeURIComponent(data.oldFilename)}`;
-      if (selected === oldUrl) {
-        onSelect(data.url);
-      }
-      if (defaultRoleplayBackground === oldUrl) {
-        onDefaultChange(data.url);
-      }
-      setRenamingFile(null);
-      qc.invalidateQueries({ queryKey: ["backgrounds"] });
-    },
-  });
-
-  const filteredBackgrounds = useMemo(() => {
-    const items = backgrounds ?? [];
-    const query = searchQuery.trim().toLowerCase();
-    if (!query) return items;
-    return items.filter((bg) => {
-      const haystack = [
-        bg.filename,
-        bg.originalName ?? "",
-        bg.tag ?? "",
-        bg.source === "game_asset" ? "game asset" : "library",
-        ...bg.tags,
-      ]
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(query);
-    });
-  }, [backgrounds, searchQuery]);
-
-  const handleUpload = async (files: File[]) => {
-    if (files.length === 0) return;
-    setUploading(true);
-    try {
-      const uploads = await Promise.allSettled(
-        files.map((file) => {
-          const formData = new FormData();
-          formData.append("file", file);
-          return api.upload<BackgroundUploadResponse>("/backgrounds/upload", formData);
-        }),
-      );
-      const successfulUploads = uploads
-        .filter((result): result is PromiseFulfilledResult<BackgroundUploadResponse> => result.status === "fulfilled")
-        .map((result) => result.value)
-        .filter((result) => result.success);
-      const failed = uploads.length - successfulUploads.length;
-
-      if (successfulUploads.length > 0) {
-        qc.invalidateQueries({ queryKey: ["backgrounds"] });
-        qc.invalidateQueries({ queryKey: ["background-tags"] });
-        void refreshGameAssetManifest().catch(() => undefined);
-        onSelect(successfulUploads[successfulUploads.length - 1]!.url);
-        toast.success(`Imported ${successfulUploads.length} background${successfulUploads.length === 1 ? "" : "s"}.`);
-      }
-
-      if (failed > 0) {
-        const rejected = uploads.find((result) => result.status === "rejected");
-        toast.error(
-          rejected?.status === "rejected" && rejected.reason instanceof Error
-            ? rejected.reason.message
-            : `${failed} background import${failed === 1 ? "" : "s"} failed.`,
-        );
-      }
-    } catch {
-      toast.error("Background import failed.");
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const addTag = (filename: string, currentTags: string[]) => {
-    const tag = tagInput
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9 _-]/g, "");
-    if (!tag || currentTags.includes(tag)) return;
-    updateTags.mutate({ filename, tags: [...currentTags, tag] });
-    setTagInput("");
-  };
-
-  const removeTag = (filename: string, currentTags: string[], tagToRemove: string) => {
-    updateTags.mutate({ filename, tags: currentTags.filter((t) => t !== tagToRemove) });
-  };
+function GenerationsSettings() {
+  const { t: localizeUi } = useUiTranslation();
+  const { data: installedCapabilities = [], isLoading } = useInstalledCapabilityPackages();
+  const openRightPanel = useUIStore((state) => state.openRightPanel);
+  const openAgentCatalog = useUIStore((state) => state.openAgentCatalog);
+  const illustratorInstalled = installedCapabilities.some(
+    (capability) => capability.id === "illustrator" && capability.status === "active",
+  );
+  const openDownloadAgents = useCallback(() => {
+    openRightPanel("agents");
+    openAgentCatalog();
+  }, [openAgentCatalog, openRightPanel]);
 
   return (
-    <div className="flex flex-col gap-2">
-      <ImageUploadDropzone
-        label="Import Backgrounds"
-        pending={uploading}
-        pendingLabel="Importing..."
-        dragLabel="Drop backgrounds to import"
-        onFilesSelected={(files) => void handleUpload(files)}
-        icon={uploading ? <Loader2 size="0.875rem" className="animate-spin" /> : <Upload size="0.875rem" />}
-        className="rounded-lg py-3 hover:border-[var(--primary)]/40 hover:bg-[var(--secondary)]/50"
-      />
+    <div className="flex flex-col gap-3">
+      <SettingsIntro>
+        {localizeUi("ui.panels.generationssettings.globalDefaultsForGeneratedImagesVideosAndReusablePrompt")}
+      </SettingsIntro>
 
-      <div className="flex flex-col gap-1.5 rounded-lg bg-[var(--secondary)]/40 p-2.5 ring-1 ring-[var(--border)]/70">
-        <div className="flex items-center gap-2">
-          <div className="relative min-w-0 flex-1">
-            <Search
-              size="0.75rem"
-              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)]"
-            />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search backgrounds..."
-              className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--background)] py-0 pl-7 pr-2 text-xs text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)]/60 focus:border-[var(--primary)]/50 md:h-9"
-            />
-          </div>
-          {searchQuery.trim() && (
-            <button
-              type="button"
-              onClick={() => setSearchQuery("")}
-              className="shrink-0 rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
-              title="Clear search"
-            >
-              <X size="0.75rem" />
-            </button>
-          )}
+      {isLoading ? (
+        <div className="flex items-center justify-center gap-2 rounded-xl border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-highlight-bg)] px-4 py-8 text-xs text-[var(--marinara-chat-chrome-panel-muted)]">
+          <Loader2 size="1rem" className="animate-spin" />
+          {localizeUi("ui.panels.generationssettings.checkingInstalledAgents")}
         </div>
-        <div className="flex flex-wrap items-center justify-between gap-2 text-[0.625rem] text-[var(--muted-foreground)]">
-          <span>
-            {filteredBackgrounds.length} of {backgrounds?.length ?? 0} backgrounds
-          </span>
-          {defaultRoleplayBackground !== DEFAULT_ROLEPLAY_BACKGROUND_URL && (
-            <button
-              type="button"
-              onClick={() => onDefaultChange(DEFAULT_ROLEPLAY_BACKGROUND_URL)}
-              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
-            >
-              <Star size="0.625rem" />
-              Reset Roleplay default
-            </button>
-          )}
+      ) : !illustratorInstalled ? (
+        <div className="flex flex-col items-center gap-3 rounded-xl border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--marinara-chat-chrome-highlight-bg)] px-5 py-8 text-center">
+          <WandSparkles size="1.5rem" className="text-[var(--marinara-chat-chrome-highlight-text)]" />
+          <p className="max-w-md text-xs leading-relaxed text-[var(--marinara-chat-chrome-panel-text)]">
+            {localizeUi("ui.panels.generationssettings.downloadIllustratorAgentFirstFromAgentsTabToEnable")}
+          </p>
+          <button type="button" onClick={openDownloadAgents} className={SETTINGS_PRIMARY_BUTTON_CLASS}>
+            {localizeUi("ui.panels.generationssettings.downloadIllustratorAgent")}
+          </button>
         </div>
-      </div>
-
-      {/* Background grid */}
-      {backgrounds && backgrounds.length > 0 && filteredBackgrounds.length > 0 && (
-        <div className="flex flex-col gap-2">
-          {filteredBackgrounds.map((bg) => {
-            const itemKey = bg.id ?? bg.url;
-            const isSelected = selected === bg.url;
-            const isDefaultRoleplay = defaultRoleplayBackground === bg.url;
-            const isUserBackground = bg.source !== "game_asset";
-            const isEditable = bg.editable !== false && isUserBackground;
-            const canRename = bg.renameable !== false && isUserBackground;
-            const canDelete = bg.deletable !== false && isUserBackground;
-            const isEditing = editingTags === itemKey;
-            const isRenaming = renamingFile === itemKey;
-            const title = bg.originalName ?? bg.tag ?? bg.filename;
-            const sourceLabel = bg.source === "game_asset" ? "Game asset" : "Library";
-            return (
-              <div key={itemKey} className="flex flex-col gap-1">
-                {/* Thumbnail row */}
-                <div className="group relative flex gap-2">
-                  <button
-                    onClick={() => onSelect(isSelected ? null : bg.url)}
-                    className={cn(
-                      "relative aspect-video w-24 shrink-0 overflow-hidden rounded-lg border-2 transition-all",
-                      isSelected
-                        ? "border-[var(--primary)] shadow-md shadow-[var(--primary)]/20"
-                        : "border-transparent hover:border-[var(--muted-foreground)]/30",
-                    )}
-                  >
-                    <img src={bg.url} alt="" className="h-full w-full object-cover" loading="lazy" />
-                    {isSelected && (
-                      <div className="absolute inset-0 flex items-center justify-center bg-black/30">
-                        <Check size="0.875rem" className="text-white" />
-                      </div>
-                    )}
-                  </button>
-                  <div className="flex min-w-0 flex-1 flex-col gap-1 py-0.5">
-                    <div className="flex items-center gap-1">
-                      {isRenaming ? (
-                        <form
-                          className="flex min-w-0 flex-1 items-center gap-1"
-                          onSubmit={(e) => {
-                            e.preventDefault();
-                            if (renameInput.trim())
-                              renameBg.mutate({ filename: bg.filename, name: renameInput.trim() });
-                          }}
-                        >
-                          <input
-                            type="text"
-                            value={renameInput}
-                            onChange={(e) => setRenameInput(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Escape") setRenamingFile(null);
-                            }}
-                            className="w-full min-w-0 rounded border border-[var(--border)] bg-[var(--background)] px-1.5 py-0.5 text-[0.625rem] text-[var(--foreground)] outline-none focus:border-[var(--primary)]"
-                            autoFocus
-                          />
-                          <button
-                            type="submit"
-                            disabled={!renameInput.trim() || renameBg.isPending}
-                            className={SETTINGS_INLINE_ACCENT_BUTTON_CLASS}
-                          >
-                            {renameBg.isPending ? "…" : "Save"}
-                          </button>
-                        </form>
-                      ) : (
-                        <>
-                          <span className="truncate text-[0.625rem] text-[var(--muted-foreground)]" title={title}>
-                            {bg.filename}
-                          </span>
-                          <span
-                            className={cn(
-                              "shrink-0 rounded-full px-1.5 py-0 text-[0.5625rem]",
-                              bg.source === "game_asset"
-                                ? "bg-[var(--primary)]/10 text-[var(--primary)]"
-                                : "bg-[var(--secondary)] text-[var(--muted-foreground)]",
-                            )}
-                          >
-                            {sourceLabel}
-                          </span>
-                          {isDefaultRoleplay && (
-                            <span className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-[var(--primary)]/12 px-1.5 py-0 text-[0.5625rem] text-[var(--primary)] ring-1 ring-[var(--primary)]/25">
-                              <Star size="0.5rem" fill="currentColor" />
-                              Default
-                            </span>
-                          )}
-                          {canRename && (
-                            <button
-                              onClick={() => {
-                                const nameWithoutExt = bg.filename.replace(/\.[^.]+$/, "");
-                                setRenameInput(nameWithoutExt);
-                                setRenamingFile(itemKey);
-                              }}
-                              className="shrink-0 rounded-md p-0.5 text-[var(--muted-foreground)] opacity-0 transition-opacity hover:text-[var(--primary)] group-hover:opacity-100"
-                              title="Rename"
-                            >
-                              <Pencil size="0.5625rem" />
-                            </button>
-                          )}
-                        </>
-                      )}
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onDefaultChange(isDefaultRoleplay ? DEFAULT_ROLEPLAY_BACKGROUND_URL : bg.url);
-                        }}
-                        className={cn(
-                          "shrink-0 rounded-md p-0.5 transition-colors",
-                          isDefaultRoleplay
-                            ? "text-[var(--primary)]"
-                            : "text-[var(--muted-foreground)]/70 hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
-                        )}
-                        title={
-                          isDefaultRoleplay
-                            ? "Default for new Roleplay chats"
-                            : "Set as default for new Roleplay chats"
-                        }
-                        aria-label={
-                          isDefaultRoleplay
-                            ? `${title} is the default Roleplay background`
-                            : `Set ${title} as the default Roleplay background`
-                        }
-                        aria-pressed={isDefaultRoleplay}
-                      >
-                        <Star size="0.75rem" fill={isDefaultRoleplay ? "currentColor" : "none"} />
-                      </button>
-                      {canDelete && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (selected === bg.url) onSelect(null);
-                            if (defaultRoleplayBackground === bg.url) onDefaultChange(DEFAULT_ROLEPLAY_BACKGROUND_URL);
-                            deleteBg.mutate(bg.filename);
-                          }}
-                          className="ml-auto shrink-0 rounded-md p-0.5 text-[var(--muted-foreground)] opacity-0 transition-opacity hover:text-[var(--destructive)] group-hover:opacity-100"
-                        >
-                          <Trash2 size="0.625rem" />
-                        </button>
-                      )}
-                    </div>
-                    {/* Tags */}
-                    <div className="flex flex-wrap items-center gap-1">
-                      {bg.tags.map((tag) => (
-                        <span
-                          key={tag}
-                          className="inline-flex items-center gap-0.5 rounded-full bg-[var(--secondary)] px-1.5 py-0 text-[0.5625rem] text-[var(--muted-foreground)]"
-                        >
-                          {tag}
-                          {isEditing && isEditable && (
-                            <button
-                              onClick={() => removeTag(bg.filename, bg.tags, tag)}
-                              className="ml-0.5 hover:text-[var(--destructive)]"
-                            >
-                              <X size="0.5rem" />
-                            </button>
-                          )}
-                        </span>
-                      ))}
-                      {isEditable && (
-                        <button
-                          onClick={() => {
-                            setEditingTags(isEditing ? null : itemKey);
-                            setTagInput("");
-                          }}
-                          className={cn(
-                            "rounded-full p-0.5 transition-colors",
-                            isEditing
-                              ? "bg-[var(--primary)]/20 text-[var(--primary)]"
-                              : "text-[var(--muted-foreground)]/60 hover:text-[var(--primary)]",
-                          )}
-                          title="Edit tags"
-                        >
-                          <Tag size="0.5625rem" />
-                        </button>
-                      )}
-                    </div>
-                    {/* Tag input */}
-                    {isEditing && isEditable && (
-                      <div className="flex items-center gap-1">
-                        <input
-                          type="text"
-                          value={tagInput}
-                          onChange={(e) => setTagInput(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              e.preventDefault();
-                              addTag(bg.filename, bg.tags);
-                            }
-                            if (e.key === "Escape") setEditingTags(null);
-                          }}
-                          placeholder="Add tag…"
-                          className="w-full min-w-0 rounded border border-[var(--border)] bg-[var(--background)] px-1.5 py-0.5 text-[0.625rem] text-[var(--foreground)] outline-none focus:border-[var(--primary)]"
-                          autoFocus
-                          list={`tag-suggestions-${itemKey}`}
-                        />
-                        <datalist id={`tag-suggestions-${itemKey}`}>
-                          {(allTags ?? [])
-                            .filter((t) => !bg.tags.includes(t))
-                            .map((t) => (
-                              <option key={t} value={t} />
-                            ))}
-                        </datalist>
-                        <button
-                          onClick={() => addTag(bg.filename, bg.tags)}
-                          disabled={!tagInput.trim()}
-                          className={SETTINGS_INLINE_ACCENT_BUTTON_CLASS}
-                        >
-                          Add
-                        </button>
-                      </div>
-                    )}
-                  </div>
+      ) : (
+        <>
+          <OverallGenerationSettings />
+          <ImageGenerationSettings />
+          <VideoGenerationSettings />
+          <div id={getSettingsSectionAnchorId("prompt-overrides")} className="flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-2 rounded-lg border border-[var(--border)]/70 bg-[var(--background)]/35 px-3 py-2">
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-[var(--foreground)]">
+                  {localizeUi("settings.sections.promptOverrides.title")}
+                </div>
+                <div className="mt-0.5 text-[0.625rem] text-[var(--muted-foreground)]">
+                  {localizeUi("settings.sections.promptOverrides.description")}
                 </div>
               </div>
-            );
-          })}
-        </div>
-      )}
-
-      {(!backgrounds || backgrounds.length === 0) && (
-        <div className="flex flex-col items-center gap-1.5 py-4 text-center">
-          <Image size="1.25rem" className="text-[var(--muted-foreground)]/40" />
-          <p className="text-[0.625rem] text-[var(--muted-foreground)]">No backgrounds available yet</p>
-        </div>
-      )}
-      {backgrounds && backgrounds.length > 0 && filteredBackgrounds.length === 0 && (
-        <div className="flex flex-col items-center gap-1.5 py-4 text-center">
-          <Search size="1.25rem" className="text-[var(--muted-foreground)]/40" />
-          <p className="text-[0.625rem] text-[var(--muted-foreground)]">No backgrounds match that search</p>
-        </div>
+            </div>
+            <PromptOverridesEditor
+              title={localizeUi("settings.prompts.video.title")}
+              description={localizeUi("settings.prompts.video.description")}
+              help={localizeUi("settings.prompts.video.help")}
+              keys={VIDEO_PROMPT_TEMPLATE_KEYS}
+              preferredKey="game.video"
+            />
+            <PromptOverridesEditor
+              title={localizeUi("settings.prompts.image.title")}
+              description={localizeUi("settings.prompts.image.description")}
+              help={localizeUi("settings.prompts.image.help")}
+              preferredKey="game.npcPortrait"
+            />
+          </div>
+        </>
       )}
     </div>
   );
 }
 
-function ThemesSettings() {
+function AddonsSettings() {
+  const { t: localizeUi } = useUiTranslation();
+  const { data: extensionPolicy } = usePersonalExtensionPolicy();
+  return (
+    <div className="flex flex-col gap-3">
+      <SettingsIntro>
+        {localizeUi("ui.panels.addonssettings.privateCustomBehaviorAndAppearanceSyncedByThisMarinara")}
+      </SettingsIntro>
+      <PersonalExtensionsSettings showIntro={false} />
+      {extensionPolicy?.externalExtensionsEnabled && <ExternalExtensionsSettings />}
+      <ThemesSettings showIntro={false} />
+    </div>
+  );
+}
+
+const THEME_PREVIEW_DEBOUNCE_MS = 300;
+
+function ThemesSettings({ showIntro = true }: { showIntro?: boolean } = {}) {
+  const { t: localizeUi } = useUiTranslation();
   const { data: syncedThemes = [], isLoading } = useThemes();
   const createTheme = useCreateTheme();
   const updateTheme = useUpdateTheme();
@@ -3457,26 +5833,39 @@ function ThemesSettings() {
   const [themeCss, setThemeCss] = useState("");
   const [livePreview, setLivePreview] = useState(true);
 
-  // Inject live preview CSS
+  // Replacing a dense app-level stylesheet invalidates styles across the full
+  // document. Keep typing immediate and apply only the settled preview instead
+  // of forcing that work for every character entered.
   useEffect(() => {
+    const previewStyleId = "marinara-css-editor-preview";
+    const existingStyle = document.getElementById(previewStyleId) as HTMLStyleElement | null;
+
     if (!editorOpen || !livePreview) {
-      const el = document.getElementById("marinara-css-editor-preview");
-      if (el) el.textContent = "";
+      existingStyle?.remove();
       return;
     }
-    let style = document.getElementById("marinara-css-editor-preview") as HTMLStyleElement | null;
-    if (!style) {
-      style = document.createElement("style");
-      style.id = "marinara-css-editor-preview";
+
+    const style = existingStyle ?? document.createElement("style");
+    if (!existingStyle) {
+      style.id = previewStyleId;
+      document.head.appendChild(style);
     }
-    style.textContent = sanitizeAppCss(themeCss);
-    // Always (re-)append so it's the last <style> in <head>,
-    // overriding the active-theme injector's saved CSS.
-    document.head.appendChild(style);
-    return () => {
-      style!.textContent = "";
-    };
+
+    const previewTimeout = window.setTimeout(() => {
+      style.textContent = sanitizeAppCss(themeCss);
+      // Keep the preview after the active-theme injector's saved CSS.
+      document.head.appendChild(style);
+    }, THEME_PREVIEW_DEBOUNCE_MS);
+
+    return () => window.clearTimeout(previewTimeout);
   }, [editorOpen, livePreview, themeCss]);
+
+  useEffect(
+    () => () => {
+      document.getElementById("marinara-css-editor-preview")?.remove();
+    },
+    [],
+  );
 
   const openNewTheme = useCallback(() => {
     setEditingId(null);
@@ -3498,7 +5887,7 @@ function ThemesSettings() {
       const css = normalizeThemeCss(themeCss);
       if (editingId) {
         await updateTheme.mutateAsync({ id: editingId, name, css });
-        toast.success(`Theme "${name}" updated`);
+        toast.success(localizeUi("ui.panels.themessettings.themeValue1Updated", { value1: name }));
       } else {
         const theme = await createTheme.mutateAsync({
           name,
@@ -3506,14 +5895,14 @@ function ThemesSettings() {
           installedAt: new Date().toISOString(),
         });
         await setActiveTheme.mutateAsync(theme.id);
-        toast.success(`Theme "${name}" saved and activated`);
+        toast.success(localizeUi("ui.panels.themessettings.themeValue1SavedAndActivated", { value1: name }));
       }
       setEditorOpen(false);
     } catch (err) {
       console.error("[ThemesSettings] Failed to save theme:", err);
-      toast.error("Failed to save theme. Check the browser console for details.");
+      toast.error(localizeUi("ui.panels.themessettings.failedToSaveThemeCheckTheBrowserConsoleFor"));
     }
-  }, [createTheme, editingId, setActiveTheme, themeCss, themeName, updateTheme]);
+  }, [createTheme, editingId, setActiveTheme, themeCss, themeName, updateTheme, localizeUi]);
 
   const handleImportThemeFile = async (file: File) => {
     try {
@@ -3604,14 +5993,17 @@ function ThemesSettings() {
         else if (skipped > 0) toast.warning(message, { description, duration: 12_000 });
         else toast.success(message);
       } else {
-        toast.error("No valid themes found in file.");
+        toast.error(localizeUi("ui.panels.themessettings.noValidThemesFoundInFile"));
       }
     } catch (err) {
       console.error("[ThemesSettings] Failed to import theme:", err);
       toast.error(
         err instanceof SyntaxError
-          ? "Failed to import theme. The JSON could not be parsed."
-          : getPrivilegedActionErrorMessage(err, "Failed to import theme. Ensure it's a valid CSS or JSON file."),
+          ? localizeUi("ui.panels.themessettings.failedToImportThemeTheJsonCouldNotBe")
+          : getPrivilegedActionErrorMessage(
+              err,
+              localizeUi("ui.panels.themessettings.failedToImportThemeEnsureValidFile"),
+            ),
       );
     }
   };
@@ -3628,7 +6020,11 @@ function ThemesSettings() {
             >
               <X size="0.875rem" />
             </button>
-            <span className="text-xs font-semibold">{editingId ? "Edit Theme" : "New Theme"}</span>
+            <span className="text-xs font-semibold">
+              {editingId
+                ? localizeUi("ui.panels.themessettings.editTheme")
+                : localizeUi("ui.panels.themessettings.newTheme")}
+            </span>
           </div>
           <div className="flex items-center gap-1.5">
             <button
@@ -3639,18 +6035,20 @@ function ThemesSettings() {
                   ? "bg-emerald-500/15 text-emerald-400"
                   : "bg-[var(--secondary)] text-[var(--muted-foreground)]",
               )}
-              title={livePreview ? "Disable live preview" : "Enable live preview"}
+              title={
+                livePreview
+                  ? localizeUi("ui.panels.themessettings.disableLivePreview")
+                  : localizeUi("ui.panels.themessettings.enableLivePreview")
+              }
             >
               {livePreview ? <Eye size="0.6875rem" /> : <EyeOff size="0.6875rem" />}
-              Preview
+              {localizeUi("settings.notifications.customSound.actions.preview")}
             </button>
-            <button
-              onClick={handleSave}
-              disabled={isSavingTheme}
-              className={SETTINGS_COMPACT_PRIMARY_BUTTON_CLASS}
-            >
+            <button onClick={handleSave} disabled={isSavingTheme} className={SETTINGS_COMPACT_PRIMARY_BUTTON_CLASS}>
               {isSavingTheme ? <Loader2 size="0.6875rem" className="animate-spin" /> : <Save size="0.6875rem" />}
-              {isSavingTheme ? "Saving..." : "Save"}
+              {isSavingTheme
+                ? localizeUi("ui.noodle.stageprofileform.saving")
+                : localizeUi("ui.noodle.noodlehome.save")}
             </button>
           </div>
         </div>
@@ -3660,7 +6058,7 @@ function ThemesSettings() {
           type="text"
           value={themeName}
           onChange={(e) => setThemeName(e.target.value)}
-          placeholder="Theme name..."
+          placeholder={localizeUi("settings.placeholders.themeName")}
           className="rounded-lg border border-[var(--border)] bg-[var(--secondary)] px-3 py-2 text-xs text-[var(--foreground)] outline-none transition-colors focus:border-[var(--primary)]/50"
         />
 
@@ -3670,44 +6068,44 @@ function ThemesSettings() {
           onChange={(e) => setThemeCss(e.target.value)}
           spellCheck={false}
           className="min-h-[22.5rem] resize-y rounded-lg border border-[var(--border)] bg-[#0d1117] p-3 font-mono text-[0.6875rem] leading-relaxed text-emerald-300 outline-none transition-colors focus:border-[var(--primary)]/50 placeholder:text-white/20"
-          placeholder="/* Enter your CSS here... */"
+          placeholder={localizeUi("settings.placeholders.themeCss")}
         />
 
         {/* Quick reference */}
         <details className="group rounded-lg bg-[var(--secondary)]/50 ring-1 ring-[var(--border)]">
           <summary className="cursor-pointer px-3 py-2 text-[0.625rem] font-medium text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]">
-            CSS Variable Reference
+            {localizeUi("ui.panels.themessettings.cssVariableReference")}
           </summary>
           <div className="border-t border-[var(--border)] px-3 py-2 font-mono text-[0.625rem] leading-relaxed text-[var(--muted-foreground)]">
             <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
-              <span>--background</span>
-              <span className="text-white/40">Page background</span>
-              <span>--foreground</span>
-              <span className="text-white/40">Main text</span>
-              <span>--primary</span>
-              <span className="text-white/40">Accent / buttons</span>
-              <span>--primary-foreground</span>
-              <span className="text-white/40">Text on primary</span>
-              <span>--secondary</span>
-              <span className="text-white/40">Cards / inputs</span>
-              <span>--card</span>
-              <span className="text-white/40">Card background</span>
-              <span>--border</span>
-              <span className="text-white/40">Borders</span>
-              <span>--muted-foreground</span>
-              <span className="text-white/40">Dimmed text</span>
-              <span>--sidebar</span>
-              <span className="text-white/40">Sidebar bg</span>
-              <span>--sidebar-border</span>
-              <span className="text-white/40">Sidebar border</span>
-              <span>--marinara-shell-edge-border</span>
-              <span className="text-white/40">Left/right shell edge</span>
-              <span>--destructive</span>
-              <span className="text-white/40">Error / delete</span>
-              <span>--popover</span>
-              <span className="text-white/40">Dropdown bg</span>
-              <span>--accent</span>
-              <span className="text-white/40">Hover highlights</span>
+              <span>{localizeUi("ui.panels.themessettings.background")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.pageBackground")}</span>
+              <span>{localizeUi("ui.panels.themessettings.foreground")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.mainText")}</span>
+              <span>{localizeUi("ui.panels.themessettings.primary")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.accentButtons")}</span>
+              <span>{localizeUi("ui.panels.themessettings.primaryForeground")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.textOnPrimary")}</span>
+              <span>{localizeUi("ui.panels.themessettings.secondary")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.cardsInputs")}</span>
+              <span>{localizeUi("ui.panels.themessettings.card")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.cardBackground")}</span>
+              <span>{localizeUi("ui.panels.themessettings.border")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.borders")}</span>
+              <span>{localizeUi("ui.panels.themessettings.mutedForeground")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.dimmedText")}</span>
+              <span>{localizeUi("ui.panels.themessettings.sidebar")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.sidebarBg")}</span>
+              <span>{localizeUi("ui.panels.themessettings.sidebarBorder")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.sidebarBorder_26eaad1")}</span>
+              <span>{localizeUi("ui.panels.themessettings.marinaraShellEdgeBorder")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.leftRightShellEdge")}</span>
+              <span>{localizeUi("ui.panels.themessettings.destructive")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.errorDelete")}</span>
+              <span>{localizeUi("ui.panels.themessettings.popover")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.dropdownBg")}</span>
+              <span>{localizeUi("ui.panels.themessettings.accent")}</span>
+              <span className="text-white/40">{localizeUi("ui.panels.themessettings.hoverHighlights")}</span>
             </div>
           </div>
         </details>
@@ -3718,14 +6116,17 @@ function ThemesSettings() {
   // ── Theme List View ──
   return (
     <div className="flex flex-col gap-3">
-      <SettingsIntro>
-        Create or import custom CSS themes. Themes sync across devices connected to this Marinara server.
-      </SettingsIntro>
+      {showIntro && (
+        <SettingsIntro>
+          {localizeUi("ui.panels.themessettings.createOrImportCustomCssThemesThemesSyncAcross")}
+        </SettingsIntro>
+      )}
 
       <SettingsSection
-        title="Theme Library"
-        description="Create, import, activate, edit, export, or remove custom CSS themes."
+        title={localizeUi("settings.sections.themeLibrary.title")}
+        description={localizeUi("settings.sections.themeLibrary.componentDescription")}
         icon={<Palette size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("theme-library")}
       >
         <div className="flex flex-col gap-3">
           {/* Action buttons */}
@@ -3734,7 +6135,7 @@ function ThemesSettings() {
               onClick={openNewTheme}
               className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-[var(--primary)]/30 bg-[var(--primary)]/5 p-3 text-xs text-[var(--primary)] transition-all hover:border-[var(--primary)]/50 hover:bg-[var(--primary)]/10"
             >
-              <Plus size="0.875rem" /> Create Theme
+              <Plus size="0.875rem" /> {localizeUi("ui.panels.themessettings.createTheme")}
             </button>
             <button
               onClick={() => {
@@ -3748,19 +6149,19 @@ function ThemesSettings() {
               }}
               className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-[var(--border)] p-3 text-xs text-[var(--muted-foreground)] transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--secondary)]/50"
             >
-              <Download size="0.875rem" /> Import File
+              <Download size="0.875rem" /> {localizeUi("ui.panels.themessettings.importFile")}
             </button>
           </div>
 
           {/* Active theme: None option */}
           <div className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium">Installed Themes</span>
+            <span className="text-xs font-medium">{localizeUi("ui.panels.themessettings.installedThemes")}</span>
             <button
               onClick={() =>
                 setActiveTheme.mutate(null, {
                   onError: (err) => {
                     console.error("[ThemesSettings] Failed to reset active theme:", err);
-                    toast.error("Failed to reset the active theme.");
+                    toast.error(localizeUi("ui.panels.themessettings.failedToResetTheActiveTheme"));
                   },
                 })
               }
@@ -3771,9 +6172,9 @@ function ThemesSettings() {
                   : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--accent)]",
               )}
             >
-              <Palette size="0.75rem" />
-              Default Theme
-              {activeCustomTheme === null && <Check size="0.75rem" className="ml-auto" />}
+              <Palette size="0.75rem" className="mari-chrome-accent-icon" />
+              {localizeUi("ui.panels.themessettings.defaultTheme")}
+              {activeCustomTheme === null && <Check size="0.75rem" className="mari-chrome-accent-icon ml-auto" />}
             </button>
 
             {/* Custom theme list */}
@@ -3792,20 +6193,22 @@ function ThemesSettings() {
                     setActiveTheme.mutate(t.id, {
                       onError: (err) => {
                         console.error("[ThemesSettings] Failed to activate theme:", err);
-                        toast.error("Failed to activate theme.");
+                        toast.error(localizeUi("ui.panels.themessettings.failedToActivateTheme"));
                       },
                     })
                   }
                   className="flex flex-1 items-center gap-2 min-w-0"
                 >
-                  <FileCode2 size="0.75rem" className="shrink-0" />
-                  <span className="truncate">{t.name}</span>
-                  {activeCustomTheme?.id === t.id && <Check size="0.75rem" className="shrink-0" />}
+                  <FileCode2 size="0.75rem" className="mari-chrome-accent-icon shrink-0" />
+                  <span className="mari-chrome-text truncate">{t.name}</span>
+                  {activeCustomTheme?.id === t.id && (
+                    <Check size="0.75rem" className="mari-chrome-accent-icon shrink-0" />
+                  )}
                 </button>
                 <button
                   onClick={() => openEditTheme(t)}
                   className="rounded p-0.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--primary)]/10 hover:text-[var(--primary)]"
-                  title="Edit theme CSS"
+                  title={localizeUi("settings.actions.editThemeCss")}
                 >
                   <Code size="0.6875rem" />
                 </button>
@@ -3831,7 +6234,7 @@ function ThemesSettings() {
                     );
                   }}
                   className="rounded p-0.5 text-[var(--muted-foreground)] transition-colors hover:bg-emerald-500/10 hover:text-emerald-400"
-                  title="Export theme"
+                  title={localizeUi("settings.actions.exportTheme")}
                 >
                   <Upload size="0.6875rem" />
                 </button>
@@ -3839,23 +6242,26 @@ function ThemesSettings() {
                   onClick={() => {
                     void (async () => {
                       const confirmed = await showConfirmDialog({
-                        title: "Delete Theme",
-                        message: `Delete "${t.name}"? This permanently removes the saved theme CSS from this server.`,
-                        confirmLabel: "Delete",
+                        title: localizeUi("ui.panels.themessettings.deleteTheme"),
+                        message: localizeUi(
+                          "ui.panels.themessettings.deleteValue1ThisPermanentlyRemovesTheSavedThemeCss",
+                          { value1: t.name },
+                        ),
+                        confirmLabel: localizeUi("lorebook.editor.batch.delete"),
                         tone: "destructive",
                       });
                       if (!confirmed) return;
                       try {
                         await deleteTheme.mutateAsync(t.id);
-                        toast.success(`Theme "${t.name}" removed`);
+                        toast.success(localizeUi("ui.panels.themessettings.themeValue1Removed", { value1: t.name }));
                       } catch (err) {
                         console.error("[ThemesSettings] Failed to remove theme:", err);
-                        toast.error("Failed to remove theme.");
+                        toast.error(localizeUi("ui.panels.themessettings.failedToRemoveTheme"));
                       }
                     })();
                   }}
-                  className="rounded p-0.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--destructive)]/10 hover:text-[var(--destructive)]"
-                  title="Remove theme"
+                  className="rounded p-0.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
+                  title={localizeUi("settings.actions.removeTheme")}
                 >
                   <Trash2 size="0.6875rem" />
                 </button>
@@ -3864,30 +6270,31 @@ function ThemesSettings() {
 
             {isLoading && syncedThemes.length === 0 && (
               <p className="mari-chrome-text-muted py-2 text-center text-[0.625rem]">
-                Loading synced themes...
+                {localizeUi("ui.panels.themessettings.loadingSyncedThemes")}
               </p>
             )}
 
             {!isLoading && syncedThemes.length === 0 && (
-              <p className="py-2 text-center text-[0.625rem] text-[var(--muted-foreground)]">
-                No synced custom themes yet. Create one or import a .css file above.
+              <p className="mari-chrome-text-muted py-2 text-center text-[0.625rem]">
+                {localizeUi("ui.panels.themessettings.noSyncedCustomThemesYetCreateOneOrImport")}
               </p>
             )}
           </div>
 
           {/* Info box */}
           <div className="rounded-lg bg-[var(--secondary)]/50 p-2.5 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
-            <strong>Tip:</strong> CSS themes can override any CSS variable (e.g.{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">--background</code>,{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">--primary</code>,{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">--marinara-app-accent-solid</code>,{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">--marinara-theme-accent-pulse</code>,{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">--marinara-chat-chrome-accent</code>,{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">--marinara-chat-chrome-accent-gradient</code>,{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">--marinara-chat-chrome-surface-bg</code>) or add custom
-            styles. JSON themes should have{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">{`{ "name": "...", "css": "..." }`}</code> format.
-            Imported theme files sync to this Marinara server but do not auto-activate.
+            <strong>{localizeUi("ui.panels.themessettings.tip")}</strong>{" "}
+            {localizeUi("ui.panels.themessettings.cssThemesCanOverrideAnyCssVariableEG")}{" "}
+            <code className="rounded bg-[var(--secondary)] px-1">{"--background"}</code>,{" "}
+            <code className="rounded bg-[var(--secondary)] px-1">{"--primary"}</code>,{" "}
+            <code className="rounded bg-[var(--secondary)] px-1">{"--marinara-app-accent-solid"}</code>,{" "}
+            <code className="rounded bg-[var(--secondary)] px-1">{"--marinara-theme-accent-pulse"}</code>,{" "}
+            <code className="rounded bg-[var(--secondary)] px-1">{"--marinara-chat-chrome-accent"}</code>,{" "}
+            <code className="rounded bg-[var(--secondary)] px-1">{"--marinara-chat-chrome-accent-gradient"}</code>,{" "}
+            <code className="rounded bg-[var(--secondary)] px-1">{"--marinara-chat-chrome-surface-bg"}</code>
+            {localizeUi("ui.panels.themessettings.orAddCustomStylesJsonThemesShouldHave")}{" "}
+            <code className="rounded bg-[var(--secondary)] px-1">{'{ "name": "...", "css": "..." }'}</code>{" "}
+            {localizeUi("ui.panels.themessettings.formatImportedThemeFilesSyncToThisMarinaraServer")}
           </div>
         </div>
       </SettingsSection>
@@ -3980,138 +6387,6 @@ function parseThemeJsonWithControlCharFallback(text: string) {
   }
 }
 
-function createInlineFolderPackageImportEntry(raw: unknown, path: string): FolderPackageImportEntry {
-  return {
-    raw,
-    path,
-    basePath: "",
-    resolveTextFile: () => null,
-  };
-}
-
-function getExtensionImportKind(raw: unknown) {
-  if (!isJsonRecord(raw)) return "";
-  const manifest = isJsonRecord(raw.manifest) ? raw.manifest : raw;
-  return typeof manifest.kind === "string" ? manifest.kind : "";
-}
-
-function getExtensionImportRuntime(raw: unknown, record: Record<string, unknown>): "client" | "server" {
-  const runtime = typeof record.runtime === "string" ? record.runtime.toLowerCase() : "";
-  const kind = getExtensionImportKind(raw).toLowerCase();
-  return runtime === "server" || kind === "marinara.server-extension" ? "server" : "client";
-}
-
-function normalizeExtensionImportEntry(entry: FolderPackageImportEntry, fallbackName: string) {
-  const source = getFolderManifestConfig(entry.raw);
-  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
-  const record = source as Record<string, unknown>;
-  const folderName = getPackagePathBasename(entry.basePath) || fallbackName;
-  const name = typeof record.name === "string" && record.name.trim() ? record.name.trim() : folderName;
-  if (!name) return null;
-  const runtime = getExtensionImportRuntime(entry.raw, record);
-
-  if (runtime === "server") {
-    const serverJsFromFiles = resolvePackageTextPaths(
-      entry.resolveTextFile,
-      record.serverJsPath ?? record.serverJsPaths ?? record.jsPath ?? record.jsPaths,
-    );
-    return {
-      name,
-      description: typeof record.description === "string" ? record.description : "",
-      runtime,
-      css: null,
-      js: null,
-      serverJs:
-        serverJsFromFiles ??
-        (typeof record.serverJs === "string" ? record.serverJs : typeof record.js === "string" ? record.js : null),
-      enabled: false,
-    };
-  }
-
-  return {
-    name,
-    description: typeof record.description === "string" ? record.description : "",
-    runtime,
-    css:
-      resolvePackageTextPaths(entry.resolveTextFile, record.cssPath ?? record.cssPaths) ??
-      (typeof record.css === "string" ? record.css : null),
-    js:
-      resolvePackageTextPaths(entry.resolveTextFile, record.jsPath ?? record.jsPaths) ??
-      (typeof record.js === "string" ? record.js : null),
-    serverJs: null,
-    enabled: typeof record.enabled === "boolean" ? record.enabled : false,
-  };
-}
-
-function createLooseExtensionFolderImportEntries(
-  files: PackageTextFile[],
-  fallbackName: string,
-): FolderPackageImportEntry[] {
-  const serverJs = files
-    .filter((file) => /\.server\.(js|mjs|cjs)$/i.test(file.path))
-    .map((file) => file.text)
-    .join("\n\n");
-  if (serverJs) {
-    return [
-      createInlineFolderPackageImportEntry(
-        {
-          name: fallbackName || "extension",
-          description: "Server extension imported from folder",
-          runtime: "server",
-          serverJs,
-          enabled: false,
-        },
-        fallbackName || "extension",
-      ),
-    ];
-  }
-
-  const css = files
-    .filter((file) => file.path.toLowerCase().endsWith(".css"))
-    .map((file) => file.text)
-    .join("\n\n");
-  const js = files
-    .filter((file) => /\.(js|mjs|cjs)$/i.test(file.path) && !/\.server\.(js|mjs|cjs)$/i.test(file.path))
-    .map((file) => file.text)
-    .join("\n\n");
-  if (!css && !js) return [];
-  return [
-    createInlineFolderPackageImportEntry(
-      {
-        name: fallbackName || "extension",
-        description: "Extension imported from folder",
-        runtime: "client",
-        css: css || null,
-        js: js || null,
-        serverJs: null,
-        enabled: false,
-      },
-      fallbackName || "extension",
-    ),
-  ];
-}
-
-function getLooseExtensionFolderName(files: PackageTextFile[], fallbackName: string) {
-  const firstPath = files[0]?.path;
-  if (!firstPath) return fallbackName;
-  const firstSlash = firstPath.indexOf("/");
-  return firstSlash > 0 ? firstPath.slice(0, firstSlash) : fallbackName;
-}
-
-function describeExtensionImportError(error: unknown, name?: string) {
-  const rawMessage =
-    error instanceof ApiError && error.message
-      ? error.message
-      : error instanceof Error && error.message
-        ? error.message
-        : "Failed to import extension.";
-  const subject = name ? `Failed to install "${name}": ${rawMessage}` : rawMessage;
-  if (error instanceof ApiError && error.status === 403) {
-    return `${subject} Installing extensions requires loopback access or admin access. Open Marinara Engine through localhost, or set ADMIN_SECRET=<secret> in the server .env and paste the same value in Settings → Advanced → Admin Access. Marinara sends it as the X-Admin-Secret header.`;
-  }
-  return subject;
-}
-
 function triggerFilePicker(options: {
   accept?: string;
   multiple?: boolean;
@@ -4154,377 +6429,6 @@ function triggerFilePicker(options: {
   el.click();
 }
 
-function ExtensionsSettings() {
-  const { data: extensions, isLoading } = useExtensions();
-  const extensionList = extensions ?? [];
-  const createExtension = useCreateExtension();
-  const updateExtension = useUpdateExtension();
-  const deleteExtension = useDeleteExtension();
-
-  const importExtensionEntries = async (
-    entries: FolderPackageImportEntry[],
-    installedAt: string,
-    fallbackName: string,
-  ) => {
-    let imported = 0;
-    let failed = 0;
-    let skipped = 0;
-    const failureMessages: string[] = [];
-    for (const entry of entries) {
-      const normalized = normalizeExtensionImportEntry(entry, fallbackName);
-      if (!normalized) {
-        skipped++;
-        failureMessages.push("Skipped an extension entry because it did not contain importable extension data.");
-        continue;
-      }
-      try {
-        await createExtension.mutateAsync({
-          ...normalized,
-          installedAt,
-        });
-        imported++;
-      } catch (err) {
-        failed++;
-        failureMessages.push(describeExtensionImportError(err, normalized.name));
-        console.warn("[ExtensionsSettings] Failed to import extension entry:", normalized.name, err);
-      }
-    }
-    if (imported === 0 && failed === 0 && skipped === 0) throw new Error("No valid extensions found in file");
-    const skipNote = skipped > 0 ? ` (${skipped} skipped — no importable entry)` : "";
-    if (failed > 0) {
-      const more = failureMessages.length > 1 ? ` (+${failureMessages.length - 1} more)` : "";
-      toast.error(
-        imported > 0
-          ? `Imported ${imported} extension${imported === 1 ? "" : "s"}${skipNote}; ${failed} failed — ${failureMessages[0]}${more}`
-          : `Failed to import ${failed} extension${failed === 1 ? "" : "s"}${skipNote} — ${failureMessages[0]}${more}`,
-        { duration: 12_000 },
-      );
-    } else if (skipped > 0) {
-      toast.warning(
-        imported > 0
-          ? `Imported ${imported} extension${imported === 1 ? "" : "s"}${skipNote}. Review before enabling.`
-          : `Skipped ${skipped} extension entr${skipped === 1 ? "y" : "ies"}.`,
-        {
-          description: failureMessages[0],
-          duration: 12_000,
-        },
-      );
-    } else {
-      toast.success(`Imported ${imported} extension${imported === 1 ? "" : "s"}${skipNote}. Review before enabling.`);
-    }
-  };
-
-  const handleImportExtensionFile = async (file: File) => {
-    try {
-      const installedAt = new Date().toISOString();
-      const fallbackName = file.name
-        .replace(/\.server\.(js|mjs|cjs)$/i, "")
-        .replace(/\.(json|css|js|mjs|cjs|zip)$/i, "");
-      const lowerName = file.name.toLowerCase();
-
-      if (isZipArchiveFile(file)) {
-        const files = await readTextFilesFromZip(file);
-        const entries = collectFolderPackageEntries(files, {
-          rootFilenames: ["marinara-extensions.json", "marinara-extension.json"],
-          collectionKeys: ["extensions"],
-        });
-        await importExtensionEntries(
-          entries.length > 0 ? entries : createLooseExtensionFolderImportEntries(files, fallbackName),
-          installedAt,
-          fallbackName,
-        );
-      } else if (lowerName.endsWith(".json")) {
-        const text = await file.text();
-        const parsed = JSON.parse(text);
-        const entries = getFolderImportEntries(parsed, ["extensions"]).map((entry) =>
-          createInlineFolderPackageImportEntry(entry, file.name),
-        );
-        await importExtensionEntries(entries, installedAt, fallbackName);
-      } else if (/\.server\.(js|mjs|cjs)$/i.test(lowerName)) {
-        const text = await file.text();
-        const name = file.name.replace(/\.server\.(js|mjs|cjs)$/i, "");
-        try {
-          await createExtension.mutateAsync({
-            name,
-            description: "Server extension imported from file",
-            runtime: "server",
-            serverJs: text,
-            enabled: false,
-            installedAt,
-          });
-        } catch (err) {
-          throw new Error(describeExtensionImportError(err, name));
-        }
-        toast.success(`Server extension "${name}" imported and left disabled for review`);
-      } else if (/\.(js|mjs|cjs)$/i.test(lowerName)) {
-        const text = await file.text();
-        const name = file.name.replace(/\.(js|mjs|cjs)$/i, "");
-        try {
-          await createExtension.mutateAsync({
-            name,
-            description: "JS extension imported from file",
-            runtime: "client",
-            js: text,
-            enabled: false,
-            installedAt,
-          });
-        } catch (err) {
-          throw new Error(describeExtensionImportError(err, name));
-        }
-        toast.success(`Extension "${name}" imported and left disabled for review`);
-      } else if (lowerName.endsWith(".css")) {
-        const text = await file.text();
-        const name = file.name.replace(/\.css$/i, "");
-        try {
-          await createExtension.mutateAsync({
-            name,
-            description: "CSS extension imported from file",
-            runtime: "client",
-            css: text,
-            enabled: false,
-            installedAt,
-          });
-        } catch (err) {
-          throw new Error(describeExtensionImportError(err, name));
-        }
-        toast.success(`Extension "${name}" imported and left disabled for review`);
-      } else {
-        toast.error(
-          "Only .zip, .json, .css, .js, .mjs, .cjs, .server.js, .server.mjs, and .server.cjs files are supported.",
-        );
-      }
-    } catch (err) {
-      toast.error(getPrivilegedActionErrorMessage(err, "Failed to import extension."));
-    }
-  };
-
-  const handleImportExtensionFolder = async (selectedFiles: FileList | null) => {
-    try {
-      const installedAt = new Date().toISOString();
-      const files = await readTextFilesFromFileList(selectedFiles);
-      const folderName = getLooseExtensionFolderName(files, "extension");
-      const entries = collectFolderPackageEntries(files, {
-        rootFilenames: ["marinara-extensions.json", "marinara-extension.json"],
-        collectionKeys: ["extensions"],
-      });
-      await importExtensionEntries(
-        entries.length > 0 ? entries : createLooseExtensionFolderImportEntries(files, folderName),
-        installedAt,
-        folderName,
-      );
-    } catch (err) {
-      toast.error(getPrivilegedActionErrorMessage(err, "Failed to import extension folder."));
-    }
-  };
-
-  const handleToggleExtension = async (ext: InstalledExtension) => {
-    const nextEnabled = !ext.enabled;
-    if (nextEnabled && ext.runtime === "server") {
-      const confirmed = await showConfirmDialog({
-        title: "Enable Server Extension",
-        message: `Enable "${ext.name}"? This runs trusted JavaScript inside the Marinara Node.js server process and can affect this server until disabled. Only enable code you trust.`,
-        confirmLabel: "Enable Server Extension",
-        tone: "destructive",
-      });
-      if (!confirmed) return;
-    } else if (nextEnabled && ext.js?.trim()) {
-      const confirmed = await showConfirmDialog({
-        title: "Enable Extension",
-        message: `Enable "${ext.name}"? This runs the extension's JavaScript inside Marinara Engine.`,
-        confirmLabel: "Enable",
-        tone: "destructive",
-      });
-      if (!confirmed) return;
-    }
-
-    try {
-      await updateExtension.mutateAsync({ id: ext.id, enabled: nextEnabled });
-    } catch (err) {
-      toast.error(getPrivilegedActionErrorMessage(err, "Failed to update extension."));
-    }
-  };
-
-  const handleDeleteExtension = async (ext: InstalledExtension) => {
-    const confirmed = await showConfirmDialog({
-      title: "Delete Extension",
-      message: `Delete "${ext.name}"? This permanently removes its saved extension code from this server.`,
-      confirmLabel: "Delete",
-      tone: "destructive",
-    });
-    if (!confirmed) return;
-
-    try {
-      await deleteExtension.mutateAsync(ext.id);
-      toast.success(`Extension "${ext.name}" removed`);
-    } catch (err) {
-      toast.error(getPrivilegedActionErrorMessage(err, "Failed to remove extension."));
-    }
-  };
-
-  return (
-    <div className="flex flex-col gap-3">
-      <SettingsIntro>Install browser or trusted server extensions to add custom behavior or styling.</SettingsIntro>
-
-      <SettingsSection
-        title="Extension Library"
-        description="Import, enable, disable, export, or remove installed extensions."
-        icon={<Puzzle size="0.875rem" />}
-      >
-        <div className="flex flex-col gap-3">
-          {/* Import button */}
-          <button
-            onClick={() => {
-              triggerFilePicker({
-                accept: ".zip,.json,.css,.js,.mjs,.cjs,.server.js,.server.mjs,.server.cjs,application/zip,application/json",
-                onSelect: (files) => {
-                  const file = files[0];
-                  if (file) void handleImportExtensionFile(file);
-                },
-              });
-            }}
-            className="flex items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-[var(--border)] p-3 text-xs text-[var(--muted-foreground)] transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--secondary)]/50"
-          >
-            <Download size="0.875rem" /> Import Extension File (.zip, .json, .css, .js, .mjs, .cjs, or .server.js)
-          </button>
-          <button
-            onClick={() => {
-              triggerFilePicker({
-                multiple: true,
-                webkitdirectory: true,
-                onSelect: (files) => void handleImportExtensionFolder(files),
-              });
-            }}
-            className="flex items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-[var(--border)] p-3 text-xs text-[var(--muted-foreground)] transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--secondary)]/50"
-          >
-            <FolderOpen size="0.875rem" /> Import Extension Folder
-          </button>
-
-          {/* Extension list */}
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium">Installed Extensions</span>
-
-            {extensionList.map((ext) => (
-              <div
-                key={ext.id}
-                className={cn(
-                  "flex items-center gap-2 rounded-lg px-3 py-2 text-xs transition-all",
-                  ext.enabled
-                    ? "bg-[var(--secondary)] text-[var(--secondary-foreground)]"
-                    : "bg-[var(--secondary)]/40 text-[var(--muted-foreground)]",
-                )}
-              >
-                <button
-                  onClick={() => void handleToggleExtension(ext)}
-                  className={cn(
-                    "rounded p-0.5 transition-colors",
-                    ext.enabled
-                      ? "text-emerald-400 hover:text-emerald-300"
-                      : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]",
-                  )}
-                  title={ext.enabled ? "Disable extension" : "Enable extension"}
-                >
-                  {ext.enabled ? <Power size="0.75rem" /> : <PowerOff size="0.75rem" />}
-                </button>
-                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                  <div className="flex min-w-0 items-center gap-1.5">
-                    <span className="truncate font-medium">{ext.name}</span>
-                    <span
-                      className={cn(
-                        "shrink-0 rounded px-1 py-px text-[0.5625rem] font-semibold",
-                        ext.runtime === "server"
-                          ? "bg-amber-500/12 text-amber-300 ring-1 ring-amber-500/20"
-                          : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]",
-                      )}
-                    >
-                      {ext.runtime === "server" ? "Server" : "Browser"}
-                    </span>
-                    {ext.runtime === "server" && ext.enabled && (
-                      <span
-                        className={cn(
-                          "shrink-0 rounded px-1 py-px text-[0.5625rem] font-semibold ring-1",
-                          ext.serverStatus === "running"
-                            ? "bg-emerald-500/12 text-emerald-300 ring-emerald-500/20"
-                            : ext.serverStatus === "error"
-                              ? "bg-[var(--destructive)]/12 text-[var(--destructive)] ring-[var(--destructive)]/20"
-                              : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-[var(--border)]",
-                        )}
-                      >
-                        {ext.serverStatus === "running"
-                          ? "Running"
-                          : ext.serverStatus === "error"
-                            ? "Error"
-                            : "Stopped"}
-                      </span>
-                    )}
-                  </div>
-                  {ext.description && (
-                    <span className="truncate text-[0.625rem] text-[var(--muted-foreground)]">{ext.description}</span>
-                  )}
-                  {ext.runtime === "server" && ext.serverError && (
-                    <span className="truncate text-[0.625rem] text-[var(--destructive)]">{ext.serverError}</span>
-                  )}
-                </div>
-                <button
-                  onClick={() => {
-                    downloadZipFile(
-                      createExtensionFolderPackageFiles([
-                        {
-                          name: ext.name,
-                          description: ext.description ?? "",
-                          runtime: ext.runtime,
-                          css: ext.css ?? null,
-                          js: ext.js ?? null,
-                          serverJs: ext.serverJs ?? null,
-                          enabled: ext.enabled,
-                        },
-                      ]),
-                      createExtensionFolderPackageFilename(ext.name, "extension"),
-                    );
-                  }}
-                  className="rounded p-0.5 text-[var(--muted-foreground)] transition-colors hover:bg-emerald-500/10 hover:text-emerald-400"
-                  title="Export extension"
-                >
-                  <Upload size="0.6875rem" />
-                </button>
-                <button
-                  onClick={() => void handleDeleteExtension(ext)}
-                  className="rounded p-0.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--destructive)]/10 hover:text-[var(--destructive)]"
-                  title="Remove extension"
-                >
-                  <Trash2 size="0.6875rem" />
-                </button>
-              </div>
-            ))}
-
-            {!isLoading && extensionList.length === 0 && (
-              <p className="py-2 text-center text-[0.625rem] text-[var(--muted-foreground)]">
-                No extensions installed. Import an extension file or folder above.
-              </p>
-            )}
-          </div>
-
-          {/* Info box */}
-          <div className="rounded-lg bg-[var(--secondary)]/50 p-2.5 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
-            <strong>Folder format:</strong>{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">Extensions/My Extension/manifest.json</code>
-            . Browser extensions can include CSS and/or JavaScript files to modify the UI.
-          </div>
-          <div className="rounded-lg bg-amber-500/10 p-2.5 text-[0.625rem] leading-relaxed text-amber-200 ring-1 ring-amber-500/20">
-            <strong>Server extensions:</strong> use{" "}
-            <code className="rounded bg-amber-500/10 px-1">runtime: "server"</code> with{" "}
-            <code className="rounded bg-amber-500/10 px-1">serverJsPath</code>, or import a{" "}
-            <code className="rounded bg-amber-500/10 px-1">.server.js</code> file. They run in the Node.js server
-            process and should only come from trusted sources.
-          </div>
-          <div className="rounded-lg bg-[var(--secondary)]/35 p-2.5 text-[0.625rem] leading-relaxed text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
-            Extensions can be downloaded from the official Marinara Engine Discord server.
-          </div>
-        </div>
-      </SettingsSection>
-    </div>
-  );
-}
-
 type ProfileImportStats = {
   characters?: number;
   personas?: number;
@@ -4535,13 +6439,10 @@ type ProfileImportStats = {
   chats?: number;
   messages?: number;
   connections?: number;
+  customTools?: number;
+  mariInstructions?: number;
+  personalExtensions?: number;
   files?: number;
-};
-
-type ProfileImportWarning = {
-  type?: string;
-  path?: string;
-  message?: string;
 };
 
 type ProfileImportProgressData = {
@@ -4613,7 +6514,7 @@ function getProfileImportPercent(progress: ProfileImportProgressState) {
   return Math.min(99, Math.max(progress.status === "running" ? 8 : 0, percent));
 }
 
-function formatProfileImportStats(stats?: ProfileImportStats) {
+function formatProfileImportStats(stats: ProfileImportStats | undefined, localizeUi: TFunction) {
   if (!stats) return "";
   const entries: Array<[number | undefined, string]> = [
     [stats.characters, "characters"],
@@ -4625,6 +6526,9 @@ function formatProfileImportStats(stats?: ProfileImportStats) {
     [stats.chats, "chats"],
     [stats.messages, "messages"],
     [stats.connections, "connections"],
+    [stats.customTools, localizeUi("ui.panels.importsettings.customTools")],
+    [stats.mariInstructions, localizeUi("ui.panels.importsettings.professorMariMemories")],
+    [stats.personalExtensions, localizeUi("ui.panels.importsettings.personalExtensions")],
     [stats.files, "files"],
   ];
   return entries
@@ -4645,9 +6549,22 @@ function getProfileImportItemCount(stats?: ProfileImportStats) {
     stats.chats,
     stats.messages,
     stats.connections,
+    stats.customTools,
+    stats.mariInstructions,
+    stats.personalExtensions,
     stats.files,
   ];
   return counts.reduce<number>((total, count) => total + (typeof count === "number" && count > 0 ? count : 0), 0);
+}
+
+function getProfileImportWarningCopy(localizeUi: TFunction): ProfileImportWarningCopy {
+  return {
+    missingAssetSummary: (count) => localizeUi("ui.panels.importsettings.profileImportMissingAssets", { count }),
+    securityWarningSummary: (count) => localizeUi("ui.panels.importsettings.profileImportSecurityWarnings", { count }),
+    missingLabel: localizeUi("ui.panels.importsettings.profileImportMissingLabel"),
+    additionalPaths: (count) => localizeUi("ui.panels.importsettings.profileImportAdditionalPaths", { count }),
+    additionalMessages: (count) => localizeUi("ui.panels.importsettings.profileImportAdditionalMessages", { count }),
+  };
 }
 
 function getProfileImportErrorMessage(data: unknown) {
@@ -4660,41 +6577,13 @@ function getProfileImportErrorMessage(data: unknown) {
   return "Unknown error";
 }
 
-function normalizeProfileImportWarnings(warnings: unknown): ProfileImportWarning[] {
-  if (!Array.isArray(warnings)) return [];
-  return warnings.flatMap((warning) => {
-    if (!warning || typeof warning !== "object") return [];
-    const record = warning as { type?: unknown; path?: unknown; message?: unknown };
-    const path = typeof record.path === "string" ? record.path : undefined;
-    const message = typeof record.message === "string" ? record.message : undefined;
-    const type = typeof record.type === "string" ? record.type : undefined;
-    if (!path && !message) return [];
-    return [{ type, path, message }];
-  });
-}
-
-function formatProfileImportWarningSummary(warnings: ProfileImportWarning[]) {
-  const missingAssets = warnings.filter((warning) => warning.type === "missing_asset" || warning.path);
-  if (missingAssets.length > 0) {
-    return `${missingAssets.length} asset file${missingAssets.length === 1 ? "" : "s"} missing from the ZIP. Imported the rest.`;
-  }
-  return `${warnings.length} import warning${warnings.length === 1 ? "" : "s"}.`;
-}
-
-function formatProfileImportWarningDetails(warnings: ProfileImportWarning[]) {
-  const paths = warnings.map((warning) => warning.path).filter((path): path is string => !!path);
-  if (paths.length === 0) return warnings[0]?.message ?? "";
-  const visible = paths.slice(0, 3).join(", ");
-  const extra = paths.length > 3 ? `, +${paths.length - 3} more` : "";
-  return `Missing: ${visible}${extra}`;
-}
-
-function formatProfileImportConfirmationMessage(preview: ProfileImportPreviewResult) {
+function formatProfileImportConfirmationMessage(preview: ProfileImportPreviewResult, localizeUi: TFunction) {
   const warnings = normalizeProfileImportWarnings(preview.warnings);
-  const found = formatProfileImportStats(preview.imported) || "no counted records";
+  const found = formatProfileImportStats(preview.imported, localizeUi) || "no counted records";
+  const warningCopy = getProfileImportWarningCopy(localizeUi);
   const warningDetail =
     warnings.length > 0
-      ? `${formatProfileImportWarningSummary(warnings)} ${formatProfileImportWarningDetails(warnings)}`
+      ? `${formatProfileImportWarningSummary(warnings, warningCopy)} ${formatProfileImportWarningDetails(warnings, warningCopy)}`
       : "";
   return [
     `Found: ${found}.`,
@@ -4774,6 +6663,8 @@ async function* readProfileImportStream(res: Response): AsyncGenerator<ProfileIm
 }
 
 function ImportSettings() {
+  const { t: localizeUi } = useUiTranslation();
+  const profileImportWarningCopy = getProfileImportWarningCopy(localizeUi);
   const openModal = useUIStore((s) => s.openModal);
   const qc = useQueryClient();
   const setActiveChatId = useChatStore((s) => s.setActiveChatId);
@@ -4834,7 +6725,7 @@ function ImportSettings() {
             elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000),
             error: "Not a valid profile export file.",
           });
-          toast.error("Not a valid profile export file.");
+          toast.error(localizeUi("ui.panels.importsettings.notAValidProfileExportFile"));
           e.target.value = "";
           return;
         }
@@ -4877,9 +6768,9 @@ function ImportSettings() {
       });
 
       const confirmed = await showConfirmDialog({
-        title: "Import Profile",
-        message: formatProfileImportConfirmationMessage(preview),
-        confirmLabel: "Import",
+        title: localizeUi("ui.panels.importsettings.importProfile"),
+        message: formatProfileImportConfirmationMessage(preview, localizeUi),
+        confirmLabel: localizeUi("ui.chat.chatbranchselector.import"),
         cancelLabel: "Cancel",
         tone: "destructive",
       });
@@ -4903,7 +6794,7 @@ function ImportSettings() {
             elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000),
             error: "Not a valid profile export file.",
           });
-          toast.error("Not a valid profile export file.");
+          toast.error(localizeUi("ui.panels.importsettings.notAValidProfileExportFile"));
           e.target.value = "";
           return;
         }
@@ -4964,12 +6855,15 @@ function ImportSettings() {
           qc.invalidateQueries();
           const imported = event.data?.imported;
           const warnings = normalizeProfileImportWarnings(event.data?.warnings);
-          const summary = formatProfileImportStats(imported);
+          const summary = formatProfileImportStats(imported, localizeUi);
           setProfileImportProgress((current) => {
             const totalItems = Math.max(1, current?.totalItems ?? 1);
             return {
               status: "success",
-              label: warnings.length > 0 ? "Profile import complete with missing assets" : "Profile import complete",
+              label:
+                warnings.length > 0
+                  ? localizeUi("ui.panels.importsettings.profileImportCompleteWithWarnings")
+                  : "Profile import complete",
               completedItems: totalItems,
               totalItems,
               startedAt,
@@ -4979,10 +6873,21 @@ function ImportSettings() {
             };
           });
           if (warnings.length > 0) {
-            const warningSummary = formatProfileImportWarningSummary(warnings);
-            toast.warning(summary ? `Imported: ${summary}. ${warningSummary}` : warningSummary);
+            const warningSummary = formatProfileImportWarningSummary(warnings, profileImportWarningCopy);
+            toast.warning(
+              summary
+                ? localizeUi("ui.panels.importsettings.importedValue1Value2", {
+                    value1: summary,
+                    value2: warningSummary,
+                  })
+                : warningSummary,
+            );
           } else {
-            toast.success(summary ? `Imported: ${summary}` : "Profile imported.");
+            toast.success(
+              summary
+                ? localizeUi("ui.panels.importsettings.importedValue1", { value1: summary })
+                : localizeUi("ui.panels.importsettings.profileImported"),
+            );
           }
         }
       }
@@ -5011,14 +6916,14 @@ function ImportSettings() {
   return (
     <div className="flex flex-col gap-3">
       <SettingsIntro>
-        Import data from Marinara exports, SillyTavern, or asset folders. Full profile imports also restore synced
-        custom themes and profile archive assets.
+        {localizeUi("ui.panels.importsettings.importDataFromMarinaraExportsSillytavernOrAssetFolders")}
       </SettingsIntro>
 
       <SettingsSection
-        title="Profile & Marinara"
-        description="Restore full profiles or import individual Marinara files."
+        title={localizeUi("settings.sections.profileMarinara.title")}
+        description={localizeUi("settings.sections.profileMarinara.description")}
         icon={<Download size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("profile-marinara")}
       >
         <div className="flex flex-col gap-2.5">
           <label
@@ -5031,9 +6936,9 @@ function ImportSettings() {
             {profileImportBusy ? <Loader2 size="1rem" className="animate-spin" /> : <Download size="1rem" />}
             {profileImportBusy
               ? profileImportProgress?.status === "reading" || profileImportProgress?.status === "preview"
-                ? "Scanning Profile..."
-                : "Importing Profile..."
-              : "Import Profile (JSON/ZIP)"}
+                ? localizeUi("ui.panels.importsettings.scanningProfile")
+                : localizeUi("ui.panels.importsettings.importingProfile")
+              : localizeUi("ui.panels.importsettings.importProfileJsonZip")}
             <input
               type="file"
               accept=".json,.zip,application/json,application/zip"
@@ -5093,29 +6998,32 @@ function ImportSettings() {
                   </div>
                   <div className="flex flex-wrap items-center justify-between gap-2 text-[0.6875rem] text-[var(--muted-foreground)]">
                     <span>
-                      {profileImportProgress.completedItems}/{profileImportProgress.totalItems} items
+                      {profileImportProgress.completedItems}/{profileImportProgress.totalItems}{" "}
+                      {localizeUi("ui.panels.importsettings.items")}
                     </span>
                     {estimateProfileImportRemainingSeconds(profileImportProgress) !== null && (
                       <span>
-                        ETA{" "}
+                        {localizeUi("ui.panels.importsettings.eta")}{" "}
                         {formatProfileImportDuration(estimateProfileImportRemainingSeconds(profileImportProgress) ?? 0)}
                       </span>
                     )}
                   </div>
-                  {formatProfileImportStats(profileImportProgress.imported) && (
+                  {formatProfileImportStats(profileImportProgress.imported, localizeUi) && (
                     <div className="text-[0.6875rem] text-[var(--muted-foreground)]">
-                      {profileImportProgress.status === "preview" ? "Found" : "Imported so far"}:{" "}
-                      {formatProfileImportStats(profileImportProgress.imported)}
+                      {profileImportProgress.status === "preview"
+                        ? localizeUi("ui.panels.importsettings.found")
+                        : localizeUi("ui.panels.importsettings.importedSoFar")}
+                      : {formatProfileImportStats(profileImportProgress.imported, localizeUi)}
                     </div>
                   )}
                   {profileImportProgress.warnings?.length ? (
                     <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[0.6875rem] text-amber-700 dark:text-amber-200">
                       <div className="font-medium">
-                        {formatProfileImportWarningSummary(profileImportProgress.warnings)}
+                        {formatProfileImportWarningSummary(profileImportProgress.warnings, profileImportWarningCopy)}
                       </div>
-                      {formatProfileImportWarningDetails(profileImportProgress.warnings) && (
+                      {formatProfileImportWarningDetails(profileImportProgress.warnings, profileImportWarningCopy) && (
                         <div className="mt-0.5 break-words text-amber-700/80 dark:text-amber-100/80">
-                          {formatProfileImportWarningDetails(profileImportProgress.warnings)}
+                          {formatProfileImportWarningDetails(profileImportProgress.warnings, profileImportWarningCopy)}
                         </div>
                       )}
                     </div>
@@ -5132,9 +7040,10 @@ function ImportSettings() {
       </SettingsSection>
 
       <SettingsSection
-        title="SillyTavern Import"
-        description="Bring over characters, chats, presets, and lorebooks from SillyTavern files."
+        title={localizeUi("settings.sections.sillyTavernImport.title")}
+        description={localizeUi("settings.sections.sillyTavernImport.componentDescription")}
         icon={<FolderOpen size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("sillytavern-import")}
       >
         <div className="flex flex-col gap-2.5">
           <button
@@ -5142,18 +7051,18 @@ function ImportSettings() {
             className={cn(SETTINGS_PRIMARY_BUTTON_CLASS, "w-full gap-2")}
           >
             <Download size="1rem" />
-            Import from SillyTavern Folder
+            {localizeUi("ui.panels.importsettings.importFromSillytavernFolder")}
           </button>
 
           <div className="flex flex-col gap-2">
             <ImportButton
-              label="Import Character (JSON/PNG)"
+              label={localizeUi("settings.transfer.importCharacter")}
               accept=".json,.png"
               endpoint="/import/st-character"
               mode="auto"
             />
             <ImportButton
-              label="Import Chat (JSONL)"
+              label={localizeUi("settings.transfer.importChat")}
               accept=".jsonl"
               endpoint="/import/st-chat"
               mode="file"
@@ -5162,8 +7071,18 @@ function ImportSettings() {
                 if (data.chatId) setActiveChatId(data.chatId);
               }}
             />
-            <ImportButton label="Import Preset (JSON)" accept=".json" endpoint="/import/st-preset" mode="json" />
-            <ImportButton label="Import Lorebook (JSON)" accept=".json" endpoint="/import/st-lorebook" mode="json" />
+            <ImportButton
+              label={localizeUi("settings.transfer.importPreset")}
+              accept=".json"
+              endpoint="/import/st-preset"
+              mode="json"
+            />
+            <ImportButton
+              label={localizeUi("settings.transfer.importLorebook")}
+              accept=".json"
+              endpoint="/import/st-lorebook"
+              mode="json"
+            />
           </div>
         </div>
       </SettingsSection>
@@ -5186,6 +7105,7 @@ function ImportButton({
   mode?: "file" | "json" | "auto";
   onImported?: (data: any) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -5200,9 +7120,10 @@ function ImportButton({
         const preview = previews[0];
         if (preview) {
           importEmbeddedLorebook = window.confirm(
-            `${preview.name ?? file.name} includes an embedded lorebook with ${preview.embeddedLorebookEntries} entr${
-              preview.embeddedLorebookEntries === 1 ? "y" : "ies"
-            }.\n\nImport it as a standalone Marinara lorebook too?`,
+            localizeUi("ui.panels.importbutton.embeddedLorebookImportPrompt", {
+              name: preview.name ?? file.name,
+              count: preview.embeddedLorebookEntries,
+            }),
           );
         }
       }
@@ -5238,13 +7159,17 @@ function ImportButton({
         if (onImported) {
           onImported(data);
         } else {
-          toast.success("Imported successfully!");
+          toast.success(localizeUi("ui.panels.importbutton.importedSuccessfully"));
         }
       } else {
-        toast.error(`Import failed: ${data.error ?? "Unknown error"}`);
+        toast.error(
+          localizeUi("ui.panels.importbutton.importFailedValue1", {
+            value1: data.error ?? localizeUi("ui.panels.importbutton.unknownError"),
+          }),
+        );
       }
     } catch {
-      toast.error("Import failed.");
+      toast.error(localizeUi("chat.branches.importFailed"));
     }
     e.target.value = "";
   };
@@ -5257,7 +7182,48 @@ function ImportButton({
   );
 }
 
+function ManualUpdateCommand({ command }: { command: string }) {
+  const { t: localizeUi } = useUiTranslation();
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(async () => {
+    const didCopy = await copyToClipboard(command);
+    setCopied(didCopy);
+    if (!didCopy) toast.error(localizeUi("ui.panels.manualupdatecommand.couldNotCopyTheUpdateCommand"));
+  }, [command, localizeUi]);
+
+  return (
+    <div
+      data-component="SettingsPanel.ManualUpdateCommand"
+      className="min-w-0 rounded-md bg-[var(--background)]/70 p-2 ring-1 ring-[var(--border)]"
+    >
+      <div className="mb-1.5 flex items-center justify-between gap-2">
+        <span className="text-[0.625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
+          {localizeUi("ui.panels.manualupdatecommand.manualUpdate")}
+        </span>
+        <button
+          type="button"
+          onClick={() => void handleCopy()}
+          className="flex shrink-0 items-center gap-1 rounded-md px-1.5 py-1 text-[0.625rem] font-medium text-[var(--primary)] transition-colors hover:bg-[var(--primary)]/10"
+          aria-label={localizeUi("settings.actions.copyUpdateCommand")}
+        >
+          {copied ? <Check size="0.6875rem" /> : <Copy size="0.6875rem" />}
+          {copied ? localizeUi("ui.panels.manualupdatecommand.copied") : localizeUi("lorebook.editor.batch.copy")}
+        </button>
+      </div>
+      <code className="block max-w-full overflow-x-auto whitespace-pre rounded bg-[var(--background)] px-2 py-1.5 font-mono text-[0.625rem] leading-relaxed text-[var(--foreground)]">
+        {command}
+      </code>
+    </div>
+  );
+}
+
 function AdvancedSettings() {
+  const { t: localizeUi } = useUiTranslation();
+  const { t } = useTranslation();
+  const activeChatId = useChatStore((state) => state.activeChatId);
+  const { data: activeChat, isLoading: isActiveChatLoading } = useChat(activeChatId);
+  const { data: rawConnections, isLoading: isConnectionsLoading } = useConnections();
   const showTimestamps = useUIStore((s) => s.showTimestamps);
   const setShowTimestamps = useUIStore((s) => s.setShowTimestamps);
   const showModelName = useUIStore((s) => s.showModelName);
@@ -5268,35 +7234,25 @@ function AdvancedSettings() {
   const setShowMessageNumbers = useUIStore((s) => s.setShowMessageNumbers);
   const guideGenerations = useUIStore((s) => s.guideGenerations);
   const setGuideGenerations = useUIStore((s) => s.setGuideGenerations);
-  const showQuickRepliesMenu = useUIStore((s) => s.showQuickRepliesMenu);
-  const setShowQuickRepliesMenu = useUIStore((s) => s.setShowQuickRepliesMenu);
-  const showQuickReplyPostOnly = useUIStore((s) => s.showQuickReplyPostOnly);
-  const setShowQuickReplyPostOnly = useUIStore((s) => s.setShowQuickReplyPostOnly);
-  const showQuickReplyGuide = useUIStore((s) => s.showQuickReplyGuide);
-  const setShowQuickReplyGuide = useUIStore((s) => s.setShowQuickReplyGuide);
-  const showQuickReplyImpersonate = useUIStore((s) => s.showQuickReplyImpersonate);
-  const setShowQuickReplyImpersonate = useUIStore((s) => s.setShowQuickReplyImpersonate);
   const includeReasoningInExports = useUIStore((s) => s.includeReasoningInExports);
   const setIncludeReasoningInExports = useUIStore((s) => s.setIncludeReasoningInExports);
   const debugMode = useUIStore((s) => s.debugMode);
   const setDebugMode = useUIStore((s) => s.setDebugMode);
   const clearAllData = useClearAllData();
   const expungeData = useExpungeData();
-  const [selectedScopes, setSelectedScopes] = useState<ExpungeScope[]>(["chats"]);
+  const [selectedScopes, setSelectedScopes] = useState<ExpungeScope[]>([]);
   const [confirmAction, setConfirmAction] = useState<"selected" | "all" | null>(null);
   const [exportingProfile, setExportingProfile] = useState(false);
   const [exportProfileDialogOpen, setExportProfileDialogOpen] = useState(false);
   const [refreshingSpa, setRefreshingSpa] = useState(false);
   const [adminSecret, setAdminSecret] = useState(() => localStorage.getItem(ADMIN_SECRET_STORAGE_KEY) ?? "");
-  const [quickRepliesDrawerOpen, setQuickRepliesDrawerOpen] = useState(true);
+  const { data: extensionPolicy, isLoading: extensionPolicyLoading } = usePersonalExtensionPolicy();
+  const setExternalExtensionsEnabled = useSetExternalExtensionsEnabled();
+  const { data: agentImportPolicy, isLoading: agentImportPolicyLoading } = useAgentImportPolicy();
+  const setAgentImportsEnabled = useSetAgentImportsEnabled();
   const nativeConsoleBridge = getMarinaraAndroidBridge();
   const canOpenNativeConsole = typeof nativeConsoleBridge?.openConsole === "function";
   const nativeConsoleHelp = getNativeConsoleShortcutHelp();
-
-  const handleQuickRepliesMenuChange = (enabled: boolean) => {
-    setShowQuickRepliesMenu(enabled);
-    if (enabled) setQuickRepliesDrawerOpen(true);
-  };
 
   const handleOpenNativeConsole = useCallback(() => {
     const bridge = getMarinaraAndroidBridge();
@@ -5305,9 +7261,55 @@ function AdvancedSettings() {
       return;
     }
 
-    bridge.openConsole();
-    toast.info("Opening Termux console…");
-  }, []);
+    const token = getAndroidBridgeToken();
+    if (token) bridge.openConsole(token);
+    else bridge.openConsole();
+    toast.info(localizeUi("ui.panels.advancedsettings.openingTermuxConsole"));
+  }, [localizeUi]);
+
+  const handleExternalExtensionsToggle = useCallback(
+    async (enabled: boolean) => {
+      if (enabled) {
+        const confirmed = await showConfirmDialog({
+          title: t("settings.externalExtensions.confirm.title"),
+          message: t("settings.externalExtensions.warning"),
+          confirmLabel: t("settings.externalExtensions.confirm.action"),
+          cancelLabel: t("settings.externalExtensions.confirm.cancel"),
+          tone: "destructive",
+        });
+        if (!confirmed) return;
+      }
+      try {
+        await setExternalExtensionsEnabled.mutateAsync(enabled);
+        toast.success(enabled ? t("settings.externalExtensions.enabled") : t("settings.externalExtensions.disabled"));
+      } catch (toggleError) {
+        toast.error(getPrivilegedActionErrorMessage(toggleError, t("settings.externalExtensions.error")));
+      }
+    },
+    [setExternalExtensionsEnabled, t],
+  );
+
+  const handleAgentImportsToggle = useCallback(
+    async (enabled: boolean) => {
+      if (enabled) {
+        const confirmed = await showConfirmDialog({
+          title: t("settings.agentImports.confirm.title"),
+          message: t("settings.agentImports.warning"),
+          confirmLabel: t("settings.agentImports.confirm.action"),
+          cancelLabel: t("settings.agentImports.confirm.cancel"),
+          tone: "destructive",
+        });
+        if (!confirmed) return;
+      }
+      try {
+        await setAgentImportsEnabled.mutateAsync(enabled);
+        toast.success(enabled ? t("settings.agentImports.enabled") : t("settings.agentImports.disabled"));
+      } catch (toggleError) {
+        toast.error(getPrivilegedActionErrorMessage(toggleError, t("settings.agentImports.error")));
+      }
+    },
+    [setAgentImportsEnabled, t],
+  );
 
   type ProfileExportFormat = "native" | "compatible" | "zip";
   const profileExportFallbackNames: Record<ProfileExportFormat, string> = {
@@ -5334,9 +7336,9 @@ function AdvancedSettings() {
           failure.fallbackFormat === "zip"
         ) {
           const confirmed = await showConfirmDialog({
-            title: "Export profile as ZIP?",
+            title: localizeUi("ui.panels.advancedsettings.exportProfileAsZip"),
             message: failure.message,
-            confirmLabel: "Export ZIP",
+            confirmLabel: localizeUi("ui.panels.advancedsettings.exportZip"),
             cancelLabel: "Cancel",
           });
           if (confirmed) {
@@ -5355,7 +7357,7 @@ function AdvancedSettings() {
       URL.revokeObjectURL(url);
       toast.success(profileExportSuccessMessages[format]);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to export profile");
+      toast.error(err instanceof Error ? err.message : localizeUi("ui.panels.advancedsettings.failedToExportProfile"));
     } finally {
       setExportingProfile(false);
     }
@@ -5374,11 +7376,11 @@ function AdvancedSettings() {
     setRefreshingSpa(true);
 
     try {
-      toast.info("Clearing caches and refreshing app…");
+      toast.info(localizeUi("ui.panels.advancedsettings.clearingCachesAndRefreshingApp"));
       await forceRefreshSpa();
     } catch (err) {
       setRefreshingSpa(false);
-      toast.error(err instanceof Error ? err.message : "Failed to refresh the app");
+      toast.error(err instanceof Error ? err.message : localizeUi("ui.panels.advancedsettings.failedToRefreshTheApp"));
     }
   };
 
@@ -5397,9 +7399,8 @@ function AdvancedSettings() {
   const handleCreateBackup = async () => {
     setCreatingBackup(true);
     try {
-      const res = await fetch("/api/backup/download", {
+      const res = await api.raw("/backup/download", {
         method: "POST",
-        headers: getAdminSecretHeader(),
       });
       if (!res.ok) throw new Error(await readSettingsResponseError(res, "Backup failed"));
 
@@ -5434,7 +7435,7 @@ function AdvancedSettings() {
           const writable = await handle.createWritable();
           await writable.write(blob);
           await writable.close();
-          toast.success("Backup saved!");
+          toast.success(localizeUi("ui.panels.advancedsettings.backupSaved"));
           qc.invalidateQueries({ queryKey: ["backups"] });
           return;
         } catch (err) {
@@ -5453,10 +7454,10 @@ function AdvancedSettings() {
       a.download = suggestedName;
       a.click();
       URL.revokeObjectURL(url);
-      toast.success("Backup downloaded!");
+      toast.success(localizeUi("ui.panels.advancedsettings.backupDownloaded"));
       qc.invalidateQueries({ queryKey: ["backups"] });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to create backup");
+      toast.error(err instanceof Error ? err.message : localizeUi("ui.panels.advancedsettings.failedToCreateBackup"));
     } finally {
       setCreatingBackup(false);
     }
@@ -5466,6 +7467,47 @@ function AdvancedSettings() {
     queryKey: ["backups"],
     queryFn: () => api.get("/backup"),
   });
+  type AutomaticBackupFrequency = "daily" | "weekly" | "monthly";
+  type AutomaticBackupSettings = {
+    enabled: boolean;
+    frequency: AutomaticBackupFrequency;
+    retentionCount: number;
+    lastBackupAt: string | null;
+    lastError: string | null;
+    nextBackupAt: string | null;
+    backupExists: boolean;
+  };
+  const automaticBackupQuery = useQuery<AutomaticBackupSettings>({
+    queryKey: ["backups", "automatic"],
+    queryFn: () => api.get("/backup/automatic"),
+    refetchInterval: (query) => (query.state.data?.enabled ? 30_000 : false),
+  });
+  const automaticBackupMutation = useMutation({
+    mutationFn: (settings: Pick<AutomaticBackupSettings, "enabled" | "frequency" | "retentionCount">) =>
+      api.put<AutomaticBackupSettings>("/backup/automatic", settings),
+    onSuccess: (settings) => {
+      qc.setQueryData(["backups", "automatic"], settings);
+      toast.success(localizeUi("ui.panels.advancedsettings.automaticBackupSettingsSaved"));
+    },
+    onError: (error) => {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : localizeUi("ui.panels.advancedsettings.failedToSaveAutomaticBackupSettings"),
+      );
+    },
+  });
+  const updateAutomaticBackup = (
+    patch: Partial<Pick<AutomaticBackupSettings, "enabled" | "frequency" | "retentionCount">>,
+  ) => {
+    const current = automaticBackupQuery.data;
+    if (!current) return;
+    automaticBackupMutation.mutate({
+      enabled: patch.enabled ?? current.enabled,
+      frequency: patch.frequency ?? current.frequency,
+      retentionCount: patch.retentionCount ?? current.retentionCount,
+    });
+  };
 
   const health = useQuery<{
     status: string;
@@ -5478,11 +7520,37 @@ function AdvancedSettings() {
     queryFn: () => api.get("/health"),
     staleTime: 60_000,
   });
+  const connections = (rawConnections ?? []) as APIConnection[];
+  const activeConnection = activeChat?.connectionId
+    ? (connections.find((connection) => connection.id === activeChat.connectionId) ?? null)
+    : (connections.find((connection) => connection.isDefault) ?? null);
+  const supportDiagnosticsPending = isConnectionsLoading || (!!activeChatId && isActiveChatLoading);
+
+  const handleCopySupportDiagnostics = useCallback(async () => {
+    const copied = await copyToClipboard(
+      formatSupportDiagnostics({
+        version: health.data?.version ?? APP_VERSION,
+        build: health.data?.build ?? APP_VERSION,
+        commit: health.data?.commit ?? null,
+        os: resolveClientOs(navigator.userAgent, navigator.platform),
+        browser: navigator.userAgent,
+        gpu: detectBrowserGpu(),
+        connectionName: activeConnection?.name ?? null,
+        connectionProvider: activeConnection?.provider ?? null,
+        model: activeConnection?.model ?? null,
+      }),
+    );
+    if (copied) {
+      toast.success(localizeUi("ui.panels.advancedsettings.supportDiagnosticsCopied"));
+    } else {
+      toast.error(localizeUi("ui.panels.advancedsettings.supportDiagnosticsCopyFailed"));
+    }
+  }, [activeConnection, health.data, localizeUi]);
 
   const deleteBackupMutation = useMutation({
     mutationFn: (name: string) => api.delete(`/backup/${name}`),
     onSuccess: () => {
-      toast.success("Backup deleted");
+      toast.success(localizeUi("ui.panels.advancedsettings.backupDeleted"));
       qc.invalidateQueries({ queryKey: ["backups"] });
     },
   });
@@ -5491,12 +7559,12 @@ function AdvancedSettings() {
     const trimmed = adminSecret.trim();
     if (trimmed) {
       localStorage.setItem(ADMIN_SECRET_STORAGE_KEY, trimmed);
-      toast.success("Admin secret saved for this browser");
+      toast.success(localizeUi("ui.panels.advancedsettings.adminSecretSavedForThisBrowser"));
     } else {
       localStorage.removeItem(ADMIN_SECRET_STORAGE_KEY);
-      toast.info("Admin secret cleared");
+      toast.info(localizeUi("ui.panels.advancedsettings.adminSecretCleared"));
     }
-  }, [adminSecret]);
+  }, [adminSecret, localizeUi]);
 
   type UpdateChannelId = "stable" | "staging";
   const [updateChannel, setUpdateChannel] = useState<UpdateChannelId | null>(null);
@@ -5531,6 +7599,7 @@ function AdvancedSettings() {
     serverPlatform?: "windows" | "macos" | "linux" | "android-termux" | "unknown";
     clientPlatform?: "ios" | "android" | "desktop" | "unknown";
     applyAvailable?: boolean;
+    channelSwitch?: boolean;
     updatesApplyEnabled?: boolean;
     applyUnavailableReason?: "disabled" | "unsupported-install" | "container-install" | null;
     manualUpdateCommand?: string | null;
@@ -5552,7 +7621,6 @@ function AdvancedSettings() {
         channel: selectedUpdateChannelId,
         currentVersion: updateCheck.data?.currentVersion ?? health.data?.version ?? APP_VERSION,
         currentCommit: updateCheck.data?.currentCommit ?? health.data?.commit ?? null,
-        currentBuild: updateCheck.data?.currentBuild ?? health.data?.build ?? null,
         targetRef: updateCheck.data?.targetRef,
         targetCommit: updateCheck.data?.targetCommit,
       }),
@@ -5616,16 +7684,18 @@ function AdvancedSettings() {
   const runExpunge = (mode: "selected" | "all") => {
     if (mode === "all") {
       clearAllData.mutate(undefined, {
-        onSuccess: () => toast.success("All selected data was cleared. Runtime caches were reset immediately."),
-        onError: () => toast.error("Failed to clear all data."),
+        onSuccess: () =>
+          toast.success(localizeUi("ui.panels.advancedsettings.allSelectedDataWasClearedRuntimeCachesWereReset")),
+        onError: () => toast.error(localizeUi("ui.panels.advancedsettings.failedToClearAllData")),
         onSettled: () => setConfirmAction(null),
       });
       return;
     }
 
     expungeData.mutate(selectedScopes, {
-      onSuccess: () => toast.success("Selected data was cleared. Runtime caches were reset immediately."),
-      onError: () => toast.error("Failed to clear selected data."),
+      onSuccess: () =>
+        toast.success(localizeUi("ui.panels.advancedsettings.selectedDataWasClearedRuntimeCachesWereResetImmediately")),
+      onError: () => toast.error(localizeUi("ui.panels.advancedsettings.failedToClearSelectedData")),
       onSettled: () => setConfirmAction(null),
     });
   };
@@ -5634,8 +7704,8 @@ function AdvancedSettings() {
     <div className="flex flex-col gap-3">
       <ExportFormatDialog
         open={exportProfileDialogOpen}
-        title="Export Profile"
-        description="Native creates a Marinara profile JSON for restoring your data in Marinara. If the JSON would be too large, Marinara will offer a profile ZIP instead."
+        title={localizeUi("settings.transfer.exportProfile.title")}
+        description={localizeUi("settings.transfer.exportProfile.description")}
         nativeDescription="Keeps Marinara fields, lorebook folders, character/persona metadata, presets, agents, themes, and inline assets for re-import."
         compatibleDescription="Exports direct character JSON, simple persona JSON, and folderless lorebooks for other roleplay tools."
         onClose={() => setExportProfileDialogOpen(false)}
@@ -5643,20 +7713,21 @@ function AdvancedSettings() {
       />
 
       <SettingsIntro>
-        Server maintenance, generation tooling, message utilities, backups, and data removal.
+        {localizeUi("ui.panels.advancedsettings.serverMaintenanceMessageUtilitiesBackupsAndDataRemoval")}
       </SettingsIntro>
 
       <SettingsSection
-        title="Admin Access"
-        description="Save the browser-side admin secret for protected maintenance actions."
+        title={localizeUi("settings.sections.adminAccess.title")}
+        description={localizeUi("settings.sections.adminAccess.componentDescription")}
         icon={<Power size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("admin-access")}
       >
         <div className="flex min-w-0 flex-col gap-2">
           <input
             type="password"
             value={adminSecret}
             onChange={(e) => setAdminSecret(e.target.value)}
-            placeholder="ADMIN_SECRET"
+            placeholder={localizeUi("ui.panels.advancedsettings.adminSecret")}
             className="w-full min-w-0 rounded-lg bg-[var(--background)] px-3 py-2 text-xs outline-none ring-1 ring-[var(--border)] placeholder:text-[var(--muted-foreground)]/50 focus:ring-[var(--primary)]"
           />
           <button
@@ -5666,21 +7737,25 @@ function AdvancedSettings() {
           >
             <span className="flex min-w-0 items-center justify-center gap-1.5">
               <Save size="0.75rem" className="shrink-0" />
-              Save
+              {localizeUi("ui.noodle.noodlehome.save")}
             </span>
           </button>
         </div>
       </SettingsSection>
 
       <SettingsSection
-        title="Updates"
-        description="Check this install, apply supported updates, or force-refresh the web shell."
+        title={localizeUi("settings.sections.updates.title")}
+        description={localizeUi("settings.sections.updates.componentDescription")}
         icon={<RefreshCw size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("updates")}
       >
         <div className="flex flex-col gap-2">
           <div className="flex flex-col gap-2">
-            <label className="flex min-w-0 flex-col gap-1 text-[0.625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
-              Release Channel
+            <label
+              id={getSettingsControlAnchorId("release-channel")}
+              className="flex scroll-mt-3 min-w-0 flex-col gap-1 text-[0.625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]"
+            >
+              {localizeUi("ui.panels.advancedsettings.releaseChannel")}
               <select
                 value={selectedUpdateChannelId}
                 onChange={(event) => setUpdateChannel(event.target.value as UpdateChannelId)}
@@ -5701,19 +7776,25 @@ function AdvancedSettings() {
               {updateCheck.isFetching ? (
                 <>
                   <Loader2 size="0.8125rem" className="animate-spin" />
-                  Checking…
+                  {localizeUi("settings.notifications.customSound.status.loading")}
                 </>
               ) : (
                 <>
                   <RefreshCw size="0.8125rem" />
-                  Check for Updates
+                  {localizeUi("ui.panels.advancedsettings.checkForUpdates")}
                 </>
               )}
             </button>
             <div className="flex flex-col px-1 text-[0.6875rem] text-[var(--muted-foreground)]">
-              <span>Release: {currentReleaseLabel}</span>
+              <span>
+                {localizeUi("ui.panels.advancedsettings.release")} {currentReleaseLabel}
+              </span>
               <span>{currentBuildLabel}</span>
-              {updateCheck.data?.currentBranch && <span>Branch: {updateCheck.data.currentBranch}</span>}
+              {updateCheck.data?.currentBranch && (
+                <span>
+                  {localizeUi("ui.panels.advancedsettings.branch")} {updateCheck.data.currentBranch}
+                </span>
+              )}
             </div>
           </div>
 
@@ -5729,7 +7810,9 @@ function AdvancedSettings() {
               <Check size="0.8125rem" className="text-green-500 shrink-0" />
               <div className="flex flex-col gap-0.5">
                 <span className="text-xs">
-                  You're on the latest {updateCheck.data.channelLabel ?? "release"} target ({currentReleaseLabel})
+                  {localizeUi("ui.panels.advancedsettings.youReOnTheLatest")}{" "}
+                  {updateCheck.data.channelLabel ?? "release"} {localizeUi("ui.panels.advancedsettings.target")}
+                  {currentReleaseLabel})
                 </span>
                 <span className="text-[0.6875rem] text-[var(--muted-foreground)]">{currentBuildLabel}</span>
               </div>
@@ -5741,8 +7824,14 @@ function AdvancedSettings() {
               <div className="flex items-center justify-between">
                 <span className="text-xs font-medium">
                   {updateCheck.data.versionUpdate
-                    ? `v${updateCheck.data.latestVersion} available`
-                    : `${commitsBehind} commit${commitsBehind !== 1 ? "s" : ""} behind ${updateCheck.data.targetRef ?? "origin/main"}`}
+                    ? localizeUi("ui.panels.advancedsettings.vValue1Available", {
+                        value1: updateCheck.data.latestVersion,
+                      })
+                    : localizeUi("ui.panels.advancedsettings.value1CommitValue2BehindValue3", {
+                        value1: commitsBehind,
+                        value2: commitsBehind !== 1 ? localizeUi("ui.noodle.stageprofileview.s") : "",
+                        value3: updateCheck.data.targetRef ?? localizeUi("ui.panels.advancedsettings.originMain"),
+                      })}
                 </span>
                 {updateCheck.data.versionUpdate && (
                   <a
@@ -5751,7 +7840,7 @@ function AdvancedSettings() {
                     rel="noopener noreferrer"
                     className="flex items-center gap-1 text-[0.625rem] text-[var(--primary)] hover:underline"
                   >
-                    Release notes <ExternalLink size="0.625rem" />
+                    {localizeUi("ui.panels.advancedsettings.releaseNotes")} <ExternalLink size="0.625rem" />
                   </a>
                 )}
               </div>
@@ -5762,14 +7851,14 @@ function AdvancedSettings() {
               )}
               {commitsBehind > 0 && (
                 <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-                  Commit counts compare this build with {updateCheck.data.targetRef ?? "origin/main"} and may include
-                  unreleased development commits, not just tagged releases.
+                  {localizeUi("ui.panels.advancedsettings.commitCountsCompareThisBuildWith")}{" "}
+                  {updateCheck.data.targetRef ?? "origin/main"}{" "}
+                  {localizeUi("ui.panels.advancedsettings.andMayIncludeUnreleasedDevelopmentCommitsNotJustTagged")}
                 </p>
               )}
               {isIosClient && (
                 <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-                  On iPhone or iPad, this updates the Marinara server you are connected to. Reload the Home Screen app
-                  after the host finishes updating.
+                  {localizeUi("ui.panels.advancedsettings.onIphoneOrIpadThisUpdatesTheMarinaraServer")}
                 </p>
               )}
               {updateCheck.data.applyAvailable ? (
@@ -5781,12 +7870,18 @@ function AdvancedSettings() {
                   {applyUpdate.isPending ? (
                     <>
                       <Loader2 size="0.8125rem" className="animate-spin" />
-                      Updating…
+                      {updateCheck.data.channelSwitch
+                        ? localizeUi("ui.panels.advancedsettings.switching")
+                        : localizeUi("ui.panels.advancedsettings.updating")}
                     </>
                   ) : (
                     <>
                       <Download size="0.8125rem" />
-                      Apply Update
+                      {updateCheck.data.channelSwitch
+                        ? localizeUi("ui.panels.advancedsettings.switchToValue1", {
+                            value1: updateCheck.data.channelLabel,
+                          })
+                        : localizeUi("ui.panels.advancedsettings.applyUpdate")}
                     </>
                   )}
                 </button>
@@ -5804,12 +7899,13 @@ function AdvancedSettings() {
                       className={SETTINGS_PRIMARY_BUTTON_CLASS}
                     >
                       <Download size="0.8125rem" />
-                      Download v{updateCheck.data.latestVersion}
+                      {localizeUi("ui.panels.advancedsettings.downloadV")}
+                      {updateCheck.data.latestVersion}
                     </a>
                   )}
                   {updateCheck.data.versionUpdate && (
                     <span className="text-[0.625rem] text-[var(--muted-foreground)]">
-                      Android APK assets are WebView shells, not standalone apps. Start Marinara in Termux first.
+                      {localizeUi("ui.panels.advancedsettings.androidApkAssetsAreWebviewShellsNotStandaloneApps")}
                     </span>
                   )}
                   {manualUpdateHint && (
@@ -5817,14 +7913,14 @@ function AdvancedSettings() {
                   )}
                   {installType === "docker" && updateCheck.data.dockerImageTag && (
                     <span className="text-[0.625rem] text-[var(--muted-foreground)]">
-                      Container tag:{" "}
+                      {localizeUi("ui.panels.advancedsettings.containerTag")}{" "}
                       <code className="break-all rounded bg-[var(--background)] px-1 py-0.5">
                         {updateCheck.data.dockerImageTag}
                       </code>
                       {updateCheck.data.dockerLiteImageTag ? (
                         <>
                           {" "}
-                          Lite:{" "}
+                          {localizeUi("ui.panels.advancedsettings.lite")}{" "}
                           <code className="break-all rounded bg-[var(--background)] px-1 py-0.5">
                             {updateCheck.data.dockerLiteImageTag}
                           </code>
@@ -5832,14 +7928,7 @@ function AdvancedSettings() {
                       ) : null}
                     </span>
                   )}
-                  {manualUpdateCommand && (
-                    <span className="text-[0.625rem] text-[var(--muted-foreground)]">
-                      Manual update:{" "}
-                      <code className="break-all rounded bg-[var(--background)] px-1 py-0.5">
-                        {manualUpdateCommand}
-                      </code>
-                    </span>
-                  )}
+                  {manualUpdateCommand && <ManualUpdateCommand command={manualUpdateCommand} />}
                 </div>
               )}
             </div>
@@ -5848,7 +7937,7 @@ function AdvancedSettings() {
           {updateCheck.isError && (
             <div className="flex items-center gap-1.5 rounded-lg bg-[var(--destructive)]/10 px-2.5 py-2 text-xs text-[var(--destructive)]">
               <AlertTriangle size="0.8125rem" className="shrink-0" />
-              Could not check for updates. Try again later.
+              {localizeUi("ui.panels.advancedsettings.couldNotCheckForUpdatesTryAgainLater")}
             </div>
           )}
 
@@ -5861,226 +7950,109 @@ function AdvancedSettings() {
               {refreshingSpa ? (
                 <>
                   <Loader2 size="0.8125rem" className="animate-spin" />
-                  Refreshing…
+                  {localizeUi("ui.panels.advancedsettings.refreshing")}
                 </>
               ) : (
                 <>
                   <RefreshCw size="0.8125rem" />
-                  Refresh App
+                  {localizeUi("ui.panels.advancedsettings.refreshApp")}
                 </>
               )}
             </button>
             <HelpTooltip
               side="bottom"
-              text="Manual refresh unregisters the active service worker and clears browser caches before reloading. Marinara's stored chats, settings, and other local app data stay intact."
+              text={localizeUi("ui.panels.advancedsettings.manualRefreshUnregistersTheActiveServiceWorkerAndClears")}
             />
           </div>
         </div>
       </SettingsSection>
 
-      <ImageGenerationSettings />
-      <PromptOverridesEditor
-        title="Image Prompt Templates"
-        description="Edit the reusable templates used for NPC portraits, scene backgrounds, and scene illustrations."
-        help="These templates render before recurring Game image requests and manual Gallery background generation. One-off prompt review edits still only affect the current request."
-        keys={GAME_IMAGE_PROMPT_TEMPLATE_KEYS}
-        preferredKey="game.npcPortrait"
-      />
-      <PromptOverridesEditor />
+      <SettingsSection
+        title={localizeUi("ui.panels.advancedsettings.supportDiagnostics")}
+        description={localizeUi("ui.panels.advancedsettings.supportDiagnosticsDescription")}
+        icon={<LifeBuoy size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("support-diagnostics")}
+      >
+        <SearchableSettingTarget controlId="copy-support-diagnostics">
+          <button
+            type="button"
+            onClick={() => void handleCopySupportDiagnostics()}
+            disabled={supportDiagnosticsPending}
+            className={cn(SETTINGS_PRIMARY_BUTTON_CLASS, "w-full gap-2")}
+          >
+            <Copy size="0.8125rem" />
+            {localizeUi("ui.panels.advancedsettings.copySupportDiagnostics")}
+          </button>
+        </SearchableSettingTarget>
+      </SettingsSection>
 
       <SettingsSection
-        title="Message Tools"
-        description="Quick reply actions, message metadata, and debug visibility."
+        title={localizeUi("settings.customGenerationParameters.title")}
+        description={localizeUi("settings.customGenerationParameters.sectionDescription")}
+        help={localizeUi("settings.customGenerationParameters.help")}
+        icon={<SlidersHorizontal size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("parameters")}
+      >
+        <SearchableSettingTarget controlId="custom-generation-parameters">
+          <CustomGenerationParametersSettings />
+        </SearchableSettingTarget>
+      </SettingsSection>
+
+      <SettingsSection
+        title={localizeUi("settings.sections.messageTools.title")}
+        description={localizeUi("settings.sections.messageTools.componentDescription")}
         icon={<MessageCircle size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("message-tools")}
       >
         <div className="flex flex-col gap-2.5">
-          <div
-            className={cn(
-              "overflow-hidden rounded-xl border transition-colors",
-              showQuickRepliesMenu
-                ? "border-[var(--primary)]/30 bg-[var(--secondary)]/15"
-                : "border-transparent bg-transparent hover:bg-[var(--secondary)]/30",
-            )}
-          >
-            <div className="flex min-h-9 items-stretch">
-              <div className="flex min-w-0 items-center gap-1.5 py-2 pl-1.5 pr-2">
-                <label className="flex min-w-0 cursor-pointer items-center gap-2.5">
-                  <input
-                    type="checkbox"
-                    checked={showQuickRepliesMenu}
-                    onChange={(e) => handleQuickRepliesMenuChange(e.target.checked)}
-                    className="h-3.5 w-3.5 shrink-0 rounded border-[var(--border)] accent-[var(--primary)]"
-                  />
-                  <span className="min-w-0 text-xs">Quick replies</span>
-                </label>
-                <span className="shrink-0" onClick={(e) => e.preventDefault()}>
-                  <HelpTooltip text="Adds alternate draft actions beside Send. One action appears directly; multiple actions open from the ellipsis." />
-                </span>
-              </div>
-              <button
-                type="button"
-                onMouseDown={(e) => e.stopPropagation()}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (!showQuickRepliesMenu) return;
-                  setQuickRepliesDrawerOpen((open) => !open);
-                }}
-                aria-disabled={!showQuickRepliesMenu}
-                aria-controls="quick-replies-actions-drawer"
-                aria-expanded={showQuickRepliesMenu && quickRepliesDrawerOpen}
-                aria-label={
-                  !showQuickRepliesMenu
-                    ? "Quick replies options disabled"
-                    : quickRepliesDrawerOpen
-                      ? "Collapse Quick replies options"
-                      : "Expand Quick replies options"
-                }
-                title={
-                  !showQuickRepliesMenu
-                    ? "Enable Quick replies to configure options"
-                    : quickRepliesDrawerOpen
-                      ? "Collapse options"
-                      : "Expand options"
-                }
-                className={cn(
-                  "flex min-w-10 flex-1 items-center justify-end py-2 pl-2 pr-2 text-[var(--muted-foreground)] transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]",
-                  showQuickRepliesMenu && quickRepliesDrawerOpen ? "rounded-tr-xl" : "rounded-r-xl",
-                  showQuickRepliesMenu
-                    ? "cursor-pointer hover:bg-[var(--secondary)]/35 hover:text-[var(--foreground)] active:scale-[0.99]"
-                    : "cursor-not-allowed opacity-35",
-                )}
-                tabIndex={showQuickRepliesMenu ? 0 : -1}
-              >
-                <span className="flex h-7 w-7 items-center justify-center rounded-lg">
-                  <ChevronDown
-                    size="0.875rem"
-                    aria-hidden="true"
-                    className={cn(
-                      "transition-transform",
-                      showQuickRepliesMenu && quickRepliesDrawerOpen ? "" : "-rotate-90",
-                    )}
-                  />
-                </span>
-              </button>
-            </div>
-            {showQuickRepliesMenu && quickRepliesDrawerOpen && (
-              <div
-                id="quick-replies-actions-drawer"
-                className="grid gap-1 border-t border-[var(--border)]/60 bg-[var(--background)]/25 p-1"
-                role="group"
-                aria-label="Quick replies actions to include"
-              >
-                {[
-                  {
-                    label: "Post only",
-                    checked: showQuickReplyPostOnly,
-                    onChange: setShowQuickReplyPostOnly,
-                    description: "Add persona message without triggering a reply.",
-                    icon: FileText,
-                  },
-                  {
-                    label: "Guide reply",
-                    checked: showQuickReplyGuide,
-                    onChange: setShowQuickReplyGuide,
-                    description: "Use draft as /guided direction.",
-                    icon: WandSparkles,
-                  },
-                  {
-                    label: "Impersonate",
-                    checked: showQuickReplyImpersonate,
-                    onChange: setShowQuickReplyImpersonate,
-                    description: "Generate a persona-side user reply.",
-                    icon: UserCheck,
-                  },
-                ].map((option) => {
-                  const Icon = option.icon;
-                  return (
-                    <button
-                      type="button"
-                      key={option.label}
-                      aria-pressed={option.checked}
-                      onClick={() => option.onChange(!option.checked)}
-                      className={cn(
-                        "group flex min-h-10 w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] active:scale-[0.99]",
-                        option.checked
-                          ? "bg-[var(--primary)]/8 text-[var(--foreground)] ring-1 ring-[var(--primary)]/30"
-                          : "text-[var(--muted-foreground)] ring-1 ring-transparent hover:bg-[var(--secondary)]/45 hover:text-[var(--foreground)]",
-                      )}
-                    >
-                      <span
-                        className={cn(
-                          "flex h-7 w-7 shrink-0 items-center justify-center rounded-md ring-1 transition-colors",
-                          option.checked
-                            ? "bg-[var(--primary)]/12 text-[var(--primary)] ring-[var(--primary)]/30"
-                            : "bg-[var(--secondary)]/35 text-[var(--muted-foreground)] ring-[var(--border)]/60 group-hover:text-[var(--foreground)]",
-                        )}
-                      >
-                        <Icon size="0.8125rem" aria-hidden="true" />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block text-xs font-semibold">{option.label}</span>
-                        <span className="block text-[0.65rem] leading-tight text-[var(--muted-foreground)]">
-                          {option.description}
-                        </span>
-                      </span>
-                      <span
-                        className={cn(
-                          "flex h-4 w-4 shrink-0 items-center justify-center rounded-full ring-1 transition-colors",
-                          option.checked
-                            ? "mari-accent-animated bg-[var(--accent)] text-[var(--primary)] ring-[var(--primary)]/35"
-                            : "bg-[var(--background)]/45 text-transparent ring-[var(--border)]/70 group-hover:text-[var(--muted-foreground)]",
-                        )}
-                        aria-hidden="true"
-                      >
-                        <Check size="0.625rem" strokeWidth={3} />
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
           <ToggleSetting
-            label="Show message timestamps"
+            anchorId={getSettingsControlAnchorId("show-message-timestamps")}
+            label={localizeUi("settings.controls.showTimestamps.label")}
             checked={showTimestamps}
             onChange={setShowTimestamps}
-            help="Displays the date and time each message was sent next to it in the chat."
+            help={localizeUi("settings.controls.showTimestamps.help")}
           />
           <ToggleSetting
-            label="Show model name on messages"
+            anchorId={getSettingsControlAnchorId("show-model-name")}
+            label={localizeUi("settings.controls.showModelName.label")}
             checked={showModelName}
             onChange={setShowModelName}
-            help="Displays which AI model generated each response, shown as a small label on assistant messages."
+            help={localizeUi("settings.controls.showModelName.help")}
           />
           <ToggleSetting
-            label="Show token usage on messages"
+            anchorId={getSettingsControlAnchorId("show-token-usage")}
+            label={localizeUi("settings.controls.showTokenUsage.label")}
             checked={showTokenUsage}
             onChange={setShowTokenUsage}
-            help="Displays prompt and completion token counts on each AI message. Useful for monitoring context size and cost."
+            help={localizeUi("settings.controls.showTokenUsage.help")}
           />
           <ToggleSetting
-            label="Show message numbers"
+            anchorId={getSettingsControlAnchorId("show-message-numbers")}
+            label={localizeUi("settings.controls.showMessageNumbers.label")}
             checked={showMessageNumbers}
             onChange={setShowMessageNumbers}
-            help="Displays message numbers in roleplay and conversation chats."
+            help={localizeUi("settings.controls.showMessageNumbers.help")}
           />
           <ToggleSetting
-            label="Guide swipes/regens with chat input"
+            anchorId={getSettingsControlAnchorId("guide-generations")}
+            label={localizeUi("settings.controls.guideGenerations.label")}
             checked={guideGenerations}
             onChange={setGuideGenerations}
-            help="Uses the current draft as direction when regenerating a message or manually triggering a character response."
+            help={localizeUi("settings.controls.guideGenerations.help")}
           />
           <ToggleSetting
-            label="Include reasoning in exports"
+            anchorId={getSettingsControlAnchorId("include-reasoning-in-exports")}
+            label={localizeUi("settings.controls.includeReasoning.label")}
             checked={includeReasoningInExports}
             onChange={setIncludeReasoningInExports}
-            help="Includes saved hidden thinking/reasoning metadata in JSONL and text chat exports. Keep this off when sharing transcripts."
+            help={localizeUi("settings.controls.includeReasoning.help")}
           />
           <ToggleSetting
-            label="Debug mode"
+            anchorId={getSettingsControlAnchorId("debug-mode")}
+            label={localizeUi("settings.controls.debugMode.label")}
             checked={debugMode}
             onChange={setDebugMode}
-            help="Logs the prompt and response payloads sent to the model in the server console for debugging."
+            help={localizeUi("settings.controls.debugMode.help")}
           />
           <div className="flex items-center gap-2">
             <div className="min-w-0 flex-1" title={nativeConsoleHelp}>
@@ -6091,7 +8063,7 @@ function AdvancedSettings() {
                 className={cn(SETTINGS_BUTTON_CLASS, "w-full justify-center gap-1.5 px-3 py-2 text-xs")}
               >
                 <Terminal size="0.8125rem" className="shrink-0" />
-                <span>Open Console</span>
+                <span>{localizeUi("ui.panels.advancedsettings.openConsole")}</span>
               </button>
             </div>
             <HelpTooltip side="bottom" text={nativeConsoleHelp} />
@@ -6100,26 +8072,96 @@ function AdvancedSettings() {
       </SettingsSection>
 
       <SettingsSection
-        title="Backup & Export"
-        description="Download profile exports or full backup archives for recovery and migration."
-        help="Download a full backup as a .zip archive (storage snapshots + avatars, sprites, backgrounds, gallery, fonts, knowledge sources). Import Profile can restore the zip directly. The raw folders are for manual recovery."
+        title={localizeUi("settings.sections.backupExport.title")}
+        description={localizeUi("settings.sections.backupExport.componentDescription")}
+        help={localizeUi("settings.transfer.fullBackup.help")}
         icon={<Download size="0.875rem" />}
+        {...getSettingsSectionAnchorProps("backup-export")}
       >
         <div className="flex flex-col gap-2">
-          <button
-            onClick={handleCreateBackup}
-            disabled={creatingBackup}
-            className={SETTINGS_PRIMARY_BUTTON_CLASS}
-          >
+          {automaticBackupQuery.data && (
+            <div className="rounded-lg border border-[var(--border)]/70 bg-[var(--secondary)]/35 p-2.5">
+              <ToggleSetting
+                anchorId={getSettingsControlAnchorId("automatic-backups")}
+                label={localizeUi("ui.panels.advancedsettings.automaticBackups")}
+                help={localizeUi("ui.panels.advancedsettings.automaticBackupsDescription")}
+                checked={automaticBackupQuery.data.enabled}
+                onChange={(enabled) => updateAutomaticBackup({ enabled })}
+                disabled={automaticBackupMutation.isPending}
+              />
+              <div className="mt-2 grid grid-cols-3 gap-1">
+                {(["daily", "weekly", "monthly"] as const).map((frequency) => (
+                  <button
+                    key={frequency}
+                    type="button"
+                    onClick={() => updateAutomaticBackup({ frequency })}
+                    disabled={automaticBackupMutation.isPending}
+                    className={cn(
+                      SETTINGS_BUTTON_CLASS,
+                      "justify-center px-2",
+                      automaticBackupQuery.data.frequency === frequency && "mari-chrome-control--selected",
+                    )}
+                  >
+                    {localizeUi(`ui.panels.advancedsettings.automaticBackupFrequency.${frequency}`)}
+                  </button>
+                ))}
+              </div>
+              <div
+                id={getSettingsControlAnchorId("automatic-backups-kept")}
+                className="mt-2 grid scroll-mt-3 gap-2 border-t border-[var(--border)]/60 pt-2 sm:grid-cols-[minmax(0,1fr)_5.5rem] sm:items-center"
+              >
+                <div className="min-w-0">
+                  <label
+                    htmlFor="automatic-backup-retention-count"
+                    className="text-[0.6875rem] font-medium text-[var(--foreground)]"
+                  >
+                    {localizeUi("ui.panels.advancedsettings.automaticBackupsKept")}
+                  </label>
+                  <p className="mt-0.5 text-[0.625rem] leading-relaxed text-[var(--muted-foreground)]">
+                    {localizeUi("ui.panels.advancedsettings.automaticBackupsKeptDescription")}
+                  </p>
+                </div>
+                <DraftNumberInput
+                  id="automatic-backup-retention-count"
+                  value={automaticBackupQuery.data.retentionCount}
+                  min={1}
+                  max={9999}
+                  selectOnFocus
+                  disabled={automaticBackupMutation.isPending}
+                  onCommit={(retentionCount) => updateAutomaticBackup({ retentionCount })}
+                  ariaLabel={localizeUi("ui.panels.advancedsettings.automaticBackupsKeptAriaLabel")}
+                  className="mari-chrome-field h-9 w-full px-2 text-right text-xs tabular-nums"
+                />
+              </div>
+              <p className="mt-2 text-[0.625rem] leading-relaxed text-[var(--muted-foreground)]">
+                {automaticBackupQuery.data.lastError
+                  ? localizeUi("ui.panels.advancedsettings.automaticBackupErrorValue1", {
+                      value1: automaticBackupQuery.data.lastError,
+                    })
+                  : automaticBackupQuery.data.lastBackupAt
+                    ? localizeUi("ui.panels.advancedsettings.lastAutomaticBackupValue1", {
+                        value1: new Date(automaticBackupQuery.data.lastBackupAt).toLocaleString(),
+                      })
+                    : automaticBackupQuery.data.enabled
+                      ? localizeUi("ui.panels.advancedsettings.automaticBackupWillBeCreatedShortly")
+                      : localizeUi("ui.panels.advancedsettings.automaticBackupsAreOff")}
+              </p>
+              <div className="mt-2 flex items-start gap-1.5 rounded-md bg-[var(--background)]/45 px-2 py-1.5 text-[0.625rem] leading-relaxed text-[var(--muted-foreground)] ring-1 ring-[var(--border)]/60">
+                <FolderOpen size="0.75rem" className="mt-0.5 shrink-0 text-[var(--primary)]" aria-hidden="true" />
+                <p>{localizeUi("settings.transfer.automaticBackup.location")}</p>
+              </div>
+            </div>
+          )}
+          <button onClick={handleCreateBackup} disabled={creatingBackup} className={SETTINGS_PRIMARY_BUTTON_CLASS}>
             {creatingBackup ? (
               <>
                 <Loader2 size="0.8125rem" className="animate-spin" />
-                Creating backup…
+                {localizeUi("ui.panels.advancedsettings.creatingBackup")}
               </>
             ) : (
               <>
                 <Download size="0.8125rem" />
-                Download Backup
+                {localizeUi("ui.panels.advancedsettings.downloadBackup")}
               </>
             )}
           </button>
@@ -6131,18 +8173,20 @@ function AdvancedSettings() {
             {exportingProfile ? (
               <>
                 <Loader2 size="0.8125rem" className="animate-spin" />
-                Exporting…
+                {localizeUi("ui.panels.advancedsettings.exporting")}
               </>
             ) : (
               <>
                 <Upload size="0.8125rem" />
-                Export Profile
+                {localizeUi("settings.transfer.exportProfile.title")}
               </>
             )}
           </button>
           {backups && backups.length > 0 && (
             <div className="flex flex-col gap-1 mt-1">
-              <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">Existing backups</span>
+              <span className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+                {localizeUi("ui.panels.advancedsettings.existingBackups")}
+              </span>
               {backups.map((b) => (
                 <div
                   key={b.name}
@@ -6156,7 +8200,7 @@ function AdvancedSettings() {
                   </div>
                   <button
                     onClick={() => deleteBackupMutation.mutate(b.name)}
-                    className="ml-2 rounded p-1 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--destructive)]/10 hover:text-[var(--destructive)]"
+                    className="ml-2 rounded p-1 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
                   >
                     <Trash2 size="0.75rem" />
                   </button>
@@ -6168,10 +8212,10 @@ function AdvancedSettings() {
       </SettingsSection>
 
       <SettingsSection
-        title="Danger Zone"
-        description="Permanently clear selected categories of local data. Professor Mari is always preserved."
+        title={localizeUi("settings.sections.dangerZone.title")}
+        description={localizeUi("settings.sections.dangerZone.componentDescription")}
         icon={<AlertTriangle size="0.875rem" />}
-        tone="danger"
+        {...getSettingsSectionAnchorProps("danger-zone")}
       >
         <div className="flex flex-col gap-2">
           <div className="grid gap-2">
@@ -6183,7 +8227,7 @@ function AdvancedSettings() {
                   className={cn(
                     "flex cursor-pointer items-start gap-2 rounded-lg px-2.5 py-2 ring-1 transition-colors",
                     checked
-                      ? "bg-[var(--destructive)]/10 ring-[var(--destructive)]/25"
+                      ? "bg-[var(--primary)]/10 ring-[var(--primary)]/30"
                       : "bg-[var(--background)]/40 ring-[var(--border)] hover:bg-[var(--secondary)]/70",
                   )}
                 >
@@ -6192,10 +8236,12 @@ function AdvancedSettings() {
                     checked={checked}
                     disabled={isClearing}
                     onChange={() => toggleScope(scope.id)}
-                    className="mt-0.5 h-3.5 w-3.5 rounded border-[var(--border)] accent-[var(--destructive)]"
+                    className="mt-0.5 h-3.5 w-3.5 rounded border-[var(--border)] accent-[var(--primary)]"
                   />
                   <span className="min-w-0">
-                    <span className="block text-xs font-medium text-[var(--foreground)]">{scope.label}</span>
+                    <span className="block text-xs font-medium text-[var(--marinara-chat-chrome-panel-text)]">
+                      {scope.label}
+                    </span>
                     <span className="block text-[0.625rem] text-[var(--muted-foreground)]">{scope.description}</span>
                   </span>
                 </label>
@@ -6210,7 +8256,9 @@ function AdvancedSettings() {
               disabled={isClearing}
               className={cn(SETTINGS_BUTTON_CLASS, "w-full px-3 py-2 text-xs")}
             >
-              {isAllScopesSelected ? "Clear Selection" : "Select All"}
+              {isAllScopesSelected
+                ? localizeUi("ui.panels.advancedsettings.clearSelection")
+                : localizeUi("ui.panels.advancedsettings.selectAll")}
             </button>
             <button
               onClick={() => setConfirmAction("selected")}
@@ -6218,7 +8266,7 @@ function AdvancedSettings() {
               className={cn(SETTINGS_BUTTON_CLASS, "w-full px-3 py-2 text-xs")}
             >
               <Trash2 size="0.8125rem" />
-              Clear Selected Data
+              {localizeUi("ui.panels.advancedsettings.clearSelectedData")}
             </button>
             <button
               onClick={() => setConfirmAction("all")}
@@ -6226,16 +8274,21 @@ function AdvancedSettings() {
               className={cn(SETTINGS_BUTTON_CLASS, "w-full px-3 py-2 text-xs")}
             >
               <Trash2 size="0.8125rem" />
-              Clear All Data
+              {localizeUi("ui.panels.advancedsettings.clearAllData")}
             </button>
           </div>
           {confirmAction && (
-            <div className="flex flex-col gap-2 rounded-lg bg-[var(--destructive)]/12 p-2.5">
-              <div className="flex items-start gap-2 text-[0.6875rem] font-medium text-[var(--destructive)]">
-                <AlertTriangle size="0.875rem" className="mt-0.5 shrink-0" />
+            <div className="flex flex-col gap-2 rounded-lg bg-[var(--background)]/55 p-2.5 ring-1 ring-[var(--border)]">
+              <div className="flex items-start gap-2 text-[0.6875rem] font-medium text-[var(--marinara-chat-chrome-panel-text)]">
+                <AlertTriangle
+                  size="0.875rem"
+                  className="mt-0.5 shrink-0 text-[var(--marinara-chat-chrome-button-text-active)]"
+                />
                 {confirmAction === "all"
-                  ? "Delete all supported data categories except Professor Mari? There is no undo."
-                  : `Delete ${selectedScopes.length} selected data categor${selectedScopes.length === 1 ? "y" : "ies"}? There is no undo.`}
+                  ? localizeUi("ui.panels.advancedsettings.deleteAllSupportedDataCategoriesExceptProfessorMariThere")
+                  : localizeUi("ui.panels.advancedsettings.deleteSelectedDataCategories", {
+                      count: selectedScopes.length,
+                    })}
               </div>
               <div className="flex flex-col gap-2">
                 <button
@@ -6243,7 +8296,7 @@ function AdvancedSettings() {
                   disabled={isClearing}
                   className={cn(SETTINGS_BUTTON_CLASS, "w-full px-3 py-2 text-xs")}
                 >
-                  Cancel
+                  {localizeUi("chat.delete.dialog.cancel")}
                 </button>
                 <button
                   onClick={() => runExpunge(confirmAction)}
@@ -6251,11 +8304,44 @@ function AdvancedSettings() {
                   className={cn(SETTINGS_BUTTON_CLASS, "w-full px-3 py-2 text-xs")}
                 >
                   {isClearing ? <Loader2 size="0.75rem" className="animate-spin" /> : <Trash2 size="0.75rem" />}
-                  Confirm Delete
+                  {localizeUi("ui.panels.advancedsettings.confirmDelete")}
                 </button>
               </div>
             </div>
           )}
+          <div className="mt-2 flex flex-col gap-2 rounded-lg border border-[var(--border)] bg-[var(--background)]/45 p-2.5">
+            <ToggleSetting
+              label={t("settings.agentImports.toggle.label")}
+              checked={agentImportPolicy?.enabled ?? false}
+              onChange={(enabled) => void handleAgentImportsToggle(enabled)}
+              disabled={agentImportPolicyLoading || setAgentImportsEnabled.isPending}
+              help={t("settings.agentImports.toggle.help")}
+            />
+            <div className="flex items-start gap-2 text-[0.6875rem] leading-relaxed text-[var(--primary)]">
+              <ShieldAlert size="0.875rem" className="mt-0.5 shrink-0" />
+              <p>{t("settings.agentImports.warning")}</p>
+            </div>
+            <div className="my-1 border-t border-[var(--border)]" />
+            <ToggleSetting
+              label={t("settings.externalExtensions.toggle.label")}
+              checked={extensionPolicy?.externalExtensionsEnabled ?? false}
+              onChange={(enabled) => void handleExternalExtensionsToggle(enabled)}
+              disabled={
+                extensionPolicyLoading ||
+                setExternalExtensionsEnabled.isPending ||
+                !extensionPolicy?.externalExtensionsEnvEnabled
+              }
+              help={
+                extensionPolicy?.externalExtensionsEnvEnabled
+                  ? t("settings.externalExtensions.toggle.help")
+                  : t("settings.externalExtensions.toggle.locked")
+              }
+            />
+            <div className="flex items-start gap-2 text-[0.6875rem] leading-relaxed text-[var(--primary)]">
+              <ShieldAlert size="0.875rem" className="mt-0.5 shrink-0" />
+              <p>{t("settings.externalExtensions.warning")}</p>
+            </div>
+          </div>
         </div>
       </SettingsSection>
     </div>

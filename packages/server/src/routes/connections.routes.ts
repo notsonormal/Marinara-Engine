@@ -6,18 +6,37 @@ import { existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { extname, join } from "path";
 import {
+  ATLAS_CLOUD_IMAGE_MODELS,
+  ATLAS_CLOUD_VIDEO_MODELS,
+  ZAI_IMAGE_MODELS,
   IMAGE_DEFAULTS_STORAGE_KEY,
   MODEL_LISTS,
+  VIDEO_DEFAULTS_STORAGE_KEY,
+  connectionImageCaptioningDefaultsSchema,
   createConnectionSchema,
+  createDefaultVideoGenerationProfile,
   generationParametersSchema,
   inferImageSource,
+  inferVideoSource,
+  isLocalAuthProvider,
+  localAuthProviderBaseUrl,
+  normalizeVideoGenerationProfile,
 } from "@marinara-engine/shared";
 import { createConnectionsStorage } from "../services/storage/connections.storage.js";
 import { resetMemoryRecallVectorizerCache } from "../services/memory-recall-embedding.js";
 import { createLLMProvider } from "../services/llm/provider-registry.js";
 import { fetchOpenAIChatGPTModels, getOpenAIChatGPTAuth } from "../services/llm/openai-chatgpt-auth.js";
-import { buildGoogleVertexModelUrl, googleAuthHeadersForVertex } from "../services/llm/providers/google.provider.js";
-import { resolveConnectionImageDefaults } from "../services/image/image-generation-defaults.js";
+import { fetchGrokCliModels } from "../services/llm/providers/grok-subscription.provider.js";
+import {
+  buildGoogleVertexModelUrl,
+  googleAuthHeadersForVertex,
+  normalizeGoogleGenerativeLanguageBaseUrl,
+} from "../services/llm/providers/google.provider.js";
+import {
+  resolveConnectionImageDefaults,
+  resolveConnectionImageQuality,
+} from "../services/image/image-generation-defaults.js";
+import { buildVeniceApiUrl, normalizeVeniceImageModels } from "../services/image/venice-image.js";
 import { isImageLocalUrlsEnabled, isProviderLocalUrlsEnabled } from "../config/runtime-config.js";
 import { logDebugOverride } from "../lib/logger.js";
 import {
@@ -31,6 +50,21 @@ import { DATA_DIR } from "../utils/data-dir.js";
 
 const CONNECTION_TEST_ERROR_PREVIEW_CHARS = 2000;
 const CONNECTION_IMAGES_DIR = join(DATA_DIR, "connections", "images");
+const SWARMUI_CONTROL_REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_COMFYUI_VIDEO_BASE_URL = "http://127.0.0.1:8188";
+const DEFAULT_SWARMUI_VIDEO_BASE_URL = "http://127.0.0.1:7801";
+const DEFAULT_GEMINI_OMNI_VIDEO_MODEL = "gemini-omni-flash-preview";
+const DEFAULT_GEMINI_OMNI_VIDEO_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_GOOGLE_VEO_VIDEO_MODEL = "veo-3.1-generate-preview";
+const DEFAULT_GOOGLE_VEO_VIDEO_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_XAI_VIDEO_MODEL = "grok-imagine-video-1.5";
+const DEFAULT_XAI_VIDEO_BASE_URL = "https://api.x.ai/v1";
+const DEFAULT_OPENROUTER_VIDEO_MODEL = "google/veo-3.1";
+const DEFAULT_OPENROUTER_VIDEO_BASE_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_ATLAS_CLOUD_VIDEO_MODEL = "google/veo3.1/text-to-video";
+const DEFAULT_ATLAS_CLOUD_VIDEO_BASE_URL = "https://api.atlascloud.ai/api/v1";
+const DEFAULT_SEEDANCE_VIDEO_MODEL = "seedance-2-0";
+const DEFAULT_SEEDANCE_VIDEO_BASE_URL = "https://api.seedance2.ai";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -87,13 +121,14 @@ function formatProviderErrorBody(body: string): string {
 }
 
 function isOpenAICompatibleProvider(provider: string): boolean {
-  return ["openai", "openrouter", "nanogpt", "xai", "mistral", "custom", "cohere"].includes(provider);
+  return ["openai", "openrouter", "nanogpt", "xai", "mistral", "custom", "cohere", "arli"].includes(provider);
 }
 
 function usesResponsesEndpointForTestMessage(provider: string, model: string): boolean {
   if (!isOpenAICompatibleProvider(provider) || provider === "custom") return false;
   const normalized = model.toLowerCase();
   return (
+    normalized.startsWith("gpt-5.6") ||
     normalized.startsWith("gpt-5.5") ||
     normalized.startsWith("gpt-5.4") ||
     normalized.startsWith("codex-") ||
@@ -106,6 +141,7 @@ function usesResponsesEndpointForTestMessage(provider: string, model: string): b
 function describeTestMessageTarget(provider: string, baseUrl: string, model: string): string {
   if (provider === "claude_subscription") return "Claude Agent SDK";
   if (provider === "openai_chatgpt") return "local ChatGPT session";
+  if (provider === "grok_subscription") return "local Grok CLI session";
   if (!baseUrl) return "(no base URL)";
   if (provider === "google_vertex") return buildGoogleVertexModelUrl(baseUrl, model, "generateContent");
   if (isOpenAICompatibleProvider(provider)) {
@@ -117,30 +153,135 @@ function describeTestMessageTarget(provider: string, baseUrl: string, model: str
 
 function resolveImageGenerationSource(conn: Record<string, unknown>, baseUrl: string): string {
   const explicitSource = typeof conn.imageGenerationSource === "string" ? conn.imageGenerationSource : "";
+  // Older connections identify their backend only through imageService.
+  const serviceHint = typeof conn.imageService === "string" ? conn.imageService : "";
   const model = typeof conn.model === "string" ? conn.model : "";
-  return inferImageSource(explicitSource || model, baseUrl);
+  return inferImageSource(explicitSource || serviceHint || model, baseUrl);
+}
+
+function resolveVideoGenerationSource(conn: Record<string, unknown>, baseUrl: string): string {
+  const explicitSource = typeof conn.videoGenerationSource === "string" ? conn.videoGenerationSource : "";
+  // Older connections identify their backend only through videoService.
+  const serviceHint = typeof conn.videoService === "string" ? conn.videoService : "";
+  const model = typeof conn.model === "string" ? conn.model : "";
+  return inferVideoSource(explicitSource || serviceHint || model, baseUrl);
+}
+
+// Returns the model-name options a ComfyUI loader node exposes through
+// object_info, or null when the response does not carry that node's schema —
+// a valid empty list and missing metadata must stay distinguishable so the
+// route can keep its 502 contract for malformed checkpoint responses.
+export function parseComfyLoaderModelNames(info: unknown, nodeName: string, inputName: string): string[] | null {
+  if (!isRecord(info)) return null;
+  const node = info[nodeName];
+  if (!isRecord(node) || !isRecord(node.input) || !isRecord(node.input.required)) return null;
+  const input = node.input.required[inputName];
+  if (!Array.isArray(input)) return null;
+  const options = input[0];
+  if (!Array.isArray(options)) return null;
+  return options.filter((option): option is string => typeof option === "string");
 }
 
 function localUrlPolicyForProvider(provider: string, imageSource: string) {
   const isLocalImageBackend =
-    provider === "image_generation" && (imageSource === "comfyui" || imageSource === "automatic1111");
+    provider === "image_generation" &&
+    (imageSource === "comfyui" || imageSource === "swarmui" || imageSource === "automatic1111");
   const isImage = provider === "image_generation";
+  const isVideo = provider === "video_generation";
+  const isLocalVideoBackend = isVideo && (imageSource === "comfyui" || imageSource === "swarmui");
   return {
-    allowLocal: isLocalImageBackend || (isImage && isImageLocalUrlsEnabled()) ? true : isProviderLocalUrlsEnabled(),
+    allowLocal: isVideo
+      ? isLocalVideoBackend
+      : isLocalImageBackend || (isImage && isImageLocalUrlsEnabled())
+        ? true
+        : isProviderLocalUrlsEnabled(),
     allowLoopback: true,
-    allowMdns: provider !== "image_generation" || isLocalImageBackend || isImageLocalUrlsEnabled(),
+    allowMdns:
+      isLocalVideoBackend ||
+      (!isVideo && (provider !== "image_generation" || isLocalImageBackend || isImageLocalUrlsEnabled())),
     allowedProtocols: ["https:", "http:"],
     flagName: isImage ? "IMAGE_LOCAL_URLS_ENABLED" : "PROVIDER_LOCAL_URLS_ENABLED",
   };
 }
 
+function swarmUiHeaders(apiKey: string): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = apiKey.trim();
+  if (token) headers.Cookie = `swarm_token=${encodeURIComponent(token)}`;
+  return headers;
+}
+
+async function postSwarmUiJson(baseUrl: string, apiKey: string, route: string, body: Record<string, unknown>) {
+  const response = await safeFetch(`${baseUrl.replace(/\/+$/, "")}/API/${route}`, {
+    method: "POST",
+    headers: swarmUiHeaders(apiKey),
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(SWARMUI_CONTROL_REQUEST_TIMEOUT_MS),
+    policy: localUrlPolicyForProvider("image_generation", "swarmui"),
+    maxResponseBytes: 5 * 1024 * 1024,
+    decodeCompressedResponse: true,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`SwarmUI returned ${response.status}: ${formatProviderErrorBody(text)}`);
+  }
+  let result: unknown;
+  try {
+    result = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error("SwarmUI returned invalid JSON");
+  }
+  if (isRecord(result) && (typeof result.error === "string" || typeof result.error_id === "string")) {
+    const message =
+      typeof result.error === "string"
+        ? result.error
+        : typeof result.error_id === "string"
+          ? result.error_id
+          : "Unknown error";
+    throw new Error(`SwarmUI API error: ${trimProviderError(message)}`);
+  }
+  return result;
+}
+
+async function createSwarmUiSession(baseUrl: string, apiKey: string): Promise<string> {
+  const result = await postSwarmUiJson(baseUrl, apiKey, "GetNewSession", {});
+  const sessionId = isRecord(result) && typeof result.session_id === "string" ? result.session_id.trim() : "";
+  if (!sessionId) throw new Error("SwarmUI did not return a session_id");
+  return sessionId;
+}
+
+export function buildGoogleModelsPageUrl(baseUrl: string, modelsEndpoint: string, pageToken = ""): string {
+  return `${baseUrl}${modelsEndpoint}?pageSize=1000` + (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+}
+
 function normalizeConnectionTestBaseUrl(baseUrl: string, provider: string): string {
-  if (provider !== "image_generation") return baseUrl;
+  if (provider === "google") return normalizeGoogleGenerativeLanguageBaseUrl(baseUrl);
+  if (provider !== "image_generation") return baseUrl.replace(/\/+$/, "");
   try {
     return normalizeLoopbackUrl(baseUrl).replace(/\/+$/, "");
   } catch {
     return baseUrl;
   }
+}
+
+function getStoredVideoDefaults(raw: unknown) {
+  const root = parseDefaultParametersRoot(raw);
+  return normalizeVideoGenerationProfile(root[VIDEO_DEFAULTS_STORAGE_KEY]).profile;
+}
+
+function parseDefaultParametersRoot(raw: unknown): Record<string, unknown> {
+  if (!raw) return {};
+  let parsed: unknown = raw;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed) as unknown;
+    } catch {
+      return {};
+    }
+  }
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? { ...(parsed as Record<string, unknown>) }
+    : {};
 }
 
 function parseImageUpload(image: string): { buffer: Buffer; hintedExt: string } {
@@ -312,8 +453,22 @@ export async function connectionsRoutes(app: FastifyInstance) {
       }
       params = { ...parsed.data };
       const rawRecord = raw as Record<string, unknown>;
+      const imageCaptioningDefaults = connectionImageCaptioningDefaultsSchema.safeParse(rawRecord);
+      if (!imageCaptioningDefaults.success) {
+        return reply.status(400).send({
+          error: "Invalid image captioning defaults",
+          issues: imageCaptioningDefaults.error.issues.map((issue) => ({
+            path: issue.path.join("."),
+            message: issue.message,
+          })),
+        });
+      }
+      Object.assign(params, imageCaptioningDefaults.data);
       if (Object.prototype.hasOwnProperty.call(rawRecord, IMAGE_DEFAULTS_STORAGE_KEY)) {
         params[IMAGE_DEFAULTS_STORAGE_KEY] = rawRecord[IMAGE_DEFAULTS_STORAGE_KEY];
+      }
+      if (Object.prototype.hasOwnProperty.call(rawRecord, VIDEO_DEFAULTS_STORAGE_KEY)) {
+        params[VIDEO_DEFAULTS_STORAGE_KEY] = rawRecord[VIDEO_DEFAULTS_STORAGE_KEY];
       }
     }
     await storage.updateDefaultParameters(req.params.id, params);
@@ -360,6 +515,9 @@ export async function connectionsRoutes(app: FastifyInstance) {
           conn.openrouterProvider,
           conn.maxTokensOverride,
           conn.claudeFastMode === "true",
+          conn.treatAsLocalEndpoint === "true",
+          conn.defaultParameters,
+          conn.id,
         );
         let responseText = "";
         for await (const chunk of provider.chat([{ role: "user", content: "Reply with OK." }], {
@@ -385,6 +543,38 @@ export async function connectionsRoutes(app: FastifyInstance) {
           message: `ChatGPT login found via Codex auth${detail}. Requests will use the local ChatGPT session.`,
           latencyMs: Date.now() - start,
           modelName: conn.model,
+        };
+      }
+
+      if (conn.provider === "grok_subscription") {
+        const provider = createLLMProvider(
+          conn.provider,
+          // Grok CLI subscription auth is local-only: the CLI reads the
+          // cached `grok login` session, so API key/base URL are intentionally
+          // unused here and in normal generation.
+          "",
+          "",
+          conn.maxContext,
+          conn.openrouterProvider,
+          conn.maxTokensOverride,
+          conn.claudeFastMode === "true",
+          conn.treatAsLocalEndpoint === "true",
+          conn.defaultParameters,
+          conn.id,
+        );
+        let responseText = "";
+        for await (const chunk of provider.chat([{ role: "user", content: "Reply with OK." }], {
+          model: conn.model ?? "",
+          maxTokens: 32,
+          stream: false,
+        })) {
+          responseText += chunk;
+        }
+        return {
+          success: true,
+          message: `Grok CLI completed a real request: ${responseText.trim().slice(0, 120) || "OK"}`,
+          latencyMs: Date.now() - start,
+          modelName: conn.model || "Grok CLI default",
         };
       }
 
@@ -417,12 +607,31 @@ export async function connectionsRoutes(app: FastifyInstance) {
 
       const imageSource =
         conn.provider === "image_generation" ? resolveImageGenerationSource(conn as any, baseUrl) : "";
+      if (conn.provider === "video_generation") {
+        return {
+          success: true,
+          message: "Video generation connection configured. Use Test Video to verify MP4 generation.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      }
       baseUrl = normalizeConnectionTestBaseUrl(baseUrl, conn.provider);
       // image_generation has no standard modelsEndpoint — use provider-specific checks
       let testUrl: string;
       if (conn.provider === "image_generation" && imageSource === "novelai") {
-        // NovelAI: validate the API key via the user subscription endpoint
-        testUrl = "https://api.novelai.net/user/subscription";
+        return {
+          success: true,
+          message: "NovelAI connection configured. Use 'Test Image' to verify generation works.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      } else if (conn.provider === "image_generation" && imageSource === "zai") {
+        return {
+          success: true,
+          message: "Z.AI connection configured. Use 'Test Image' to verify generation works.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
       } else if (conn.provider === "image_generation" && imageSource === "horde") {
         // Horde: heartbeat is the lightweight health endpoint for the public API.
         testUrl = buildHordeUrl(baseUrl, "status/heartbeat");
@@ -432,6 +641,14 @@ export async function connectionsRoutes(app: FastifyInstance) {
       } else if (conn.provider === "image_generation" && imageSource === "comfyui") {
         // ComfyUI: ping the system stats endpoint
         testUrl = `${baseUrl}/system_stats`;
+      } else if (conn.provider === "image_generation" && imageSource === "swarmui") {
+        await createSwarmUiSession(baseUrl, conn.apiKey || "");
+        return {
+          success: true,
+          message: "Connection successful",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
       } else if (conn.provider === "image_generation" && imageSource === "automatic1111") {
         // AUTOMATIC1111 / SD Web UI: ping the internal ping endpoint
         testUrl = `${baseUrl}/sdapi/v1/options`;
@@ -519,6 +736,23 @@ export async function connectionsRoutes(app: FastifyInstance) {
         return { models: MODEL_LISTS.openai_chatgpt.map((m) => ({ id: m.id, name: m.name })) };
       }
 
+      if (conn.provider === "grok_subscription") {
+        const models = await fetchGrokCliModels();
+        return { models };
+      }
+
+      const videoSource =
+        conn.provider === "video_generation" ? resolveVideoGenerationSource(conn as any, conn.baseUrl || "") : "";
+      if (conn.provider === "video_generation") {
+        if (videoSource === "atlas") {
+          return { models: ATLAS_CLOUD_VIDEO_MODELS.map((model) => ({ id: model.id, name: model.name })) };
+        }
+        if (videoSource !== "comfyui" && videoSource !== "swarmui") {
+          const models = MODEL_LISTS.video_generation.map((m) => ({ id: m.id, name: m.name }));
+          return { models };
+        }
+      }
+
       const { PROVIDERS } = await import("@marinara-engine/shared");
       const provider = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
       let baseUrl = conn.baseUrl || provider?.defaultBaseUrl || "";
@@ -546,6 +780,13 @@ export async function connectionsRoutes(app: FastifyInstance) {
       // ── Special handling for local image gen services ──
       const imageSource =
         conn.provider === "image_generation" ? resolveImageGenerationSource(conn as any, baseUrl) : "";
+      const mediaSource = imageSource || videoSource;
+      if (conn.provider === "image_generation" && imageSource === "atlas") {
+        return { models: ATLAS_CLOUD_IMAGE_MODELS.map((model) => ({ id: model.id, name: model.name })) };
+      }
+      if (conn.provider === "image_generation" && imageSource === "zai") {
+        return { models: ZAI_IMAGE_MODELS.map((model) => ({ id: model.id, name: model.name })) };
+      }
       baseUrl = normalizeConnectionTestBaseUrl(baseUrl, conn.provider);
       const lowerBase = baseUrl.toLowerCase();
       const sanitizeProviderBody = (body: string): string => {
@@ -618,21 +859,63 @@ export async function connectionsRoutes(app: FastifyInstance) {
         return { models: knownStabilityImageModels() };
       }
 
-      // ComfyUI: fetch checkpoints from object_info
-      if (conn.provider === "image_generation" && imageSource === "comfyui") {
-        const res = await safeFetch(`${baseUrl}/object_info/CheckpointLoaderSimple`, {
-          policy: localUrlPolicyForProvider(conn.provider, imageSource),
-          maxResponseBytes: 5 * 1024 * 1024,
-          decodeCompressedResponse: true,
-        });
-        if (!res.ok) {
-          return reply.status(502).send({ error: `ComfyUI returned ${res.status}` });
-        }
-        const info = (await res.json()) as {
-          CheckpointLoaderSimple?: { input?: { required?: { ckpt_name?: [string[]] } } };
+      if ((conn.provider === "image_generation" || conn.provider === "video_generation") && mediaSource === "swarmui") {
+        const sessionId = await createSwarmUiSession(baseUrl, conn.apiKey || "");
+        const result = await postSwarmUiJson(baseUrl, conn.apiKey || "", "ListT2IParams", { session_id: sessionId });
+        const modelGroups = isRecord(result) && isRecord(result.models) ? result.models : {};
+        const modelNames = Array.isArray(modelGroups["Stable-Diffusion"])
+          ? modelGroups["Stable-Diffusion"].filter((model): model is string => typeof model === "string")
+          : [];
+        const loraNames = Array.isArray(modelGroups.LoRA)
+          ? modelGroups.LoRA.filter((model): model is string => typeof model === "string")
+          : [];
+        return {
+          models: modelNames.map((name) => ({ id: name, name })),
+          loras: loraNames.map((name) => ({ id: name, name })),
         };
-        const ckpts = info.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0] ?? [];
-        return { models: ckpts.map((name: string) => ({ id: name, name })) };
+      }
+
+      // ComfyUI: fetch checkpoints and diffusion models from object_info
+      if ((conn.provider === "image_generation" || conn.provider === "video_generation") && mediaSource === "comfyui") {
+        const fetchComfyLoaderModelNames = async (nodeName: string, inputName: string) => {
+          const res = await safeFetch(`${baseUrl}/object_info/${nodeName}`, {
+            policy: localUrlPolicyForProvider(conn.provider, mediaSource),
+            maxResponseBytes: 5 * 1024 * 1024,
+            decodeCompressedResponse: true,
+          });
+          if (!res.ok) return { ok: false, status: res.status, names: null };
+          return {
+            ok: true,
+            status: res.status,
+            names: parseComfyLoaderModelNames(await res.json(), nodeName, inputName),
+          };
+        };
+
+        const checkpoints = await fetchComfyLoaderModelNames("CheckpointLoaderSimple", "ckpt_name");
+        if (!checkpoints.names) {
+          return reply.status(502).send({
+            error: checkpoints.ok
+              ? "ComfyUI did not return checkpoint model metadata"
+              : `ComfyUI returned ${checkpoints.status}`,
+          });
+        }
+        // Models in ComfyUI's diffusion_models folder (e.g. Anima, zImage) load
+        // through UNETLoader, not CheckpointLoaderSimple. Listing failures here
+        // must not hide the checkpoints on ComfyUI builds without that node.
+        const diffusionModels = await fetchComfyLoaderModelNames("UNETLoader", "unet_name").catch(() => ({
+          status: 0,
+          names: null,
+        }));
+        const loraModels = await fetchComfyLoaderModelNames("LoraLoader", "lora_name").catch(() => ({
+          status: 0,
+          names: null,
+        }));
+        const names = [...new Set([...checkpoints.names, ...(diffusionModels.names ?? [])])];
+        const loras = [...new Set(loraModels.names ?? [])];
+        return {
+          models: names.map((name: string) => ({ id: name, name })),
+          loras: loras.map((name: string) => ({ id: name, name })),
+        };
       }
 
       // AUTOMATIC1111 / SD Web UI: fetch models from /sdapi/v1/sd-models
@@ -711,6 +994,31 @@ export async function connectionsRoutes(app: FastifyInstance) {
         return { models: normalizeModelsResponse("openrouter", json) };
       }
 
+      if (conn.provider === "image_generation" && imageSource === "venice") {
+        const res = await safeFetch(buildVeniceApiUrl(baseUrl, "models"), {
+          headers,
+          policy: localUrlPolicyForProvider(conn.provider, imageSource),
+          maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          return reply.status(502).send({
+            error: `Venice returned ${res.status}: ${sanitizeProviderBody(body)}`,
+          });
+        }
+        const text = await res.text();
+        let json: unknown;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          return reply.status(502).send({
+            error: `Failed to fetch models: ${sanitizeProviderBody(text)}`,
+          });
+        }
+        return { models: normalizeVeniceImageModels(json) };
+      }
+
       if (conn.provider === "image_generation" && imageSource === "horde") {
         const res = await safeFetch(`${buildHordeUrl(baseUrl, "status/models")}?type=image`, {
           headers: hordeHeaders(conn.apiKey),
@@ -744,13 +1052,58 @@ export async function connectionsRoutes(app: FastifyInstance) {
         return { models };
       }
 
-      let modelsUrl =
+      // Google's ListModels endpoint is paginated (small default page size),
+      // so a single request silently drops most of the catalog. Follow
+      // nextPageToken until the list is complete.
+      if (conn.provider === "google") {
+        const collected: unknown[] = [];
+        let pageToken = "";
+        for (let page = 0; page < 20; page++) {
+          const pageUrl = buildGoogleModelsPageUrl(baseUrl, provider?.modelsEndpoint ?? "/models", pageToken);
+          const pageRes = await safeFetch(pageUrl, {
+            headers,
+            policy: {
+              allowLocal: isProviderLocalUrlsEnabled(),
+              allowLoopback: true,
+              allowMdns: true,
+              allowedProtocols: ["https:", "http:"],
+              flagName: "PROVIDER_LOCAL_URLS_ENABLED",
+            },
+            maxResponseBytes: 5 * 1024 * 1024,
+            decodeCompressedResponse: true,
+          });
+          if (!pageRes.ok) {
+            const body = await pageRes.text();
+            return reply.status(502).send({
+              error: `Provider returned ${pageRes.status}: ${sanitizeProviderBody(body)}`,
+            });
+          }
+          const pageText = await pageRes.text();
+          let pageJson: { models?: unknown[]; nextPageToken?: string };
+          try {
+            pageJson = JSON.parse(pageText) as { models?: unknown[]; nextPageToken?: string };
+          } catch {
+            return reply.status(502).send({
+              error: `Failed to fetch models: ${sanitizeProviderBody(pageText)}`,
+            });
+          }
+          if (Array.isArray(pageJson.models)) collected.push(...pageJson.models);
+          pageToken = typeof pageJson.nextPageToken === "string" ? pageJson.nextPageToken : "";
+          if (!pageToken) break;
+        }
+        if (pageToken) {
+          // Never report a silently truncated catalog as success.
+          return reply.status(502).send({
+            error: "Google returned more model pages than expected; refusing to show a truncated list.",
+          });
+        }
+        return { models: normalizeModelsResponse("google", { models: collected }) };
+      }
+
+      const modelsUrl =
         conn.provider === "google_vertex"
           ? buildGoogleVertexModelUrl(baseUrl, conn.model, "models")
           : `${baseUrl}${provider?.modelsEndpoint ?? "/models"}`;
-      if (conn.provider === "google") {
-        modelsUrl += `?key=${conn.apiKey}`;
-      }
 
       const res = await safeFetch(modelsUrl, {
         headers,
@@ -791,7 +1144,7 @@ export async function connectionsRoutes(app: FastifyInstance) {
     }
   });
 
-  // ── Test image generation — generates a small fixed test image ──
+  // ── Test image generation — uses a broadly supported 1K square canvas ──
   app.post<{ Params: { id: string } }>("/:id/test-image", async (req, reply) => {
     const conn = await storage.getWithKey(req.params.id);
     if (!conn) return reply.status(404).send({ error: "Connection not found" });
@@ -818,10 +1171,12 @@ export async function connectionsRoutes(app: FastifyInstance) {
         prompt: BASE_PROMPT,
         model: imgModel || undefined,
         imageEndpointId: (conn.imageEndpointId as string | undefined) ?? undefined,
-        width: 512,
-        height: 512,
+        width: 1024,
+        height: 1024,
         comfyWorkflow: conn.comfyuiWorkflow || undefined,
         imageDefaults,
+        quality: resolveConnectionImageQuality(conn),
+        debugMode: readDebugMode(req.body),
       });
       return {
         success: true,
@@ -842,13 +1197,141 @@ export async function connectionsRoutes(app: FastifyInstance) {
     }
   });
 
+  // ── Test video generation — generates a short fixed MP4 ──
+  app.post<{ Params: { id: string } }>("/:id/test-video", async (req, reply) => {
+    const conn = await storage.getWithKey(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+    if (conn.provider !== "video_generation") {
+      return reply.status(400).send({ error: "Not a video generation connection" });
+    }
+
+    const { PROVIDERS } = await import("@marinara-engine/shared");
+    const providerDef = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
+    const videoApiKey = conn.apiKey || "";
+    const defaults = conn.defaultParameters
+      ? getStoredVideoDefaults(conn.defaultParameters)
+      : createDefaultVideoGenerationProfile();
+    const inferredVideoSource = resolveVideoGenerationSource(conn as any, conn.baseUrl || "");
+    const explicitVideoSource = conn.videoGenerationSource || conn.videoService || "";
+    const videoSource =
+      explicitVideoSource || (inferredVideoSource !== "gemini_omni" ? inferredVideoSource : defaults.service);
+    const rawVideoServiceHint = conn.videoService || videoSource;
+    const videoServiceHint =
+      videoSource === "swarmui"
+        ? "swarmui"
+        : rawVideoServiceHint === "google_ai_studio"
+          ? inferVideoSource(conn.model || "", conn.baseUrl || "")
+          : rawVideoServiceHint;
+    const isXaiVideo = videoSource === "xai" || videoServiceHint === "xai";
+    const isGoogleVeoVideo = videoSource === "google_veo" || videoServiceHint === "google_veo";
+    const isOpenRouterVideo = videoSource === "openrouter" || videoServiceHint === "openrouter";
+    const isAtlasVideo = videoSource === "atlas" || videoServiceHint === "atlas";
+    const isSeedanceVideo = videoSource === "seedance" || videoServiceHint === "seedance";
+    const isSwarmUiVideo = videoSource === "swarmui" || videoServiceHint === "swarmui";
+    const isComfyUiVideo = videoSource === "comfyui" || videoServiceHint === "comfyui" || isSwarmUiVideo;
+    const baseUrl = (
+      conn.baseUrl ||
+      (isXaiVideo
+        ? DEFAULT_XAI_VIDEO_BASE_URL
+        : isGoogleVeoVideo
+          ? DEFAULT_GOOGLE_VEO_VIDEO_BASE_URL
+          : isOpenRouterVideo
+            ? DEFAULT_OPENROUTER_VIDEO_BASE_URL
+            : isAtlasVideo
+              ? DEFAULT_ATLAS_CLOUD_VIDEO_BASE_URL
+              : isSeedanceVideo
+                ? DEFAULT_SEEDANCE_VIDEO_BASE_URL
+                : isSwarmUiVideo
+                  ? DEFAULT_SWARMUI_VIDEO_BASE_URL
+                  : isComfyUiVideo
+                    ? DEFAULT_COMFYUI_VIDEO_BASE_URL
+                    : providerDef?.defaultBaseUrl || DEFAULT_GEMINI_OMNI_VIDEO_BASE_URL)
+    ).replace(/\/+$/, "");
+    const videoModel =
+      conn.model ||
+      (isXaiVideo
+        ? DEFAULT_XAI_VIDEO_MODEL
+        : isGoogleVeoVideo
+          ? DEFAULT_GOOGLE_VEO_VIDEO_MODEL
+          : isOpenRouterVideo
+            ? DEFAULT_OPENROUTER_VIDEO_MODEL
+            : isAtlasVideo
+              ? DEFAULT_ATLAS_CLOUD_VIDEO_MODEL
+              : isSeedanceVideo
+                ? DEFAULT_SEEDANCE_VIDEO_MODEL
+                : isComfyUiVideo
+                  ? ""
+                  : DEFAULT_GEMINI_OMNI_VIDEO_MODEL);
+    const activeDefaults = isXaiVideo
+      ? defaults.xai
+      : isGoogleVeoVideo
+        ? defaults.googleVeo
+        : isOpenRouterVideo
+          ? defaults.openrouter
+          : isAtlasVideo
+            ? defaults.atlas
+            : isSeedanceVideo
+              ? defaults.seedance
+              : isComfyUiVideo
+                ? defaults.comfyui
+                : defaults.geminiOmni;
+
+    const prompt =
+      "Create a concise cinematic 16:9 game scene video: a plate of spaghetti with marinara sauce on a table, gentle steam rising, warm kitchen light, slow push-in camera, no text or logos.";
+
+    const start = Date.now();
+    try {
+      const { generateVideo } = await import("../services/video/video-generation.js");
+      const result = await generateVideo(videoSource, baseUrl, videoApiKey, videoServiceHint, {
+        prompt,
+        model: videoModel,
+        debugMode: readDebugMode(req.body),
+        durationSeconds: activeDefaults.durationSeconds,
+        aspectRatio: activeDefaults.aspectRatio,
+        resolution: isXaiVideo
+          ? defaults.xai.resolution
+          : isGoogleVeoVideo
+            ? defaults.googleVeo.resolution
+            : isOpenRouterVideo
+              ? defaults.openrouter.resolution
+              : isAtlasVideo
+                ? defaults.atlas.resolution
+                : isSeedanceVideo
+                  ? defaults.seedance.resolution
+                  : isComfyUiVideo
+                    ? defaults.comfyui.resolution
+                    : undefined,
+        comfyWorkflow: conn.comfyuiWorkflow || undefined,
+        comfyLoras: isComfyUiVideo ? defaults.comfyui.loras : [],
+        fps: isComfyUiVideo ? defaults.comfyui.fps : undefined,
+      });
+      return {
+        success: true,
+        base64: result.base64,
+        mimeType: result.mimeType,
+        latencyMs: Date.now() - start,
+        prompt,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        base64: null,
+        mimeType: null,
+        latencyMs: Date.now() - start,
+        prompt,
+        error: err instanceof Error ? err.message : "Unknown error",
+      };
+    }
+  });
+
   // ── Diagnose Claude (Subscription) — verifies which model the SDK actually
   //    billed against. The Claude Agent SDK can silently route a request to a
   //    smaller model (fast mode, post-rate-limit `cooldown` state, account-tier
   //    gating) without surfacing the swap to the caller. We send a tiny prompt
-  //    through the SDK with fast mode forced off, then return the model(s) the
-  //    SDK reports in `modelUsage` plus its `fast_mode_state` so the UI can
-  //    show "you asked for X, the SDK billed Y." ──
+  //    through the SDK with the connection's own fast-mode setting (not
+  //    forced off), then return the model(s) the SDK reports in `modelUsage`
+  //    plus its `fast_mode_state` so the UI can show "you asked for X, the
+  //    SDK billed Y." ──
   app.post<{ Params: { id: string } }>("/:id/diagnose-claude-subscription", async (req, reply) => {
     const conn = await storage.getWithKey(req.params.id);
     if (!conn) return reply.status(404).send({ error: "Connection not found" });
@@ -938,7 +1421,11 @@ export async function connectionsRoutes(app: FastifyInstance) {
     const conn = await storage.getWithKey(req.params.id);
     if (!conn) return reply.status(404).send({ error: "Connection not found" });
 
-    if (!conn.model) {
+    if (conn.provider === "image_generation" || conn.provider === "video_generation") {
+      return reply.status(400).send({ error: "This provider does not support chat test messages." });
+    }
+
+    if (!conn.model && conn.provider !== "grok_subscription") {
       return reply.status(400).send({ error: "No model configured. Set a model first." });
     }
 
@@ -948,29 +1435,33 @@ export async function connectionsRoutes(app: FastifyInstance) {
 
     // Local subscription/session providers manage their own endpoint, so skip
     // the baseUrl precondition. Every HTTP provider still requires one.
-    if (!baseUrl && conn.provider !== "claude_subscription" && conn.provider !== "openai_chatgpt") {
+    if (!baseUrl && !isLocalAuthProvider(conn.provider)) {
       return reply.status(400).send({ error: "No base URL configured" });
     }
 
     const start = Date.now();
     const requestDebug = readDebugMode(req.body);
     const debugLog = (message: string, ...args: any[]) => logDebugOverride(requestDebug, message, ...args);
-    const targetUrl = describeTestMessageTarget(conn.provider, baseUrl, conn.model);
+    const model = conn.model ?? "";
+    const targetUrl = describeTestMessageTarget(conn.provider, baseUrl, model);
     try {
-      debugLog("[connections/test-message] provider=%s model=%s url=%s", conn.provider, conn.model, targetUrl);
+      debugLog("[connections/test-message] provider=%s model=%s url=%s", conn.provider, model, targetUrl);
       const provider = createLLMProvider(
         conn.provider,
-        baseUrl,
+        localAuthProviderBaseUrl(conn.provider) ?? baseUrl,
         conn.apiKey,
         conn.maxContext,
         conn.openrouterProvider,
         conn.maxTokensOverride,
         conn.claudeFastMode === "true",
+        conn.treatAsLocalEndpoint === "true",
+        conn.defaultParameters,
+        conn.id,
       );
 
       let fullResponse = "";
       for await (const chunk of provider.chat([{ role: "user", content: "hi" }], {
-        model: conn.model,
+        model,
         temperature: 0.7,
         maxTokens: 200,
         stream: false,
@@ -989,13 +1480,13 @@ export async function connectionsRoutes(app: FastifyInstance) {
         success: true,
         response: fullResponse.slice(0, 500),
         latencyMs,
-        model: conn.model,
+        model: model || "Grok CLI default",
       };
     } catch (err) {
       debugLog(
         "[connections/test-message] provider=%s model=%s url=%s failed: %s",
         conn.provider,
-        conn.model,
+        model,
         targetUrl,
         err instanceof Error ? err.message : "Unknown error",
       );
@@ -1004,7 +1495,7 @@ export async function connectionsRoutes(app: FastifyInstance) {
         response: "",
         latencyMs: Date.now() - start,
         error: err instanceof Error ? err.message : "Unknown error",
-        model: conn.model,
+        model: model || "Grok CLI default",
       };
     }
   });
@@ -1066,7 +1557,14 @@ function normalizeModelsResponse(provider: string, json: Record<string, unknown>
         outputTokenLimit?: number;
       }>;
       return models
-        .filter((m) => m.supportedGenerationMethods?.includes("generateContent"))
+        .filter(
+          // Keep chat-capable models. Some catalog entries only advertise the
+          // streaming method, and a missing field should not hide a model.
+          (m) =>
+            !m.supportedGenerationMethods ||
+            m.supportedGenerationMethods.includes("generateContent") ||
+            m.supportedGenerationMethods.includes("streamGenerateContent"),
+        )
         .map((m) => ({
           id: (m.name ?? "").replace(/^models\//, ""),
           name: m.displayName ?? (m.name ?? "").replace(/^models\//, ""),

@@ -27,6 +27,22 @@ const characterBookRoleSchema = z.union([
   z.literal(2),
 ]);
 
+/** Conversation-mode behavior directive insertion strategy. */
+export const convoBehaviorInsertionStrategySchema = z.enum([
+  "constant_before",
+  "constant_after",
+  "post_history_replace",
+  "post_history_before",
+  "post_history_after",
+  "macro",
+]);
+
+/** Conversation-mode-only behavior directive. */
+export const convoBehaviorConfigSchema = z.object({
+  instruction: z.string().default(""),
+  insertionStrategy: convoBehaviorInsertionStrategySchema.catch("constant_after").default("constant_after"),
+});
+
 export const characterExtensionsSchema = z
   .object({
     talkativeness: z.number().min(0).max(1).default(0.5),
@@ -35,6 +51,11 @@ export const characterExtensionsSchema = z
     depth_prompt: depthPromptSchema.default({}),
     backstory: z.string().default(""),
     appearance: z.string().default(""),
+    // Conversation-mode-only fields (optional — absent on non-convo cards).
+    convoDisplayName: z.string().optional(),
+    convoDisplayNameInCard: z.boolean().optional(),
+    aboutMe: z.string().optional(),
+    convoBehavior: convoBehaviorConfigSchema.optional(),
   })
   .passthrough();
 
@@ -59,19 +80,21 @@ export const characterBookEntrySchema = z
   })
   .passthrough();
 
-export const characterBookSchema = z.object({
-  name: z.string().default(""),
-  description: z.string().default(""),
-  scan_depth: z.number().default(2),
-  token_budget: z.number().default(512),
-  recursive_scanning: z.boolean().default(false),
-  extensions: z.record(z.unknown()).default({}),
-  entries: z.array(characterBookEntrySchema).default([]),
-});
+export const characterBookSchema = z
+  .object({
+    name: z.string().default(""),
+    description: z.string().default(""),
+    scan_depth: z.number().default(2),
+    token_budget: z.number().default(512),
+    recursive_scanning: z.boolean().default(false),
+    extensions: z.record(z.unknown()).default({}),
+    entries: z.array(characterBookEntrySchema).default([]),
+  })
+  .passthrough();
 
 export const characterDataSchema = z
   .object({
-    name: z.string().min(1),
+    name: z.string().trim().min(1),
     description: z.string().default(""),
     personality: z.string().default(""),
     scenario: z.string().default(""),
@@ -99,8 +122,18 @@ export const createCharacterSchema = z.object({
   data: characterDataSchema,
 });
 
+const updateCharacterExtensionsSchema = characterExtensionsSchema.partial().extend({
+  // Zod 3 short-circuits these optional wrappers before applying the nested
+  // schema defaults. Revalidate this omission behavior before upgrading to Zod 4.
+  depth_prompt: depthPromptSchema.partial().optional(),
+  convoBehavior: convoBehaviorConfigSchema.partial().optional(),
+});
+
 export const updateCharacterSchema = z.object({
-  data: characterDataSchema.partial(),
+  data: characterDataSchema.partial().extend({
+    extensions: updateCharacterExtensionsSchema.optional(),
+    character_book: characterBookSchema.partial().nullable().optional(),
+  }),
 });
 
 export const createGroupSchema = z.object({

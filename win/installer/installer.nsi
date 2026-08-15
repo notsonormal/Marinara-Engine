@@ -1,24 +1,27 @@
 ; ──────────────────────────────────────────────
 ; Marinara Engine — Windows Installer
-; Cross-compiled from macOS via NSIS (makensis)
+; Built in CI via NSIS (makensis)
 ; ──────────────────────────────────────────────
 
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
+!include "StrFunc.nsh"
 !include "WinMessages.nsh"
 
 !insertmacro GetParent
+${StrTrimNewLines}
 
 ; ── App metadata ──
 !define APP_NAME "Marinara Engine"
-!define APP_VERSION "2.0.9"
+!define APP_VERSION "2.4.2"
 !define APP_PUBLISHER "Pasta-Devs"
 !define APP_URL "https://github.com/Pasta-Devs/Marinara-Engine"
 !define REPO_URL "https://github.com/Pasta-Devs/Marinara-Engine.git"
 !define DEFAULT_DIR "$LOCALAPPDATA\Marinara-Engine"
-!define PNPM_VERSION "10.33.2"
+!define PNPM_VERSION "10.34.5"
+!define PNPM_DESCRIPTOR "10.34.5+sha512.a4ee05f2f73658255bd6a89859c065a45c28a57daefae2c893a168ee2b73168c37b91e83e57ea67654ad03f03031746430e8bce38e362e042605fb8abc80192e"
 
 ; ── Prerequisite download URLs ──
 ; Pin to known-good versions so the installer is deterministic and doesn't
@@ -27,7 +30,7 @@
 !define NODE_DOWNLOAD_URL "https://nodejs.org/dist/v24.15.0/node-v24.15.0-x64.msi"
 !define GIT_SHA256 "2b96e7854f0520f0f6b709c21041d9801b1be44d5e1a0d9fa621b2fbc40f1983"
 !define NODE_SHA256 "feffb8e5cb5ac47f793666636d496ef3e975be82c84c4da5d20e6aa8fa4eb806"
-!define RELEASE_TAG "v2.0.9"
+!define RELEASE_TAG "v2.4.2"
 !ifndef RELEASE_COMMIT
 !define RELEASE_COMMIT ""
 !endif
@@ -109,6 +112,8 @@ Var GIT_OK
 Var NODE_OK
 Var PNPM_OK
 Var PNPM_RUNNER
+Var CURRENT_PNPM_VERSION
+Var NPM_PREFIX
 Var CLONE_DIR
 Var CLONE_DIR_CREATED
 Var STAGE_DIR
@@ -349,33 +354,73 @@ Please restart your computer and run this installer again."
   Pop $1
   ${If} $0 == 0
     DetailPrint "Trying pinned pnpm ${PNPM_VERSION} via Corepack..."
-    nsExec::ExecToStack 'cmd /c corepack pnpm@${PNPM_VERSION} --version'
+    StrCpy $CURRENT_PNPM_VERSION ""
+    nsExec::ExecToStack 'cmd /d /c corepack pnpm@${PNPM_DESCRIPTOR} --version 2>nul'
     Pop $PNPM_OK
-    Pop $1
+    Pop $CURRENT_PNPM_VERSION
     ${If} $PNPM_OK == 0
-      StrCpy $PNPM_RUNNER "corepack"
+      ${StrTrimNewLines} $CURRENT_PNPM_VERSION "$CURRENT_PNPM_VERSION"
+      ${If} $CURRENT_PNPM_VERSION == "${PNPM_VERSION}"
+        StrCpy $PNPM_RUNNER "corepack"
+      ${EndIf}
     ${EndIf}
   ${EndIf}
   ${If} $PNPM_RUNNER == ""
     DetailPrint "Corepack pnpm ${PNPM_VERSION} unavailable; trying installed pnpm..."
-    nsExec::ExecToStack 'cmd /c pnpm --version'
+    StrCpy $CURRENT_PNPM_VERSION ""
+    nsExec::ExecToStack 'cmd /d /c pnpm --version 2>nul'
     Pop $PNPM_OK
-    Pop $1
+    Pop $CURRENT_PNPM_VERSION
     ${If} $PNPM_OK == 0
-      StrCpy $PNPM_RUNNER "pnpm"
+      ${StrTrimNewLines} $CURRENT_PNPM_VERSION "$CURRENT_PNPM_VERSION"
+      ${If} $CURRENT_PNPM_VERSION == "${PNPM_VERSION}"
+        StrCpy $PNPM_RUNNER "pnpm"
+      ${EndIf}
     ${EndIf}
   ${EndIf}
   ${If} $PNPM_RUNNER == ""
     DetailPrint "Installed pnpm unavailable; trying temporary pnpm ${PNPM_VERSION} via npx..."
-    nsExec::ExecToStack 'cmd /c npx --yes pnpm@${PNPM_VERSION} --version'
+    StrCpy $CURRENT_PNPM_VERSION ""
+    nsExec::ExecToStack 'cmd /d /c npx --yes pnpm@${PNPM_VERSION} --version 2>nul'
     Pop $PNPM_OK
-    Pop $1
+    Pop $CURRENT_PNPM_VERSION
     ${If} $PNPM_OK == 0
-      StrCpy $PNPM_RUNNER "npx"
+      ${StrTrimNewLines} $CURRENT_PNPM_VERSION "$CURRENT_PNPM_VERSION"
+      ${If} $CURRENT_PNPM_VERSION == "${PNPM_VERSION}"
+        StrCpy $PNPM_RUNNER "npx"
+      ${EndIf}
     ${EndIf}
   ${EndIf}
   ${If} $PNPM_RUNNER == ""
-    MessageBox MB_OK|MB_ICONSTOP "pnpm ${PNPM_VERSION} could not be started.$\r$\n$\r$\nPlease enable Corepack or install pnpm manually, then run the installer again."
+    DetailPrint "Temporary pnpm unavailable; installing pnpm ${PNPM_VERSION} via npm..."
+    nsExec::ExecToLog 'cmd /c npm install --global pnpm@${PNPM_VERSION}'
+    Pop $0
+    ${If} $0 == 0
+      StrCpy $NPM_PREFIX ""
+      nsExec::ExecToStack 'cmd /d /c npm config get prefix 2>nul'
+      Pop $0
+      Pop $NPM_PREFIX
+      ${If} $0 == 0
+        ${StrTrimNewLines} $NPM_PREFIX "$NPM_PREFIX"
+      ${EndIf}
+      ${If} $NPM_PREFIX != ""
+        ReadEnvStr $1 "PATH"
+        System::Call 'Kernel32::SetEnvironmentVariable(t "PATH", t "$NPM_PREFIX;$1")i'
+        StrCpy $CURRENT_PNPM_VERSION ""
+        nsExec::ExecToStack 'cmd /d /c pnpm --version 2>nul'
+        Pop $PNPM_OK
+        Pop $CURRENT_PNPM_VERSION
+        ${If} $PNPM_OK == 0
+          ${StrTrimNewLines} $CURRENT_PNPM_VERSION "$CURRENT_PNPM_VERSION"
+          ${If} $CURRENT_PNPM_VERSION == "${PNPM_VERSION}"
+            StrCpy $PNPM_RUNNER "pnpm"
+          ${EndIf}
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  ${If} $PNPM_RUNNER == ""
+    MessageBox MB_OK|MB_ICONSTOP "pnpm ${PNPM_VERSION} could not be installed automatically.$\r$\n$\r$\nPlease check your internet connection or run npm install --global pnpm@${PNPM_VERSION}, then run this installer again."
     Abort
   ${EndIf}
   DetailPrint "pnpm ready."
@@ -412,6 +457,7 @@ Please restart your computer and run this installer again."
     nsExec::ExecToStack 'git rev-parse ${RELEASE_TAG}^{commit}'
     Pop $0
     Pop $3
+    ${StrTrimNewLines} $3 "$3"
     ${If} $0 != 0
       ${If} $5 == "1"
         nsExec::ExecToLog 'git stash apply -q'
@@ -432,7 +478,12 @@ Please restart your computer and run this installer again."
 
     ${If} "${RELEASE_COMMIT}" != ""
     ${AndIf} $3 != "${RELEASE_COMMIT}"
-      DetailPrint "Warning: ${RELEASE_TAG} resolved to $3, not the installer-expected ${RELEASE_COMMIT}. Continuing with fetched tag."
+      ${If} $5 == "1"
+        nsExec::ExecToLog 'git stash apply -q'
+        Pop $1
+      ${EndIf}
+      MessageBox MB_OK|MB_ICONSTOP "Release ${RELEASE_TAG} resolved to an unexpected commit.$\r$\n$\r$\nExpected: ${RELEASE_COMMIT}$\r$\nReceived: $3$\r$\n$\r$\nInstallation was stopped before updating files."
+      Abort
     ${EndIf}
 
     nsExec::ExecToLog 'cmd /c git cat-file -e $3 >nul 2>&1'
@@ -590,6 +641,7 @@ ${APP_URL}"
     nsExec::ExecToStack 'cmd /c cd /d "$CLONE_DIR" && git rev-parse HEAD'
     Pop $0
     Pop $2
+    ${StrTrimNewLines} $2 "$2"
     ${If} $0 != 0
       ${If} $CLONE_DIR_CREATED == "1"
         RMDir /r "$CLONE_DIR"
@@ -612,7 +664,14 @@ ${APP_URL}"
     ${EndIf}
     ${If} "${RELEASE_COMMIT}" != ""
     ${AndIf} $2 != "${RELEASE_COMMIT}"
-      DetailPrint "Warning: ${RELEASE_TAG} resolved to $2, not the installer-expected ${RELEASE_COMMIT}. Continuing with fetched tag."
+      ${If} $CLONE_DIR_CREATED == "1"
+        RMDir /r "$CLONE_DIR"
+      ${EndIf}
+      ${If} $STAGE_DIR_CREATED == "1"
+        RMDir /r "$STAGE_DIR"
+      ${EndIf}
+      MessageBox MB_OK|MB_ICONSTOP "Downloaded release ${RELEASE_TAG} resolved to an unexpected commit.$\r$\n$\r$\nExpected: ${RELEASE_COMMIT}$\r$\nReceived: $2$\r$\n$\r$\nInstallation was stopped before publishing files."
+      Abort
     ${EndIf}
     DetailPrint "Staging downloaded files..."
     ; robocopy returns 0-7 for success, 8+ for errors
@@ -671,17 +730,17 @@ ${APP_URL}"
   DetailPrint ""
   DetailPrint "═══ Step 3/6: Installing dependencies ═══"
   DetailPrint ""
-  DetailPrint "Running pnpm install (this may take 2-5 minutes and creates dependency folders)..."
+  DetailPrint "Running pnpm install --force --frozen-lockfile (this may take 2-5 minutes and creates dependency folders)..."
   ${If} $PNPM_RUNNER == "corepack"
-    nsExec::ExecToLog 'cmd /c corepack pnpm@${PNPM_VERSION} install'
+    nsExec::ExecToLog 'cmd /c corepack pnpm@${PNPM_DESCRIPTOR} --config.trustPolicy=off --config.confirmModulesPurge=false install --force --frozen-lockfile'
     Pop $0
   ${EndIf}
   ${If} $PNPM_RUNNER == "npx"
-    nsExec::ExecToLog 'cmd /c npx --yes pnpm@${PNPM_VERSION} install'
+    nsExec::ExecToLog 'cmd /c npx --yes pnpm@${PNPM_VERSION} --config.trustPolicy=off --config.confirmModulesPurge=false install --force --frozen-lockfile'
     Pop $0
   ${EndIf}
   ${If} $PNPM_RUNNER == "pnpm"
-    nsExec::ExecToLog 'cmd /c pnpm install'
+    nsExec::ExecToLog 'cmd /c pnpm --config.trustPolicy=off --config.confirmModulesPurge=false install --force --frozen-lockfile'
     Pop $0
   ${EndIf}
   ${If} $0 != 0
@@ -693,15 +752,15 @@ Would you like to retry?" IDYES retryInstall IDNO skipRetryInstall
     retryInstall:
       DetailPrint "Retrying pnpm install..."
       ${If} $PNPM_RUNNER == "corepack"
-        nsExec::ExecToLog 'cmd /c corepack pnpm@${PNPM_VERSION} install'
+        nsExec::ExecToLog 'cmd /c corepack pnpm@${PNPM_DESCRIPTOR} --config.trustPolicy=off --config.confirmModulesPurge=false install --force --frozen-lockfile'
         Pop $0
       ${EndIf}
       ${If} $PNPM_RUNNER == "npx"
-        nsExec::ExecToLog 'cmd /c npx --yes pnpm@${PNPM_VERSION} install'
+        nsExec::ExecToLog 'cmd /c npx --yes pnpm@${PNPM_VERSION} --config.trustPolicy=off --config.confirmModulesPurge=false install --force --frozen-lockfile'
         Pop $0
       ${EndIf}
       ${If} $PNPM_RUNNER == "pnpm"
-        nsExec::ExecToLog 'cmd /c pnpm install'
+        nsExec::ExecToLog 'cmd /c pnpm --config.trustPolicy=off --config.confirmModulesPurge=false install --force --frozen-lockfile'
         Pop $0
       ${EndIf}
     skipRetryInstall:
@@ -718,10 +777,10 @@ Would you like to retry?" IDYES retryInstall IDNO skipRetryInstall
   DetailPrint ""
   DetailPrint "Building ${APP_NAME} (this may take 1-3 minutes)..."
   ${If} $PNPM_RUNNER == "corepack"
-    nsExec::ExecToLog 'cmd /c corepack pnpm@${PNPM_VERSION} --filter @marinara-engine/shared build'
+    nsExec::ExecToLog 'cmd /c corepack pnpm@${PNPM_DESCRIPTOR} --filter @marinara-engine/shared build'
     Pop $0
     ${If} $0 == 0
-      nsExec::ExecToLog 'cmd /c corepack pnpm@${PNPM_VERSION} --filter @marinara-engine/server --filter @marinara-engine/client --parallel run build'
+      nsExec::ExecToLog 'cmd /c corepack pnpm@${PNPM_DESCRIPTOR} --filter @marinara-engine/server --filter @marinara-engine/client --parallel run build'
       Pop $0
     ${EndIf}
   ${EndIf}
@@ -810,6 +869,46 @@ SectionEnd
 Section "Uninstall"
   SetDetailsPrint both
 
+  ; User data lives inside packages/server/data in current installs. Decide
+  ; whether to preserve it BEFORE removing any application directories.
+  ; Older installs used $INSTDIR\data, so keep supporting that location too.
+  StrCpy $0 "delete"
+  ${If} ${FileExists} "$INSTDIR\packages\server\data\*.*"
+    Goto un_confirmData
+  ${ElseIf} ${FileExists} "$INSTDIR\data\*.*"
+    Goto un_confirmData
+  ${ElseIf} ${FileExists} "$INSTDIR\.__marinara-preserved-data\*.*"
+    ; Recover data left staged by an interrupted previous uninstall.
+    Goto un_confirmData
+  ${Else}
+    Goto un_removeApplication
+  ${EndIf}
+
+  un_confirmData:
+    MessageBox MB_YESNO|MB_ICONQUESTION "\
+${APP_NAME} stores your chats, characters, personas, and other user data inside its installation folder.$\r$\n$\r$\n\
+Would you like to delete your data too?$\r$\n$\r$\n\
+Choose No to preserve it for a future reinstall." IDYES un_removeApplication IDNO un_preserveData
+
+  un_preserveData:
+    StrCpy $0 "keep"
+    ${If} ${FileExists} "$INSTDIR\packages\server\data\*.*"
+      ${If} ${FileExists} "$INSTDIR\.__marinara-preserved-data\*.*"
+        MessageBox MB_OK|MB_ICONSTOP "Uninstall stopped because the temporary preservation folder already exists:$\r$\n$INSTDIR\.__marinara-preserved-data$\r$\n$\r$\nMove or rename that folder, then run the uninstaller again. No application files were removed."
+        Abort
+      ${EndIf}
+      ClearErrors
+      Rename "$INSTDIR\packages\server\data" "$INSTDIR\.__marinara-preserved-data"
+      IfErrors un_preserveFailed un_removeApplication
+    ${EndIf}
+    Goto un_removeApplication
+
+  un_preserveFailed:
+    MessageBox MB_OK|MB_ICONSTOP "Uninstall stopped because your user data could not be moved to a safe temporary location. No application files were removed."
+    Abort
+
+  un_removeApplication:
+
   DetailPrint "Removing desktop shortcut..."
   Delete "$DESKTOP\${APP_NAME}.lnk"
 
@@ -827,7 +926,7 @@ Section "Uninstall"
   RMDir /r "$INSTDIR\packages"
   RMDir /r "$INSTDIR\android"
   RMDir /r "$INSTDIR\docs"
-  RMDir /r "$INSTDIR\installer"
+  RMDir /r "$INSTDIR\win"
   RMDir /r "$INSTDIR\.git"
   Delete "$INSTDIR\*.json"
   Delete "$INSTDIR\*.yaml"
@@ -842,24 +941,35 @@ Section "Uninstall"
   Delete "$INSTDIR\Dockerfile"
   Delete "$INSTDIR\uninstall.exe"
 
-  ; Keep the data/ directory (user chats, characters, etc.)
-  ; Show a message about it
-  ${If} ${FileExists} "$INSTDIR\data\*.*"
-    MessageBox MB_YESNO|MB_ICONQUESTION "\
-${APP_NAME} has been uninstalled.$\r$\n$\r$\n\
-Your data (chats, characters, personas, etc.) is still in:$\r$\n\
-$INSTDIR\data$\r$\n$\r$\n\
-Would you like to delete your data too?" IDYES deleteData IDNO keepData
-    deleteData:
-      RMDir /r "$INSTDIR\data"
-      RMDir /r "$INSTDIR"
-      Goto doneUninstall
-    keepData:
-      DetailPrint "User data preserved in $INSTDIR\data"
-      Goto doneUninstall
+  ${If} $0 == "keep"
+    ; Restore current-layout data after packages/ has been removed. If restore
+    ; fails, the data remains intact in the explicitly reported safe folder.
+    ${If} ${FileExists} "$INSTDIR\.__marinara-preserved-data\*.*"
+      CreateDirectory "$INSTDIR\packages\server"
+      ClearErrors
+      Rename "$INSTDIR\.__marinara-preserved-data" "$INSTDIR\packages\server\data"
+      IfErrors un_restoreFailed un_dataPreserved
+    ${EndIf}
+    Goto un_dataPreserved
   ${Else}
-    RMDir /r "$INSTDIR"
+    RMDir /r "$INSTDIR\data"
+    RMDir /r "$INSTDIR\.__marinara-preserved-data"
+    RMDir "$INSTDIR"
   ${EndIf}
+
+  Goto doneUninstall
+
+  un_restoreFailed:
+    MessageBox MB_OK|MB_ICONEXCLAMATION "${APP_NAME} was removed, but your preserved data could not be restored to its usual location. It remains safe in:$\r$\n$INSTDIR\.__marinara-preserved-data"
+    Goto doneUninstall
+
+  un_dataPreserved:
+    ${If} ${FileExists} "$INSTDIR\packages\server\data\*.*"
+      DetailPrint "User data preserved in $INSTDIR\packages\server\data"
+    ${EndIf}
+    ${If} ${FileExists} "$INSTDIR\data\*.*"
+      DetailPrint "Legacy user data preserved in $INSTDIR\data"
+    ${EndIf}
 
   doneUninstall:
   DetailPrint "Uninstallation complete."

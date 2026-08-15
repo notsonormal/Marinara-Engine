@@ -5,6 +5,7 @@ import { type ReactNode } from "react";
 import { normalizeCardAssetImageSyntax, resolveCardAssetUrl } from "./card-asset-links";
 import { convertBasicLatexSymbols, convertBasicLatexSymbolsInHtml } from "./latex-symbols";
 import { useUIStore } from "../stores/ui.store";
+import { DISCORD_SUBTEXT_RE, INLINE_MD_RE, MD_LINK_TARGET_SOURCE } from "./inline-markdown-regex";
 
 // ─── Inline Markdown ────────────────────────────────────────────────────────
 
@@ -19,27 +20,47 @@ import { useUIStore } from "../stores/ui.store";
  *   7     Strikethrough     ~~text~~
  *   8     Bold-italic       ***text***   (must precede bold)
  *   9     Bold              **text**
- *   10    Italic (__)       __text__
+ *   10    Underline         __text__
  *   11    Italic (*)        *text*
  *   12    Italic (_)        _text_   (not inside a word)
  */
-const MD_LINK_TARGET_SOURCE = String.raw`(?:https?:\/\/[^)\s]+|card:\/\/[^)\s]+|\/api\/[^)\s]+)`;
-const INLINE_MD_RE = new RegExp(
-  "\\\\([-\\\\*_~`#|>!=\\[\\]{}])|(!?\\[([^\\]]*)\\]\\((" +
-    MD_LINK_TARGET_SOURCE +
-    ")\\))|`([^`\\n]+)`|==(.+?)==|~~(.+?)~~|\\*\\*\\*(.+?)\\*\\*\\*|\\*\\*(.+?)\\*\\*|__(.+?)__|\\*(.+?)\\*|(?<![_\\w])_([^_]+?)_(?![_\\w])",
-  "g",
-);
-
 /** Maximum recursion depth for nested inline markdown. */
 const MAX_INLINE_DEPTH = 6;
+const CHAT_TEXT_HTML_ENTITY_RE = /&(amp|lt|gt|quot|apos|#\d{1,7}|#x[0-9a-f]{1,6});/gi;
 
 function shouldConvertLatexSymbols(): boolean {
   return useUIStore.getState().convertLatexSymbols !== false;
 }
 
+function decodeChatTextHtmlEntities(text: string): string {
+  return text.replace(CHAT_TEXT_HTML_ENTITY_RE, (match, entity: string) => {
+    const normalized = entity.toLowerCase();
+    switch (normalized) {
+      case "amp":
+        return "&";
+      case "lt":
+        return "<";
+      case "gt":
+        return ">";
+      case "quot":
+        return '"';
+      case "apos":
+        return "'";
+      default: {
+        const isHex = normalized.startsWith("#x");
+        const rawCodePoint = isHex ? normalized.slice(2) : normalized.slice(1);
+        const codePoint = Number.parseInt(rawCodePoint, isHex ? 16 : 10);
+        return Number.isFinite(codePoint) && codePoint > 0 && codePoint <= 0x10ffff
+          ? String.fromCodePoint(codePoint)
+          : match;
+      }
+    }
+  });
+}
+
 function maybeConvertLatexSymbols(text: string, enabled = shouldConvertLatexSymbols()): string {
-  return enabled ? convertBasicLatexSymbols(text) : text;
+  const decoded = decodeChatTextHtmlEntities(text);
+  return enabled ? convertBasicLatexSymbols(decoded) : decoded;
 }
 
 /**
@@ -53,7 +74,7 @@ function maybeConvertLatexSymbols(text: string, enabled = shouldConvertLatexSymb
  */
 export function applyInlineMarkdown(text: string, keyPrefix: string, _depth = 0): ReactNode[] {
   // Safety: prevent runaway recursion
-  if (_depth > MAX_INLINE_DEPTH) return [text];
+  if (_depth > MAX_INLINE_DEPTH) return [maybeConvertLatexSymbols(text)];
 
   const markdownText = normalizeCardAssetImageSyntax(text);
   const convertLatex = shouldConvertLatexSymbols();
@@ -84,10 +105,11 @@ export function applyInlineMarkdown(text: string, keyPrefix: string, _depth = 0)
           <img
             key={`${keyPrefix}img${key++}`}
             src={resolvedUrl}
-            alt={match[3] || ""}
+            alt={decodeChatTextHtmlEntities(match[3] || "")}
             className="my-1 inline-block max-w-full rounded-lg align-bottom sm:max-w-md"
             loading="lazy"
             decoding="async"
+            referrerPolicy="no-referrer"
           />,
         );
       } else {
@@ -100,15 +122,17 @@ export function applyInlineMarkdown(text: string, keyPrefix: string, _depth = 0)
             rel="noopener noreferrer"
             className="text-blue-400 underline hover:text-blue-300"
           >
-            {match[3]}
+            {decodeChatTextHtmlEntities(match[3])}
           </a>,
         );
       }
     } else if (match[5] != null) {
       // ── Inline code: `code` (no recursion — content is literal) ──
+      // dir="ltr": code is LTR syntax; inside an RTL paragraph the bidi
+      // algorithm would otherwise reorder it (`--flag value` → `flag value--`).
       nodes.push(
-        <code key={`${keyPrefix}c${key++}`} className="mari-md-inline-code">
-          {match[5]}
+        <code key={`${keyPrefix}c${key++}`} className="mari-md-inline-code" dir="ltr">
+          {decodeChatTextHtmlEntities(match[5])}
         </code>,
       );
     } else if (match[6] != null) {
@@ -136,8 +160,12 @@ export function applyInlineMarkdown(text: string, keyPrefix: string, _depth = 0)
       // ── Bold: **text** ──
       nodes.push(<strong key={`${keyPrefix}b${key++}`}>{recurse(match[9], "b")}</strong>);
     } else if (match[10] != null) {
-      // ── Italic: __text__ ──
-      nodes.push(<em key={`${keyPrefix}di${key++}`}>{recurse(match[10], "di")}</em>);
+      // ── Underline: __text__ ──
+      nodes.push(
+        <u key={`${keyPrefix}u${key++}`} className="mari-md-underline">
+          {recurse(match[10], "u")}
+        </u>,
+      );
     } else if (match[11] != null) {
       // ── Italic: *text* ──
       nodes.push(<em key={`${keyPrefix}i${key++}`}>{recurse(match[11], "i")}</em>);
@@ -205,14 +233,15 @@ interface ListItem {
 
 // ── Table helpers ──
 
-/** Parse alignment from separator cells (e.g. :---, :---:, ---:). */
-function parseTableAlign(sep: string): "left" | "center" | "right" | undefined {
+/** Parse alignment from separator cells (e.g. :---, :---:, ---:). Logical
+ * values so `:---` means "reading start" in RTL content too. */
+function parseTableAlign(sep: string): "start" | "center" | "end" | undefined {
   const trimmed = sep.trim();
   const left = trimmed.startsWith(":");
   const right = trimmed.endsWith(":");
   if (left && right) return "center";
-  if (right) return "right";
-  if (left) return "left";
+  if (right) return "end";
+  if (left) return "start";
   return undefined;
 }
 
@@ -221,7 +250,7 @@ function parseTableAlign(sep: string): "left" | "center" | "right" | undefined {
 function renderCodeBlock(lines: string[], lang: string, blockKey: string): ReactNode {
   const code = lines.join("\n");
   return (
-    <pre key={blockKey} className="mari-md-codeblock">
+    <pre key={blockKey} className="mari-md-codeblock" dir="ltr">
       {lang && <span className="mari-md-codeblock-lang">{lang}</span>}
       <code>{code}</code>
     </pre>
@@ -375,7 +404,10 @@ export function renderMarkdownBlocks(
   renderInline: (text: string, keyPrefix: string) => ReactNode[] = applyInlineMarkdown,
   keyBase = "md",
 ): ReactNode {
-  const lines = normalizeCardAssetImageSyntax(text).split("\n");
+  // Split on CRLF or LF — CRLF input (e.g. .md files written on Windows) must
+  // not leave a trailing \r on lines, or line-anchored patterns like
+  // HEADING_RE fail to match.
+  const lines = normalizeCardAssetImageSyntax(text).split(/\r?\n/);
   const segments: ReactNode[] = [];
   let key = 0;
 
@@ -384,6 +416,7 @@ export function renderMarkdownBlocks(
   let inCodeBlock = false;
   let codeBuffer: string[] = [];
   let codeLang = "";
+  let codeFenceIndent = 0;
   let quoteBuffer: string[] = [];
   let listItems: ListItem[] = [];
   let listOrdered = false;
@@ -444,13 +477,20 @@ export function renderMarkdownBlocks(
 
     // ── Inside fenced code block ──
     if (inCodeBlock) {
-      if (CODE_FENCE_CLOSE_RE.test(line.trimEnd())) {
+      // The close fence may be indented like its opener (fence inside a list
+      // item), so trim both ends before matching.
+      if (CODE_FENCE_CLOSE_RE.test(line.trim())) {
         segments.push(renderCodeBlock(codeBuffer, codeLang, `${keyBase}cb${key++}`));
         codeBuffer = [];
         codeLang = "";
         inCodeBlock = false;
       } else {
-        codeBuffer.push(line);
+        // CommonMark: strip up to the opening fence's indent from each content
+        // line so list-nested code blocks don't render with phantom leading
+        // spaces (and the Copy button doesn't copy them).
+        let stripped = 0;
+        while (stripped < codeFenceIndent && line[stripped] === " ") stripped++;
+        codeBuffer.push(stripped > 0 ? line.slice(stripped) : line);
       }
       continue;
     }
@@ -461,6 +501,7 @@ export function renderMarkdownBlocks(
       flushAll();
       inCodeBlock = true;
       codeLang = codeFenceMatch[1]?.trim() ?? "";
+      codeFenceIndent = line.length - line.trimStart().length;
       continue;
     }
 
@@ -508,6 +549,7 @@ export function renderMarkdownBlocks(
           className="my-1 max-w-full rounded-lg sm:max-w-md"
           loading="lazy"
           decoding="async"
+          referrerPolicy="no-referrer"
         />,
       );
       continue;
@@ -549,6 +591,19 @@ export function renderMarkdownBlocks(
     // If we were in a table and this line doesn't continue it, flush
     if (tableRows.length > 0) {
       flushTable();
+    }
+
+    // ── Discord-style subtext (must be checked before regular UL) ──
+    const subtextMatch = DISCORD_SUBTEXT_RE.exec(line);
+    if (subtextMatch) {
+      flushText();
+      flushList();
+      segments.push(
+        <small key={`${keyBase}sub${key++}`} className="mari-md-subtext">
+          {renderInline(subtextMatch[1] ?? "", `${keyBase}sub${key}`)}
+        </small>,
+      );
+      continue;
     }
 
     // ── Task list item (must be checked before regular UL) ──
@@ -644,7 +699,9 @@ export function applyInlineMarkdownHTML(html: string): string {
         return `<pre class="mari-md-codeblock">${langLabel}<code>${code}</code></pre>`;
       },
     )
-    // Inline code: `code`
+    // Inline code: `code`. No dir attribute here — this path is re-sanitized by
+    // sanitizeChatHtml, whose attribute allowlist strips `dir`; the LTR forcing
+    // for this path comes from the .mari-md-codeblock/.mari-md-inline-code CSS.
     .replace(/`([^`\n]+)`/g, '<code class="mari-md-inline-code">$1</code>');
 
   if (shouldConvertLatexSymbols()) {
@@ -666,8 +723,8 @@ export function applyInlineMarkdownHTML(html: string): string {
       .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
       // Bold: **text**
       .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-      // Italic: __text__
-      .replace(/__(.+?)__/g, "<em>$1</em>")
+      // Underline: __text__
+      .replace(/__(.+?)__/g, '<u class="mari-md-underline">$1</u>')
       // Italic: *text* (single asterisk, not part of **)
       .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "<em>$1</em>")
       // Italic: _text_ (not inside a word)
@@ -677,5 +734,7 @@ export function applyInlineMarkdownHTML(html: string): string {
         /(?:^|(?<=<br[^>]*>))\s*&gt;\s?(.+?)(?=<br|$)/g,
         '<blockquote class="mari-md-blockquote">$1</blockquote>',
       )
+      // Discord-style subtext: -# text
+      .replace(/(?:^|(?<=<br[^>]*>))[ \t]*-#(?:[ \t]+(.*?))?(?=<br|$)/g, '<small class="mari-md-subtext">$1</small>')
   );
 }

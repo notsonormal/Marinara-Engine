@@ -1,10 +1,12 @@
-import type { Message } from "@marinara-engine/shared";
-import type { AvatarCrop, LegacyAvatarCrop } from "../../lib/utils";
+import type { Message, AvatarCrop } from "@marinara-engine/shared";
 
 export type CharacterMap = Map<
   string,
   {
     name: string;
+    /** Conversation-only cosmetic display name (extensions.convoDisplayName). */
+    convoDisplayName?: string;
+    phoneticName?: string;
     description?: string;
     personality?: string;
     backstory?: string;
@@ -15,7 +17,7 @@ export type CharacterMap = Map<
     nameColor?: string;
     dialogueColor?: string;
     boxColor?: string;
-    avatarCrop?: AvatarCrop | LegacyAvatarCrop | null;
+    avatarCrop?: AvatarCrop | null;
     conversationStatus?: "online" | "idle" | "dnd" | "offline";
     conversationActivity?: string;
   }
@@ -24,13 +26,16 @@ export type CharacterMap = Map<
 export type PersonaInfo = {
   id?: string;
   name: string;
+  /** Conversation-only cosmetic display name (persona.convoDisplayName). */
+  convoDisplayName?: string;
+  phoneticName?: string;
   description?: string;
   personality?: string;
   backstory?: string;
   appearance?: string;
   scenario?: string;
   avatarUrl?: string;
-  avatarCrop?: AvatarCrop | LegacyAvatarCrop | null;
+  avatarCrop?: AvatarCrop | null;
   nameColor?: string;
   dialogueColor?: string;
   boxColor?: string;
@@ -38,6 +43,7 @@ export type PersonaInfo = {
 
 export type PeekPromptData = {
   messages: Array<{ role: string; content: string }>;
+  chatMode?: string;
   parameters: unknown;
   source?: "cached" | "live_preview" | "raw_messages";
   exact?: boolean;

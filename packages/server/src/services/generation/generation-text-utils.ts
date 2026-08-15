@@ -1,10 +1,5 @@
-import { stripMacroComments } from "@marinara-engine/shared";
 import type { LLMUsage } from "../llm/base-provider.js";
 import { stripGmCommandTags } from "../game/segment-edits.js";
-
-export function cardPromptText(value: unknown): string {
-  return typeof value === "string" ? stripMacroComments(value).trim() : "";
-}
 
 export function bumpCharacterVersion(value: unknown): string {
   const raw = typeof value === "string" ? value.trim() : "";
@@ -70,8 +65,8 @@ export function stripSpacesBeforeLineBreaks(content: string): string {
   return content.replace(/[ \t]+(\r?\n)/g, "$1");
 }
 
-function prefixConversationUserTurn(content: string, personaName: string): string {
-  const speaker = personaName.trim() || "User";
+function prefixConversationSpeakerTurn(content: string, speakerName: string, fallbackSpeaker: string): string {
+  const speaker = speakerName.trim() || fallbackSpeaker;
   const trimmed = content.trim();
   const escapedSpeaker = speaker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   if (new RegExp(`^${escapedSpeaker}\\s*:`, "i").test(trimmed)) return trimmed;
@@ -79,6 +74,15 @@ function prefixConversationUserTurn(content: string, personaName: string): strin
   return trimmed ? `${speaker}: ${trimmed}` : `${speaker}:`;
 }
 
-export function formatConversationPromptTurn(content: string, role: string, personaName: string): string {
-  return role === "user" ? prefixConversationUserTurn(content, personaName) : content.trim();
+export function formatConversationPromptTurn(
+  content: string,
+  role: string,
+  personaName: string,
+  assistantName?: string | null,
+): string {
+  if (role === "user") return prefixConversationSpeakerTurn(content, personaName, "User");
+  if (role === "assistant" && assistantName?.trim()) {
+    return prefixConversationSpeakerTurn(content, assistantName, "Character");
+  }
+  return content.trim();
 }

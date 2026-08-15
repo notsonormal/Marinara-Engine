@@ -36,6 +36,12 @@ export type SidecarStatus =
   | "ready"
   | "server_error";
 
+/** Curated local speech-to-text model managed beside the Local Model sidecar. */
+export type SidecarSpeechModelId = "whisper_tiny" | "whisper_base";
+
+/** Local speech model lifecycle. Kept separate from the chat sidecar status. */
+export type SidecarSpeechStatus = "not_downloaded" | "downloading_model" | "downloaded" | "loading" | "ready" | "error";
+
 /** Progress info while downloading the runtime or model assets. */
 export interface SidecarDownloadProgress {
   phase: "runtime" | "model";
@@ -78,6 +84,8 @@ export interface SidecarConfig {
   topP: number;
   /** Top-k sampling limit for local inference. */
   topK: number;
+  /** Maximum local agent requests and llama-server slots that may run in parallel. */
+  maxParallelJobs: number;
   /** GPU layers to offload (-1 = try max GPU offload first, then fall back if startup fails). */
   gpuLayers: number;
   /** Start llama.cpp with Jinja chat templates so OpenAI-compatible native tool calls can work. */
@@ -153,6 +161,18 @@ export interface SceneSegmentEffect {
   directions?: DirectionCommand[];
 }
 
+/** A provider-ready prompt for one named character in a multi-character scene illustration. */
+export interface SceneIllustrationCharacterPrompt {
+  /** Visible character name, matched against the scene's allowed character roster. */
+  name: string;
+  /** Character-only identity, appearance, pose, expression, and action prompt. */
+  prompt: string;
+  /** Optional character-only undesired-content prompt used by providers that support it. */
+  negativePrompt?: string;
+  /** Optional normalized subject center used by providers with spatial character prompting. */
+  position?: { x: number; y: number };
+}
+
 /** Rare request for a VN CG-style illustration background. */
 export interface SceneIllustrationRequest {
   /** 0-based narration segment where the illustration should replace the background. */
@@ -163,6 +183,8 @@ export interface SceneIllustrationRequest {
   prompt: string;
   /** Names of visible referenced characters, if known. */
   characters?: string[];
+  /** Optional provider-ready prompts that keep named characters visually distinct. */
+  characterPrompts?: SceneIllustrationCharacterPrompt[];
   /** Why this scene is important enough to spend an image generation. */
   reason?: string;
   /** Optional stable filename hint. */
@@ -277,6 +299,46 @@ export interface SidecarModelInfo {
   sha256?: string;
 }
 
+export interface SidecarSpeechModelInfo {
+  id: SidecarSpeechModelId;
+  label: string;
+  repoId: string;
+  sizeBytes: number;
+  ramBytes: number;
+  description: string;
+}
+
+export interface SidecarSpeechConfig {
+  modelId: SidecarSpeechModelId | null;
+}
+
+export interface SidecarSpeechRuntimeDiagnostics {
+  packageFound: boolean;
+  bindingFound: boolean;
+  expectedBindingPath: string | null;
+  installedBindingArchs: string[];
+  platform: string;
+  arch: string;
+  nodeVersion: string;
+  nodeExecPath: string;
+  liteMode: boolean;
+}
+
+export interface SidecarSpeechStatusResponse {
+  status: SidecarSpeechStatus;
+  config: SidecarSpeechConfig;
+  available: boolean;
+  modelDownloaded: boolean;
+  modelDisplayName: string | null;
+  modelSize: number | null;
+  models: SidecarSpeechModelInfo[];
+  downloadProgress: SidecarDownloadProgress | null;
+  error: string | null;
+  platform: string;
+  arch: string;
+  runtime: SidecarSpeechRuntimeDiagnostics;
+}
+
 export interface SidecarCustomModelEntry {
   path: string;
   filename: string;
@@ -299,6 +361,7 @@ export const SIDECAR_DEFAULT_CONFIG: SidecarConfig = {
   temperature: 0.3,
   topP: 0.95,
   topK: 64,
+  maxParallelJobs: 2,
   gpuLayers: -1,
   enableNativeToolCalls: true,
   embeddingPooling: "none",
@@ -313,6 +376,27 @@ export const SIDECAR_DEFAULT_CONFIG: SidecarConfig = {
  */
 export const SIDECAR_CONNECTION_ID = "sidecar:local";
 
+export const SIDECAR_SPEECH_DEFAULT_MODEL_ID: SidecarSpeechModelId = "whisper_tiny";
+
+export const SIDECAR_SPEECH_MODELS: SidecarSpeechModelInfo[] = [
+  {
+    id: "whisper_tiny",
+    label: "Whisper Tiny (Multilingual)",
+    repoId: "Xenova/whisper-tiny",
+    sizeBytes: 180_000_000,
+    ramBytes: 350_000_000,
+    description: "Smallest local call transcription model. Best first choice for phones and older machines.",
+  },
+  {
+    id: "whisper_base",
+    label: "Whisper Base (Multilingual)",
+    repoId: "Xenova/whisper-base",
+    sizeBytes: 320_000_000,
+    ramBytes: 650_000_000,
+    description: "Better accuracy for messy speech, at the cost of slower startup and higher memory use.",
+  },
+];
+
 /** Available models for download. */
 export const SIDECAR_MODELS: SidecarModelInfo[] = [
   {
@@ -321,7 +405,7 @@ export const SIDECAR_MODELS: SidecarModelInfo[] = [
     label: "Gemma 4 E2B — Q8 (Best Quality)",
     filename: "gemma-4-E2B-it-Q8_0.gguf",
     sizeBytes: 5_400_000_000,
-    downloadSizeBytes: 5_048_350_848,
+    downloadSizeBytes: 5_048_352_864,
     ramBytes: 5_800_000_000,
     downloadUrl: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q8_0.gguf",
   },
@@ -331,7 +415,7 @@ export const SIDECAR_MODELS: SidecarModelInfo[] = [
     label: "Gemma 4 E2B — Q4_K_M (Smaller, Faster)",
     filename: "gemma-4-E2B-it-Q4_K_M.gguf",
     sizeBytes: 3_200_000_000,
-    downloadSizeBytes: 3_106_736_256,
+    downloadSizeBytes: 3_106_738_272,
     ramBytes: 3_600_000_000,
     downloadUrl: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
   },

@@ -12,12 +12,15 @@
 // so you can never lock yourself out of local access.
 
 import type { FastifyRequest, FastifyReply } from "fastify";
+import { readFileSync } from "node:fs";
+import { networkInterfaces } from "node:os";
 import {
+  getDockerBypassMode,
   getIpAllowlist,
+  getTailscaleBypassMode,
   getTrustedPrivateNetworksOverride,
-  isDockerBypassEnabled,
   isDockerProxyAuthRequired,
-  isTailscaleBypassEnabled,
+  isDockerRuntime,
 } from "../config/runtime-config.js";
 import { logger } from "../lib/logger.js";
 
@@ -139,6 +142,160 @@ const LOOPBACK_CIDRS: CIDREntry[] = [parseCIDR("127.0.0.1")!, parseCIDR("::1")!]
 const TAILSCALE_CIDR = parseCIDR("100.64.0.0/10")!;
 const DOCKER_CIDR = parseCIDR("172.16.0.0/12")!;
 
+/**
+ * Resolve the IPv4 default gateway from Linux's route table.
+ *
+ * Docker Desktop and custom Docker address pools do not necessarily use the
+ * conventional 172.16.0.0/12 bridge range. In those environments, traffic
+ * forwarded from the host arrives from this exact gateway address.
+ */
+export function parseDockerDefaultGatewayIp(routeTable: string): string | null {
+  const candidates: Array<{ ip: string; metric: number }> = [];
+
+  for (const line of routeTable.split(/\r?\n/u).slice(1)) {
+    const columns = line.trim().split(/\s+/u);
+    if (columns.length < 8) continue;
+
+    const destination = columns[1];
+    const gatewayHex = columns[2];
+    const flagsHex = columns[3];
+    const metricText = columns[6];
+    if (destination !== "00000000" || !/^[0-9a-f]{8}$/iu.test(gatewayHex ?? "")) continue;
+
+    const flags = Number.parseInt(flagsHex ?? "", 16);
+    if (!Number.isFinite(flags) || (flags & 0x3) !== 0x3) continue;
+
+    const octets = (gatewayHex!.match(/.{2}/gu) ?? []).map((part) => Number.parseInt(part, 16)).reverse();
+    if (octets.length !== 4 || octets.every((octet) => octet === 0)) continue;
+
+    const metric = Number.parseInt(metricText ?? "", 10);
+    candidates.push({
+      ip: octets.join("."),
+      metric: Number.isFinite(metric) ? metric : Number.MAX_SAFE_INTEGER,
+    });
+  }
+
+  candidates.sort((left, right) => left.metric - right.metric);
+  return candidates[0]?.ip ?? null;
+}
+
+/** Read and parse Docker's default gateway once during module initialization. */
+function readDockerDefaultGatewayIp(): string | null {
+  try {
+    return parseDockerDefaultGatewayIp(readFileSync("/proc/net/route", "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+const dockerDefaultGatewayIp = isDockerRuntime() ? readDockerDefaultGatewayIp() : null;
+
+function readInterfaceIndex(interfaceName: string, field: "ifindex" | "iflink"): number | null {
+  if (!/^[a-z0-9_.:-]+$/iu.test(interfaceName)) return null;
+  try {
+    const raw = readFileSync(`/sys/class/net/${interfaceName}/${field}`, "utf8").trim();
+    if (!/^\d+$/u.test(raw)) return null;
+    const value = Number(raw);
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A bridge/macvlan container interface links to a different peer index in the
+ * host namespace. Host-network interfaces link to themselves, so they are not
+ * sufficient evidence for the automatic bypass.
+ */
+function readContainerPeerInterfaceNames(
+  interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces(),
+): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const interfaceName of Object.keys(interfaces)) {
+    const ifindex = readInterfaceIndex(interfaceName, "ifindex");
+    const iflink = readInterfaceIndex(interfaceName, "iflink");
+    if (ifindex !== null && iflink !== null && ifindex !== iflink) names.add(interfaceName);
+  }
+  return names;
+}
+
+const dockerContainerInterfaceNames = isDockerRuntime() ? readContainerPeerInterfaceNames() : new Set<string>();
+const DOCKER_INTERFACE_CACHE_TTL_MS = 5_000;
+type ParsedDockerInterfaceCidr = { interfaceName: string; cidr: CIDREntry };
+let cachedDockerInterfaces:
+  | {
+      expiresAt: number;
+      interfaces: ReturnType<typeof networkInterfaces>;
+      parsedCidrs: ParsedDockerInterfaceCidr[];
+    }
+  | undefined;
+
+function parseDockerInterfaceCidrs(interfaces: ReturnType<typeof networkInterfaces>): ParsedDockerInterfaceCidr[] {
+  const entries: ParsedDockerInterfaceCidr[] = [];
+  for (const [interfaceName, addresses] of Object.entries(interfaces)) {
+    for (const address of addresses ?? []) {
+      if (address.internal || typeof address.cidr !== "string") continue;
+      const cidr = parseCIDR(address.cidr);
+      if (cidr) entries.push({ interfaceName, cidr });
+    }
+  }
+  return entries;
+}
+
+function getDockerInterfaceSnapshot() {
+  const timestamp = Date.now();
+  if (!cachedDockerInterfaces || cachedDockerInterfaces.expiresAt <= timestamp) {
+    const interfaces = networkInterfaces();
+    cachedDockerInterfaces = {
+      expiresAt: timestamp + DOCKER_INTERFACE_CACHE_TTL_MS,
+      interfaces,
+      parsedCidrs: parseDockerInterfaceCidrs(interfaces),
+    };
+  }
+  return cachedDockerInterfaces;
+}
+
+function matchesIp(ip: string, cidr: string): boolean {
+  const bytes = ipToBytes(ip);
+  const parsed = parseCIDR(cidr);
+  return Boolean(bytes && parsed && matchesCIDR(bytes, parsed));
+}
+
+/** True only when the client matches an actual container network or its exact gateway. */
+export function isDockerRuntimeNetworkIp(
+  ip: string,
+  interfaces?: ReturnType<typeof networkInterfaces>,
+  gatewayIp: string | null = dockerDefaultGatewayIp,
+  containerInterfaceNames: ReadonlySet<string> = dockerContainerInterfaceNames,
+  parsedInterfaceCidrs?: readonly ParsedDockerInterfaceCidr[],
+): boolean {
+  const defaultNetwork = interfaces === undefined ? getDockerInterfaceSnapshot() : undefined;
+  const resolvedInterfaces = interfaces ?? defaultNetwork!.interfaces;
+  const resolvedCidrs =
+    parsedInterfaceCidrs ?? defaultNetwork?.parsedCidrs ?? parseDockerInterfaceCidrs(resolvedInterfaces);
+  const hasContainerInterface = Object.keys(resolvedInterfaces).some((interfaceName) =>
+    containerInterfaceNames.has(interfaceName),
+  );
+  if (!hasContainerInterface) return false;
+  if (gatewayIp && matchesIp(ip, gatewayIp)) return true;
+  const bytes = ipToBytes(ip);
+  return Boolean(
+    bytes &&
+    resolvedCidrs.some((entry) => containerInterfaceNames.has(entry.interfaceName) && matchesCIDR(bytes, entry.cidr)),
+  );
+}
+
+function isDockerCompatibilityNetworkIp(
+  ip: string,
+  interfaces: ReturnType<typeof networkInterfaces>,
+  gatewayIp: string | null,
+  parsedInterfaceCidrs: readonly ParsedDockerInterfaceCidr[] = parseDockerInterfaceCidrs(interfaces),
+): boolean {
+  if (gatewayIp && matchesIp(ip, gatewayIp)) return true;
+  const bytes = ipToBytes(ip);
+  return Boolean(bytes && parsedInterfaceCidrs.some((entry) => matchesCIDR(bytes, entry.cidr)));
+}
+
 // ── Private / non-routable network CIDRs ──
 // Used by the safe-by-default Basic Auth lockdown to avoid breaking
 // LAN, Docker bridge, Kubernetes pod, and Tailscale traffic when no
@@ -208,7 +365,11 @@ function buildAllowlist(raw: string | null): CIDREntry[] | null {
     entries.push(cidr);
   }
 
-  if (entries.length === 0) return null; // all entries were invalid → no restriction
+  if (entries.length === 0) {
+    logger.error("[ip-allowlist] IP_ALLOWLIST contains no valid entries; denying all non-loopback traffic");
+  }
+  // A configured but invalid list must fail closed. An empty array still lets
+  // loopback through in ipAllowlistHook while matching no remote address.
   return entries;
 }
 
@@ -310,37 +471,74 @@ function hasProxyForwardingHeaders(request: Pick<FastifyRequest, "headers">): bo
   return PROXY_FORWARDING_HEADERS.some((header) => hasHeaderValue(request.headers[header]));
 }
 
-/** True when Docker bridge traffic appears to be forwarding another client. */
-function isDockerProxyForwardedRequest(request: Pick<FastifyRequest, "headers" | "ip">): boolean {
-  return isDockerIp(request.ip) && hasProxyForwardingHeaders(request);
-}
-
 let bypassAnnounced = { tailscale: false, docker: false, dockerProxyForwarded: false };
 
-/**
- * True if the given IP belongs to a Tailscale or Docker interface AND the
- * matching BYPASS_AUTH_* flag is enabled. These clients skip both the IP
- * allowlist and Basic Auth, the same way loopback does.
- */
-export function isTrustedInterfaceIp(ip: string): boolean {
-  const tailscaleOn = isTailscaleBypassEnabled();
-  const dockerOn = isDockerBypassEnabled();
-  if (!tailscaleOn && !dockerOn) return false;
+/** Request-aware variant that can withhold Docker trust for proxy-forwarded traffic. */
+export function isTrustedInterfaceRequest(
+  request: FastifyRequest,
+  dockerNetwork: {
+    interfaces?: ReturnType<typeof networkInterfaces>;
+    gatewayIp?: string | null;
+    containerInterfaceNames?: ReadonlySet<string>;
+  } = {},
+): boolean {
+  const tailscaleMode = getTailscaleBypassMode();
+  const localAddress = request.raw?.socket?.localAddress;
+  const tailscaleTrusted =
+    isTailscaleIp(request.ip) &&
+    (tailscaleMode === "enabled" ||
+      (tailscaleMode === "auto" && typeof localAddress === "string" && isTailscaleIp(localAddress)));
 
-  if (tailscaleOn && isTailscaleIp(ip)) {
+  const dockerMode = getDockerBypassMode();
+  const defaultDockerNetwork = dockerNetwork.interfaces === undefined ? getDockerInterfaceSnapshot() : undefined;
+  const dockerInterfaces = dockerNetwork.interfaces ?? defaultDockerNetwork!.interfaces;
+  const parsedDockerCidrs = defaultDockerNetwork?.parsedCidrs;
+  const dockerGatewayIp = dockerNetwork.gatewayIp === undefined ? dockerDefaultGatewayIp : dockerNetwork.gatewayIp;
+  const dockerRuntimeMatch =
+    isDockerRuntime() &&
+    isDockerRuntimeNetworkIp(
+      request.ip,
+      dockerInterfaces,
+      dockerGatewayIp,
+      dockerNetwork.containerInterfaceNames ?? dockerContainerInterfaceNames,
+      parsedDockerCidrs,
+    );
+  const dockerTrusted =
+    dockerMode === "enabled"
+      ? isDockerIp(request.ip) ||
+        dockerRuntimeMatch ||
+        (isDockerRuntime() &&
+          isDockerCompatibilityNetworkIp(request.ip, dockerInterfaces, dockerGatewayIp, parsedDockerCidrs))
+      : dockerMode === "auto" && dockerRuntimeMatch;
+  const dockerProxyForwarded = dockerTrusted && hasProxyForwardingHeaders(request);
+  if (dockerProxyForwarded && isDockerProxyAuthRequired()) return false;
+  if (dockerProxyForwarded) {
+    if (!bypassAnnounced.dockerProxyForwarded) {
+      logger.warn(
+        "[auth-bypass] REQUIRE_AUTH_FOR_DOCKER_PROXY=false — forwarded Docker clients will skip Basic Auth and IP allowlist while Docker trust remains enabled",
+      );
+      bypassAnnounced.dockerProxyForwarded = true;
+    }
+  }
+
+  if (tailscaleTrusted) {
     if (!bypassAnnounced.tailscale) {
       logger.warn(
-        "[auth-bypass] BYPASS_AUTH_TAILSCALE=true — clients in 100.64.0.0/10 will skip Basic Auth and IP allowlist",
+        tailscaleMode === "enabled"
+          ? "[auth-bypass] BYPASS_AUTH_TAILSCALE=true — clients in 100.64.0.0/10 will skip Basic Auth and IP allowlist"
+          : "[auth-bypass] Direct Tailscale connection detected — the peer and local socket are both in 100.64.0.0/10 and will skip Basic Auth and IP allowlist",
       );
       bypassAnnounced.tailscale = true;
     }
     return true;
   }
 
-  if (dockerOn && isDockerIp(ip)) {
+  if (dockerTrusted) {
     if (!bypassAnnounced.docker) {
       logger.warn(
-        "[auth-bypass] BYPASS_AUTH_DOCKER=true — clients in 172.16.0.0/12 will skip Basic Auth and IP allowlist",
+        dockerMode === "enabled"
+          ? "[auth-bypass] BYPASS_AUTH_DOCKER=true — clients in 172.16.0.0/12 or this container's detected networks will skip Basic Auth and IP allowlist"
+          : "[auth-bypass] Direct Docker connection detected — a peer on this container's network will skip Basic Auth and IP allowlist",
       );
       bypassAnnounced.docker = true;
     }
@@ -348,21 +546,6 @@ export function isTrustedInterfaceIp(ip: string): boolean {
   }
 
   return false;
-}
-
-/** Request-aware variant that can withhold Docker trust for proxy-forwarded traffic. */
-export function isTrustedInterfaceRequest(request: FastifyRequest): boolean {
-  const dockerProxyForwarded = isDockerProxyForwardedRequest(request);
-  if (dockerProxyForwarded && isDockerProxyAuthRequired()) return false;
-  if (dockerProxyForwarded && isDockerBypassEnabled()) {
-    if (!bypassAnnounced.dockerProxyForwarded) {
-      logger.warn(
-        "[auth-bypass] Docker bridge request includes proxy forwarding headers; forwarded clients will skip Basic Auth and IP allowlist unless REQUIRE_AUTH_FOR_DOCKER_PROXY=true or BYPASS_AUTH_DOCKER=false",
-      );
-      bypassAnnounced.dockerProxyForwarded = true;
-    }
-  }
-  return isTrustedInterfaceIp(request.ip);
 }
 
 // ── Fastify onRequest hook ──
@@ -387,8 +570,8 @@ export function ipAllowlistHook(request: FastifyRequest, reply: FastifyReply, do
     if (matchesCIDR(bytes, lb)) return done();
   }
 
-  // Trusted Tailscale / Docker interfaces (when their bypass flag is on)
-  // are treated like loopback — skip the allowlist check entirely.
+  // Trusted direct Tailscale / Docker connections are treated like loopback —
+  // skip the allowlist check entirely.
   if (isTrustedInterfaceRequest(request)) return done();
 
   // Check the allowlist

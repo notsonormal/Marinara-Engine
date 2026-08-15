@@ -6,24 +6,79 @@ import { existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { extname, join } from "path";
 import {
+  agentSuiteRewriteSchema,
+  customAgentImportPolicyUpdateSchema,
   createAgentConfigSchema,
+  importAgentConfigSchema,
   updateAgentConfigSchema,
   BUILT_IN_AGENTS,
+  CUSTOM_AGENT_IMPORT_SOURCE_SETTING,
+  CUSTOM_AGENT_PERMISSIONS_EXPLICIT_SETTING,
   DEFAULT_AGENT_TOOLS,
+  PROVIDERS,
+  createImportedAgentType,
   getDefaultBuiltInAgentSettings,
+  localAuthProviderBaseUrl,
+  normalizeCustomAgentCapabilities,
   normalizeAgentPhaseForType,
+  type CustomAgentCapability,
 } from "@marinara-engine/shared";
+import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
+import {
+  getCustomAgentImportPolicy,
+  setCustomAgentImportsEnabled,
+} from "../services/agents/custom-agent-import-policy.service.js";
 import { createAgentsStorage } from "../services/storage/agents.storage.js";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
+import { createConnectionsStorage } from "../services/storage/connections.storage.js";
+import { createLLMProvider } from "../services/llm/provider-registry.js";
 import { DATA_DIR } from "../utils/data-dir.js";
 import { assertInsideDir, extensionFromImageMime, isAllowedImageBuffer } from "../utils/security.js";
 import { z } from "zod";
 
 const AGENT_IMAGES_DIR = join(DATA_DIR, "agents", "images");
+const IMPORT_UNSAFE_AGENT_SETTING_KEYS = new Set([
+  "spotifyAccessToken",
+  "spotifyRefreshToken",
+  "spotifyExpiresAt",
+  "spotifyScope",
+  "youtubeApiKey",
+  "sourceLorebookIds",
+  "sourceFileIds",
+  "writableLorebookId",
+  "writableLorebookIds",
+  "targetLorebookId",
+  "imageConnectionId",
+  "lorebookWriteEnabled",
+  "customAgentRepositorySource",
+  CUSTOM_AGENT_IMPORT_SOURCE_SETTING,
+  CUSTOM_AGENT_PERMISSIONS_EXPLICIT_SETTING,
+]);
 
 const updateAgentRunSchema = z.object({
   resultData: z.unknown(),
 });
+
+const AGENT_SUITE_REWRITE_SYSTEM_PROMPT = [
+  "You are a precise text editor embedded in a roleplay application. You edit fragments of stored AI-agent data (memory, tracker state, generated notes). Rewrite ONLY the provided excerpt according to the user's instruction.",
+  "Rules:",
+  "- Return ONLY the rewritten excerpt. No explanations, no preamble, no code fences.",
+  "- The excerpt may be a fragment of a larger document; the surrounding document is provided for context but must NOT be included in your output.",
+  "- Reference context blocks (character cards, lorebook entries) may be provided. Use them to ground names, facts, and details, but never copy them into the output beyond what the instruction requires.",
+  "- If the excerpt is JSON or a fragment of JSON, keep the same structural shape so the result can be spliced back without breaking the document.",
+  "- Preserve everything the instruction does not ask to change. Do not invent new facts beyond what the instruction and provided context support.",
+].join("\n");
+
+/** Strip a single markdown code fence when it wraps the entire response. */
+function stripWrappingCodeFence(text: string): string {
+  const match = text.match(/^```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n?```$/);
+  return match ? match[1]! : text;
+}
+
+function escapePromptFrameDelimiter(text: string, marker: string): string {
+  const pattern = new RegExp(`^${marker}`, "gm");
+  return text.replace(pattern, `${marker.slice(0, -1)} ${marker.slice(-1)}`);
+}
 
 const secretPlotArcSchema = z
   .object({
@@ -82,6 +137,38 @@ function parseAgentSettings(value: unknown): Record<string, unknown> {
   return typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
+function buildImportedAgentInput(input: ReturnType<typeof importAgentConfigSchema.parse>) {
+  const sourceSettings = { ...input.agent.settings };
+  delete sourceSettings[CUSTOM_AGENT_PERMISSIONS_EXPLICIT_SETTING];
+  if (input.agent.resultType) sourceSettings.resultType = input.agent.resultType;
+  const requestedCapabilities = normalizeCustomAgentCapabilities(sourceSettings);
+  const approvedCapabilities: Partial<Record<CustomAgentCapability, boolean>> = {};
+  for (const capability of input.approvedCapabilities) {
+    if (requestedCapabilities[capability] !== true) {
+      throw new Error(`The imported Agent did not request the ${capability} capability`);
+    }
+    approvedCapabilities[capability] = true;
+  }
+
+  const settings = { ...input.agent.settings };
+  for (const key of IMPORT_UNSAFE_AGENT_SETTING_KEYS) delete settings[key];
+  delete settings.enabledTools;
+  delete settings.capabilities;
+  delete settings.customCapabilities;
+  settings.customCapabilities = approvedCapabilities;
+  settings[CUSTOM_AGENT_PERMISSIONS_EXPLICIT_SETTING] = true;
+  settings[CUSTOM_AGENT_IMPORT_SOURCE_SETTING] = input.source;
+
+  return {
+    ...input.agent,
+    type: createImportedAgentType(input.agent.type),
+    enabled: true,
+    connectionId: null,
+    imagePath: null,
+    settings,
+  };
+}
+
 function normalizeRunInterval(value: unknown, fallback: number, max = 100): number {
   const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   return Number.isFinite(parsed) && parsed >= 1 ? Math.min(max, Math.floor(parsed)) : fallback;
@@ -112,6 +199,7 @@ function getSafeAgentImagePath(filename: string): string | null {
 export async function agentsRoutes(app: FastifyInstance) {
   const storage = createAgentsStorage(app.db);
   const chats = createChatsStorage(app.db);
+  const connections = createConnectionsStorage(app.db);
   const getOrCreateConfigByType = async (agentType: string) => {
     const existing = await storage.getByType(agentType);
     if (existing) return existing;
@@ -134,6 +222,32 @@ export async function agentsRoutes(app: FastifyInstance) {
 
   app.get("/", async () => {
     return storage.list();
+  });
+
+  app.get("/import-policy", async () => getCustomAgentImportPolicy(app.db));
+
+  app.patch("/import-policy", async (req, reply) => {
+    if (!requirePrivilegedAccess(req, reply, { feature: "Custom Agent imports" })) return;
+    const { enabled } = customAgentImportPolicyUpdateSchema.parse(req.body);
+    return setCustomAgentImportsEnabled(app.db, enabled);
+  });
+
+  app.post("/import", async (req, reply) => {
+    if (!requirePrivilegedAccess(req, reply, { feature: "Custom Agent import" })) return;
+    if (!(await getCustomAgentImportPolicy(app.db)).enabled) {
+      return reply.status(403).send({
+        error: "Custom Agent imports are disabled",
+        message: "Enable Agent imports in Advanced Settings → Danger Zone first.",
+      });
+    }
+    try {
+      const input = importAgentConfigSchema.parse(req.body);
+      return storage.create(buildImportedAgentInput(input));
+    } catch (error) {
+      return reply.status(400).send({
+        error: error instanceof Error ? error.message : "Invalid Agent import",
+      });
+    }
   });
 
   app.get<{ Params: { filename: string } }>("/images/file/:filename", async (req, reply) => {
@@ -174,28 +288,30 @@ export async function agentsRoutes(app: FastifyInstance) {
 
     const lastRun = await storage.getLastSuccessfulRunByType(agentType, chatId);
     const messages = await chats.listMessages(chatId);
-    let assistantMessagesSinceLastRun: number | null = null;
+    let messagesSinceLastRun: number | null = null;
     let lastRunMessageFound: boolean | null = null;
 
     if (lastRun) {
       const lastRunIdx = messages.findIndex((message: any) => message.id === lastRun.messageId);
       lastRunMessageFound = lastRunIdx >= 0;
-      assistantMessagesSinceLastRun =
+      messagesSinceLastRun =
         lastRunIdx >= 0
-          ? messages.slice(lastRunIdx + 1).filter((message: any) => message.role === "assistant").length
+          ? messages
+              .slice(lastRunIdx + 1)
+              .filter((message: any) => message.role === "user" || message.role === "assistant").length
           : runInterval;
     }
 
-    const remainingAssistantMessages =
-      runInterval <= 1 || !lastRun ? 0 : Math.max(0, runInterval - ((assistantMessagesSinceLastRun ?? 0) + 1));
+    const remainingMessages =
+      runInterval <= 1 || !lastRun ? 0 : Math.max(0, runInterval - ((messagesSinceLastRun ?? 0) + 1));
 
     return {
       agentType,
       runInterval,
       lastSuccessfulRun: lastRun ? { messageId: lastRun.messageId, createdAt: lastRun.createdAt } : null,
-      assistantMessagesSinceLastRun,
-      remainingAssistantMessages,
-      runsNextAssistantMessage: remainingAssistantMessages === 0,
+      messagesSinceLastRun,
+      remainingMessages,
+      runsNextMessage: remainingMessages === 0,
       lastRunMessageFound,
     };
   });
@@ -408,5 +524,87 @@ export async function agentsRoutes(app: FastifyInstance) {
       await storage.clearMemoryForAgentInChat(config.id, req.params.chatId);
     }
     return reply.status(204).send();
+  });
+
+  /**
+   * POST /api/agents/suite/rewrite
+   * Agent Suite AI-assisted edit: rewrite a fragment of stored agent data
+   * with the user's instruction via a chosen connection. One-shot, non-streaming.
+   */
+  app.post("/suite/rewrite", async (req) => {
+    const input = agentSuiteRewriteSchema.parse(req.body);
+
+    const conn = await connections.getWithKey(input.connectionId);
+    if (!conn) {
+      throw Object.assign(new Error("API connection not found"), { statusCode: 400 });
+    }
+
+    let baseUrl = conn.baseUrl;
+    if (!baseUrl) {
+      const providerDef = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
+      baseUrl = providerDef?.defaultBaseUrl ?? "";
+    }
+    const localAuthBaseUrl = localAuthProviderBaseUrl(conn.provider);
+    if (!baseUrl && localAuthBaseUrl) baseUrl = localAuthBaseUrl;
+    if (!baseUrl) {
+      throw Object.assign(new Error("No base URL configured for this connection"), { statusCode: 400 });
+    }
+
+    const provider = createLLMProvider(
+      conn.provider,
+      baseUrl,
+      conn.apiKey,
+      conn.maxContext,
+      conn.openrouterProvider,
+      conn.maxTokensOverride,
+      conn.claudeFastMode === "true",
+      conn.treatAsLocalEndpoint === "true",
+      conn.defaultParameters,
+      conn.id,
+    );
+
+    const contextLines: string[] = [];
+    if (input.agentName) contextLines.push(`Agent: ${input.agentName}`);
+    if (input.dataLabel) contextLines.push(`Data: ${input.dataLabel}`);
+    // Keep the frame intact: labels stay single-line and content can't
+    // close the delimiter early (names/entries are user- or import-authored).
+    const referenceBlock = input.contextSections?.length
+      ? `Reference context selected by the user (grounding only — do not output):\n${input.contextSections
+          .map(
+            (section) =>
+              `<<<CONTEXT: ${section.label.replace(/[\r\n]+/g, " ")}\n${section.content.replace(
+                /^CONTEXT>>>/gm,
+                "CONTEXT >>>",
+              )}\nCONTEXT>>>`,
+          )
+          .join("\n")}\n\n`
+      : "";
+    const documentBlock =
+      input.documentText && input.documentText !== input.selectedText
+        ? `Full document (context only — do not output):\n<<<DOCUMENT\n${escapePromptFrameDelimiter(
+            input.documentText,
+            "DOCUMENT>>>",
+          )}\nDOCUMENT>>>\n\n`
+        : "";
+    const userContent =
+      `${contextLines.length ? `${contextLines.join("\n")}\n\n` : ""}` +
+      `${referenceBlock}` +
+      `${documentBlock}` +
+      `Excerpt to rewrite:\n<<<EXCERPT\n${escapePromptFrameDelimiter(input.selectedText, "EXCERPT>>>")}\nEXCERPT>>>\n\n` +
+      `Instruction: ${input.instruction}`;
+
+    const result = await provider.chatComplete(
+      [
+        { role: "system", content: AGENT_SUITE_REWRITE_SYSTEM_PROMPT },
+        { role: "user", content: userContent },
+      ],
+      { model: conn.model, temperature: 0.3 },
+    );
+
+    const rewrittenText = stripWrappingCodeFence((result.content ?? "").trim());
+    if (!rewrittenText) {
+      throw Object.assign(new Error("The model returned an empty response"), { statusCode: 502 });
+    }
+    return { rewrittenText };
   });
 }

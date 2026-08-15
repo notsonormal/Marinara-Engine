@@ -1,4 +1,9 @@
-import { PROVIDERS, type APIProvider } from "@marinara-engine/shared";
+import {
+  normalizeImagePromptInstructions,
+  PROVIDERS,
+  type APIProvider,
+  type ImageGenerationQuality,
+} from "@marinara-engine/shared";
 import type { CreateConnectionPayload } from "../hooks/use-connections";
 
 export type ConnectionTransferRow = {
@@ -15,16 +20,22 @@ export type ConnectionTransferRow = {
   anthropicExtendedCacheTtl?: unknown;
   cachingAtDepth?: unknown;
   isDefault?: unknown;
+  fallbackForMain?: unknown;
   useForRandom?: unknown;
   defaultForAgents?: unknown;
+  fallbackForAgents?: unknown;
   embeddingModel?: unknown;
   embeddingBaseUrl?: unknown;
   embeddingConnectionId?: unknown;
   openrouterProvider?: unknown;
   imageGenerationSource?: unknown;
   imageService?: unknown;
+  videoGenerationSource?: unknown;
+  videoService?: unknown;
   service?: unknown;
   imageEndpointId?: unknown;
+  imagePromptInstructions?: unknown;
+  imageGenerationQuality?: unknown;
   comfyuiWorkflow?: unknown;
   treatAsLocalEndpoint?: unknown;
   claudeFastMode?: unknown;
@@ -44,15 +55,21 @@ export type SafeConnectionExport = {
   anthropicExtendedCacheTtl: boolean;
   cachingAtDepth: number;
   isDefault: boolean;
+  fallbackForMain: boolean;
   useForRandom: boolean;
   defaultForAgents: boolean;
+  fallbackForAgents: boolean;
   embeddingModel: string;
   embeddingBaseUrl: string;
   embeddingConnectionId: string | null;
   openrouterProvider: string | null;
   imageGenerationSource: string | null;
   imageService: string | null;
+  videoGenerationSource: string | null;
+  videoService: string | null;
   imageEndpointId: string | null;
+  imagePromptInstructions: string | null;
+  imageGenerationQuality: ImageGenerationQuality;
   comfyuiWorkflow: string | null;
   treatAsLocalEndpoint: boolean;
   claudeFastMode: boolean;
@@ -97,6 +114,7 @@ export function normalizeImportedConnectionEntry(value: unknown): ConnectionImpo
 
   const defaultParameters = parseDefaultParameters(value.defaultParameters);
   const imageService = asNullableString(value.imageService ?? value.service);
+  const videoService = provider === "video_generation" ? asNullableString(value.videoService ?? value.service) : null;
 
   return {
     connection: {
@@ -107,8 +125,10 @@ export function normalizeImportedConnectionEntry(value: unknown): ConnectionImpo
       model: asString(value.model),
       maxContext: asPositiveInteger(value.maxContext, 128000),
       isDefault: false,
+      fallbackForMain: false,
       useForRandom: false,
       defaultForAgents: false,
+      fallbackForAgents: false,
       enableCaching: asBoolean(value.enableCaching),
       anthropicExtendedCacheTtl: asBoolean(value.anthropicExtendedCacheTtl),
       cachingAtDepth: asNonNegativeInteger(value.cachingAtDepth, 5),
@@ -120,6 +140,10 @@ export function normalizeImportedConnectionEntry(value: unknown): ConnectionImpo
       comfyuiWorkflow: asNullableString(value.comfyuiWorkflow),
       imageService,
       imageEndpointId: asNullableString(value.imageEndpointId),
+      imagePromptInstructions: normalizeImagePromptInstructions(value.imagePromptInstructions),
+      imageGenerationQuality: asImageGenerationQuality(value.imageGenerationQuality),
+      videoGenerationSource: provider === "video_generation" ? asNullableString(value.videoGenerationSource) : null,
+      videoService,
       promptPresetId: null,
       maxTokensOverride: asNullablePositiveInteger(value.maxTokensOverride),
       maxParallelJobs: asBoundedPositiveInteger(value.maxParallelJobs, 1, MAX_PARALLEL_JOBS),
@@ -133,6 +157,7 @@ export function normalizeImportedConnectionEntry(value: unknown): ConnectionImpo
 
 function serializeConnectionForExport(connection: ConnectionTransferRow): SafeConnectionExport {
   const provider = asProvider(connection.provider) ?? "custom";
+  const isVideoProvider = provider === "video_generation";
   return {
     name: asString(connection.name) || "Unnamed Connection",
     provider,
@@ -147,19 +172,29 @@ function serializeConnectionForExport(connection: ConnectionTransferRow): SafeCo
     anthropicExtendedCacheTtl: asBoolean(connection.anthropicExtendedCacheTtl),
     cachingAtDepth: asNonNegativeInteger(connection.cachingAtDepth, 5),
     isDefault: asBoolean(connection.isDefault),
+    fallbackForMain: asBoolean(connection.fallbackForMain),
     useForRandom: asBoolean(connection.useForRandom),
     defaultForAgents: asBoolean(connection.defaultForAgents),
+    fallbackForAgents: asBoolean(connection.fallbackForAgents),
     embeddingModel: asString(connection.embeddingModel),
     embeddingBaseUrl: asString(connection.embeddingBaseUrl),
     embeddingConnectionId: asNullableString(connection.embeddingConnectionId),
     openrouterProvider: asNullableString(connection.openrouterProvider),
     imageGenerationSource: asNullableString(connection.imageGenerationSource),
     imageService: asNullableString(connection.imageService ?? connection.service),
+    videoGenerationSource: isVideoProvider ? asNullableString(connection.videoGenerationSource) : null,
+    videoService: isVideoProvider ? asNullableString(connection.videoService ?? connection.service) : null,
     imageEndpointId: asNullableString(connection.imageEndpointId),
+    imagePromptInstructions: normalizeImagePromptInstructions(connection.imagePromptInstructions),
+    imageGenerationQuality: asImageGenerationQuality(connection.imageGenerationQuality),
     comfyuiWorkflow: asNullableString(connection.comfyuiWorkflow),
     treatAsLocalEndpoint: asBoolean(connection.treatAsLocalEndpoint),
     claudeFastMode: asBoolean(connection.claudeFastMode),
   };
+}
+
+function asImageGenerationQuality(value: unknown): ImageGenerationQuality {
+  return value === "low" || value === "medium" || value === "high" ? value : "auto";
 }
 
 function parseDefaultParameters(value: unknown): Record<string, unknown> | null {

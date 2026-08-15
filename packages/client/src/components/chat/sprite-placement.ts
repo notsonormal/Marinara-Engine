@@ -30,11 +30,30 @@ export function normalizeSpritePlacements(raw: unknown): SpritePlacementMap {
   return Object.fromEntries(entries);
 }
 
-export function mirrorSpritePlacements(placements: SpritePlacementMap): SpritePlacementMap {
+export function mirrorSpritePlacements(
+  placements: SpritePlacementMap,
+  excludedCharacterIds: readonly string[] = [],
+): SpritePlacementMap {
   return Object.fromEntries(
-    Object.entries(placements).map(([characterId, placement]) => [
-      characterId,
-      clampSpritePlacement({ x: 100 - placement.x, y: placement.y }),
+    Object.entries(placements).map(([placementKey, placement]) => {
+      const excluded = excludedCharacterIds.some(
+        (characterId) => placementKey === characterId || placementKey.startsWith(`${characterId}:`),
+      );
+      return [placementKey, excluded ? placement : clampSpritePlacement({ x: 100 - placement.x, y: placement.y })];
+    }),
+  );
+}
+
+export function mirrorCharacterSpritePlacements(
+  placements: SpritePlacementMap,
+  characterId: string,
+): SpritePlacementMap {
+  return Object.fromEntries(
+    Object.entries(placements).map(([placementKey, placement]) => [
+      placementKey,
+      placementKey === characterId || placementKey.startsWith(`${characterId}:`)
+        ? clampSpritePlacement({ x: 100 - placement.x, y: placement.y })
+        : placement,
     ]),
   );
 }
@@ -46,7 +65,15 @@ export function getDefaultSpritePlacement(index: number, total: number, side: Sp
     center: [[50], [35, 65], [25, 50, 75]],
   };
 
-  const byCount = layouts[side][Math.max(0, Math.min(total, 3) - 1)] ?? layouts[side][0];
+  if (total > 3) {
+    const start = side === "right" ? 86 : 14;
+    const end = side === "right" ? 14 : 86;
+    const x = start + ((end - start) * index) / (total - 1);
+    const y = 98 - (index % 4) * 1.5;
+    return clampSpritePlacement({ x, y });
+  }
+
+  const byCount = layouts[side][Math.max(0, total - 1)] ?? layouts[side][0];
   const x = byCount[index] ?? (side === "left" ? 26 + index * 16 : 74 - index * 16);
   const yOffsets = total >= 3 ? [98, 96, 94] : total === 2 ? [98, 96] : [98];
   const y = yOffsets[index] ?? 98;

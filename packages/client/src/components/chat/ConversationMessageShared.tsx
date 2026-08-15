@@ -4,29 +4,30 @@
 // ──────────────────────────────────────────────
 import { Fragment, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { ChevronRight, EyeOff, FileText, X } from "lucide-react";
-import { normalizeTextForMatch, type MessageExtra, type QuoteFormat } from "@marinara-engine/shared";
+import {
+  type GroupedSegment,
+  type MessageExtra,
+  type MessageReaction,
+  type QuoteFormat,
+} from "@marinara-engine/shared";
 import { cn } from "../../lib/utils";
+import type { ReactionSegmentTarget } from "../../lib/reactions";
 import { applyInlineMarkdown, renderMarkdownBlocks } from "../../lib/markdown";
+import { resolveSelfCardAssets, type ChatGalleryIndex } from "../../lib/card-asset-links";
 import { renderInlineWithCustomEmojis } from "../../lib/custom-emoji-render";
 import { renderWithStickerBlocks } from "../../lib/sticker-render";
 import { applyTextareaQuoteFormat } from "../../lib/textarea-quotes";
 import { ImagePromptPanel } from "./ImagePromptPanel";
 import { SwipeJumpControl } from "./SwipeJumpControl";
+import { AnimatedDiceRoll, isDiceRollResult, shouldAnimateDiceRollMessage } from "../dice/AnimatedDiceRoll";
 import type { CharacterMap } from "./chat-area.types";
+import { useTranslation as useUiTranslation } from "react-i18next";
+
+const EMPTY_INLINE_EMOJI_MAP = new Map<string, string>();
 
 // ── Types ────────────────────────────────────────
 
 export type CharInfo = NonNullable<ReturnType<CharacterMap["get"]>>;
-
-export interface SpeakerSegment {
-  speaker: string | null;
-  text: string;
-}
-
-export interface GroupedSegment {
-  speaker: string | null;
-  lines: string[];
-}
 
 export interface MessageData {
   id: string;
@@ -45,6 +46,7 @@ export interface MessageData {
     hiddenFromAI?: boolean;
     thinking?: string | null;
     generationReplay?: MessageExtra["generationReplay"];
+    diceRollResult?: MessageExtra["diceRollResult"];
     attachments?: Array<{
       type: string;
       url?: string;
@@ -58,6 +60,11 @@ export interface MessageData {
   createdAt: string;
 }
 
+export function DiceMessageContent({ diceRollResult, createdAt }: { diceRollResult: unknown; createdAt?: string | null }) {
+  if (!isDiceRollResult(diceRollResult)) return null;
+  return <AnimatedDiceRoll {...diceRollResult} mode="chat" animate={shouldAnimateDiceRollMessage(createdAt)} />;
+}
+
 /** Everything the layout sub-components (Bubble, Line, Grouped) need, pre-resolved by the shell. */
 export interface MessageRenderContext {
   // raw
@@ -69,9 +76,19 @@ export interface MessageRenderContext {
   displayName: string;
   avatarUrl: string | null;
   avatarCropStyle: CSSProperties;
+  avatarCornerClass: string;
   nameColor?: string;
   mentionNames: string[];
   charByName: Map<string, CharInfo> | null;
+  /** Same keys as charByName, mapping normalized speaker name -> character id
+   *  (CharInfo carries no id; grouped segments need it for card://self refs). */
+  charIdByName: Map<string, string> | null;
+  /** Speaking character of the whole message (null for user/system) — resolves
+   *  portable card://self/gallery refs; grouped segments prefer their own speaker. */
+  selfCharacterId: string | null;
+  /** Chat-wide gallery filename index — card://self falls back to whichever
+   *  chat character owns the file when the speaker doesn't (group chats). */
+  galleryIndex: ChatGalleryIndex | null;
   // content
   quoteFormat: QuoteFormat;
   renderedContent: string;
@@ -109,12 +126,15 @@ export interface MessageRenderContext {
   isGuided: boolean;
   regenerateButtonTitle: string;
   regenerateGuidedClass?: string;
-  thinking?: string | null;
+  hasReasoning: boolean;
+  reasoningSummaryUnavailable: boolean;
+  thinkingButtonRef: RefObject<HTMLButtonElement | null>;
   generationReplay: MessageExtra["generationReplay"] | null;
   canRegenerate: boolean;
   isLastAssistantMessage?: boolean;
   translatedText?: string | null;
   isTranslating: boolean;
+  showTranslationOnly: boolean;
   // swipes
   hasSwipes: boolean;
   swipeCount: number;
@@ -128,6 +148,8 @@ export interface MessageRenderContext {
   onTranslate: () => void;
   onStartEdit: () => void;
   onImageOpen: (url: string, prompt?: string | null) => void;
+  /** Open the Convo about-me profile popout, anchored to the clicked avatar (undefined when unresolvable). */
+  onOpenAboutMe?: (anchor: DOMRect) => void;
   onRemoveAttachment: (index: number) => void;
   onSetActiveSwipe?: (id: string, index: number) => void;
   onRegenerate?: (id: string) => void;
@@ -138,6 +160,15 @@ export interface MessageRenderContext {
   onShowThinking: () => void;
   // reactions — toggle the user's reaction on this message (chip row rendered by the shell)
   onPickReaction?: (emoji: string, imageUrl: string | null) => void;
+  // reactions — segment-targeted (grouped multi-speaker messages, issue #3210)
+  /** Per-segment reaction lists, index-aligned with groupedSegments; null when not grouped. */
+  segmentReactions: MessageReaction[][] | null;
+  /** Resolve a reactor id ("user" or a character id) to a display name for chip tooltips. */
+  resolveReactorName: (reactorId: string) => string;
+  /** Toggle the user's reaction aimed at one grouped speaker segment. */
+  onPickSegmentReaction?: (target: ReactionSegmentTarget, emoji: string, imageUrl: string | null) => void;
+  /** Toggle the user's membership in an existing reaction entry (segment-aware chip click). */
+  onToggleReactionEntry: (reaction: MessageReaction) => void;
   // style
   messageTextStyle: CSSProperties;
   // bubble-specific (ignored by Line/Grouped)
@@ -217,76 +248,68 @@ export function highlightMentions(nodes: ReactNode[], names: string[], keyPrefix
   });
 }
 
-export function parseSpeakerTags(content: string, knownNames: Set<string>): SpeakerSegment[] | null {
-  const regex = /<speaker="([^"]*)">([\s\S]*?)<\/speaker>/g;
-  let match: RegExpExecArray | null;
-  const segments: SpeakerSegment[] = [];
-  let lastIndex = 0;
-  let foundTag = false;
-  while ((match = regex.exec(content)) !== null) {
-    foundTag = true;
-    const speakerName = match[1]!.trim();
-    const knownSpeaker = knownNames.has(normalizeTextForMatch(speakerName));
-    if (match.index > lastIndex) {
-      const before = content.slice(lastIndex, match.index).trim();
-      if (before) segments.push({ speaker: null, text: before });
-    }
-    segments.push({ speaker: knownSpeaker ? speakerName : null, text: match[2]!.trim() });
-    lastIndex = regex.lastIndex;
-  }
-  if (lastIndex < content.length) {
-    const after = content.slice(lastIndex).trim();
-    if (after) segments.push({ speaker: null, text: after });
-  }
-  return foundTag ? segments : null;
-}
-
-export function parseNamePrefixFormat(content: string, knownNames: Set<string>): SpeakerSegment[] | null {
-  if (!knownNames.size) return null;
-  const lines = content.split("\n");
-  const segments: SpeakerSegment[] = [];
-  let currentSpeaker: string | null = null;
-  let currentLines: string[] = [];
-  let found = false;
-  for (const line of lines) {
-    const colonIdx = line.indexOf(": ");
-    if (colonIdx > 0) {
-      const potentialName = line.slice(0, colonIdx).trim();
-      if (knownNames.has(normalizeTextForMatch(potentialName))) {
-        if (currentLines.length > 0) segments.push({ speaker: currentSpeaker, text: currentLines.join("\n") });
-        currentSpeaker = potentialName;
-        currentLines = [line.slice(colonIdx + 2)];
-        found = true;
-        continue;
-      }
-    }
-    currentLines.push(line);
-  }
-  if (currentLines.length > 0) segments.push({ speaker: currentSpeaker, text: currentLines.join("\n") });
-  if (!found) return null;
-  return segments.filter((s) => s.text.trim());
-}
-
-export function groupConsecutiveSegments(segments: SpeakerSegment[]): GroupedSegment[] {
-  const groups: GroupedSegment[] = [];
-  for (const seg of segments) {
-    const last = groups[groups.length - 1];
-    const trimmed = seg.text.replace(/^\n+|\n+$/g, "");
-    if (
-      last &&
-      last.speaker &&
-      seg.speaker &&
-      normalizeTextForMatch(last.speaker) === normalizeTextForMatch(seg.speaker)
-    ) {
-      last.lines.push(trimmed);
-    } else {
-      groups.push({ speaker: seg.speaker, lines: [trimmed] });
-    }
-  }
-  return groups;
-}
+// Speaker-segment parsing (parseSpeakerTags / parseNamePrefixFormat /
+// groupConsecutiveSegments / parseGroupedSpeakerSegments) lives in
+// @marinara-engine/shared (utils/speaker-segments.ts): the server derives
+// reaction-attribution segment indexes with the same code.
 
 // ── Small shared components ───────────────────────
+
+/**
+ * Message sender name. When `onOpenAboutMe` is provided (Convo, with a resolvable
+ * character/persona target) the name becomes clickable and opens the about-me
+ * popout anchored to itself — matching the clickable avatar. Kept as a `span`
+ * with `role="button"` (not a `<button>`) so it stays inline and baseline-aligned
+ * with the timestamp beside it. Falls back to a plain, non-interactive label.
+ */
+export function ConversationMessageName({
+  displayName,
+  nameColor,
+  onOpenAboutMe,
+  className,
+}: {
+  displayName: string;
+  nameColor?: string;
+  onOpenAboutMe?: (anchor: DOMRect) => void;
+  className?: string;
+}) {
+  const { t: localizeUi } = useUiTranslation();
+  const baseClass = "mari-message-name text-[0.9375rem] font-semibold leading-tight";
+  if (!onOpenAboutMe) {
+    return (
+      <span className={cn(baseClass, "cursor-default", className)} style={nameColorStyle(nameColor)}>
+        {displayName}
+      </span>
+    );
+  }
+  const open = (e: React.SyntheticEvent<HTMLSpanElement>) => {
+    e.stopPropagation();
+    onOpenAboutMe(e.currentTarget.getBoundingClientRect());
+  };
+  return (
+    <span
+      role="button"
+      tabIndex={0}
+      onClick={open}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open(e);
+        }
+      }}
+      aria-label={localizeUi("ui.chat.conversationmessagebubble.viewValue1SAboutMe", { value1: displayName })}
+      title={localizeUi("ui.chat.conversationmessagebubble.viewValue1SAboutMe", { value1: displayName })}
+      className={cn(
+        baseClass,
+        "cursor-pointer rounded-sm hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]/50",
+        className,
+      )}
+      style={nameColorStyle(nameColor)}
+    >
+      {displayName}
+    </span>
+  );
+}
 
 export function HiddenFromAIConversationButton({
   canCollapse,
@@ -297,11 +320,12 @@ export function HiddenFromAIConversationButton({
   onExpand: () => void;
   isHiddenExpanded: boolean;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   if (!canCollapse) {
     return (
       <span
         className="inline-flex items-center gap-1 align-middle text-[0.625rem] font-medium text-[var(--marinara-chat-chrome-highlight-text)]"
-        title="Hidden from AI"
+        title={localizeUi("ui.chat.conversationmessagegrouped.hiddenFromAi")}
       >
         <EyeOff size="0.7rem" className="shrink-0" />
       </span>
@@ -316,8 +340,8 @@ export function HiddenFromAIConversationButton({
           "inline-flex items-center gap-1 rounded px-1 py-0.5 text-[0.625rem] font-medium text-[var(--marinara-chat-chrome-highlight-text)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg-hover)] hover:text-[var(--marinara-chat-chrome-button-text-hover)]",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--marinara-chat-chrome-focus-ring)]",
         )}
-        aria-label={isHiddenExpanded ? "Collapse hidden from AI message" : "Expand hidden from AI message"}
-        title={isHiddenExpanded ? "Collapse hidden from AI message" : "Expand hidden from AI message"}
+        aria-label={isHiddenExpanded ?localizeUi("ui.chat.hiddenfromaiconversationbutton.collapseHiddenFromAiMessage") :localizeUi("ui.chat.hiddenfromaimessagesummary.expandHiddenFromAiMessage")}
+        title={isHiddenExpanded ?localizeUi("ui.chat.hiddenfromaiconversationbutton.collapseHiddenFromAiMessage") :localizeUi("ui.chat.hiddenfromaimessagesummary.expandHiddenFromAiMessage")}
       >
         <ChevronRight size="0.7rem" className={cn("shrink-0 transition-transform", isHiddenExpanded && "rotate-90")} />
         <EyeOff size="0.7rem" className="shrink-0" />
@@ -327,6 +351,7 @@ export function HiddenFromAIConversationButton({
 }
 
 export function HiddenFromAIConversationSummary({ onExpand }: { onExpand: () => void }) {
+  const { t: localizeUi } = useUiTranslation();
   return (
     <button
       type="button"
@@ -335,12 +360,12 @@ export function HiddenFromAIConversationSummary({ onExpand }: { onExpand: () => 
         onExpand();
       }}
       className="flex w-full items-center gap-2 rounded-md border border-[var(--marinara-chat-chrome-button-border-active)] bg-[var(--marinara-chat-chrome-highlight-bg)] px-2.5 py-1.5 text-left text-[0.75rem] text-[var(--marinara-chat-chrome-highlight-text)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg-hover)]"
-      title="Expand hidden from AI message"
-      aria-label="Expand hidden from AI message"
+      title={localizeUi("ui.chat.hiddenfromaimessagesummary.expandHiddenFromAiMessage")}
+      aria-label={localizeUi("ui.chat.hiddenfromaimessagesummary.expandHiddenFromAiMessage")}
     >
       <EyeOff size="0.8rem" className="shrink-0" />
-      <span className="min-w-0 flex-1 truncate">Hidden from AI</span>
-      <span className="shrink-0 text-[0.625rem] opacity-70">Show</span>
+      <span className="min-w-0 flex-1 truncate">{localizeUi("ui.chat.conversationmessagegrouped.hiddenFromAi")}</span>
+      <span className="shrink-0 text-[0.625rem] opacity-70">{localizeUi("ui.chat.hiddenfromaimessagesummary.show")}</span>
     </button>
   );
 }
@@ -351,15 +376,26 @@ export function MessageContent({
   emojiMap,
   stickerMap,
   onImageOpen,
+  selfCharacterId,
+  galleryIndex,
 }: {
   content: string;
   mentionNames?: string[];
   emojiMap?: Map<string, string>;
   stickerMap?: Map<string, string>;
   onImageOpen: (url: string) => void;
+  /** Speaking character of this content — resolves portable card://self/gallery refs. */
+  selfCharacterId?: string | null;
+  /** Optional chat-wide filename index for any-owner fallback resolution. */
+  galleryIndex?: ChatGalleryIndex | null;
 }) {
-  if (IMAGE_URL_RE.test(content.trim())) {
-    const url = content.trim();
+  const { t: localizeUi } = useUiTranslation();
+  // Portable gallery refs resolve to the speaker BEFORE markdown rendering, so
+  // the shared renderer stays untouched and grouped segments can resolve to
+  // their own per-segment speaker.
+  const resolved = resolveSelfCardAssets(content, selfCharacterId, galleryIndex);
+  if (IMAGE_URL_RE.test(resolved.trim())) {
+    const url = resolved.trim();
     return (
       <button
         type="button"
@@ -368,20 +404,18 @@ export function MessageContent({
           onImageOpen(url);
         }}
         className="block cursor-zoom-in rounded-lg text-left"
-        title="Open image"
+        title={localizeUi("ui.noodle.noodlepostcard.openImage")}
       >
-        <img src={url} alt="GIF" className="max-h-48 max-w-full sm:max-w-xs rounded-lg" loading="lazy" />
+        <img src={url} alt={localizeUi("ui.chat.messagecontent.gif")} className="max-h-48 max-w-full sm:max-w-xs rounded-lg" loading="lazy" />
       </button>
     );
   }
-  const compacted = content.replace(/\n{3,}/g, "\n\n");
+  const compacted = resolved.replace(/\n{3,}/g, "\n\n");
   const baseInline = mentionNames?.length
     ? (text: string, kp: string) => highlightMentions(applyInlineMarkdown(text, kp), mentionNames, kp)
     : applyInlineMarkdown;
-  const renderInline =
-    emojiMap && emojiMap.size > 0
-      ? (text: string, kp: string) => renderInlineWithCustomEmojis(text, kp, emojiMap, baseInline)
-      : baseInline;
+  const renderInline = (text: string, kp: string) =>
+    renderInlineWithCustomEmojis(text, kp, emojiMap ?? EMPTY_INLINE_EMOJI_MAP, baseInline);
   const renderTextBlock = (text: string, kp: string) => (
     <Fragment key={kp}>{renderMarkdownBlocks(text, renderInline)}</Fragment>
   );
@@ -399,15 +433,18 @@ export function MsgAction({
   title,
   className,
   tabIndex,
+  buttonRef,
 }: {
   icon: React.ReactNode;
   onClick: () => void;
   title: string;
   className?: string;
   tabIndex?: number;
+  buttonRef?: RefObject<HTMLButtonElement | null>;
 }) {
   return (
     <button
+      ref={buttonRef}
       onClick={(e) => {
         e.stopPropagation();
         onClick();
@@ -442,13 +479,14 @@ export function ConversationMessageEditForm({
   messageTextStyle: CSSProperties;
   quoteFormat: QuoteFormat;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   return (
     <div className="space-y-2">
       <textarea
         ref={editRef}
         value={editValue}
         onChange={(e) => {
-          const nextValue = applyTextareaQuoteFormat(e.currentTarget, quoteFormat);
+          const nextValue = applyTextareaQuoteFormat(e.currentTarget, quoteFormat, e.nativeEvent as InputEvent);
           onValueChange(nextValue);
           const el = e.target;
           el.style.height = "auto";
@@ -465,13 +503,9 @@ export function ConversationMessageEditForm({
         }}
       />
       <div className="flex items-center gap-2 text-[0.6875rem] text-[var(--muted-foreground)]">
-        <button onClick={onCancel} className="text-foreground/70 hover:underline hover:text-foreground">
-          cancel
-        </button>
+        <button onClick={onCancel} className="text-foreground/70 hover:underline hover:text-foreground">{localizeUi("ui.chat.conversationmessageeditform.cancel")}</button>
         <span>·</span>
-        <button onClick={onSave} className="text-foreground/70 hover:underline hover:text-foreground">
-          save
-        </button>
+        <button onClick={onSave} className="text-foreground/70 hover:underline hover:text-foreground">{localizeUi("ui.chat.conversationmessageeditform.save")}</button>
       </div>
     </div>
   );
@@ -489,6 +523,7 @@ export function ConversationMessageAttachments({
   onImageOpen: (url: string, prompt?: string | null) => void;
   onRemove: (i: number) => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   if (!attachments.length || IMAGE_URL_RE.test(renderedContent.trim())) return null;
   return (
     <div className="mt-1.5 flex flex-col items-center gap-2">
@@ -502,12 +537,12 @@ export function ConversationMessageAttachments({
                 onImageOpen(att.url || att.data || "", att.prompt);
               }}
               className="block cursor-zoom-in rounded-lg text-left"
-              title="Open image"
+              title={localizeUi("ui.noodle.noodlepostcard.openImage")}
             >
               <img
                 src={att.url || att.data}
                 alt={att.filename || att.name || "image"}
-                className="max-h-80 max-w-full rounded-lg"
+                className="max-h-[70vh] max-w-full rounded-lg object-contain sm:max-h-[32rem]"
                 loading="lazy"
               />
             </button>
@@ -517,7 +552,7 @@ export function ConversationMessageAttachments({
                 event.stopPropagation();
                 onRemove(i);
               }}
-              title="Remove from message"
+              title={localizeUi("ui.chat.chatmessage.removeFromMessage")}
               className="absolute top-1.5 right-1.5 rounded-full bg-black/60 p-1 text-white/80 transition-opacity hover:bg-black/80 hover:text-white sm:opacity-0 sm:group-hover/att:opacity-100"
             >
               <X size="0.875rem" />
@@ -536,7 +571,7 @@ export function ConversationMessageAttachments({
                 event.stopPropagation();
                 onRemove(i);
               }}
-              title="Remove from message"
+              title={localizeUi("ui.chat.chatmessage.removeFromMessage")}
               className="rounded-full p-0.5 text-foreground/45 transition-colors hover:bg-foreground/10 hover:text-[var(--destructive)] sm:opacity-0 sm:group-hover/att:opacity-100"
             >
               <X size="0.75rem" />
@@ -556,13 +591,14 @@ export function ConversationMessageTranslation({
   translatedText?: string | null;
   isTranslating: boolean;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   if (!translatedText && !isTranslating) return null;
   return (
     <div className="mt-1.5 border-t border-[var(--border)] pt-1.5">
       {isTranslating ? (
-        <span className="text-[0.75rem] italic text-[var(--muted-foreground)]">Translating…</span>
+        <span className="text-[0.75rem] italic text-[var(--muted-foreground)]">{localizeUi("ui.chat.chatmessage.translating")}</span>
       ) : (
-        <div className="whitespace-pre-wrap text-[0.8125rem] leading-relaxed text-[var(--muted-foreground)]">
+        <div className="translation-text whitespace-pre-wrap">
           {translatedText}
         </div>
       )}
@@ -613,6 +649,7 @@ export function ConversationMessageLightbox({
   prompt?: string | null;
   onClose: () => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   return (
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm max-md:pt-[env(safe-area-inset-top)]"
@@ -624,7 +661,7 @@ export function ConversationMessageLightbox({
       >
         <img
           src={url}
-          alt="Expanded image"
+          alt={localizeUi("ui.chat.conversationmessagelightbox.expandedImage")}
           className={
             prompt?.trim()
               ? "max-h-[calc(90vh-9rem)] max-w-full rounded-lg object-contain shadow-2xl"
@@ -636,7 +673,7 @@ export function ConversationMessageLightbox({
       <button
         onClick={onClose}
         className="absolute right-4 top-4 rounded-full bg-black/50 p-2 text-white/80 transition-colors hover:bg-black/70 hover:text-white"
-        aria-label="Close image"
+        aria-label={localizeUi("ui.chat.chatimagelightbox.closeImage")}
       >
         <X size="1.125rem" />
       </button>

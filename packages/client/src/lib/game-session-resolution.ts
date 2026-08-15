@@ -38,11 +38,21 @@ export function getCurrentGameGroupRepresentative<T extends GameSessionChat>(
   return sessions.reduce((latest, candidate) => (compareGameSessions(candidate, latest) > 0 ? candidate : latest));
 }
 
-export function resolveCurrentGameSessionChatId(
-  activeChat: GameSessionChat | null | undefined,
-  chats: readonly GameSessionChat[] | null | undefined,
-): string | null {
-  if (!activeChat) return null;
-  const current = getCurrentGameGroupRepresentative(activeChat, chats);
-  return current.id !== activeChat.id ? current.id : null;
+/** Resolve the canonical stored chat for one numbered Game Mode session, preferring it over user-created branches. */
+export function findReplayableGameSessionChat<T extends GameSessionChat>(
+  chats: readonly T[] | null | undefined,
+  sessionNumber: number,
+): T | null {
+  if (!chats?.length || !Number.isFinite(sessionNumber)) return null;
+
+  const candidates = chats.filter((chat) => chat.mode === "game" && readSessionNumber(chat) === sessionNumber);
+  if (candidates.length === 0) return null;
+
+  const canonical = candidates.filter((chat) => {
+    const metadata = parseChatMetadata(chat.metadata);
+    return typeof metadata.branchName !== "string" || !metadata.branchName.trim();
+  });
+  const replayable = canonical.length > 0 ? canonical : candidates;
+
+  return replayable.reduce((latest, candidate) => (compareGameSessions(candidate, latest) > 0 ? candidate : latest));
 }

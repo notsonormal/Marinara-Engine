@@ -1,18 +1,16 @@
 // ──────────────────────────────────────────────
 // Seed: Default Game Assets
-// Copies bundled game-mode assets (music, SFX, sprites)
+// Copies bundled game-mode assets (music, ambient, and SFX)
 // into the data/game-assets directory on first boot.
 // All assets are CC0 — see CREDITS.md in the bundle.
 // ──────────────────────────────────────────────
 import { logger } from "../lib/logger.js";
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readdirSync, copyFileSync, statSync, writeFileSync, readFileSync } from "fs";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
+import { join } from "path";
 import { GAME_ASSETS_DIR } from "../services/game/asset-manifest.service.js";
+import { BUNDLED_GAME_ASSETS_DIR } from "../services/game/native-game-assets.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const BUNDLED_DIR = join(__dirname, "..", "assets", "default-game-assets");
 const SEED_MARKER = join(GAME_ASSETS_DIR, ".default-assets-seeded.sha256");
 
 function hashDirRecursive(src: string, relativeRoot = ""): string {
@@ -92,25 +90,23 @@ function ensureNativeMarkers(src: string, dest: string) {
 }
 
 export async function seedDefaultGameAssets(): Promise<void> {
-  if (!existsSync(BUNDLED_DIR)) {
+  if (!existsSync(BUNDLED_GAME_ASSETS_DIR)) {
     logger.warn("[seed] Default game assets bundle not found — skipping");
     return;
   }
 
-  const bundleHash = hashDirRecursive(BUNDLED_DIR);
+  const bundleHash = hashDirRecursive(BUNDLED_GAME_ASSETS_DIR);
   const existingHash = existsSync(SEED_MARKER) ? readFileSync(SEED_MARKER, "utf-8").trim() : "";
   const needsCopy = !bundleHash || existingHash !== bundleHash;
 
   if (needsCopy) {
-    const copied = copyDirRecursive(BUNDLED_DIR, GAME_ASSETS_DIR);
+    const copied = copyDirRecursive(BUNDLED_GAME_ASSETS_DIR, GAME_ASSETS_DIR);
     writeFileSync(SEED_MARKER, `${bundleHash}\n`, "utf-8");
     if (copied > 0) {
-      logger.info(
-        `[seed] Installed ${copied} default game asset${copied > 1 ? "s" : ""} (music, ambient, SFX, sprites)`,
-      );
+      logger.info(`[seed] Installed ${copied} default game asset${copied > 1 ? "s" : ""} (music, ambient, SFX)`);
     }
   }
 
   // Always ensure native markers are up to date (idempotent)
-  ensureNativeMarkers(BUNDLED_DIR, GAME_ASSETS_DIR);
+  ensureNativeMarkers(BUNDLED_GAME_ASSETS_DIR, GAME_ASSETS_DIR);
 }

@@ -9,8 +9,25 @@ echo  ^|       Marinara Engine  -  Launcher        ^|
 echo  +==========================================+
 echo.
 
+set "SKIP_UPDATE="
+if /I "%~1"=="--skip-update" set "SKIP_UPDATE=1"
+if /I "%~1"=="--no-update" set "SKIP_UPDATE=1"
+
+:: Load launcher settings before the update decision. Server settings are reused below.
+if not exist .env goto :early_env_done
+for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do (
+    if not "%%A"=="" if not "%%B"=="" set "%%A=%%~B"
+)
+:early_env_done
+
+set "AUTO_UPDATE_DISABLED="
+if /I "%AUTO_UPDATE_ENABLED%"=="0" set "AUTO_UPDATE_DISABLED=1"
+if /I "%AUTO_UPDATE_ENABLED%"=="false" set "AUTO_UPDATE_DISABLED=1"
+if /I "%AUTO_UPDATE_ENABLED%"=="no" set "AUTO_UPDATE_DISABLED=1"
+if /I "%AUTO_UPDATE_ENABLED%"=="off" set "AUTO_UPDATE_DISABLED=1"
+
 :: Check for Node.js
-where node >nul 2>&1
+node --version >nul 2>&1
 if errorlevel 1 (
     echo  [ERROR] Node.js is not installed or not in PATH.
     echo  Please install Node.js 24 LTS or newer from https://nodejs.org
@@ -34,46 +51,9 @@ if !NODE_MAJOR! LSS 24 (
     exit /b 1
 )
 
-:: Resolve the repo-pinned pnpm version from package.json
-set "PNPM_VERSION=10.33.2"
-for /f "usebackq delims=" %%i in (`node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).packageManager?.split('@')[1] || '10.33.2'"`) do set "PNPM_VERSION=%%i"
-set "PNPM_RUNNER=pnpm"
-set "CURRENT_PNPM_VERSION="
-
-:: Ensure pnpm is available before any update/install path uses it
-where corepack >nul 2>&1
-if not errorlevel 1 (
-    echo  [..] Aligning pnpm to %PNPM_VERSION% via Corepack...
-    for /f "usebackq delims=" %%i in (`corepack pnpm@%PNPM_VERSION% --version 2^>nul`) do set "CURRENT_PNPM_VERSION=%%i"
-    if /I "!CURRENT_PNPM_VERSION!"=="%PNPM_VERSION%" (
-        set "PNPM_RUNNER=corepack"
-    ) else (
-        set "CURRENT_PNPM_VERSION="
-    )
-)
-
-if not defined CURRENT_PNPM_VERSION (
-    where pnpm >nul 2>&1
-    if not errorlevel 1 (
-        for /f "usebackq delims=" %%i in (`pnpm --version 2^>nul`) do set "CURRENT_PNPM_VERSION=%%i"
-        if defined CURRENT_PNPM_VERSION (
-            echo  [..] Using installed pnpm !CURRENT_PNPM_VERSION!
-        )
-    )
-)
-
-if not defined CURRENT_PNPM_VERSION (
-    echo  [..] Using temporary pnpm %PNPM_VERSION% via npx...
-    for /f "usebackq delims=" %%i in (`npx --yes pnpm@%PNPM_VERSION% --version 2^>nul`) do set "CURRENT_PNPM_VERSION=%%i"
-    if /I "!CURRENT_PNPM_VERSION!"=="%PNPM_VERSION%" (
-        set "PNPM_RUNNER=npx"
-    ) else (
-        set "CURRENT_PNPM_VERSION="
-    )
-)
-
-if not defined CURRENT_PNPM_VERSION (
-    echo  [ERROR] Failed to make pnpm %PNPM_VERSION% available.
+:: Resolve the exact repo-pinned pnpm before any install path uses it.
+call :resolve_pnpm_runner
+if errorlevel 1 (
     pause
     exit /b 1
 )
@@ -96,8 +76,34 @@ git stash drop -q "!STASH_REF!" >nul 2>&1
 goto :eof
 
 :after_restore_helper
+set "INSTALL_REQUIRED=0"
+set "BUILD_REQUIRED=0"
+set "DATA_SNAPSHOT_READY=0"
+set "PNPM_RESOLUTION_FAILED=0"
+
+:: Drop untracked leftovers in the source trees (e.g. files a failed Windows
+:: checkout could not delete after a channel switch); they break tsc. This is
+:: working-tree repair, not an update, so it runs even when auto-update is
+:: disabled -- and before "stash push -u", which would otherwise capture the
+:: stale file and restore it again after every update.
+:: Not quiet: git prints "Removing <path>" only when it actually deletes
+:: something, so a stray file of your own does not vanish without a trace.
+set "CLEAN_FAILED=0"
+if exist ".git" (
+    git clean -fd -- packages/shared/src packages/server/src packages/client/src 2>nul
+    if errorlevel 1 set "CLEAN_FAILED=1"
+)
 
 :: Auto-update from Git
+if defined SKIP_UPDATE (
+    echo  [OK] Skipping update check; starting the current local install.
+    goto :skip_update
+)
+if defined AUTO_UPDATE_DISABLED (
+    echo  [OK] Automatic Engine updates disabled by AUTO_UPDATE_ENABLED=false.
+    node scripts\check-launcher-update.mjs
+    goto :skip_update
+)
 if not exist ".git" goto :skip_update
 echo  [..] Checking for updates...
 for /f "tokens=*" %%i in ('git rev-parse HEAD 2^>nul') do set "OLD_HEAD=%%i"
@@ -124,6 +130,27 @@ if /I "!OLD_HEAD!"=="!TARGET_HEAD!" (
     echo  [OK] Already up to date
     goto :skip_update
 )
+:: Never auto-move onto a build whose storage format predates the data on
+:: disk - it would silently show empty chat history (#4708). Checked BEFORE
+:: the snapshot: a blocked target stays blocked on every launch, and
+:: re-copying the whole data directory each time serves nothing. Exit 2 is a
+:: real format block; any other failure means the check itself could not run.
+:: Both skip the update (fail-safe) with distinguishable messages.
+node scripts\protect-launcher-data.mjs check-target "!TARGET_HEAD!"
+if errorlevel 2 (
+    echo  [WARN] Skipping auto-update: the target version is older than your data format.
+    goto :skip_update
+)
+if errorlevel 1 (
+    echo  [WARN] Skipping auto-update: could not verify the target's storage format.
+    goto :skip_update
+)
+node scripts\protect-launcher-data.mjs snapshot
+if errorlevel 1 (
+    echo  [WARN] Could not create an update snapshot. Skipping auto-update to protect your data.
+    goto :skip_update
+)
+set "DATA_SNAPSHOT_READY=1"
 :: Drop known-safe untracked files that older installer versions placed in
 :: $INSTDIR but are now also tracked in the repo. Without this, git merge
 :: --ff-only refuses to overwrite them and the auto-update silently fails.
@@ -146,7 +173,13 @@ if errorlevel 1 set "DIRTY=1"
 set "UNTRACKED="
 for /f "tokens=*" %%i in ('git ls-files --others --exclude-standard 2^>nul') do if not defined UNTRACKED set "UNTRACKED=1"
 if defined UNTRACKED set "DIRTY=1"
-if "!DIRTY!"=="1" (
+:: A leftover we could not delete would be captured by "stash push -u" and
+:: restored afterwards, making the broken tree permanent -- so a failed cleanup
+:: blocks the stash and, with it, the update.
+if "!CLEAN_FAILED!"=="1" (
+    echo  [WARN] Could not clear stale files under packages\*\src.
+    set "STASH_FAILED=1"
+) else if "!DIRTY!"=="1" (
     git stash push -u -q -m "auto-stash before update" >nul 2>&1 && set "STASHED=1"
     if not "!STASHED!"=="1" set "STASH_FAILED=1"
     if "!STASHED!"=="1" for /f "tokens=*" %%i in ('git stash list -1 --format^=%%gd 2^>nul') do set "STASH_REF=%%i"
@@ -198,16 +231,29 @@ if /I not "!NEW_HEAD!"=="!TARGET_HEAD!" (
 if "!STASHED!"=="1" call :restore_stashed_changes
 if exist "!UPDATE_LOG!" del /q "!UPDATE_LOG!" >nul 2>&1
 echo  [OK] Updated to latest version
-echo  [..] Reinstalling dependencies...
-call :run_pnpm install
-if exist "packages\shared\dist" rmdir /s /q "packages\shared\dist"
-if exist "packages\server\dist" rmdir /s /q "packages\server\dist"
-if exist "packages\client\dist" rmdir /s /q "packages\client\dist"
-del /q "packages\shared\tsconfig.tsbuildinfo" 2>nul
-del /q "packages\server\tsconfig.tsbuildinfo" 2>nul
-del /q "packages\client\tsconfig.tsbuildinfo" 2>nul
+echo  [..] Dependencies and build will be refreshed before startup.
+call :resolve_pnpm_runner
+if errorlevel 1 (
+    set "PNPM_RESOLUTION_FAILED=1"
+) else (
+    set "INSTALL_REQUIRED=1"
+    set "BUILD_REQUIRED=1"
+)
 
 :skip_update
+if "!DATA_SNAPSHOT_READY!"=="1" (
+    node scripts\protect-launcher-data.mjs restore-if-missing
+    if errorlevel 1 (
+        echo  [ERROR] User data verification failed after the update attempt.
+        echo          Startup stopped to avoid creating empty data.
+        pause
+        exit /b 1
+    )
+)
+if "!PNPM_RESOLUTION_FAILED!"=="1" (
+    pause
+    exit /b 1
+)
 echo  [OK] Node.js found:
 node -v
 echo  [OK] pnpm !CURRENT_PNPM_VERSION! ready
@@ -220,39 +266,33 @@ for /f "usebackq delims=" %%i in (`git rev-parse --short=12 HEAD 2^>nul`) do set
 for /f "usebackq delims=" %%i in (`node -e "try{const m=require('./packages/server/dist/config/build-meta.json');console.log(m.commit || '')}catch{}" 2^>nul`) do set "DIST_COMMIT=%%i"
 if not "!SOURCE_VER!"=="" if not "!DIST_VER!"=="" if not "!SOURCE_VER!"=="!DIST_VER!" (
     echo  [WARN] Version mismatch: source v!SOURCE_VER! but dist has v!DIST_VER!
-    echo  [..] Forcing rebuild to apply update...
-    call :run_pnpm install
-    if exist "packages\shared\dist" rmdir /s /q "packages\shared\dist"
-    if exist "packages\server\dist" rmdir /s /q "packages\server\dist"
-    if exist "packages\client\dist" rmdir /s /q "packages\client\dist"
-    del /q "packages\shared\tsconfig.tsbuildinfo" 2>nul
-    del /q "packages\server\tsconfig.tsbuildinfo" 2>nul
-    del /q "packages\client\tsconfig.tsbuildinfo" 2>nul
+    echo  [..] Dependencies and build will be refreshed before startup.
+    set "INSTALL_REQUIRED=1"
+    set "BUILD_REQUIRED=1"
 )
 if not "!SOURCE_COMMIT!"=="" if /I not "!SOURCE_COMMIT!"=="!DIST_COMMIT!" (
     echo  [WARN] Build commit mismatch: source !SOURCE_COMMIT! but dist has !DIST_COMMIT!
-    echo  [..] Forcing rebuild to apply update...
-    call :run_pnpm install
-    if exist "packages\shared\dist" rmdir /s /q "packages\shared\dist"
-    if exist "packages\server\dist" rmdir /s /q "packages\server\dist"
-    if exist "packages\client\dist" rmdir /s /q "packages\client\dist"
-    del /q "packages\shared\tsconfig.tsbuildinfo" 2>nul
-    del /q "packages\server\tsconfig.tsbuildinfo" 2>nul
-    del /q "packages\client\tsconfig.tsbuildinfo" 2>nul
+    echo  [..] Dependencies and build will be refreshed before startup.
+    set "INSTALL_REQUIRED=1"
+    set "BUILD_REQUIRED=1"
 )
 :skip_version_check
 
 :: Install dependencies if needed
-if exist "node_modules" goto :skip_install
+if not exist "node_modules" set "INSTALL_REQUIRED=1"
+node scripts\check-workspace-install.mjs >nul 2>&1
+if errorlevel 1 set "INSTALL_REQUIRED=1"
+if not "!INSTALL_REQUIRED!"=="1" goto :skip_install
 echo.
-echo  [..] Installing dependencies (first run)...
+echo  [..] Installing dependencies...
 echo      This may take a few minutes.
 echo.
-call :run_pnpm install
+call :run_pnpm install --frozen-lockfile --prefer-offline
 if errorlevel 1 echo  [ERROR] Failed to install dependencies. & pause & exit /b 1
 
 :skip_install
 
+:skip_env
 :: Optional AI sprite background remover
 if defined BACKGROUNDREMOVER_AUTO_INSTALL (
     if /I "%BACKGROUNDREMOVER_AUTO_INSTALL%"=="1" goto install_bgremover
@@ -268,31 +308,28 @@ if errorlevel 1 echo  [WARN] Optional background remover install failed; built-i
 :skip_bgremover
 
 :: Build if needed
-if not exist "packages\shared\dist" (
-    echo  [..] Building shared types...
+if not exist "packages\shared\dist\constants\defaults.js" set "BUILD_REQUIRED=1"
+if not exist "packages\server\dist\index.js" set "BUILD_REQUIRED=1"
+if not exist "packages\client\dist\index.html" set "BUILD_REQUIRED=1"
+if "!BUILD_REQUIRED!"=="1" (
+    echo  [..] Cleaning stale build artifacts...
+    call :run_pnpm clean:stale-client
+    if errorlevel 1 echo  [ERROR] Failed to clean stale client artifacts. & pause & exit /b 1
+    call :run_pnpm --filter @marinara-engine/shared run clean
+    if errorlevel 1 echo  [ERROR] Failed to clean shared build artifacts. & pause & exit /b 1
+    call :run_pnpm --filter @marinara-engine/server run clean
+    if errorlevel 1 echo  [ERROR] Failed to clean server build artifacts. & pause & exit /b 1
+    call :run_pnpm --filter @marinara-engine/client run clean
+    if errorlevel 1 echo  [ERROR] Failed to clean client build artifacts. & pause & exit /b 1
+    echo  [..] Building Marinara Engine...
     call :run_pnpm --filter @marinara-engine/shared build
-    if errorlevel 1 echo  [ERROR] Failed to build shared types. & pause & exit /b 1
-)
-if not exist "packages\server\dist" (
-    echo  [..] Building server...
-    call :run_pnpm --filter @marinara-engine/server build
-    if errorlevel 1 echo  [ERROR] Failed to build the server. & pause & exit /b 1
-)
-if not exist "packages\client\dist" (
-    echo  [..] Building client...
-    call :run_pnpm --filter @marinara-engine/client build
-    if errorlevel 1 echo  [ERROR] Failed to build the client. & pause & exit /b 1
+    if errorlevel 1 echo  [ERROR] Failed to build shared package. & pause & exit /b 1
+    call :run_pnpm --filter @marinara-engine/server --filter @marinara-engine/client --parallel run build
+    if errorlevel 1 echo  [ERROR] Failed to build server or client package. & pause & exit /b 1
 )
 
 :: Database migrations are handled automatically at server startup by runMigrations()
 
-:: Load .env if present (respects user overrides)
-if not exist .env goto :skip_env
-for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do (
-    if not "%%A"=="" if not "%%B"=="" set "%%A=%%B"
-)
-
-:skip_env
 :: Set defaults only if not already set
 set NODE_ENV=production
 if not defined PORT set PORT=7860
@@ -301,6 +338,10 @@ if not defined SIDECAR_RUNTIME_INSTALL_ENABLED set SIDECAR_RUNTIME_INSTALL_ENABL
 
 set PROTOCOL=http
 if defined SSL_CERT if defined SSL_KEY set PROTOCOL=https
+set "BROWSER_HOST=%HOST%"
+if "%BROWSER_HOST%"=="" set "BROWSER_HOST=127.0.0.1"
+if "%BROWSER_HOST%"=="0.0.0.0" set "BROWSER_HOST=127.0.0.1"
+if "%BROWSER_HOST%"=="::" set "BROWSER_HOST=127.0.0.1"
 
 set "AUTO_OPEN_BROWSER_ENABLED=1"
 if defined AUTO_OPEN_BROWSER (
@@ -318,14 +359,15 @@ if errorlevel 1 (
 
 echo.
 echo  ==========================================
-echo    Starting Marinara Engine on %PROTOCOL%://127.0.0.1:%PORT%
+echo    Starting Marinara Engine on %PROTOCOL%://%HOST%:%PORT%
+if not "%BROWSER_HOST%"=="%HOST%" echo    Local browser URL: %PROTOCOL%://%BROWSER_HOST%:%PORT%
 echo    Press Ctrl+C to stop
 echo  ==========================================
 echo.
 
 :: Open browser after a short delay (use explorer.exe as fallback)
 if defined AUTO_OPEN_BROWSER_ENABLED (
-    start "" cmd /c "timeout /t 4 /nobreak >nul && start %PROTOCOL%://127.0.0.1:%PORT% || explorer %PROTOCOL%://127.0.0.1:%PORT%"
+    start "" cmd /c "timeout /t 4 /nobreak >nul && start %PROTOCOL%://%BROWSER_HOST%:%PORT% || explorer %PROTOCOL%://%BROWSER_HOST%:%PORT%"
 ) else (
     echo  [OK] Auto-open disabled ^(AUTO_OPEN_BROWSER=%AUTO_OPEN_BROWSER%^)
 )
@@ -343,12 +385,71 @@ goto :eof
 
 :run_pnpm
 if /I "%PNPM_RUNNER%"=="corepack" (
-    call corepack pnpm@%PNPM_VERSION% %*
+    call corepack pnpm@%PNPM_DESCRIPTOR% --config.trustPolicy=off --config.confirmModulesPurge=false %*
 ) else (
     if /I "%PNPM_RUNNER%"=="npx" (
-        call npx --yes pnpm@%PNPM_VERSION% %*
+        call npx --yes pnpm@%PNPM_VERSION% --config.trustPolicy=off --config.confirmModulesPurge=false %*
     ) else (
-        call pnpm %*
+        call pnpm --config.trustPolicy=off --config.confirmModulesPurge=false %*
     )
 )
 exit /b %errorlevel%
+
+:resolve_pnpm_runner
+set "PNPM_DESCRIPTOR="
+for /f "usebackq delims=" %%i in (`node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).packageManager?.replace(/^^pnpm@/, '') || ''"`) do set "PNPM_DESCRIPTOR=%%i"
+if not defined PNPM_DESCRIPTOR (
+    echo  [ERROR] Could not read the pinned pnpm descriptor from package.json.
+    exit /b 1
+)
+set "PNPM_VERSION="
+for /f "tokens=1 delims=+" %%i in ("!PNPM_DESCRIPTOR!") do set "PNPM_VERSION=%%i"
+if not defined PNPM_VERSION (
+    echo  [ERROR] The pinned pnpm descriptor in package.json has no version.
+    exit /b 1
+)
+set "PNPM_RUNNER=pnpm"
+set "CURRENT_PNPM_VERSION="
+
+where corepack >nul 2>&1
+if not errorlevel 1 (
+    echo  [..] Aligning pnpm to !PNPM_VERSION! via Corepack...
+    for /f "usebackq delims=" %%i in (`corepack pnpm@!PNPM_DESCRIPTOR! --version 2^>nul`) do set "CURRENT_PNPM_VERSION=%%i"
+    if /I "!CURRENT_PNPM_VERSION!"=="!PNPM_VERSION!" (
+        set "PNPM_RUNNER=corepack"
+    ) else (
+        set "CURRENT_PNPM_VERSION="
+    )
+)
+
+if not defined CURRENT_PNPM_VERSION (
+    where pnpm >nul 2>&1
+    if not errorlevel 1 (
+        for /f "usebackq delims=" %%i in (`pnpm --version 2^>nul`) do set "CURRENT_PNPM_VERSION=%%i"
+        if /I "!CURRENT_PNPM_VERSION!"=="!PNPM_VERSION!" (
+            echo  [..] Using installed pnpm !CURRENT_PNPM_VERSION!
+        ) else (
+            if defined CURRENT_PNPM_VERSION echo  [..] Installed pnpm !CURRENT_PNPM_VERSION! does not match required !PNPM_VERSION!; trying a pinned temporary runner...
+            set "CURRENT_PNPM_VERSION="
+        )
+    )
+)
+
+if not defined CURRENT_PNPM_VERSION (
+    echo  [..] Using temporary pnpm !PNPM_VERSION! via npx...
+    for /f "usebackq delims=" %%i in (`npx --yes pnpm@!PNPM_VERSION! --version 2^>nul`) do set "CURRENT_PNPM_VERSION=%%i"
+    if /I "!CURRENT_PNPM_VERSION!"=="!PNPM_VERSION!" (
+        set "PNPM_RUNNER=npx"
+    ) else (
+        set "CURRENT_PNPM_VERSION="
+    )
+)
+
+if not defined CURRENT_PNPM_VERSION (
+    echo  [ERROR] Failed to make pnpm !PNPM_VERSION! available.
+    echo          Marinara can run without a global pnpm install, but Node.js must provide Corepack or npx/npm.
+    echo          Reinstall Node.js 24 LTS with npm enabled, or run: npm install -g pnpm@!PNPM_VERSION!
+    exit /b 1
+)
+echo  [OK] pnpm !CURRENT_PNPM_VERSION! ready
+exit /b 0

@@ -14,13 +14,18 @@ import { useAgentStore } from "../../stores/agent.store";
 import { useCharacter, useUpdateCharacter } from "../../hooks/use-characters";
 import { type CharacterCardFieldUpdate, type EditableCharacterCardField } from "@marinara-engine/shared";
 import { useGenerate } from "../../hooks/use-generate";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 function getCharacterCardFieldValue(data: Record<string, unknown>, field: EditableCharacterCardField): string | null {
-  if (field === "backstory" || field === "appearance") {
+  if (field === "backstory" || field === "appearance" || field === "aboutMe") {
     const extensions = data.extensions;
-    if (!extensions || typeof extensions !== "object") return null;
-    const value = (extensions as Record<string, unknown>)[field];
-    return typeof value === "string" ? value : null;
+    const value =
+      extensions && typeof extensions === "object" ? (extensions as Record<string, unknown>)[field] : undefined;
+    if (typeof value === "string") return value;
+    // aboutMe is optional and often absent; treat missing as empty so About Me
+    // Keeper can populate a character's about-me from scratch. backstory/appearance
+    // keep returning null when absent (they always carry a "" default in practice).
+    return field === "aboutMe" ? "" : null;
   }
 
   const value = data[field];
@@ -32,7 +37,7 @@ function setCharacterCardFieldValue(
   field: EditableCharacterCardField,
   value: string,
 ): Record<string, unknown> {
-  if (field === "backstory" || field === "appearance") {
+  if (field === "backstory" || field === "appearance" || field === "aboutMe") {
     const extensions =
       data.extensions && typeof data.extensions === "object" ? (data.extensions as Record<string, unknown>) : {};
 
@@ -49,6 +54,14 @@ function setCharacterCardFieldValue(
     ...data,
     [field]: value,
   };
+}
+
+function appendStaleCardReplacement(base: string, replacement: string): string {
+  const trimmedReplacement = replacement.trim();
+  if (!trimmedReplacement) return base;
+  if (base.includes(trimmedReplacement)) return base;
+  const separator = base.trim().length > 0 ? "\n\n" : "";
+  return `${base.trimEnd()}${separator}${trimmedReplacement}`;
 }
 
 function bumpCharacterVersion(value: unknown): string {
@@ -69,14 +82,21 @@ interface Props {
 }
 
 type BusyAction = "approve" | "regenerate" | null;
+type CardUpdateState = {
+  update: CharacterCardFieldUpdate;
+  stale: boolean;
+};
 
 export function CharacterCardUpdateModal({ open, onClose }: Props) {
+  const { t: localizeUi } = useUiTranslation();
   const pending = useAgentStore((s) => s.pendingCardUpdates);
   const dismissPendingCardUpdate = useAgentStore((s) => s.dismissPendingCardUpdate);
 
   const entry = pending[0] ?? null;
   const { retryAgents } = useGenerate();
-  const { data: character } = useCharacter(entry?.characterId ?? null);
+  const { data: character, isFetching: isFetchingCharacter, refetch: refetchCharacter } = useCharacter(
+    entry?.characterId ?? null,
+  );
   const updateCharacter = useUpdateCharacter();
   const [error, setError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<BusyAction>(null);
@@ -87,6 +107,11 @@ export function CharacterCardUpdateModal({ open, onClose }: Props) {
     setError(null);
     setBusyAction(null);
   }, [entry?.id, entry?.updates]);
+
+  useEffect(() => {
+    if (!entry?.characterId) return;
+    void refetchCharacter();
+  }, [entry?.characterId, entry?.id, refetchCharacter]);
 
   // Character rows come back from /characters with `data` serialized as a JSON
   // string, so parse it once here and reuse below.
@@ -102,17 +127,33 @@ export function CharacterCardUpdateModal({ open, onClose }: Props) {
     return (raw as Record<string, unknown>) ?? {};
   }, [character]);
 
-  // Only show updates whose oldText is still present in the current field —
-  // stale suggestions (field already changed since the agent ran) are dropped.
+  // Only apply exact replacements whose oldText is still present in the current
+  // field. We force-refetch the character above before letting the user approve,
+  // because a 5-minute React Query cache can otherwise make fresh server-side
+  // auditor proposals look stale in this modal.
   // We use substring match, not equality, because oldText is a sentence-level
   // slice of a field that often contains multiple paragraphs.
-  const applicableUpdates = useMemo(() => {
+  const updateStates = useMemo<CardUpdateState[]>(() => {
     if (!entry || !character) return [];
-    return draftUpdates.filter((u) => {
+    return draftUpdates.map((u) => {
       const current = getCharacterCardFieldValue(parsedData, u.field);
-      return typeof current === "string" && u.oldText.length > 0 && current.includes(u.oldText);
+      // Populating a currently-empty field from scratch (oldText === "") is a valid
+      // insert, not a stale match — e.g. About Me Keeper filling a blank about-me.
+      const isEmptyInsert = u.oldText.length === 0 && current === "";
+      return {
+        update: u,
+        stale: !isEmptyInsert && !(typeof current === "string" && u.oldText.length > 0 && current.includes(u.oldText)),
+      };
     });
   }, [entry, character, draftUpdates, parsedData]);
+  const applicableUpdates = useMemo(
+    () => updateStates.filter((state) => !state.stale).map((state) => state.update),
+    [updateStates],
+  );
+  const staleUpdates = useMemo(
+    () => updateStates.filter((state) => state.stale).map((state) => state.update),
+    [updateStates],
+  );
 
   if (!entry) return null;
 
@@ -127,21 +168,41 @@ export function CharacterCardUpdateModal({ open, onClose }: Props) {
     }
   };
 
-  const handleApprove = async () => {
-    if (!character || applicableUpdates.length === 0) {
+  const handleApprove = async (overrideStale = false) => {
+    if (!character || (applicableUpdates.length === 0 && (!overrideStale || staleUpdates.length === 0))) {
       closeAndAdvance();
       return;
     }
+    if (overrideStale && staleUpdates.length > 0) {
+      const ok = window.confirm(localizeUi("ui.modals.charactercardupdatemodal.someProposedCardEditsNoLongerMatchTheCurrent"),
+      );
+      if (!ok) return;
+    }
     // Apply each edit as a targeted substring replace inside the field's current
     // value, NOT by overwriting the field with newText (which would erase
-    // everything around the edited sentence).
+    // everything around the edited sentence). If the user explicitly overrides
+    // a stale proposal, append the edited replacement text to the current field
+    // so stale oldText cannot delete unrelated card content.
     setBusyAction("approve");
     setError(null);
     let nextData: Record<string, unknown> = { ...parsedData };
-    for (const u of applicableUpdates) {
+    for (const u of overrideStale ? [...applicableUpdates, ...staleUpdates] : applicableUpdates) {
       const base = getCharacterCardFieldValue(nextData, u.field);
       if (typeof base !== "string") continue;
-      nextData = setCharacterCardFieldValue(nextData, u.field, base.replace(u.oldText, u.newText));
+      let nextValue: string;
+      if (u.oldText.length === 0 && base === "") {
+        // From-scratch insert into an empty field — set it directly.
+        nextValue = u.newText;
+      } else if (u.oldText.length > 0 && base.includes(u.oldText)) {
+        // Exact-match replace (guard against empty oldText, which base.includes()
+        // always matches and would prepend newText at index 0).
+        nextValue = base.replace(u.oldText, () => u.newText);
+      } else if (overrideStale) {
+        nextValue = appendStaleCardReplacement(base, u.newText);
+      } else {
+        nextValue = base;
+      }
+      nextData = setCharacterCardFieldValue(nextData, u.field, nextValue);
     }
     nextData.character_version = bumpCharacterVersion(nextData.character_version);
     try {
@@ -191,7 +252,7 @@ export function CharacterCardUpdateModal({ open, onClose }: Props) {
   const queueNote = pending.length > 1 ? ` (${pending.length - 1} more queued)` : "";
 
   return (
-    <Modal open={open} onClose={closeAndAdvance} title="Review Character Card Updates" width="max-w-2xl">
+    <Modal open={open} onClose={closeAndAdvance} title={localizeUi("ui.modals.charactercardupdatemodal.reviewCharacterCardUpdates")} width="max-w-2xl">
       <div className="flex flex-col gap-3">
         <div className="flex items-center gap-3">
           <div className="mari-chrome-accent-tile mari-accent-animated flex h-12 w-12 items-center justify-center rounded-xl">
@@ -202,23 +263,25 @@ export function CharacterCardUpdateModal({ open, onClose }: Props) {
               {(typeof parsedData.name === "string" && parsedData.name) || entry.characterName}
             </p>
             <p className="text-xs text-[var(--muted-foreground)]">
-              {entry.agentName} proposed {draftUpdates.length} {draftUpdates.length === 1 ? "change" : "changes"}
+              {entry.agentName} {localizeUi("ui.modals.charactercardupdatemodal.proposed")} {draftUpdates.length} {draftUpdates.length === 1 ?localizeUi("ui.modals.charactercardupdatemodal.change") :localizeUi("ui.modals.charactercardupdatemodal.changes")}
               {queueNote}
             </p>
           </div>
         </div>
 
-        {applicableUpdates.length === 0 && (
+        {isFetchingCharacter && (
           <div className="flex items-center gap-2 rounded-lg bg-[var(--secondary)] p-2.5 text-xs text-[var(--muted-foreground)]">
-            <AlertCircle size="0.75rem" className="shrink-0" />
-            None of these proposals still match the current card — the field was probably already edited. Reject to
-            dismiss.
-          </div>
+            <Loader2 size="0.75rem" className="shrink-0 animate-spin" />{localizeUi("ui.modals.charactercardupdatemodal.refreshingTheCurrentCharacterCardBeforeCheckingStaleProposals")}</div>
+        )}
+
+        {applicableUpdates.length === 0 && !isFetchingCharacter && (
+          <div className="flex items-center gap-2 rounded-lg bg-[var(--secondary)] p-2.5 text-xs text-[var(--muted-foreground)]">
+            <AlertCircle size="0.75rem" className="shrink-0" />{localizeUi("ui.modals.charactercardupdatemodal.noneOfTheseProposalsStillMatchTheFreshlyLoaded")}</div>
         )}
 
         <div className="flex max-h-[60vh] flex-col gap-3 overflow-y-auto">
           {draftUpdates.map((u, idx) => {
-            const stale = !applicableUpdates.includes(u);
+            const stale = updateStates[idx]?.stale ?? true;
             return (
               <div
                 key={idx}
@@ -231,24 +294,18 @@ export function CharacterCardUpdateModal({ open, onClose }: Props) {
                     {u.field}
                   </span>
                   {stale && (
-                    <span className="rounded-full bg-[var(--destructive)]/10 px-2 py-0.5 text-[10px] font-medium text-[var(--destructive)]">
-                      stale
-                    </span>
+                    <span className="rounded-full bg-[var(--destructive)]/10 px-2 py-0.5 text-[10px] font-medium text-[var(--destructive)]">{localizeUi("ui.modals.charactercardupdatemodal.stale")}</span>
                   )}
                 </div>
                 {u.reason && <p className="text-xs italic text-[var(--muted-foreground)]">{u.reason}</p>}
                 <div className="flex flex-col gap-1">
-                  <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">
-                    Before
-                  </span>
+                  <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">{localizeUi("ui.modals.charactercardupdatemodal.before")}</span>
                   <p className="whitespace-pre-wrap rounded-md bg-[var(--destructive)]/5 p-2 text-xs leading-relaxed text-[var(--foreground)]">
                     {u.oldText}
                   </p>
                 </div>
                 <div className="flex flex-col gap-1">
-                  <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">
-                    After
-                  </span>
+                  <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">{localizeUi("ui.modals.charactercardupdatemodal.after")}</span>
                   <textarea
                     value={u.newText}
                     onChange={(event) => updateDraftNewText(idx, event.target.value)}
@@ -276,36 +333,47 @@ export function CharacterCardUpdateModal({ open, onClose }: Props) {
             disabled={busyAction !== null || updateCharacter.isPending}
             className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] disabled:opacity-50"
           >
-            <X size="0.75rem" />
-            Reject
-          </button>
+            <X size="0.75rem" />{localizeUi("ui.modals.charactercardupdatemodal.reject")}</button>
           <button
             type="button"
             onClick={handleRegenerate}
             disabled={busyAction !== null || updateCharacter.isPending}
             className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] disabled:opacity-50"
-            title="Regenerate this proposal"
+            title={localizeUi("ui.modals.agentwriteapprovalmodal.regenerateThisProposal")}
           >
             {busyAction === "regenerate" ? (
               <Loader2 size="0.75rem" className="animate-spin" />
             ) : (
               <RefreshCw size="0.75rem" />
-            )}
-            Regenerate
-          </button>
+            )}{localizeUi("ui.agents.secretplotpanel.regenerate")}</button>
           <button
             type="button"
-            onClick={handleApprove}
-            disabled={busyAction !== null || updateCharacter.isPending || applicableUpdates.length === 0}
+            onClick={() => void handleApprove(false)}
+            disabled={
+              busyAction !== null || updateCharacter.isPending || isFetchingCharacter || applicableUpdates.length === 0
+            }
             className="flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-4 py-2 text-xs font-medium text-[var(--primary-foreground)] transition-all hover:opacity-90 disabled:opacity-50"
           >
             {busyAction === "approve" || updateCharacter.isPending ? (
               <Loader2 size="0.75rem" className="animate-spin" />
             ) : (
               <Check size="0.75rem" />
-            )}
-            Approve {applicableUpdates.length > 0 ? `(${applicableUpdates.length})` : ""}
+            )}{localizeUi("ui.modals.charactercardupdatemodal.approve")} {applicableUpdates.length > 0 ?localizeUi("ui.modals.charactercardupdatemodal.value1", { value1: applicableUpdates.length }) : ""}
           </button>
+          {staleUpdates.length > 0 && (
+            <button
+              type="button"
+              onClick={() => void handleApprove(true)}
+              disabled={busyAction !== null || updateCharacter.isPending || isFetchingCharacter}
+              className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-4 py-2 text-xs font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--accent)] disabled:opacity-50"
+            >
+              {busyAction === "approve" || updateCharacter.isPending ? (
+                <Loader2 size="0.75rem" className="animate-spin" />
+              ) : (
+                <AlertCircle size="0.75rem" />
+              )}{localizeUi("ui.modals.charactercardupdatemodal.overrideStale")}{staleUpdates.length})
+            </button>
+          )}
         </div>
       </div>
     </Modal>

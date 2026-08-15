@@ -4,12 +4,17 @@
 
 export interface MacroContext {
   user: string;
+  userPhonetic?: string;
   char: string;
-  /** All characters in the chat */
+  charPhonetic?: string;
+  /** Character names in the current prompt scope (used by {{characters}}) */
   characters: string[];
+  /** Full active chat character roster (used by {{group}} when the prompt is scoped to one responder) */
+  groupCharacters?: string[];
   /** Full per-character card fields for grouped macro expansion */
   characterProfiles?: Array<{
     name: string;
+    phoneticName?: string;
     description?: string;
     personality?: string;
     backstory?: string;
@@ -35,8 +40,13 @@ export interface MacroContext {
   timeZone?: string;
   /** Agent data keyed by agent type (for {{agent::TYPE}}) */
   agentData?: Record<string, string>;
+  /** Referenced character names keyed by exact card ID (for {{CHARACTER_ID}}) */
+  characterReferences?: Record<string, string>;
+  /** Activated lorebook Outlet content keyed by its exact, case-sensitive name */
+  outlets?: Record<string, string>;
   /** Current character card fields used by macros like {{description}} */
   characterFields?: {
+    phoneticName?: string;
     description?: string;
     personality?: string;
     backstory?: string;
@@ -48,11 +58,21 @@ export interface MacroContext {
   };
   /** Active persona card fields used by {{persona}} */
   personaFields?: {
+    phoneticName?: string;
     description?: string;
     personality?: string;
     backstory?: string;
     appearance?: string;
     scenario?: string;
+  };
+  /** Conversation-mode-only fields for {{convo_display}}/{{char_about}}/{{persona_about}}/{{convo_behavior}}.
+   *  Populated ONLY by the conversation prompt branch, so these macros resolve to ""
+   *  in Roleplay/Game — even if placed in a shared surface those modes render. */
+  convoFields?: {
+    charDisplayName?: string;
+    charAbout?: string;
+    personaAbout?: string;
+    convoBehavior?: string;
   };
 }
 
@@ -60,9 +80,19 @@ export interface ResolveMacroOptions {
   trimResult?: boolean;
   /**
    * Preserve character macros as internal tokens for a later known-speaker pass.
-   * "names" delays only {{char}}/{{charName}}; "all" also delays character field macros.
+   * "names" delays {{char}}/{{charName}} and {{group}}; "all" also delays character field macros.
    */
   deferCharacterMacros?: "names" | "all";
+  /**
+   * Opt-in hook to defer a {{#if}} block whose condition references an operand
+   * whose value isn't known during macro resolution (e.g. conversation
+   * relocation macros the route fills in afterward). When the predicate returns
+   * true for a condition operand, the block is encoded as a deferred token
+   * instead of being evaluated; the caller decodes it later against the real
+   * value (see DEFERRED_RELOCATION_CONDITIONAL_TOKEN_RE + selectConditionalPayloadBranch).
+   * The engine stays mode-agnostic — it never hardcodes which operands defer.
+   */
+  deferConditionalOperand?: (operand: string) => boolean;
   /** Internal guard for recursive character/persona field macro expansion. */
   fieldResolutionDepth?: number;
   /** Stable seed used to resolve random/dice macros consistently for one message. */
@@ -85,8 +115,33 @@ export interface SupportedMacroDefinition {
   description: string;
 }
 
-const CHARACTER_MACRO_PATTERN =
-  /\{\{(?:char|charName|description|personality|backstory|appearance|scenario|example|charSysInfo|charPostHistory)\}\}|\{\{\s*#if\s+[^}]*\b(?:char|charName|character|speaker|description|personality|backstory|appearance|scenario|example|charSysInfo|charPostHistory)\b/i;
+export const CHARACTER_REFERENCE_ID_PATTERN = /\{\{([A-Za-z0-9_-]{21})\}\}/g;
+
+const CHARACTER_MACRO_NAMES = new Set([
+  "appearance",
+  "backstory",
+  "char",
+  "char_about",
+  "charname",
+  "charnamephonetic",
+  "charphonetic",
+  "charposthistory",
+  "charsysinfo",
+  "convo_behavior",
+  "convo_display",
+  "description",
+  "example",
+  "group",
+  "personality",
+  "scenario",
+]);
+const CHARACTER_CONDITIONAL_OPERAND_NAMES = new Set([
+  ...CHARACTER_MACRO_NAMES,
+  "character",
+  "characterphonetic",
+  "speaker",
+  "speakerphonetic",
+]);
 const MAX_CHARACTER_FIELD_RESOLUTION_DEPTH = 4;
 const MAX_DICE_COUNT = 1000;
 const MAX_DICE_SIDES = 1_000_000;
@@ -101,9 +156,19 @@ const DEFERRED_CHARACTER_CONDITIONAL_TOKEN_RE = new RegExp(
   `${DEFERRED_CHARACTER_CONDITIONAL_TOKEN_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^\\x1f]+)\\x1f`,
   "g",
 );
-const MACRO_COMMENT_PATTERN = /\{\{\/\/[^}]*\}\}/g;
+// Placeholder for a {{#if}} block whose condition depends on a caller-deferred
+// operand (e.g. a conversation relocation macro whose value is injected later).
+// The prefix deliberately does NOT contain "DEFERRED_CHARACTER_", so the
+// per-character decode and hasDeferredCharacterMacros never touch it.
+const DEFERRED_RELOCATION_CONDITIONAL_TOKEN_PREFIX = "\x1eMARINARA_DEFERRED_RELOCATION_IF:";
+export const DEFERRED_RELOCATION_CONDITIONAL_TOKEN_RE = new RegExp(
+  `${DEFERRED_RELOCATION_CONDITIONAL_TOKEN_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^\\x1f]+)\\x1f`,
+  "g",
+);
 const DEFERRED_CHARACTER_MACRO_TOKENS = {
   char: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}CHAR\x1f`,
+  charPhonetic: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}CHAR_PHONETIC\x1f`,
+  group: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}GROUP\x1f`,
   description: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}DESCRIPTION\x1f`,
   personality: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}PERSONALITY\x1f`,
   backstory: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}BACKSTORY\x1f`,
@@ -112,10 +177,16 @@ const DEFERRED_CHARACTER_MACRO_TOKENS = {
   example: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}EXAMPLE\x1f`,
   systemPrompt: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}SYSTEM_PROMPT\x1f`,
   postHistoryInstructions: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}POST_HISTORY\x1f`,
+  convoDisplay: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}CONVO_DISPLAY\x1f`,
+  charAbout: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}CHAR_ABOUT\x1f`,
+  convoBehavior: `${DEFERRED_CHARACTER_MACRO_TOKEN_PREFIX}CONVO_BEHAVIOR\x1f`,
 } as const;
 
 export type CharacterMacroProfile = NonNullable<MacroContext["characterProfiles"]>[number];
-type CharacterFieldMacroName = Exclude<keyof typeof DEFERRED_CHARACTER_MACRO_TOKENS, "char">;
+type CharacterFieldMacroName = Exclude<
+  keyof typeof DEFERRED_CHARACTER_MACRO_TOKENS,
+  "char" | "charPhonetic" | "group" | "convoDisplay" | "charAbout" | "convoBehavior"
+>;
 type ConditionalBlockPayload = {
   condition: string;
   truthy: string;
@@ -140,7 +211,17 @@ export type MacroResolutionBudget = {
 };
 
 export function stripMacroComments(template: string): string {
-  return template.replace(MACRO_COMMENT_PATTERN, "");
+  let result = "";
+  let cursor = 0;
+  while (cursor < template.length) {
+    const start = template.indexOf("{{//", cursor);
+    if (start < 0) break;
+    const firstClose = template.indexOf("}}", start + 4);
+    if (firstClose < 0) break;
+    result += template.slice(cursor, start);
+    cursor = firstClose + 2;
+  }
+  return result + template.slice(cursor);
 }
 
 function getMacroBudget(options: ResolveMacroOptions): MacroResolutionBudget {
@@ -216,9 +297,46 @@ export function hasDeferredCharacterMacros(template: string): boolean {
   );
 }
 
+/** True if any deferred relocation conditional token is still unresolved. */
+export function hasDeferredRelocationConditionals(template: string): boolean {
+  return template.includes(DEFERRED_RELOCATION_CONDITIONAL_TOKEN_PREFIX);
+}
+
+/**
+ * Extract the condition operands (left/right of each branch) from every deferred
+ * relocation conditional token in `text`. Lets the caller decide which of its
+ * slots the deferred blocks actually reference using the SAME parse the deferral
+ * used — so slot detection can never disagree with the defer decision (#3449).
+ */
+export function collectDeferredRelocationConditionOperands(text: string): string[] {
+  if (!text.includes(DEFERRED_RELOCATION_CONDITIONAL_TOKEN_PREFIX)) return [];
+  const operands: string[] = [];
+  for (const match of text.matchAll(DEFERRED_RELOCATION_CONDITIONAL_TOKEN_RE)) {
+    const payload = parseDeferredConditionalPayload(match[1]!);
+    if (!payload) continue;
+    const chainBranches = (payload as ConditionalChainPayload).branches;
+    const branches = Array.isArray(chainBranches)
+      ? chainBranches
+      : [{ condition: (payload as ConditionalBlockPayload).condition, content: "" }];
+    for (const branch of branches) {
+      if (branch.condition === null) continue;
+      for (const parsed of parseConditionComparisons(branch.condition)) {
+        operands.push(parsed.left);
+        if (parsed.right !== undefined) operands.push(parsed.right);
+      }
+    }
+  }
+  return operands;
+}
+
 export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
   { category: "Identity", syntax: "{{user}}", description: "Current user or persona name" },
   { category: "Identity", syntax: "{{userName}}", description: "Alias for {{user}}" },
+  {
+    category: "Identity",
+    syntax: "{{userNamePhonetic}}",
+    description: "Active persona phonetic name, or {{user}} when none is configured",
+  },
   {
     category: "Identity",
     syntax: "{{persona}}",
@@ -231,7 +349,23 @@ export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
   { category: "Identity", syntax: "{{personaScenario}}", description: "Active persona scenario" },
   { category: "Identity", syntax: "{{char}}", description: "Current character name" },
   { category: "Identity", syntax: "{{charName}}", description: "Alias for {{char}}" },
+  {
+    category: "Identity",
+    syntax: "{{21-character-card-ID}}",
+    description:
+      "Name of another character, pulls the card into the context; referenced by its exact 21-character ID",
+  },
+  {
+    category: "Identity",
+    syntax: "{{charNamePhonetic}}",
+    description: "Current character phonetic name, or {{char}} when none is configured",
+  },
   { category: "Identity", syntax: "{{characters}}", description: "All character names, comma-separated" },
+  {
+    category: "Identity",
+    syntax: "{{group}}",
+    description: "Other active chat characters, excluding the current responder",
+  },
   { category: "Character", syntax: "{{description}}", description: "Current character description" },
   { category: "Character", syntax: "{{personality}}", description: "Current character personality" },
   { category: "Character", syntax: "{{backstory}}", description: "Current character backstory" },
@@ -244,12 +378,64 @@ export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
     syntax: "{{charPostHistory}}",
     description: "Current character post-history instructions",
   },
+  {
+    category: "Conversation",
+    syntax: "{{convo_display}}",
+    description: "Convo display name (Conversation mode only)",
+  },
+  { category: "Conversation", syntax: "{{char_about}}", description: "Character about-me (Conversation mode only)" },
+  { category: "Conversation", syntax: "{{persona_about}}", description: "Persona about-me (Conversation mode only)" },
+  {
+    category: "Conversation",
+    syntax: "{{convo_behavior}}",
+    description: "Character convo behavior directive (Conversation mode only)",
+  },
+  {
+    category: "Conversation",
+    syntax: "{{context}} / {{status}}",
+    description: "Place the context/status block here and skip its auto insertion (Conversation mode)",
+  },
+  {
+    category: "Conversation",
+    syntax: "{{commands}}",
+    description: "Place the commands reminder here and skip its auto insertion (Conversation mode)",
+  },
+  {
+    category: "Conversation",
+    syntax: "{{reactRules}}",
+    description: "Legacy placeholder; reaction syntax is now included in {{commands}} (Conversation mode)",
+  },
+  {
+    category: "Conversation",
+    syntax: "{{replyRules}}",
+    description: "Place the custom-emoji/sticker reply rules here and skip their auto insertion (Conversation mode)",
+  },
+  {
+    category: "Conversation",
+    syntax: "{{memories}}",
+    description: "Place the memory-recall block here and skip its auto insertion (Conversation mode)",
+  },
+  {
+    category: "Conversation",
+    syntax: "{{lorebook}}",
+    description: "Place lorebook injections here and skip their auto insertion (Conversation mode)",
+  },
   { category: "Context", syntax: "{{input}}", description: "Most recent user message" },
   { category: "Context", syntax: "{{model}}", description: "Current model name" },
   { category: "Context", syntax: "{{chatId}}", description: "Current chat ID" },
   { category: "Context", syntax: "{{lastGenerationType}}", description: "Current generation type label" },
   { category: "Context", syntax: "{{idle_duration}}", description: "Time since the last chat activity" },
   { category: "Context", syntax: "{{agent::TYPE}}", description: "Cached output for an agent or tracker type" },
+  {
+    category: "Lorebooks",
+    syntax: "{{outlet::name}}",
+    description: "Activated lorebook entries assigned to the exact, case-sensitive Outlet name",
+  },
+  {
+    category: "Game",
+    syntax: "{{gameStoryboardKeyframeCount}}",
+    description: "Current Game Mode Keyframes per Turn target (1-6, default 3)",
+  },
   { category: "Time", syntax: "{{date}}", description: "Current real date in the user's timezone" },
   { category: "Time", syntax: "{{time}}", description: "Current real time in the user's timezone" },
   { category: "Time", syntax: "{{datetime}} / {{isotime}}", description: "Current timestamp in the user's timezone" },
@@ -292,8 +478,8 @@ export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
   },
   {
     category: "Formatting",
-    syntax: '{{#if char == "Name"}}...{{else}}...{{/if}}',
-    description: "Conditional block; supports straight or typographic quotes",
+    syntax: '{{#if char == "Name" || "Other"}}...{{else}}...{{/if}}',
+    description: "Conditional block with ||, &&, parentheses, else branches, and straight or typographic quotes",
   },
   { category: "Formatting", syntax: "{{noop}}", description: "No-op placeholder removed from output" },
   { category: "Formatting", syntax: "{{// comment}}", description: "Inline author comment removed from output" },
@@ -303,6 +489,18 @@ export const SUPPORTED_MACROS: readonly SupportedMacroDefinition[] = [
     description: "Accepted with straight or typographic quotes, but currently stripped from output",
   },
 ];
+
+function normalizeMacroIdentity(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function resolveGroupCharacters(ctx: Pick<MacroContext, "characters" | "groupCharacters" | "char">): string {
+  const responderName = normalizeMacroIdentity(ctx.char);
+  return (ctx.groupCharacters ?? ctx.characters)
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0 && normalizeMacroIdentity(name) !== responderName)
+    .join(", ");
+}
 
 function getCharacterFieldValue(profile: CharacterMacroProfile, field: CharacterFieldMacroName): string {
   return stripMacroComments(profile[field] ?? "");
@@ -323,8 +521,11 @@ function resolveCharacterFieldValue(
 function macroContextForCharacterProfile(profile: CharacterMacroProfile, base?: MacroContext): MacroContext {
   return {
     user: base?.user ?? "User",
+    userPhonetic: base?.userPhonetic,
     char: profile.name,
+    charPhonetic: profile.phoneticName ?? profile.name,
     characters: base?.characters ?? [profile.name],
+    groupCharacters: base?.groupCharacters,
     characterProfiles: base?.characterProfiles ?? [profile],
     variables: base?.variables ?? {},
     lastInput: base?.lastInput,
@@ -335,7 +536,9 @@ function macroContextForCharacterProfile(profile: CharacterMacroProfile, base?: 
     timeZone: base?.timeZone,
     agentData: base?.agentData,
     personaFields: base?.personaFields,
+    convoFields: base?.convoFields,
     characterFields: {
+      phoneticName: profile.phoneticName ?? "",
       description: profile.description ?? "",
       personality: profile.personality ?? "",
       backstory: profile.backstory ?? "",
@@ -354,21 +557,20 @@ export function resolveCharacterScopedMacros(
   depth = 0,
   baseContext?: MacroContext,
 ): string {
-  const scoped = resolveConditionalBlocks(
-    stripMacroComments(template),
-    macroContextForCharacterProfile(profile, baseContext),
-    {},
-  );
+  const scopedContext = macroContextForCharacterProfile(profile, baseContext);
+  const scoped = resolveConditionalBlocks(stripMacroComments(template), scopedContext, {});
   return scoped
-    .replace(/\{\{char(?:Name)?\}\}/gi, profile.name)
-    .replace(/\{\{description\}\}/gi, () => resolveCharacterFieldValue(profile, "description", depth, baseContext))
-    .replace(/\{\{personality\}\}/gi, () => resolveCharacterFieldValue(profile, "personality", depth, baseContext))
-    .replace(/\{\{backstory\}\}/gi, () => resolveCharacterFieldValue(profile, "backstory", depth, baseContext))
-    .replace(/\{\{appearance\}\}/gi, () => resolveCharacterFieldValue(profile, "appearance", depth, baseContext))
-    .replace(/\{\{scenario\}\}/gi, () => resolveCharacterFieldValue(profile, "scenario", depth, baseContext))
-    .replace(/\{\{example\}\}/gi, () => resolveCharacterFieldValue(profile, "example", depth, baseContext))
-    .replace(/\{\{charSysInfo\}\}/gi, () => resolveCharacterFieldValue(profile, "systemPrompt", depth, baseContext))
-    .replace(/\{\{charPostHistory\}\}/gi, () =>
+    .replace(/\{\{\s*char(?:Name)?\s*\}\}/gi, profile.name)
+    .replace(/\{\{\s*char(?:Name)?Phonetic\s*\}\}/gi, profile.phoneticName ?? profile.name)
+    .replace(/\{\{\s*group\s*\}\}/gi, resolveGroupCharacters(scopedContext))
+    .replace(/\{\{\s*description\s*\}\}/gi, () => resolveCharacterFieldValue(profile, "description", depth, baseContext))
+    .replace(/\{\{\s*personality\s*\}\}/gi, () => resolveCharacterFieldValue(profile, "personality", depth, baseContext))
+    .replace(/\{\{\s*backstory\s*\}\}/gi, () => resolveCharacterFieldValue(profile, "backstory", depth, baseContext))
+    .replace(/\{\{\s*appearance\s*\}\}/gi, () => resolveCharacterFieldValue(profile, "appearance", depth, baseContext))
+    .replace(/\{\{\s*scenario\s*\}\}/gi, () => resolveCharacterFieldValue(profile, "scenario", depth, baseContext))
+    .replace(/\{\{\s*example\s*\}\}/gi, () => resolveCharacterFieldValue(profile, "example", depth, baseContext))
+    .replace(/\{\{\s*charSysInfo\s*\}\}/gi, () => resolveCharacterFieldValue(profile, "systemPrompt", depth, baseContext))
+    .replace(/\{\{\s*charPostHistory\s*\}\}/gi, () =>
       resolveCharacterFieldValue(profile, "postHistoryInstructions", depth, baseContext),
     );
 }
@@ -382,6 +584,8 @@ export function resolveDeferredCharacterMacros(
   const scopedContext = macroContextForCharacterProfile(profile, baseContext);
   let result = resolveDeferredCharacterConditionals(template, scopedContext);
   result = result.split(DEFERRED_CHARACTER_MACRO_TOKENS.char).join(profile.name);
+  result = result.split(DEFERRED_CHARACTER_MACRO_TOKENS.charPhonetic).join(profile.phoneticName ?? profile.name);
+  result = result.split(DEFERRED_CHARACTER_MACRO_TOKENS.group).join(resolveGroupCharacters(scopedContext));
   result = result
     .split(DEFERRED_CHARACTER_MACRO_TOKENS.description)
     .join(resolveCharacterFieldValue(profile, "description", 0, baseContext));
@@ -406,10 +610,19 @@ export function resolveDeferredCharacterMacros(
   result = result
     .split(DEFERRED_CHARACTER_MACRO_TOKENS.postHistoryInstructions)
     .join(resolveCharacterFieldValue(profile, "postHistoryInstructions", 0, baseContext));
+  result = result
+    .split(DEFERRED_CHARACTER_MACRO_TOKENS.convoDisplay)
+    .join(scopedContext.convoFields?.charDisplayName ?? "");
+  result = result
+    .split(DEFERRED_CHARACTER_MACRO_TOKENS.charAbout)
+    .join(scopedContext.convoFields?.charAbout ?? "");
+  result = result
+    .split(DEFERRED_CHARACTER_MACRO_TOKENS.convoBehavior)
+    .join(scopedContext.convoFields?.convoBehavior ?? "");
   return result;
 }
 
-function parseDeferredConditionalPayload(encoded: string): DeferredConditionalPayload | null {
+export function parseDeferredConditionalPayload(encoded: string): DeferredConditionalPayload | null {
   try {
     const parsed = JSON.parse(decodeURIComponent(encoded)) as Partial<DeferredConditionalPayload>;
     const branches = (parsed as Partial<ConditionalChainPayload>).branches;
@@ -446,9 +659,102 @@ function resolveDeferredCharacterConditionals(template: string, ctx: MacroContex
   });
 }
 
+function hasCharacterConditionalOperandCandidate(condition: string): boolean {
+  let quote: "single" | "double" | null = null;
+  let escaped = false;
+
+  for (let index = 0; index < condition.length; index++) {
+    const character = condition[index]!;
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (quoteKind(character) === quote) quote = null;
+      continue;
+    }
+
+    const nextQuote = quoteKind(character);
+    if (nextQuote) {
+      quote = nextQuote;
+      continue;
+    }
+
+    const candidateStart = character === "@" ? index + 1 : index;
+    let candidateEnd = candidateStart;
+    while (candidateEnd < condition.length) {
+      const code = condition.charCodeAt(candidateEnd);
+      const isIdentifierCharacter =
+        (code >= 48 && code <= 57) ||
+        (code >= 65 && code <= 90) ||
+        code === 95 ||
+        (code >= 97 && code <= 122);
+      if (!isIdentifierCharacter) break;
+      candidateEnd++;
+    }
+    if (candidateEnd === candidateStart) continue;
+    if (CHARACTER_CONDITIONAL_OPERAND_NAMES.has(condition.slice(candidateStart, candidateEnd).toLowerCase())) {
+      return true;
+    }
+    index = candidateEnd - 1;
+  }
+  return false;
+}
+
+function hasCharacterMacro(template: string): boolean {
+  const lowerTemplate = template.toLowerCase();
+  for (const name of CHARACTER_MACRO_NAMES) {
+    if (lowerTemplate.includes(`{{${name}}}`)) return true;
+  }
+
+  let searchIndex = 0;
+  while (searchIndex < template.length) {
+    const start = template.indexOf("{{", searchIndex);
+    if (start === -1) return false;
+    let bodyStart = start + 2;
+    while (bodyStart < template.length && /\s/u.test(template[bodyStart]!)) bodyStart++;
+    let nameEnd = bodyStart;
+    while (nameEnd < template.length && /[A-Za-z_]/u.test(template[nameEnd]!)) nameEnd++;
+    const name = template.slice(bodyStart, nameEnd).toLowerCase();
+    let directEnd = nameEnd;
+    while (directEnd < template.length && /\s/u.test(template[directEnd]!)) directEnd++;
+    if (template.startsWith("}}", directEnd) && CHARACTER_MACRO_NAMES.has(name)) return true;
+
+    const ifEnd = bodyStart + 3;
+    const elseIfEnd = directEnd + 2;
+    const isIf =
+      template.slice(bodyStart, ifEnd).toLowerCase() === "#if" &&
+      (template.startsWith("}}", ifEnd) || (ifEnd < template.length && /\s/u.test(template[ifEnd]!)));
+    const isElseIf =
+      name === "else" &&
+      directEnd > nameEnd &&
+      template.slice(directEnd, elseIfEnd).toLowerCase() === "if" &&
+      (template.startsWith("}}", elseIfEnd) ||
+        (elseIfEnd < template.length && /\s/u.test(template[elseIfEnd]!)));
+    if (!isIf && !isElseIf) {
+      searchIndex = Math.max(start + 2, nameEnd);
+      continue;
+    }
+
+    const end = findBalancedMacroEnd(template, start);
+    if (end === -1) {
+      return hasCharacterConditionalOperandCandidate(template.slice(bodyStart));
+    }
+    const body = template.slice(start + 2, end - 2).trim();
+    const condition = parseIfCondition(body) ?? parseElseIfCondition(body);
+    if (
+      condition !== null &&
+      hasCharacterConditionalOperandCandidate(condition) &&
+      (conditionDependsOnCharacter(condition) || conditionHasLegacyAdjacentCharacterReference(condition))
+    ) {
+      return true;
+    }
+    searchIndex = end;
+  }
+  return false;
+}
+
 function expandBracketedCharacterBlocks(template: string, ctx: MacroContext): string {
   const profiles = ctx.characterProfiles ?? [];
-  if (profiles.length <= 1 || !CHARACTER_MACRO_PATTERN.test(template)) {
+  if (profiles.length <= 1 || !hasCharacterMacro(template)) {
     return template;
   }
 
@@ -474,7 +780,7 @@ function expandBracketedCharacterBlocks(template: string, ctx: MacroContext): st
     }
 
     const block = lines.slice(index, endIndex + 1).join("\n");
-    if (!CHARACTER_MACRO_PATTERN.test(block)) {
+    if (!hasCharacterMacro(block)) {
       expandedLines.push(...lines.slice(index, endIndex + 1));
       index = endIndex;
       continue;
@@ -551,8 +857,11 @@ function replaceBalancedMacros(
   return result;
 }
 
-function encodeDeferredConditional(payload: DeferredConditionalPayload): string {
-  return `${DEFERRED_CHARACTER_CONDITIONAL_TOKEN_PREFIX}${encodeURIComponent(JSON.stringify(payload))}\x1f`;
+function encodeDeferredConditional(
+  payload: DeferredConditionalPayload,
+  prefix: string = DEFERRED_CHARACTER_CONDITIONAL_TOKEN_PREFIX,
+): string {
+  return `${prefix}${encodeURIComponent(JSON.stringify(payload))}\x1f`;
 }
 
 function quoteKind(value?: string): "single" | "double" | null {
@@ -566,7 +875,7 @@ function stripOuterQuotes(value: string): string | null {
   const trimmed = value.trim();
   if (trimmed.length < 2) return null;
   const openingKind = quoteKind(trimmed[0]);
-  if (!openingKind || quoteKind(trimmed.at(-1)) !== openingKind) return null;
+  if (!openingKind || quoteKind(trimmed[trimmed.length - 1]) !== openingKind) return null;
   return trimmed
     .slice(1, -1)
     .replace(/\\(["'\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\\])/g, "$1")
@@ -589,7 +898,7 @@ function resolvePersonaText(ctx: MacroContext): string {
     .join("\n");
 }
 
-function resolveConditionalOperand(raw: string, ctx: MacroContext): string {
+function resolveConditionalOperand(raw: string, ctx: MacroContext, options: ResolveMacroOptions): string {
   const quoted = stripOuterQuotes(raw);
   if (quoted !== null) return quoted;
 
@@ -601,9 +910,17 @@ function resolveConditionalOperand(raw: string, ctx: MacroContext): string {
     case "character":
     case "speaker":
       return ctx.char;
+    case "charphonetic":
+    case "charnamephonetic":
+    case "characterphonetic":
+    case "speakerphonetic":
+      return ctx.charPhonetic || ctx.characterFields?.phoneticName || ctx.char;
     case "user":
     case "username":
       return ctx.user;
+    case "userphonetic":
+    case "usernamephonetic":
+      return ctx.userPhonetic || ctx.personaFields?.phoneticName || ctx.user;
     case "persona":
       return resolvePersonaText(ctx);
     case "personadescription":
@@ -618,6 +935,8 @@ function resolveConditionalOperand(raw: string, ctx: MacroContext): string {
       return ctx.personaFields?.scenario ?? "";
     case "characters":
       return ctx.characters.join(", ");
+    case "group":
+      return resolveGroupCharacters(ctx);
     case "input":
       return ctx.lastInput ?? "";
     case "model":
@@ -645,33 +964,320 @@ function resolveConditionalOperand(raw: string, ctx: MacroContext): string {
         const name = token.replace(/^var[:.]/i, "").trim();
         return ctx.variables[name] ?? "";
       }
+      // Resolve any other bare operand through the same flat pass used for
+      // {{token}}, so every read macro valid in {{...}} is also testable bare in
+      // {{#if}} — conversation macros ({{char_about}} …), {{date}}/{{time}},
+      // {{agent::TYPE}}, {{lastGenerationType}}, etc. — instead of drifting out
+      // of sync with a hand-maintained switch (#3435). Guards:
+      //   • never run a variable-WRITE macro (side effect) as an operand;
+      //   • unknown tokens stay literal (the flat pass leaves them as-is), so a
+      //     plain word or number still compares as itself — unchanged behavior;
+      //   • force concrete resolution (deferCharacterMacros off) so a group chat
+      //     compares the real value, not a deferred per-character placeholder.
+      if (!/^(setvar|addvar|incvar|decvar)\b/i.test(token)) {
+        const braced = `{{${token}}}`;
+        const resolved = resolveMacros(braced, ctx, {
+          ...nestedMacroOptions(options),
+          trimResult: false,
+          deferCharacterMacros: undefined,
+        });
+        if (resolved !== braced) return resolved;
+      }
       return ctx.variables[token] ?? token;
   }
 }
 
 function isCharacterConditionalOperand(raw: string): boolean {
-  const normalized = normalizeConditionKey(raw);
-  return /^(char|charname|character|speaker|description|personality|backstory|appearance|scenario|example|charsysinfo|charposthistory)$/.test(
-    normalized,
-  );
+  return CHARACTER_CONDITIONAL_OPERAND_NAMES.has(normalizeConditionKey(raw));
 }
 
-function parseConditionExpression(condition: string): { left: string; operator: string; right?: string } {
-  const match = condition.match(
-    /^(.+?)\s*(>=|<=|>|<|==|!=|=|is\s+not|is|not\s+contains|not\s+includes|contains|includes)\s*(.+)$/i,
-  );
-  if (!match) return { left: condition.trim(), operator: "truthy" };
+type ParsedConditionExpression = { left: string; operator: string; right?: string };
+const CONDITION_WORD_OPERATOR_RE = /(?:is\s+not|not\s+contains|not\s+includes|contains|includes|is)(?=\s|$)/iyu;
+
+function parseConditionExpression(condition: string): ParsedConditionExpression {
+  const symbolicOperators = [">=", "<=", "==", "!=", ">", "<", "="] as const;
+  let quote: "single" | "double" | null = null;
+  let escaped = false;
+  let macroDepth = 0;
+
+  for (let index = 0; index < condition.length; index += 1) {
+    const character = condition[index]!;
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (quoteKind(character) === quote) quote = null;
+      continue;
+    }
+    if (macroDepth > 0) {
+      if (character === "{" && condition[index + 1] === "{") {
+        macroDepth += 1;
+        index += 1;
+      } else if (character === "}" && condition[index + 1] === "}") {
+        macroDepth -= 1;
+        index += 1;
+      }
+      continue;
+    }
+    const nextQuote = quoteKind(character);
+    if (nextQuote) {
+      quote = nextQuote;
+      continue;
+    }
+    if (character === "{" && condition[index + 1] === "{") {
+      macroDepth = 1;
+      index += 1;
+      continue;
+    }
+
+    const symbolicOperator = symbolicOperators.find((operator) => condition.startsWith(operator, index));
+    if (symbolicOperator) {
+      const left = condition.slice(0, index).trim();
+      const right = condition.slice(index + symbolicOperator.length).trim();
+      if (left && right) return { left, operator: symbolicOperator, right };
+    }
+
+    if (index === 0 || /\s/u.test(condition[index - 1]!)) {
+      CONDITION_WORD_OPERATOR_RE.lastIndex = index;
+      const wordMatch = CONDITION_WORD_OPERATOR_RE.exec(condition);
+      if (wordMatch?.[0]) {
+        const left = condition.slice(0, index).trim();
+        const right = condition.slice(index + wordMatch[0].length).trim();
+        if (left && right) {
+          return { left, operator: wordMatch[0].toLowerCase().replace(/\s+/g, " "), right };
+        }
+      }
+    }
+  }
+
+  return { left: condition.trim(), operator: "truthy" };
+}
+
+type ConditionSyntaxNode =
+  | { kind: "atom"; value: string }
+  | { kind: "and" | "or"; children: ConditionSyntaxNode[] }
+  | { kind: "group"; child: ConditionSyntaxNode }
+  | { kind: "adjacent"; children: ConditionSyntaxNode[] };
+
+type ConditionSyntaxFrame = {
+  atomStart: number;
+  andChildren: ConditionSyntaxNode[];
+  orChildren: ConditionSyntaxNode[];
+  expectsOperand: boolean;
+  literalParenthesisDepth: number;
+};
+
+function createConditionSyntaxFrame(atomStart: number): ConditionSyntaxFrame {
   return {
-    left: match[1]?.trim() ?? "",
-    operator: (match[2] ?? "").toLowerCase().replace(/\s+/g, " "),
-    right: match[3]?.trim() ?? "",
+    atomStart,
+    andChildren: [],
+    orChildren: [],
+    expectsOperand: true,
+    literalParenthesisDepth: 0,
   };
 }
 
+function appendConditionSyntaxNode(frame: ConditionSyntaxFrame, node: ConditionSyntaxNode): void {
+  if (!frame.expectsOperand) {
+    const previous = frame.andChildren.pop()!;
+    if (previous.kind === "adjacent") {
+      previous.children.push(node);
+      frame.andChildren.push(previous);
+    } else {
+      frame.andChildren.push({ kind: "adjacent", children: [previous, node] });
+    }
+    frame.expectsOperand = false;
+    return;
+  }
+  frame.andChildren.push(node);
+  frame.expectsOperand = false;
+}
+
+function conditionSyntaxNodeText(node: ConditionSyntaxNode): string {
+  const parts: string[] = [];
+  const pending: Array<ConditionSyntaxNode | string> = [node];
+  while (pending.length > 0) {
+    const part = pending.pop()!;
+    if (typeof part === "string") {
+      parts.push(part);
+    } else if (part.kind === "atom") {
+      parts.push(part.value);
+    } else if (part.kind === "group") {
+      pending.push(")", part.child, "(");
+    } else {
+      const separator = part.kind === "and" ? " && " : part.kind === "or" ? " || " : "";
+      for (let index = part.children.length - 1; index >= 0; index -= 1) {
+        pending.push(part.children[index]!);
+        if (index > 0 && separator) pending.push(separator);
+      }
+    }
+  }
+  return parts.join("");
+}
+
+function appendConditionAtom(
+  frame: ConditionSyntaxFrame,
+  condition: string,
+  end: number,
+  forceEmpty: boolean,
+): void {
+  const value = condition.slice(frame.atomStart, end).trim();
+  frame.atomStart = end;
+  if (!value && !(forceEmpty && frame.expectsOperand)) return;
+  appendConditionSyntaxNode(frame, { kind: "atom", value });
+}
+
+function combineConditionNodes(kind: "and" | "or", children: ConditionSyntaxNode[]): ConditionSyntaxNode {
+  return children.length === 1 ? children[0]! : { kind, children };
+}
+
+function finishConditionSyntaxFrame(frame: ConditionSyntaxFrame): ConditionSyntaxNode {
+  const andNode = combineConditionNodes("and", frame.andChildren);
+  if (frame.orChildren.length === 0) return andNode;
+  return combineConditionNodes("or", [...frame.orChildren, andNode]);
+}
+
+/** Parse the supported boolean grammar in one quote- and macro-aware pass. */
+function parseConditionSyntax(condition: string): ConditionSyntaxNode {
+  const frames = [createConditionSyntaxFrame(0)];
+  let quote: "single" | "double" | null = null;
+  let escaped = false;
+  let macroDepth = 0;
+
+  for (let index = 0; index < condition.length; index += 1) {
+    const character = condition[index]!;
+    const frame = frames[frames.length - 1]!;
+
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (quoteKind(character) === quote) quote = null;
+      continue;
+    }
+    if (macroDepth > 0) {
+      if (character === "{" && condition[index + 1] === "{") {
+        macroDepth += 1;
+        index += 1;
+      } else if (character === "}" && condition[index + 1] === "}") {
+        macroDepth -= 1;
+        index += 1;
+      }
+      continue;
+    }
+
+    const nextQuote = quoteKind(character);
+    if (nextQuote) {
+      quote = nextQuote;
+      continue;
+    }
+    if (character === "{" && condition[index + 1] === "{") {
+      macroDepth = 1;
+      index += 1;
+      continue;
+    }
+
+    if (character === "(") {
+      const prefix = condition.slice(frame.atomStart, index);
+      if (frame.literalParenthesisDepth === 0 && frame.expectsOperand && prefix.trim().length === 0) {
+        frames.push(createConditionSyntaxFrame(index + 1));
+      } else {
+        frame.literalParenthesisDepth += 1;
+      }
+      continue;
+    }
+
+    if (character === ")") {
+      if (frame.literalParenthesisDepth > 0) {
+        frame.literalParenthesisDepth -= 1;
+        continue;
+      }
+      if (frames.length === 1) {
+        if (frame.andChildren.length > 0) {
+          appendConditionSyntaxNode(frame, { kind: "atom", value: ")" });
+          frame.atomStart = index + 1;
+        }
+        continue;
+      }
+
+      appendConditionAtom(frame, condition, index, true);
+      const groupedNode = finishConditionSyntaxFrame(frame);
+      frames.pop();
+      const parent = frames[frames.length - 1]!;
+      appendConditionSyntaxNode(parent, { kind: "group", child: groupedNode });
+      parent.atomStart = index + 1;
+      continue;
+    }
+
+    const operator = frame.literalParenthesisDepth === 0 ? condition.slice(index, index + 2) : "";
+    if (operator !== "&&" && operator !== "||") continue;
+
+    appendConditionAtom(frame, condition, index, true);
+    if (operator === "||") {
+      frame.orChildren.push(combineConditionNodes("and", frame.andChildren));
+      frame.andChildren = [];
+    }
+    frame.expectsOperand = true;
+    frame.atomStart = index + 2;
+    index += 1;
+  }
+
+  // An unmatched opening parenthesis makes every operator after it nested in
+  // the legacy grammar. Treat that suffix as one atom without rescanning it.
+  const root = frames[0]!;
+  appendConditionAtom(root, condition, condition.length, true);
+  return finishConditionSyntaxFrame(root);
+}
+
+function parseConditionComparisons(condition: string): ParsedConditionExpression[] {
+  const comparisons: ParsedConditionExpression[] = [];
+  const pending = [parseConditionSyntax(condition)];
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    if (node.kind === "atom") {
+      comparisons.push(parseConditionExpression(node.value));
+    } else if (node.kind === "group") {
+      pending.push(node.child);
+    } else if (node.kind === "adjacent") {
+      comparisons.push(parseConditionExpression(conditionSyntaxNodeText(node)));
+    } else {
+      for (let index = node.children.length - 1; index >= 0; index -= 1) pending.push(node.children[index]!);
+    }
+  }
+  return comparisons;
+}
+
+// Bracket expansion historically recognized character operands even in
+// malformed adjacent groups such as `(char)()`. Keep that compatibility local
+// while comparison/deferred-operand consumers match the atom actually evaluated.
+function conditionHasLegacyAdjacentCharacterReference(condition: string): boolean {
+  const pending: Array<{ node: ConditionSyntaxNode; insideAdjacent: boolean }> = [
+    { node: parseConditionSyntax(condition), insideAdjacent: false },
+  ];
+  while (pending.length > 0) {
+    const { node, insideAdjacent } = pending.pop()!;
+    if (node.kind === "atom") {
+      if (!insideAdjacent) continue;
+      const parsed = parseConditionExpression(node.value);
+      if (
+        isCharacterConditionalOperand(parsed.left) ||
+        (parsed.right ? isCharacterConditionalOperand(parsed.right) : false)
+      ) {
+        return true;
+      }
+    } else if (node.kind === "group") {
+      pending.push({ node: node.child, insideAdjacent });
+    } else {
+      const childInsideAdjacent = insideAdjacent || node.kind === "adjacent";
+      for (const child of node.children) pending.push({ node: child, insideAdjacent: childInsideAdjacent });
+    }
+  }
+  return false;
+}
+
 function conditionDependsOnCharacter(condition: string): boolean {
-  const parsed = parseConditionExpression(condition);
-  return (
-    isCharacterConditionalOperand(parsed.left) || (parsed.right ? isCharacterConditionalOperand(parsed.right) : false)
+  return parseConditionComparisons(condition).some(
+    (parsed) =>
+      isCharacterConditionalOperand(parsed.left) ||
+      (parsed.right ? isCharacterConditionalOperand(parsed.right) : false),
   );
 }
 
@@ -725,12 +1331,156 @@ function resolveConditionMacros(condition: string, ctx: MacroContext, options: R
   });
 }
 
-function evaluateCondition(condition: string, ctx: MacroContext, options: ResolveMacroOptions = {}): boolean {
-  const parsed = parseConditionExpression(resolveConditionMacros(condition, ctx, options));
-  const left = resolveConditionalOperand(parsed.left, ctx);
+function evaluateParsedCondition(
+  parsed: ParsedConditionExpression,
+  ctx: MacroContext,
+  options: ResolveMacroOptions,
+): boolean {
+  const left = resolveConditionalOperand(parsed.left, ctx, options);
   if (parsed.operator === "truthy") return left.trim().length > 0 && !/^(false|0|no|off|null|undefined)$/i.test(left);
-  const right = resolveConditionalOperand(parsed.right ?? "", ctx);
+  const right = resolveConditionalOperand(parsed.right ?? "", ctx, options);
   return compareConditionValues(left, parsed.operator, right);
+}
+
+type EqualityShorthand = Pick<ParsedConditionExpression, "left" | "operator">;
+
+type ConditionEvaluationFrame =
+  | { kind: "group" }
+  | { kind: "and"; children: ConditionSyntaxNode[]; index: number }
+  | {
+      kind: "or";
+      children: ConditionSyntaxNode[];
+      index: number;
+      equalityShorthand: EqualityShorthand | null;
+    };
+
+function parseResolvedConditionAtom(
+  atom: string,
+  ctx: MacroContext,
+  options: ResolveMacroOptions,
+): ParsedConditionExpression {
+  return parseConditionExpression(resolveConditionMacros(atom, ctx, options));
+}
+
+function conditionSyntaxAtomValue(node: ConditionSyntaxNode): string | null {
+  if (node.kind === "atom") return node.value;
+  return node.kind === "adjacent" ? conditionSyntaxNodeText(node) : null;
+}
+
+function evaluateOrConditionAtom(
+  atom: string,
+  equalityShorthand: EqualityShorthand | null,
+  ctx: MacroContext,
+  options: ResolveMacroOptions,
+): { matches: boolean; equalityShorthand: EqualityShorthand | null } {
+  const parsed = parseResolvedConditionAtom(atom, ctx, options);
+  let effective = parsed;
+  let nextShorthand = equalityShorthand;
+  if (["=", "==", "is"].includes(parsed.operator) && parsed.right !== undefined) {
+    nextShorthand = { left: parsed.left, operator: parsed.operator };
+  } else if (equalityShorthand && parsed.operator === "truthy" && stripOuterQuotes(parsed.left) !== null) {
+    effective = { ...equalityShorthand, right: parsed.left };
+  }
+  return { matches: evaluateParsedCondition(effective, ctx, options), equalityShorthand: nextShorthand };
+}
+
+function evaluateConditionExpression(condition: string, ctx: MacroContext, options: ResolveMacroOptions): boolean {
+  const frames: ConditionEvaluationFrame[] = [];
+  let current: ConditionSyntaxNode | null = parseConditionSyntax(condition);
+  let result = false;
+
+  while (true) {
+    if (current) {
+      if (current.kind === "atom" || current.kind === "adjacent") {
+        result = evaluateParsedCondition(
+          parseResolvedConditionAtom(conditionSyntaxAtomValue(current)!, ctx, options),
+          ctx,
+          options,
+        );
+        current = null;
+      } else if (current.kind === "group") {
+        frames.push({ kind: "group" });
+        current = current.child;
+        continue;
+      } else if (current.kind === "and") {
+        frames.push({ kind: "and", children: current.children, index: 0 });
+        current = current.children[0]!;
+        continue;
+      } else {
+        const frame: ConditionEvaluationFrame = {
+          kind: "or",
+          children: current.children,
+          index: 0,
+          equalityShorthand: null,
+        };
+        frames.push(frame);
+        const child: ConditionSyntaxNode = current.children[0]!;
+        if (child.kind === "atom" || child.kind === "adjacent") {
+          const evaluated = evaluateOrConditionAtom(
+            conditionSyntaxAtomValue(child)!,
+            frame.equalityShorthand,
+            ctx,
+            options,
+          );
+          frame.equalityShorthand = evaluated.equalityShorthand;
+          result = evaluated.matches;
+          current = null;
+        } else {
+          current = child;
+        }
+        continue;
+      }
+    }
+
+    const frame = frames[frames.length - 1];
+    if (!frame) return result;
+    if (frame.kind === "group") {
+      frames.pop();
+      continue;
+    }
+    if (frame.kind === "and") {
+      if (!result) {
+        frames.pop();
+        continue;
+      }
+      frame.index += 1;
+      if (frame.index >= frame.children.length) {
+        frames.pop();
+        result = true;
+      } else {
+        current = frame.children[frame.index]!;
+      }
+      continue;
+    }
+
+    if (result) {
+      frames.pop();
+      continue;
+    }
+    frame.index += 1;
+    if (frame.index >= frame.children.length) {
+      frames.pop();
+      result = false;
+      continue;
+    }
+    const child = frame.children[frame.index]!;
+    if (child.kind === "atom" || child.kind === "adjacent") {
+      const evaluated = evaluateOrConditionAtom(
+        conditionSyntaxAtomValue(child)!,
+        frame.equalityShorthand,
+        ctx,
+        options,
+      );
+      frame.equalityShorthand = evaluated.equalityShorthand;
+      result = evaluated.matches;
+    } else {
+      current = child;
+    }
+  }
+}
+
+function evaluateCondition(condition: string, ctx: MacroContext, options: ResolveMacroOptions = {}): boolean {
+  return evaluateConditionExpression(condition, ctx, options);
 }
 
 type MacroTag = {
@@ -841,7 +1591,47 @@ function branchDependsOnCharacter(branches: ConditionalBranchPayload[]): boolean
   return branches.some((branch) => branch.condition !== null && conditionDependsOnCharacter(branch.condition));
 }
 
-function selectConditionalPayloadBranch(
+function conditionDependsOnDeferredOperand(condition: string, predicate: (operand: string) => boolean): boolean {
+  return parseConditionComparisons(condition).some(
+    (parsed) => predicate(parsed.left) || (parsed.right ? predicate(parsed.right) : false),
+  );
+}
+
+function branchDependsOnDeferredOperand(
+  branches: ConditionalBranchPayload[],
+  predicate: (operand: string) => boolean,
+): boolean {
+  return branches.some(
+    (branch) => branch.condition !== null && conditionDependsOnDeferredOperand(branch.condition, predicate),
+  );
+}
+
+/**
+ * Bake the standalone-block whitespace trim into a deferred block's branch
+ * contents so the later-filled value collapses onto the surrounding lines the
+ * same way an evaluated block would. Each branch's content starts right after
+ * its governing tag ({{#if}}/{{else}}/{{else if}}), so under a standalone
+ * opening the leading newline of WHICHEVER branch is later selected must be
+ * dropped — matching the evaluate-now path, which strips the selected branch's
+ * leading newline regardless of which one it is (#3449). The trailing {{/if}}
+ * indent trim applies only to the last branch (only its line's standalone-ness
+ * was measured).
+ */
+function trimDeferredStandaloneBranches(
+  branches: ConditionalBranchPayload[],
+  openStandalone: boolean,
+  closeStandalone: boolean,
+): ConditionalBranchPayload[] {
+  if (!openStandalone && !closeStandalone) return branches;
+  return branches.map((branch, index) => {
+    let content = branch.content;
+    if (openStandalone) content = content.replace(/^[ \t]*\n/, "");
+    if (closeStandalone && index === branches.length - 1) content = content.replace(/\n[ \t]*$/, "\n");
+    return { condition: branch.condition, content };
+  });
+}
+
+export function selectConditionalPayloadBranch(
   payload: DeferredConditionalPayload,
   ctx: MacroContext,
   options: ResolveMacroOptions,
@@ -922,14 +1712,62 @@ function resolveConditionalBlocks(input: string, ctx: MacroContext, options: Res
       content: input.slice(branch.contentStart, branch.contentEnd),
     }));
 
-    result += resolveVariableOperationMacros(input.slice(index, blockStart), ctx, options);
-    if (options.deferCharacterMacros && branchDependsOnCharacter(branches)) {
+    const preTag = input.slice(index, blockStart);
+    // Resolve the pre-tag text first so its side effects (e.g. {{setvar}}) are
+    // applied before the condition is evaluated — preserves original ordering.
+    const resolvedPreTag = resolveVariableOperationMacros(preTag, ctx, options);
+
+    // Standalone-block whitespace control (Jinja trim_blocks / lstrip_blocks):
+    // when the {{#if}} and/or {{/if}} tag occupies its own line, collapse that
+    // tag line so a block — whether removed, rendered, or deferred — never
+    // leaves a stray blank line (#3435). Judged from the raw layout; each side
+    // is decided independently, so inline tags stay exactly as authored.
+    const openLineStart = /(^|\n)[ \t]*$/.test(preTag);
+    const openLineEnd = /^[ \t]*\n/.test(input.slice(contentStart));
+    const openStandalone = openLineStart && openLineEnd;
+    const closeLineIndentStart = input.lastIndexOf("\n", blockEnd.endStart - 1) + 1;
+    const closeLineStart = /^[ \t]*$/.test(input.slice(closeLineIndentStart, blockEnd.endStart));
+    const closeTrailing = input.slice(blockEnd.endEnd).match(/^[ \t]*\n/);
+    const closeStandalone = closeLineStart && closeTrailing !== null;
+
+    const deferCharacter = Boolean(options.deferCharacterMacros) && branchDependsOnCharacter(branches);
+    const deferRelocation =
+      !deferCharacter &&
+      options.deferConditionalOperand !== undefined &&
+      branchDependsOnDeferredOperand(branches, options.deferConditionalOperand);
+
+    if (deferCharacter) {
+      // Per-character deferral keeps its original (untrimmed) behavior.
+      result += resolvedPreTag;
       result += encodeDeferredConditional({ branches });
+      index = blockEnd.endEnd;
+    } else if (deferRelocation) {
+      // The operand's value isn't known during macro resolution; encode the
+      // block — with the standalone trim baked into the stored branches — for
+      // the caller to evaluate later against the real value.
+      result += openStandalone ? resolvedPreTag.replace(/[ \t]*$/, "") : resolvedPreTag;
+      result += encodeDeferredConditional(
+        { branches: trimDeferredStandaloneBranches(branches, openStandalone, closeStandalone) },
+        DEFERRED_RELOCATION_CONDITIONAL_TOKEN_PREFIX,
+      );
+      index = closeStandalone && closeTrailing ? blockEnd.endEnd + closeTrailing[0].length : blockEnd.endEnd;
     } else {
       const selected = selectConditionalPayloadBranch({ branches }, ctx, options);
-      result += resolveConditionalBlocks(selected, ctx, options);
+      const resolvedBlock = resolveConditionalBlocks(selected, ctx, options);
+      let emittedPre = resolvedPreTag;
+      let emittedBlock = resolvedBlock;
+      let nextIndex = blockEnd.endEnd;
+      if (openStandalone) {
+        emittedPre = emittedPre.replace(/[ \t]*$/, ""); // lstrip {{#if}} indent
+        emittedBlock = emittedBlock.replace(/^[ \t]*\n/, ""); // trim newline after {{#if}}
+      }
+      if (closeStandalone) {
+        emittedBlock = emittedBlock.replace(/[ \t]*$/, ""); // lstrip {{/if}} indent
+        nextIndex = blockEnd.endEnd + closeTrailing![0].length; // trim newline after {{/if}}
+      }
+      result += emittedPre + emittedBlock;
+      index = nextIndex;
     }
-    index = blockEnd.endEnd;
   }
 
   return result;
@@ -1023,7 +1861,7 @@ function pickWeightedRandomChoice(choices: string[], options: ResolveMacroOption
     if (roll < 0) return choice.text;
   }
 
-  return weightedChoices.at(-1)?.text ?? "";
+  return weightedChoices[weightedChoices.length - 1]?.text ?? "";
 }
 
 type MacroDateTimeParts = {
@@ -1097,7 +1935,9 @@ function formatMacroDateTime(now: Date, requestedTimeZone?: string): MacroDateTi
  *  - {{user}} — user's display name
  *  - {{persona}} — active persona description, personality, backstory, appearance, and scenario joined by new lines
  *  - {{char}} — current character name
+ *  - {{CHARACTER_ID}} — name of another character card referenced by its exact ID
  *  - {{characters}} — comma-separated list of all character names
+ *  - {{group}} — comma-separated list of other active chat characters
  *  - {{description}} / {{personality}} / {{backstory}} / {{appearance}} / {{scenario}} / {{example}} — current character card fields
  *  - {{charSysInfo}} / {{charPostHistory}} — current character instruction fields
  *  - {{date}} — current real date in the user's timezone (YYYY-MM-DD)
@@ -1121,6 +1961,8 @@ function formatMacroDateTime(now: Date, requestedTimeZone?: string): MacroDateTi
  *  - {{chatId}} — current chat ID
  *  - {{lastGenerationType}} — current generation type label
  *  - {{idle_duration}} — time since the last chat activity
+ *  - {{outlet::name}} — activated lorebook entries assigned to a named Outlet
+ *  - {{gameStoryboardKeyframeCount}} — current Game Mode Keyframes per Turn target
  *  - {{// comment}} — removed (author comments)
  *  - {{trim}} — remove surrounding whitespace
  *  - {{trimStart}} / {{trimEnd}} — directional trim markers
@@ -1129,7 +1971,7 @@ function formatMacroDateTime(now: Date, requestedTimeZone?: string): MacroDateTi
  *  - {{banned "text"}} — content filter (removed for now)
  *  - {{uppercase}}...{{/uppercase}} — convert to uppercase
  *  - {{lowercase}}...{{/lowercase}} — convert to lowercase
- *  - {{#if char == "Name"}}...{{else}}...{{/if}} — conditional block
+ *  - {{#if char == "Name" || "Other"}}...{{else}}...{{/if}} — conditional block with OR/AND logic
  */
 export function resolveMacros(template: string, ctx: MacroContext, options: ResolveMacroOptions = {}): string {
   const macroDepth = options.macroDepth ?? 0;
@@ -1162,12 +2004,19 @@ export function resolveMacros(template: string, ctx: MacroContext, options: Reso
   };
   const deferCharacterMacros = options.deferCharacterMacros;
   const characterReplacement = (field: keyof typeof DEFERRED_CHARACTER_MACRO_TOKENS): string => {
-    if (deferCharacterMacros === "all" || (deferCharacterMacros === "names" && field === "char")) {
+    const isNameField = field === "char" || field === "charPhonetic" || field === "group";
+    if (deferCharacterMacros === "all" || (deferCharacterMacros === "names" && isNameField)) {
       return DEFERRED_CHARACTER_MACRO_TOKENS[field];
     }
     if (field === "char") return ctx.char;
-    return resolveNestedFieldMacros(ctx.characterFields?.[field] ?? "");
+    if (field === "charPhonetic") return ctx.charPhonetic || ctx.characterFields?.phoneticName || ctx.char;
+    if (field === "group") return resolveGroupCharacters(ctx);
+    return resolveNestedFieldMacros(ctx.characterFields?.[field as CharacterFieldMacroName] ?? "");
   };
+  const conversationCharacterReplacement = (
+    field: "convoDisplay" | "charAbout" | "convoBehavior",
+    value: string | undefined,
+  ): string => (deferCharacterMacros === "all" ? DEFERRED_CHARACTER_MACRO_TOKENS[field] : (value ?? ""));
 
   // ── Comments — strip first so they don't interfere ──
   result = stripMacroComments(result);
@@ -1203,6 +2052,10 @@ export function resolveMacros(template: string, ctx: MacroContext, options: Reso
 
   // ── Static substitutions ──
   result = result.replace(/\{\{user(?:Name)?\}\}/gi, ctx.user);
+  result = result.replace(
+    /\{\{user(?:Name)?Phonetic\}\}/gi,
+    ctx.userPhonetic || ctx.personaFields?.phoneticName || ctx.user,
+  );
   // The gated build above can be skipped when {{persona}} only materializes
   // mid-pipeline (e.g. substituted in by an earlier pass), so fall back to
   // building here. String form is kept so $-sequences in persona text
@@ -1226,7 +2079,9 @@ export function resolveMacros(template: string, ctx: MacroContext, options: Reso
     resolveNestedFieldMacros(ctx.personaFields?.scenario ?? ""),
   );
   result = result.replace(/\{\{char(?:Name)?\}\}/gi, characterReplacement("char"));
+  result = result.replace(/\{\{char(?:Name)?Phonetic\}\}/gi, characterReplacement("charPhonetic"));
   result = result.replace(/\{\{characters\}\}/gi, ctx.characters.join(", "));
+  result = result.replace(/\{\{group\}\}/gi, characterReplacement("group"));
   result = result.replace(/\{\{description\}\}/gi, characterReplacement("description"));
   result = result.replace(/\{\{personality\}\}/gi, characterReplacement("personality"));
   result = result.replace(/\{\{backstory\}\}/gi, characterReplacement("backstory"));
@@ -1235,21 +2090,46 @@ export function resolveMacros(template: string, ctx: MacroContext, options: Reso
   result = result.replace(/\{\{example\}\}/gi, characterReplacement("example"));
   result = result.replace(/\{\{charSysInfo\}\}/gi, characterReplacement("systemPrompt"));
   result = result.replace(/\{\{charPostHistory\}\}/gi, characterReplacement("postHistoryInstructions"));
+  // Conversation-mode-only macros. `convoFields` is set only by the convo prompt
+  // branch, so these are "" in every other mode.
+  result = result.replace(/\{\{convo_display\}\}/gi, () =>
+    conversationCharacterReplacement("convoDisplay", ctx.convoFields?.charDisplayName),
+  );
+  result = result.replace(/\{\{char_about\}\}/gi, () =>
+    conversationCharacterReplacement("charAbout", ctx.convoFields?.charAbout),
+  );
+  result = result.replace(/\{\{persona_about\}\}/gi, () => ctx.convoFields?.personaAbout ?? "");
+  result = result.replace(/\{\{convo_behavior\}\}/gi, () =>
+    conversationCharacterReplacement("convoBehavior", ctx.convoFields?.convoBehavior),
+  );
   result = result.replace(/\{\{input\}\}/gi, ctx.lastInput ?? "");
   result = result.replace(/\{\{model\}\}/gi, ctx.model ?? "");
   result = result.replace(/\{\{chatId\}\}/gi, ctx.chatId ?? "");
   result = result.replace(/\{\{lastGenerationType\}\}/gi, ctx.lastGenerationType ?? "");
   result = result.replace(/\{\{idle_duration\}\}/gi, ctx.idleDuration ?? "");
+  const unresolvedCharacterReferences = new Set<string>();
+  result = result.replace(CHARACTER_REFERENCE_ID_PATTERN, (match, characterId: string) => {
+    const reference = ctx.characterReferences?.[characterId];
+    if (reference !== undefined) return reference;
+    unresolvedCharacterReferences.add(characterId);
+    return match;
+  });
 
   // ── Date/time ──
+  // #3164: formatting the date/time parts constructs Intl.DateTimeFormat — a
+  // large share of the pipeline's fixed cost — so build them only when a
+  // date/time macro is actually present. `now` is still captured once per
+  // invocation so all six macros agree on the instant. (Function replacers
+  // are output-identical here: date strings never contain "$" sequences.)
   const now = new Date();
-  const macroDateTime = formatMacroDateTime(now, ctx.timeZone);
-  result = result.replace(/\{\{date\}\}/gi, macroDateTime.date);
-  result = result.replace(/\{\{time\}\}/gi, macroDateTime.time);
-  result = result.replace(/\{\{datetime\}\}/gi, macroDateTime.datetime);
-  result = result.replace(/\{\{isotime\}\}/gi, macroDateTime.isoTime);
-  result = result.replace(/\{\{weekday\}\}/gi, macroDateTime.weekday);
-  result = result.replace(/\{\{timezone\}\}/gi, macroDateTime.timeZone);
+  let macroDateTime: ReturnType<typeof formatMacroDateTime> | null = null;
+  const getMacroDateTime = () => (macroDateTime ??= formatMacroDateTime(now, ctx.timeZone));
+  result = result.replace(/\{\{date\}\}/gi, () => getMacroDateTime().date);
+  result = result.replace(/\{\{time\}\}/gi, () => getMacroDateTime().time);
+  result = result.replace(/\{\{datetime\}\}/gi, () => getMacroDateTime().datetime);
+  result = result.replace(/\{\{isotime\}\}/gi, () => getMacroDateTime().isoTime);
+  result = result.replace(/\{\{weekday\}\}/gi, () => getMacroDateTime().weekday);
+  result = result.replace(/\{\{timezone\}\}/gi, () => getMacroDateTime().timeZone);
 
   // ── Random values ──
   result = result.replace(/\{\{random\}\}/gi, (original) => {
@@ -1319,6 +2199,7 @@ export function resolveMacros(template: string, ctx: MacroContext, options: Reso
   // ── Catch-all: resolve any remaining {{name}} from variables ──
   // This allows preset variables like {{POV}} to resolve directly
   result = result.replace(/\{\{(\w+)\}\}/g, (match, name) => {
+    if (unresolvedCharacterReferences.has(name)) return match;
     const val = ctx.variables[name];
     return val !== undefined ? val : match; // leave unknown macros as-is
   });
@@ -1329,6 +2210,18 @@ export function resolveMacros(template: string, ctx: MacroContext, options: Reso
   // dice rolls, variable writes, or other macros back into this resolution.
   result = result.replace(/\{\{agent::([\w-]+)\}\}/gi, (_, type) => {
     return ctx.agentData?.[type] ?? "";
+  });
+
+  // Outlet content has already passed through lorebook macro resolution before
+  // it is collected. Insert it after every executable macro pass so Outlet
+  // content cannot recursively invoke another Outlet or introduce side effects.
+  result = replaceBalancedMacros(result, (body) => {
+    const match = body.match(/^outlet::([\s\S]*)$/i);
+    if (!match) return undefined;
+    const name = (match[1] ?? "").trim();
+    return name && ctx.outlets && Object.prototype.hasOwnProperty.call(ctx.outlets, name)
+      ? ctx.outlets[name]!
+      : "";
   });
 
   if (options.trimResult !== false) {

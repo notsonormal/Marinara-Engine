@@ -1,7 +1,7 @@
 // ──────────────────────────────────────────────
 // Storage: Lorebooks
 // ──────────────────────────────────────────────
-import { eq, desc, and, like, inArray, asc, or } from "drizzle-orm";
+import { eq, desc, and, like, inArray, asc, or } from "../../db/file-query.js";
 import type { DB } from "../../db/connection.js";
 import {
   characters,
@@ -15,25 +15,36 @@ import {
 import { newId, now } from "../../utils/id-generator.js";
 import {
   LIMITS,
+  normalizeLorebookCategory,
   type CreateLorebookInput,
   type UpdateLorebookInput,
   type CreateLorebookEntryInput,
   type UpdateLorebookEntryInput,
+  type BulkUpdateLorebookEntriesInput,
   type CreateLorebookFolderInput,
+  type LorebookEntry,
   type UpdateLorebookFolderInput,
 } from "@marinara-engine/shared";
 import { collectEffectivelyDisabledFolderIds, collectFolderSubtreeIds } from "@marinara-engine/shared";
 import { normalizeTimestampOverrides, type TimestampOverrides } from "../import/import-timestamps.js";
-import { GAME_LOREBOOK_KEEPER_SOURCE_ID } from "../lorebook/game-lorebook-scope.js";
 import { toPaginatedList } from "../../utils/list-pagination.js";
 
 function normalizeLorebookEntryLimit(value: unknown): number {
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(parsed)) return LIMITS.LOREBOOK_ENTRY_LIMIT_DEFAULT;
-  return Math.max(
-    LIMITS.LOREBOOK_ENTRY_LIMIT_MIN,
-    Math.min(LIMITS.LOREBOOK_ENTRY_LIMIT_MAX, Math.trunc(parsed)),
-  );
+  return Math.max(LIMITS.LOREBOOK_ENTRY_LIMIT_MIN, Math.min(LIMITS.LOREBOOK_ENTRY_LIMIT_MAX, Math.trunc(parsed)));
+}
+
+function normalizeNonNegativeLorebookInteger(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.trunc(parsed));
+}
+
+function normalizeLorebookMaxRecursionDepth(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return 3;
+  return Math.max(1, Math.min(10, Math.trunc(parsed)));
 }
 
 function normalizeLorebookVectorQueryDepth(value: unknown): number {
@@ -115,26 +126,10 @@ type LorebookScopeFilters = {
 
 type LinkedLorebook = {
   id: string;
-  characterId?: string | null;
-  characterIds?: string[];
-  personaId?: string | null;
-  personaIds?: string[];
-  chatId?: string | null;
-  sourceAgentId?: string | null;
 };
 
 function activeLorebookMatchesFilters(book: LinkedLorebook, filters: LorebookScopeFilters): boolean {
-  if (!filters.activeLorebookIds?.includes(book.id)) return false;
-  if (book.sourceAgentId === GAME_LOREBOOK_KEEPER_SOURCE_ID) return true;
-
-  const characterIds = resolveLinkIds(book.characterIds, book.characterId);
-  if (characterIds.length > 0) return characterIds.some((id) => filters.characterIds?.includes(id));
-
-  const personaIds = resolveLinkIds(book.personaIds, book.personaId);
-  if (personaIds.length > 0) return !!filters.personaId && personaIds.includes(filters.personaId);
-
-  if (book.chatId) return book.chatId === filters.chatId;
-  return true;
+  return filters.activeLorebookIds?.includes(book.id) === true;
 }
 
 /** Parse DB row booleans ("true"/"false") → real booleans and JSON strings → objects. */
@@ -143,15 +138,19 @@ function parseLorebookRow(row: Record<string, unknown>) {
   const personaIds = resolveLinkIds(row.personaIds, row.personaId);
   return {
     ...row,
+    category: normalizeLorebookCategory(row.category),
+    scanDepth: normalizeNonNegativeLorebookInteger(row.scanDepth, 2),
+    tokenBudget: normalizeNonNegativeLorebookInteger(row.tokenBudget, 2048),
     recursiveScanning: row.recursiveScanning === "true",
     entryLimit: normalizeLorebookEntryLimit(row.entryLimit),
-    maxRecursionDepth: typeof row.maxRecursionDepth === "number" ? row.maxRecursionDepth : 3,
+    maxRecursionDepth: normalizeLorebookMaxRecursionDepth(row.maxRecursionDepth),
     excludeFromVectorization: row.excludeFromVectorization === "true",
     vectorQueryDepth: normalizeLorebookVectorQueryDepth(row.vectorQueryDepth),
     vectorScoreThreshold: normalizeLorebookVectorScoreThreshold(row.vectorScoreThreshold),
     vectorMaxResults: normalizeLorebookVectorMaxResults(row.vectorMaxResults),
     isGlobal: row.isGlobal === "true",
     enabled: row.enabled === "true",
+    hiddenFromLibrary: row.hiddenFromLibrary === "true",
     scope: parseLorebookScope(row.scope),
     imagePath: row.imagePath || null,
     generatedBy: row.generatedBy || null,
@@ -166,7 +165,11 @@ function parseLorebookRow(row: Record<string, unknown>) {
 }
 
 function parseStringArray(value: unknown): string[] {
-  const normalize = (items: unknown[]) => items.map(String).map((item) => item.trim()).filter(Boolean);
+  const normalize = (items: unknown[]) =>
+    items
+      .map(String)
+      .map((item) => item.trim())
+      .filter(Boolean);
   if (Array.isArray(value)) return normalize(value);
   if (typeof value !== "string" || !value.trim()) return [];
   try {
@@ -383,7 +386,7 @@ export function createLorebooksStorage(db: DB) {
     },
 
     async listPage(options: LorebookListPageOptions) {
-      const clauses = [];
+      const clauses = [eq(lorebooks.hiddenFromLibrary, "false")];
       if (options.category) clauses.push(eq(lorebooks.category, options.category));
       const pattern = likePattern(options.search);
       if (pattern) {
@@ -497,6 +500,7 @@ export function createLorebooksStorage(db: DB) {
           chatId: input.chatId ?? null,
           isGlobal: String(input.isGlobal ?? false),
           enabled: String(input.enabled ?? true),
+          hiddenFromLibrary: String(input.hiddenFromLibrary ?? false),
           scope: JSON.stringify(parseLorebookScope(input.scope)),
           tags: input.tags ? JSON.stringify(input.tags) : "[]",
           generatedBy: input.generatedBy ?? null,
@@ -530,30 +534,69 @@ export function createLorebooksStorage(db: DB) {
         updates.vectorMaxResults = normalizeLorebookVectorMaxResults(input.vectorMaxResults);
       const shouldUpdateCharacterLinks = input.characterIds !== undefined || input.characterId !== undefined;
       const shouldUpdatePersonaLinks = input.personaIds !== undefined || input.personaId !== undefined;
-      const current = shouldUpdateCharacterLinks || shouldUpdatePersonaLinks ? ((await this.getById(id)) as any) : null;
-      if ((shouldUpdateCharacterLinks || shouldUpdatePersonaLinks) && !current) return null;
-      const nextCharacterIds = shouldUpdateCharacterLinks
-        ? resolveLinkIds(input.characterIds, input.characterId)
-        : ((current?.characterIds as string[] | undefined) ?? []);
-      const nextPersonaIds = shouldUpdatePersonaLinks
-        ? resolveLinkIds(input.personaIds, input.personaId)
-        : ((current?.personaIds as string[] | undefined) ?? []);
-      if (shouldUpdateCharacterLinks) updates.characterId = nextCharacterIds[0] ?? null;
-      if (shouldUpdatePersonaLinks) updates.personaId = nextPersonaIds[0] ?? null;
       if (input.chatId !== undefined) updates.chatId = input.chatId;
       if (input.isGlobal !== undefined) updates.isGlobal = String(input.isGlobal);
       if (input.enabled !== undefined) updates.enabled = String(input.enabled);
+      if (input.hiddenFromLibrary !== undefined) updates.hiddenFromLibrary = String(input.hiddenFromLibrary);
       if (input.scope !== undefined) updates.scope = JSON.stringify(parseLorebookScope(input.scope));
       if (input.tags !== undefined) updates.tags = JSON.stringify(input.tags);
       if (input.generatedBy !== undefined) updates.generatedBy = input.generatedBy;
       if (input.sourceAgentId !== undefined) updates.sourceAgentId = input.sourceAgentId;
 
-      await db.transaction(async (tx) => {
-        await tx.update(lorebooks).set(updates).where(eq(lorebooks.id, id));
+      const updated = await db.transaction(async (tx) => {
+        const transactionalUpdates = { ...updates };
+        let nextCharacterIds: string[] = [];
+        let nextPersonaIds: string[] = [];
+        if (shouldUpdateCharacterLinks || shouldUpdatePersonaLinks) {
+          const currentRows = await tx.select().from(lorebooks).where(eq(lorebooks.id, id));
+          const current = currentRows[0];
+          if (!current) return false;
+          const currentCharacterLinks = await tx
+            .select()
+            .from(lorebookCharacterLinks)
+            .where(eq(lorebookCharacterLinks.lorebookId, id));
+          const currentPersonaLinks = await tx
+            .select()
+            .from(lorebookPersonaLinks)
+            .where(eq(lorebookPersonaLinks.lorebookId, id));
+          const currentCharacterIds = resolveLinkIds(
+            currentCharacterLinks.map((link) => link.characterId),
+            current.characterId,
+          );
+          const currentPersonaIds = resolveLinkIds(
+            currentPersonaLinks.map((link) => link.personaId),
+            current.personaId,
+          );
+          nextCharacterIds = shouldUpdateCharacterLinks
+            ? resolveLinkIds(input.characterIds, input.characterId)
+            : currentCharacterIds;
+          nextPersonaIds = shouldUpdatePersonaLinks
+            ? resolveLinkIds(input.personaIds, input.personaId)
+            : currentPersonaIds;
+          if (shouldUpdateCharacterLinks) transactionalUpdates.characterId = nextCharacterIds[0] ?? null;
+          if (shouldUpdatePersonaLinks) transactionalUpdates.personaId = nextPersonaIds[0] ?? null;
+
+          const nextChatId = input.chatId !== undefined ? input.chatId : current.chatId;
+          const nextIsGlobal = input.isGlobal !== undefined ? input.isGlobal : current.isGlobal === "true";
+          const lostFinalOwner =
+            (currentCharacterIds.length > 0 || currentPersonaIds.length > 0) &&
+            nextCharacterIds.length === 0 &&
+            nextPersonaIds.length === 0 &&
+            !nextChatId &&
+            !nextIsGlobal;
+          if (lostFinalOwner) {
+            if (input.enabled === undefined) transactionalUpdates.enabled = "false";
+            if (input.hiddenFromLibrary === undefined) transactionalUpdates.hiddenFromLibrary = "false";
+          }
+        }
+
+        await tx.update(lorebooks).set(transactionalUpdates).where(eq(lorebooks.id, id));
         if (shouldUpdateCharacterLinks || shouldUpdatePersonaLinks) {
           await syncLorebookLinks(tx, id, nextCharacterIds, nextPersonaIds);
         }
+        return true;
       });
+      if (!updated) return null;
       return this.getById(id);
     },
 
@@ -588,10 +631,79 @@ export function createLorebooksStorage(db: DB) {
     },
 
     /**
+     * Resolve explicitly attached entries without requiring normal character/persona/global scope.
+     * Disabled books, entries, folders, chat exclusions, and excluded agent sources still win.
+     */
+    async listEligibleEntriesByIds(
+      entryIds: string[],
+      filters?: { excludedLorebookIds?: string[]; excludedSourceAgentIds?: string[] },
+    ): Promise<LorebookEntry[]> {
+      const requestedIds = uniqueStrings(entryIds).slice(0, LIMITS.MAX_LOREBOOK_ENTRIES);
+      if (requestedIds.length === 0) return [];
+
+      const entryRows = await db
+        .select()
+        .from(lorebookEntries)
+        .where(and(inArray(lorebookEntries.id, requestedIds), eq(lorebookEntries.enabled, "true")));
+      if (entryRows.length === 0) return [];
+
+      const candidateBookIds = uniqueStrings(entryRows.map((row) => row.lorebookId));
+      const enabledBookRows = await db
+        .select()
+        .from(lorebooks)
+        .where(and(inArray(lorebooks.id, candidateBookIds), eq(lorebooks.enabled, "true")));
+      const enabledBooks = (await hydrateLorebookRows(db, enabledBookRows)) as unknown as Array<{
+        id: string;
+        sourceAgentId?: string | null;
+      }>;
+      const excludedLorebookIds = new Set(filters?.excludedLorebookIds ?? []);
+      const excludedSourceAgentIds = new Set(filters?.excludedSourceAgentIds ?? []);
+      const allowedBookIds = new Set(
+        enabledBooks
+          .filter(
+            (book) =>
+              !excludedLorebookIds.has(book.id) &&
+              !(book.sourceAgentId && excludedSourceAgentIds.has(book.sourceAgentId)),
+          )
+          .map((book) => book.id),
+      );
+      if (allowedBookIds.size === 0) return [];
+
+      const folderRows = await db
+        .select({
+          id: lorebookFolders.id,
+          parentFolderId: lorebookFolders.parentFolderId,
+          enabled: lorebookFolders.enabled,
+        })
+        .from(lorebookFolders)
+        .where(inArray(lorebookFolders.lorebookId, Array.from(allowedBookIds)));
+      const disabledFolderIds = collectEffectivelyDisabledFolderIds(
+        folderRows.map((row) => ({
+          id: row.id,
+          parentFolderId: row.parentFolderId,
+          enabled: row.enabled === "true",
+        })),
+      );
+      const requestedOrder = new Map(requestedIds.map((id, index) => [id, index]));
+      const parsedEntries = entryRows.map((row) => parseEntryRow(row as Record<string, unknown>)) as Array<
+        ReturnType<typeof parseEntryRow> & { id: string; lorebookId: string; folderId: string | null }
+      >;
+      return parsedEntries
+        .filter(
+          (entry) =>
+            allowedBookIds.has(entry.lorebookId) &&
+            (!entry.folderId || !disabledFolderIds.has(entry.folderId as string)),
+        )
+        .sort(
+          (left, right) => (requestedOrder.get(left.id) ?? 0) - (requestedOrder.get(right.id) ?? 0),
+        ) as unknown as LorebookEntry[];
+    },
+
+    /**
      * Get all enabled entries from lorebooks that are relevant for a given context.
      * A lorebook is relevant if it's enabled AND one of:
      *  - `isGlobal` is true
-     *  - Its ID is in `activeLorebookIds`, while any character/persona/chat owner link still matches this context
+     *  - Its ID is in `activeLorebookIds`
      *  - Its `characterId` matches one of the chat's active characters
      *  - Its `personaId` matches the chat's active persona
      *  - Its `chatId` matches the current chat
@@ -634,7 +746,7 @@ export function createLorebooksStorage(db: DB) {
           if (b.sourceAgentId && excludedSourceAgentIds.has(b.sourceAgentId)) return false;
           // Globally active lorebooks bypass all scope filters
           if (b.isGlobal) return true;
-          // Explicitly added to this chat, while still respecting owner links.
+          // Explicitly added to this chat.
           if (activeLorebookMatchesFilters(b, filters)) return true;
           // Belongs to one of the active characters
           if ((b.characterIds ?? []).some((id) => filters.characterIds?.includes(id))) return true;
@@ -721,6 +833,7 @@ export function createLorebooksStorage(db: DB) {
         generationTriggerFilters: JSON.stringify(input.generationTriggerFilters ?? []),
         additionalMatchingSources: JSON.stringify(input.additionalMatchingSources ?? []),
         position: input.position ?? 0,
+        outletName: input.outletName ?? "",
         depth: input.depth ?? 0,
         order: input.order ?? 100,
         role: input.role ?? "system",
@@ -748,8 +861,12 @@ export function createLorebooksStorage(db: DB) {
 
     async updateEntry(id: string, input: UpdateLorebookEntryInput) {
       const updates: Record<string, unknown> = { updatedAt: now() };
+      // Must cover EXACTLY the fields buildLorebookEntryEmbeddingText embeds
+      // (name, description, keys, secondary keys, content) — description was
+      // omitted, so editing only the description left a stale embedding.
       const shouldClearEmbedding =
         input.name !== undefined ||
+        input.description !== undefined ||
         input.content !== undefined ||
         input.keys !== undefined ||
         input.secondaryKeys !== undefined ||
@@ -804,6 +921,7 @@ export function createLorebooksStorage(db: DB) {
       if (input.additionalMatchingSources !== undefined)
         updates.additionalMatchingSources = JSON.stringify(input.additionalMatchingSources);
       if (input.position !== undefined) updates.position = input.position;
+      if (input.outletName !== undefined) updates.outletName = input.outletName;
       if (input.depth !== undefined) updates.depth = input.depth;
       if (input.order !== undefined) updates.order = input.order;
       if (input.role !== undefined) updates.role = input.role;
@@ -822,14 +940,81 @@ export function createLorebooksStorage(db: DB) {
       if (input.locked !== undefined) updates.locked = String(input.locked);
       if (input.preventRecursion !== undefined) updates.preventRecursion = String(input.preventRecursion);
       if (input.excludeRecursion !== undefined) updates.excludeRecursion = String(input.excludeRecursion);
-      if (input.delayUntilRecursion !== undefined)
-        updates.delayUntilRecursion = String(input.delayUntilRecursion);
+      if (input.delayUntilRecursion !== undefined) updates.delayUntilRecursion = String(input.delayUntilRecursion);
       if (input.excludeFromVectorization !== undefined)
         updates.excludeFromVectorization = String(input.excludeFromVectorization);
       if (shouldClearEmbedding) updates.embedding = null;
 
       await db.update(lorebookEntries).set(updates).where(eq(lorebookEntries.id, id));
       return this.getEntry(id);
+    },
+
+    async bulkUpdateEntries(
+      lorebookId: string,
+      entryIds: string[],
+      changes: BulkUpdateLorebookEntriesInput["changes"],
+    ) {
+      const uniqueEntryIds = Array.from(new Set(entryIds));
+      const rows = await db
+        .select({ id: lorebookEntries.id })
+        .from(lorebookEntries)
+        .where(and(eq(lorebookEntries.lorebookId, lorebookId), inArray(lorebookEntries.id, uniqueEntryIds)));
+      if (rows.length !== uniqueEntryIds.length) {
+        throw new Error("One or more selected entries do not belong to this lorebook");
+      }
+
+      if (changes.folderId !== undefined) {
+        await assertFolderBelongsToLorebook(lorebookId, changes.folderId);
+      }
+
+      const updates: Record<string, unknown> = { updatedAt: now() };
+      if (changes.enabled !== undefined) updates.enabled = String(changes.enabled);
+      if (changes.constant !== undefined) updates.constant = String(changes.constant);
+      if (changes.selective !== undefined) updates.selective = String(changes.selective);
+      if (changes.selectiveLogic !== undefined) updates.selectiveLogic = changes.selectiveLogic;
+      if (changes.probability !== undefined) updates.probability = changes.probability;
+      if (changes.scanDepth !== undefined) updates.scanDepth = changes.scanDepth;
+      if (changes.matchWholeWords !== undefined) updates.matchWholeWords = String(changes.matchWholeWords);
+      if (changes.caseSensitive !== undefined) updates.caseSensitive = String(changes.caseSensitive);
+      if (changes.useRegex !== undefined) updates.useRegex = String(changes.useRegex);
+      if (changes.characterFilterMode !== undefined) updates.characterFilterMode = changes.characterFilterMode;
+      if (changes.characterFilterIds !== undefined)
+        updates.characterFilterIds = JSON.stringify(changes.characterFilterIds);
+      if (changes.characterTagFilterMode !== undefined) updates.characterTagFilterMode = changes.characterTagFilterMode;
+      if (changes.characterTagFilters !== undefined)
+        updates.characterTagFilters = JSON.stringify(changes.characterTagFilters);
+      if (changes.generationTriggerFilterMode !== undefined)
+        updates.generationTriggerFilterMode = changes.generationTriggerFilterMode;
+      if (changes.generationTriggerFilters !== undefined)
+        updates.generationTriggerFilters = JSON.stringify(changes.generationTriggerFilters);
+      if (changes.additionalMatchingSources !== undefined)
+        updates.additionalMatchingSources = JSON.stringify(changes.additionalMatchingSources);
+      if (changes.position !== undefined) updates.position = changes.position;
+      if (changes.outletName !== undefined) updates.outletName = changes.outletName;
+      if (changes.depth !== undefined) updates.depth = changes.depth;
+      if (changes.order !== undefined) updates.order = changes.order;
+      if (changes.role !== undefined) updates.role = changes.role;
+      if (changes.sticky !== undefined) updates.sticky = changes.sticky;
+      if (changes.cooldown !== undefined) updates.cooldown = changes.cooldown;
+      if (changes.delay !== undefined) updates.delay = changes.delay;
+      if (changes.ephemeral !== undefined) updates.ephemeral = changes.ephemeral;
+      if (changes.group !== undefined) updates.group = changes.group;
+      if (changes.groupWeight !== undefined) updates.groupWeight = changes.groupWeight;
+      if (changes.folderId !== undefined) updates.folderId = changes.folderId;
+      if (changes.tag !== undefined) updates.tag = changes.tag;
+      if (changes.locked !== undefined) updates.locked = String(changes.locked);
+      if (changes.preventRecursion !== undefined) updates.preventRecursion = String(changes.preventRecursion);
+      if (changes.excludeRecursion !== undefined) updates.excludeRecursion = String(changes.excludeRecursion);
+      if (changes.delayUntilRecursion !== undefined) updates.delayUntilRecursion = String(changes.delayUntilRecursion);
+      if (changes.excludeFromVectorization !== undefined)
+        updates.excludeFromVectorization = String(changes.excludeFromVectorization);
+      if (changes.excludeFromVectorization === true) updates.embedding = null;
+
+      await db
+        .update(lorebookEntries)
+        .set(updates)
+        .where(and(eq(lorebookEntries.lorebookId, lorebookId), inArray(lorebookEntries.id, uniqueEntryIds)));
+      return { updated: rows.length };
     },
 
     /** Update just the embedding vector for an entry. */
@@ -963,7 +1148,8 @@ export function createLorebooksStorage(db: DB) {
         lorebookId,
         name: input.name,
         enabled: String(input.enabled ?? true),
-        // v1 ignores any non-null parentFolderId — caller is the route layer.
+        // Honors input.parentFolderId (null = root); the route layer validates
+        // the parent (exists, same lorebook, no cycle) before calling.
         parentFolderId: input.parentFolderId ?? null,
         order,
         createdAt: timestamp,

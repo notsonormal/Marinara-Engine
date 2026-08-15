@@ -10,7 +10,9 @@ import { usePresetFull, useUpdatePreset } from "../../hooks/use-presets";
 import { useUpdateChatMetadata } from "../../hooks/use-chats";
 import { CheckCircle2, Circle, CheckSquare2, Square, ListChecks, Shuffle, Save } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { arePresetChoiceSelectionsComplete } from "../../lib/preset-choice-selection";
 import { SettingsSwitch } from "../panels/settings/SettingControls";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 interface ChoiceSelectionModalProps {
   open: boolean;
@@ -91,6 +93,7 @@ export function ChoiceSelectionModal({
   existingChoices = {},
   chatFloatingPanel = false,
 }: ChoiceSelectionModalProps) {
+  const { t: localizeUi } = useUiTranslation();
   const { data } = usePresetFull(presetId);
   const isLoading = !data && !!presetId;
   const updateMetadata = useUpdateChatMetadata();
@@ -174,13 +177,7 @@ export function ChoiceSelectionModal({
   // Merged view: base + user overrides
   const selections = useMemo(() => ({ ...baseSelections, ...overrides }), [baseSelections, overrides]);
 
-  const allSelected = variables.every((v) => {
-    const sel = selections[v.variableName];
-    if (v.multiSelect) return Array.isArray(sel) && sel.length > 0;
-    // Single-option variables are boolean toggles — both ON and OFF are valid
-    if (v.options.length === 1) return sel !== undefined;
-    return sel !== undefined && sel !== "";
-  });
+  const allSelected = arePresetChoiceSelectionsComplete(variables, selections);
 
   const handleConfirm = useCallback(() => {
     // Save selections to chat metadata
@@ -211,7 +208,7 @@ export function ChoiceSelectionModal({
     <Modal
       open={open}
       onClose={onClose}
-      title="Configure Preset Variables"
+      title={localizeUi("ui.presets.choiceselectionmodal.configurePresetVariables")}
       width="max-w-lg"
       chatFloatingPanel={chatFloatingPanel}
     >
@@ -223,9 +220,7 @@ export function ChoiceSelectionModal({
         ) : null
       ) : (
         <div className="space-y-4 p-4">
-          <p className="text-xs text-[var(--muted-foreground)]">
-            This preset has configurable variables. Select option(s) for each to customize your experience.
-          </p>
+          <p className="text-xs text-[var(--muted-foreground)]">{localizeUi("ui.presets.choiceselectionmodal.thisPresetHasConfigurableVariablesSelectOptionSFor")}</p>
 
           {variables.map((v) => {
             const presentedOptions = getPresentedOptions(v);
@@ -234,24 +229,19 @@ export function ChoiceSelectionModal({
               <div key={v.id} className="rounded-xl border border-[var(--border)] bg-[var(--secondary)] p-3">
               <h4 className="mb-1 text-xs font-semibold text-[var(--foreground)]">{v.question}</h4>
               <div className="mb-2 flex items-center gap-2">
-                <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-                  Variable: <code className="text-[var(--foreground)]">{`{{${v.variableName}}}`}</code>
+                <p className="text-[0.625rem] text-[var(--muted-foreground)]">{localizeUi("ui.presets.choiceselectionmodal.variable")} <code className="text-[var(--foreground)]">{`{{${v.variableName}}}`}</code>
                 </p>
                 {v.options.length === 1 && !v.multiSelect && (
-                  <span className="flex items-center gap-0.5 rounded bg-[var(--accent)] px-1.5 py-0.5 text-[0.5625rem] font-medium text-[var(--foreground)]">
-                    Boolean toggle
-                  </span>
+                  <span className="flex items-center gap-0.5 rounded bg-[var(--accent)] px-1.5 py-0.5 text-[0.5625rem] font-medium text-[var(--foreground)]">{localizeUi("ui.presets.choiceselectionmodal.booleanToggle")}</span>
                 )}
                 {v.multiSelect && (
                   <span className="flex items-center gap-0.5 rounded bg-[var(--accent)] px-1.5 py-0.5 text-[0.5625rem] font-medium text-[var(--foreground)]">
                     {v.randomPick ? (
                       <>
-                        <Shuffle size="0.5625rem" /> Random pick
-                      </>
+                        <Shuffle size="0.5625rem" /> {localizeUi("ui.presets.choiceselectionmodal.randomPick")}</>
                     ) : (
                       <>
-                        <ListChecks size="0.5625rem" /> Multi-select
-                      </>
+                        <ListChecks size="0.5625rem" /> {localizeUi("ui.presets.choiceselectionmodal.multiSelect")}</>
                     )}
                   </span>
                 )}
@@ -266,7 +256,7 @@ export function ChoiceSelectionModal({
                       setOverrides((prev) => ({ ...prev, [v.variableName]: next }));
                     }}
                     size={Math.min(8, Math.max(4, presentedOptions.length))}
-                    className="min-h-28 w-full rounded-lg bg-[var(--background)] px-2 py-2 text-xs text-[var(--foreground)] ring-1 ring-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
+                    className="mari-preset-native-select min-h-28 w-full rounded-lg bg-[var(--background)] px-2 py-2 text-xs text-[var(--foreground)] ring-1 ring-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
                   >
                     {presentedOptions.map((opt) => (
                       <option key={opt.id} value={opt.value}>
@@ -278,7 +268,7 @@ export function ChoiceSelectionModal({
                   <select
                     value={typeof selections[v.variableName] === "string" ? (selections[v.variableName] as string) : ""}
                     onChange={(e) => setOverrides((prev) => ({ ...prev, [v.variableName]: e.target.value }))}
-                    className="w-full rounded-lg bg-[var(--background)] px-3 py-2 text-xs text-[var(--foreground)] ring-1 ring-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
+                    className="mari-preset-native-select w-full rounded-lg bg-[var(--background)] px-3 py-2 text-xs text-[var(--foreground)] ring-1 ring-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
                   >
                     {presentedOptions.map((opt) => (
                       <option key={opt.id} value={opt.value}>
@@ -417,22 +407,18 @@ export function ChoiceSelectionModal({
                 onChange={setSaveAsDefault}
                 className="p-0 hover:bg-transparent"
               />
-              <Save size="0.75rem" />
-              Save as default
-            </div>
+              <Save size="0.75rem" />{localizeUi("ui.presets.choiceselectionmodal.saveAsDefault")}</div>
             <div className="flex gap-2">
               <button
                 onClick={onClose}
                 className="rounded-xl px-4 py-2 text-xs font-medium text-[var(--muted-foreground)] hover:bg-[var(--accent)]"
-              >
-                Skip
-              </button>
+              >{localizeUi("onboarding.actions.skip")}</button>
               <button
                 onClick={handleConfirm}
                 disabled={!allSelected || updateMetadata.isPending}
                 className="rounded-xl bg-[var(--primary)] px-4 py-2 text-xs font-medium text-[var(--primary-foreground)] shadow-md transition-all hover:opacity-90 active:scale-[0.98] disabled:opacity-50"
               >
-                {updateMetadata.isPending ? "Saving…" : "Confirm Choices"}
+                {updateMetadata.isPending ?localizeUi("chat.settings.inlineEditor.saving") :localizeUi("ui.presets.choiceselectionmodal.confirmChoices")}
               </button>
             </div>
           </div>

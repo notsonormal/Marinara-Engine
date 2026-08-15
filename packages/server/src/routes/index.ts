@@ -41,8 +41,8 @@ import { chatFoldersRoutes } from "./chat-folders.routes.js";
 import { connectionFoldersRoutes } from "./connection-folders.routes.js";
 import { chatPresetsRoutes } from "./chat-presets.routes.js";
 import { updatesRoutes } from "./updates.routes.js";
+import { docsRoutes } from "./docs.routes.js";
 import { themesRoutes } from "./themes.routes.js";
-import { extensionsRoutes } from "./extensions.routes.js";
 import { appSettingsRoutes } from "./app-settings.routes.js";
 import { achievementsRoutes } from "./achievements.routes.js";
 import { gameRoutes } from "./game.routes.js";
@@ -53,8 +53,15 @@ import { ttsRoutes } from "./tts.routes.js";
 import { promptOverridesRoutes } from "./prompt-overrides.routes.js";
 import { csrfDiagnosticsRoutes } from "./csrf-diagnostics.routes.js";
 import { professorMariWorkspaceRoutes } from "./professor-mari-workspace.routes.js";
+import { capabilityPackagesRoutes } from "./capability-packages.routes.js";
+import { customAgentRepositoriesRoutes } from "./custom-agent-repositories.routes.js";
+import { personalExtensionsRoutes } from "./personal-extensions.routes.js";
+import { notificationSoundRoutes } from "./notification-sound.routes.js";
+import { libraryFoldersRoutes } from "./library-folders.routes.js";
+import { androidLocalAuthRoutes } from "../middleware/android-local-auth.js";
 
 export async function registerRoutes(app: FastifyInstance) {
+  await app.register(androidLocalAuthRoutes, { prefix: "/api/android-auth" });
   await app.register(chatsRoutes, { prefix: "/api/chats" });
   await app.register(chatFoldersRoutes, { prefix: "/api/chat-folders" });
   await app.register(chatPresetsRoutes, { prefix: "/api/chat-presets" });
@@ -63,6 +70,7 @@ export async function registerRoutes(app: FastifyInstance) {
   await app.register(promptsRoutes, { prefix: "/api/prompts" });
   await app.register(connectionsRoutes, { prefix: "/api/connections" });
   await app.register(connectionFoldersRoutes, { prefix: "/api/connection-folders" });
+  await app.register(libraryFoldersRoutes, { prefix: "/api/library-folders" });
   await app.register(agentsRoutes, { prefix: "/api/agents" });
   await app.register(customToolsRoutes, { prefix: "/api/custom-tools" });
   await app.register(generateRoutes, { prefix: "/api/generate" });
@@ -94,8 +102,8 @@ export async function registerRoutes(app: FastifyInstance) {
   await app.register(botBrowserWyvernRoutes, { prefix: "/api/bot-browser" });
   await app.register(botBrowserDatacatRoutes, { prefix: "/api/bot-browser" });
   await app.register(updatesRoutes, { prefix: "/api/updates" });
+  await app.register(docsRoutes, { prefix: "/api/docs" });
   await app.register(themesRoutes, { prefix: "/api/themes" });
-  await app.register(extensionsRoutes, { prefix: "/api/extensions" });
   await app.register(appSettingsRoutes, { prefix: "/api/app-settings" });
   await app.register(achievementsRoutes, { prefix: "/api/achievements" });
   await app.register(gameRoutes, { prefix: "/api/game" });
@@ -105,6 +113,10 @@ export async function registerRoutes(app: FastifyInstance) {
   await app.register(promptOverridesRoutes, { prefix: "/api/prompt-overrides" });
   await app.register(csrfDiagnosticsRoutes, { prefix: "/api/csrf" });
   await app.register(professorMariWorkspaceRoutes, { prefix: "/api/professor-mari/workspace" });
+  await app.register(capabilityPackagesRoutes, { prefix: "/api/capability-packages" });
+  await app.register(customAgentRepositoriesRoutes, { prefix: "/api/custom-agent-repositories" });
+  await app.register(personalExtensionsRoutes, { prefix: "/api/personal-extensions" });
+  await app.register(notificationSoundRoutes, { prefix: "/api/notification-sound" });
   if (process.env.MARINARA_LITE !== "true" && process.env.MARINARA_LITE !== "1") {
     await app.register(sidecarRoutes, { prefix: "/api/sidecar" });
   }

@@ -1,8 +1,10 @@
 import { LOCAL_SIDECAR_CONNECTION_ID } from "@marinara-engine/shared";
 import type { createConnectionsStorage } from "../storage/connections.storage.js";
-import type { BaseLLMProvider } from "../llm/base-provider.js";
+import type { BaseLLMProvider, ChatOptions } from "../llm/base-provider.js";
 import { getLocalSidecarProvider, LOCAL_SIDECAR_MODEL } from "../llm/local-sidecar.js";
 import { createLLMProvider } from "../llm/provider-registry.js";
+import { withConnectionFallbackProvider } from "../llm/connection-fallback-provider.js";
+import { resolveStoredChatOptions } from "../generation/generation-parameters.js";
 
 type ConnectionsStorage = ReturnType<typeof createConnectionsStorage>;
 type ConnectionWithKey = NonNullable<Awaited<ReturnType<ConnectionsStorage["getWithKey"]>>>;
@@ -21,6 +23,8 @@ export type ResolvedChatSummaryConnection =
       connectionId: string;
       source: SummaryConnectionSource;
       warnings: string[];
+      temperature?: number;
+      enabledParameters?: ChatOptions["enabledParameters"];
     }
   | {
       ok: false;
@@ -36,6 +40,20 @@ function pushUniqueCandidate(candidates: SummaryConnectionCandidate[], candidate
   if (!candidate) return;
   if (candidates.some((entry) => entry.id === candidate.id)) return;
   candidates.push(candidate);
+}
+
+export function resolveChatSummaryTemperatureOptions(connection: {
+  temperature?: number;
+  enabledParameters?: ChatOptions["enabledParameters"];
+}): Pick<ChatOptions, "temperature" | "enabledParameters"> {
+  const hasTemperature = typeof connection.temperature === "number";
+  return {
+    ...(hasTemperature ? { temperature: connection.temperature } : {}),
+    enabledParameters: {
+      ...connection.enabledParameters,
+      temperature: hasTemperature,
+    },
+  };
 }
 
 async function resolveRandomConnection(
@@ -71,19 +89,22 @@ export async function resolveChatSummaryConnection(args: {
   const candidates: SummaryConnectionCandidate[] = [];
   const summaryConnectionId = normalizeId(args.chatMetadata.summaryConnectionId);
   const defaultAgentConnection = await args.connections.getDefaultForAgents();
+  const fallbackAgentConnection = await args.connections.getFallbackForAgents();
+  const wrapWithFallback = (provider: BaseLLMProvider, primaryConnectionId: string) =>
+    withConnectionFallbackProvider({
+      primary: provider,
+      primaryConnectionId,
+      fallbackConnection: fallbackAgentConnection,
+      fallbackBaseUrl: fallbackAgentConnection ? args.resolveBaseUrl(fallbackAgentConnection) : "",
+      category: "agents",
+    });
 
-  pushUniqueCandidate(
-    candidates,
-    summaryConnectionId ? { id: summaryConnectionId, source: "summary" } : null,
-  );
+  pushUniqueCandidate(candidates, summaryConnectionId ? { id: summaryConnectionId, source: "summary" } : null);
   pushUniqueCandidate(
     candidates,
     defaultAgentConnection?.id ? { id: defaultAgentConnection.id, source: "agent-default" } : null,
   );
-  pushUniqueCandidate(
-    candidates,
-    args.chatConnectionId ? { id: args.chatConnectionId, source: "chat" } : null,
-  );
+  pushUniqueCandidate(candidates, args.chatConnectionId ? { id: args.chatConnectionId, source: "chat" } : null);
 
   if (candidates.length === 0) {
     return { ok: false, error: "No API connection configured for chat summary", warnings };
@@ -93,7 +114,7 @@ export async function resolveChatSummaryConnection(args: {
     if (candidate.id === LOCAL_SIDECAR_CONNECTION_ID) {
       return {
         ok: true,
-        provider: getLocalSidecarProvider(),
+        provider: wrapWithFallback(getLocalSidecarProvider(), LOCAL_SIDECAR_CONNECTION_ID),
         model: LOCAL_SIDECAR_MODEL,
         connectionId: LOCAL_SIDECAR_CONNECTION_ID,
         source: candidate.source,
@@ -107,27 +128,42 @@ export async function resolveChatSummaryConnection(args: {
       warnings.push(`Connection ${conn.id} is an image-generation connection`);
       continue;
     }
+    if (conn.provider === "video_generation") {
+      warnings.push(`Connection ${conn.id} is a video-generation connection`);
+      continue;
+    }
 
     const baseUrl = args.resolveBaseUrl(conn);
     if (!baseUrl) {
       warnings.push(`Connection ${conn.id} has no base URL`);
       continue;
     }
+    const storedOptions = resolveStoredChatOptions(conn.defaultParameters, conn.provider, conn.model);
+    const temperature =
+      storedOptions.enabledParameters?.temperature === false ? undefined : storedOptions.temperature;
 
     return {
       ok: true,
-      provider: createLLMProvider(
-        conn.provider,
-        baseUrl,
-        conn.apiKey,
-        conn.maxContext,
-        conn.openrouterProvider,
-        conn.maxTokensOverride,
+      provider: wrapWithFallback(
+        createLLMProvider(
+          conn.provider,
+          baseUrl,
+          conn.apiKey,
+          conn.maxContext,
+          conn.openrouterProvider,
+          conn.maxTokensOverride,
+          conn.claudeFastMode === "true",
+          conn.treatAsLocalEndpoint === "true",
+          conn.defaultParameters,
+        ),
+        conn.id,
       ),
       model: conn.model,
       connectionId: conn.id,
       source: candidate.source,
       warnings,
+      ...(typeof temperature === "number" ? { temperature } : {}),
+      ...(storedOptions.enabledParameters ? { enabledParameters: storedOptions.enabledParameters } : {}),
     };
   }
 

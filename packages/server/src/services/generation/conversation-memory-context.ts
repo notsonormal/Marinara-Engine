@@ -1,5 +1,9 @@
+import type { WrapFormat } from "@marinara-engine/shared";
+
 import { logger } from "../../lib/logger.js";
-import { escapeXmlText } from "../prompt/prompt-escaping.js";
+import { getZonedDayBounds } from "../conversation/timezone.js";
+import { wrapContent } from "../prompt/format-engine.js";
+import { sanitizePromptLeaf } from "../prompt/prompt-escaping.js";
 
 type CharactersStore = {
   getById(id: string): Promise<{ data: unknown } | null>;
@@ -16,14 +20,17 @@ export async function mergeConversationCharacterMemories({
   chars,
   characterIds,
   awarenessBlock,
+  timeZone,
+  wrapFormat,
 }: {
   chars: CharactersStore;
   characterIds: string[];
   awarenessBlock: string | null;
+  timeZone?: string;
+  wrapFormat: WrapFormat;
 }): Promise<string | null> {
   const memoryLines: string[] = [];
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const today = getZonedDayBounds(new Date(), timeZone).start;
 
   for (const characterId of characterIds) {
     const charRow = await chars.getById(characterId);
@@ -44,15 +51,20 @@ export async function mergeConversationCharacterMemories({
     const validMemories = memories.filter((memory) => new Date(memory.createdAt) >= today);
 
     for (const memory of validMemories) {
-      memoryLines.push(`Memory from ${escapeXmlText(memory.from)}: ${escapeXmlText(memory.summary)}`);
+      memoryLines.push(
+        `Memory from ${sanitizePromptLeaf(memory.from, wrapFormat)}: ${sanitizePromptLeaf(memory.summary, wrapFormat)}`,
+      );
     }
   }
 
   if (memoryLines.length === 0) return awarenessBlock;
 
-  const memoriesSection = `\n\n## Memories\n${memoryLines.join("\n")}`;
+  const memoriesSection = wrapContent(memoryLines.join("\n"), "Memories", wrapFormat, 1);
   if (awarenessBlock) {
-    return awarenessBlock.replace(/<\/awareness>$/, memoriesSection + "\n</awareness>");
+    if (wrapFormat === "xml") {
+      return awarenessBlock.replace(/<\/awareness>$/, `${memoriesSection}\n</awareness>`);
+    }
+    return `${awarenessBlock}\n\n${memoriesSection}`;
   }
-  return `<awareness>\n${memoriesSection.trimStart()}\n</awareness>`;
+  return wrapContent(memoriesSection, "Awareness", wrapFormat);
 }

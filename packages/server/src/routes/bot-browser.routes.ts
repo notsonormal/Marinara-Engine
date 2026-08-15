@@ -1,12 +1,17 @@
 // ──────────────────────────────────────────────
 // Routes: Browser (proxy to character sources)
 // ──────────────────────────────────────────────
-import type { FastifyInstance } from "fastify";
-import { isAllowedImageBuffer, safeFetch } from "../utils/security.js";
+import type { FastifyInstance, FastifyPluginOptions } from "fastify";
+import {
+  fetchBotBrowserJson,
+  type BotBrowserJsonFetchOptions,
+} from "../services/bot-browser/fetch-json.js";
+import { resolveValidatedImage, safeFetch } from "../utils/security.js";
 
 const CHUB_API_BASE = "https://api.chub.ai";
 const CHUB_AVATARS = "https://avatars.charhub.io";
 const AVATAR_PROXY_MAX_BYTES = 10 * 1024 * 1024;
+const CARD_DOWNLOAD_MAX_BYTES = 256 * 1024 * 1024;
 
 async function fetchAvatarImage(url: string, signal: AbortSignal) {
   const res = await safeFetch(url, {
@@ -16,31 +21,17 @@ async function fetchAvatarImage(url: string, signal: AbortSignal) {
   });
   if (!res.ok) return null;
   const buf = Buffer.from(await res.arrayBuffer());
-  const contentType = res.headers.get("content-type")?.toLowerCase() ?? "";
-  const imageInfo = isAllowedImageBuffer(buf);
-  if (!contentType.startsWith("image/") || !imageInfo) {
-    throw new Error("Unsupported avatar image content");
-  }
-  return { buf, mimeType: imageInfo.mimeType };
+  const image = resolveValidatedImage(buf);
+  if (!image) throw new Error("Unsupported avatar image content");
+  return { buf, mimeType: image.mimeType };
 }
 
-/** Safely proxy-fetch an external URL, returning sanitised JSON. */
-async function proxyFetch(url: string, init?: RequestInit): Promise<unknown> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30_000);
-  try {
-    const res = await fetch(url, { ...init, signal: controller.signal });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`Upstream ${res.status}: ${text.slice(0, 300)}`);
-    }
-    return res.json();
-  } finally {
-    clearTimeout(timeout);
-  }
+export interface BotBrowserRoutesOptions extends FastifyPluginOptions {
+  fetchJson?: (url: string | URL, options: BotBrowserJsonFetchOptions) => Promise<unknown>;
 }
 
-export async function botBrowserRoutes(app: FastifyInstance) {
+export async function botBrowserRoutes(app: FastifyInstance, options: BotBrowserRoutesOptions) {
+  const fetchJson = options.fetchJson ?? fetchBotBrowserJson;
   // ── Search characters on Chub ──
   app.get<{
     Querystring: {
@@ -86,8 +77,12 @@ export async function botBrowserRoutes(app: FastifyInstance) {
       search: q,
       first: "48",
       page,
+      namespace: "characters",
       nsfw,
       nsfl: nsfw,
+      nsfw_only: "false",
+      chub: "true",
+      count: "true",
       include_forks: "true",
       venus: "false",
       min_tokens,
@@ -131,7 +126,8 @@ export async function botBrowserRoutes(app: FastifyInstance) {
     if (require_expressions === "true") params.set("require_expressions", "true");
     if (require_alternate_greetings === "true") params.set("require_alternate_greetings", "true");
 
-    const data = await proxyFetch(`${CHUB_API_BASE}/search?${params}`, {
+    const data = await fetchJson(`${CHUB_API_BASE}/search?${params}`, {
+      allowedHosts: ["api.chub.ai"],
       method: "GET",
       headers: { Accept: "application/json" },
     });
@@ -143,9 +139,13 @@ export async function botBrowserRoutes(app: FastifyInstance) {
     const fullPath = (req.params as Record<string, string>)["*"];
     if (!fullPath) throw new Error("Missing character path");
     const nocache = Date.now();
-    const data = await proxyFetch(
+    const data = await fetchJson(
       `${CHUB_API_BASE}/api/characters/${encodeURI(fullPath)}?full=true&nocache=${nocache}`,
-      { headers: { Accept: "application/json", "Cache-Control": "no-cache" } },
+      {
+        allowedHosts: ["api.chub.ai"],
+        maxResponseBytes: 8 * 1024 * 1024,
+        headers: { Accept: "application/json", "Cache-Control": "no-cache" },
+      },
     );
     return data;
   });
@@ -158,12 +158,17 @@ export async function botBrowserRoutes(app: FastifyInstance) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60_000);
     try {
-      const res = await fetch(`${CHUB_AVATARS}/avatars/${encodeURI(fullPath)}/chara_card_v2.png`, {
+      const res = await safeFetch(`${CHUB_AVATARS}/avatars/${encodeURI(fullPath)}/chara_card_v2.png`, {
         signal: controller.signal,
+        policy: { allowedProtocols: ["https:"] },
+        allowedContentTypes: ["image/png", "application/octet-stream"],
+        allowMissingContentType: true,
+        maxResponseBytes: CARD_DOWNLOAD_MAX_BYTES,
       });
       if (!res.ok) throw new Error(`Download failed: ${res.status}`);
 
       const buf = Buffer.from(await res.arrayBuffer());
+      if (resolveValidatedImage(buf)?.mimeType !== "image/png") throw new Error("Downloaded card is not a PNG image");
       return reply
         .header("Content-Type", "image/png")
         .header("Content-Disposition", `attachment; filename="character.png"`)

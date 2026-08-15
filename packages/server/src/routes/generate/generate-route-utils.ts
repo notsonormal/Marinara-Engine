@@ -1,15 +1,21 @@
 import { isDeepStrictEqual } from "node:util";
 import {
   GENERATION_PARAMETER_SEND_KEYS,
-  LOCAL_SIDECAR_CONNECTION_ID,
-  PROVIDERS,
   SUMMARY_TAIL_MESSAGES,
   applyTrackerFieldLocksToGameStatePatch,
+  compileChatSummaryEntries,
   generationParametersSchema,
+  normalizeChatSummaryEntries,
   normalizeTextForMatch,
+  normalizeSummaryTailMessages,
+  normalizeWorldCustomFields,
   normalizeThinkingTagPairs,
   parseTrackerFieldLocks,
+  parseTrackerHiddenFields,
   resolveMacros,
+  resolveChatPersonaCandidate,
+  unwrapConversationInstructions,
+  wrapConversationInstructions,
   type CharacterStat,
   type GameState,
   type GenerationParameterSendMap,
@@ -17,10 +23,32 @@ import {
   type InventoryItem,
   type MacroContext,
   type PlayerStats,
+  type WrapFormat,
 } from "@marinara-engine/shared";
-import { LOCAL_SIDECAR_MODEL } from "../../services/llm/local-sidecar.js";
-import { sidecarModelService } from "../../services/sidecar/sidecar-model.service.js";
 import { wrapContent } from "../../services/prompt/format-engine.js";
+import {
+  appendReadableAttachmentsToContent,
+  extractFileAttachmentInputs,
+  extractImageAttachmentDataUrls,
+  parseExtra,
+  type PromptAttachment,
+} from "../../services/generation/prompt-attachments.js";
+
+export { resolveBaseUrl } from "../../services/generation/connection-base-url.js";
+export {
+  createLocalSidecarGenerationConnection,
+  type LocalSidecarGenerationConnection,
+} from "../../services/generation/local-sidecar-generation-connection.js";
+export {
+  appendReadableAttachmentsToContent,
+  buildReadableAttachmentBlocks,
+  escapeXmlAttribute,
+  extractFileAttachmentInputs,
+  extractImageAttachmentDataUrls,
+  getAttachmentFilename,
+  parseExtra,
+  type PromptAttachment,
+} from "../../services/generation/prompt-attachments.js";
 
 export type SimpleMessage = {
   role: "system" | "user" | "assistant";
@@ -32,59 +60,36 @@ export type SimpleMessage = {
 export type SpeakerPrefixMessage = SimpleMessage & {
   characterId?: string | null;
   name?: string | null;
+  personaSnapshotName?: string | null;
   providerMetadata?: Record<string, unknown>;
 };
 export type StoredGenerationParameters = Partial<GenerationParameters>;
-export type LocalSidecarGenerationConnection = {
-  id: typeof LOCAL_SIDECAR_CONNECTION_ID;
-  name: string;
-  provider: "local_sidecar";
-  baseUrl: string;
-  apiKey: string;
-  apiKeyEncrypted: string;
-  model: string;
-  imagePath: null;
-  maxContext: number;
-  isDefault: "false";
-  useForRandom: "false";
-  enableCaching: "false";
-  anthropicExtendedCacheTtl: "false";
-  cachingAtDepth: number;
-  defaultForAgents: "false";
-  embeddingModel: string;
-  embeddingBaseUrl: string;
-  embeddingConnectionId: null;
-  openrouterProvider: null;
-  imageGenerationSource: null;
-  comfyuiWorkflow: null;
-  imageService: null;
-  imageEndpointId: null;
-  defaultParameters: null;
-  promptPresetId: null;
-  maxTokensOverride: null;
-  maxParallelJobs: number;
-  treatAsLocalEndpoint: "true";
-  claudeFastMode: "false";
-  folderId: null;
-  sortOrder: number;
-  createdAt: string;
-  updatedAt: string;
-};
-export type PromptAttachment = {
-  type?: string | null;
-  url?: string | null;
-  data?: string | null;
-  filename?: string | null;
-  name?: string | null;
-  prompt?: string | null;
-  galleryId?: string | null;
-  imageCaption?: string | null;
-  imageCaptionConnectionId?: string | null;
-  imageCaptionModel?: string | null;
-  imageCaptionProvider?: string | null;
-  imageCaptionedAt?: string | null;
-};
 
+/**
+ * Preserve the route-layer export while sharing the same Persona policy with
+ * the client: only Conversation falls back to the globally active Persona.
+ */
+export function resolveActivePersonaCandidate<T extends { id: string; isActive?: unknown }>(
+  personas: readonly T[],
+  chatPersonaId: string | null | undefined,
+  chatMode: string | null | undefined,
+): T | null {
+  return resolveChatPersonaCandidate(personas, chatPersonaId, chatMode);
+}
+
+const PROMPT_WRAP_FORMATS = new Set<WrapFormat>(["xml", "markdown", "none"]);
+
+export function normalizePromptWrapFormat(value: unknown): WrapFormat {
+  return typeof value === "string" && PROMPT_WRAP_FORMATS.has(value as WrapFormat) ? (value as WrapFormat) : "xml";
+}
+
+export function formatConversationInstructionsForWrap(prompt: string, wrapFormat: WrapFormat): string {
+  const body = unwrapConversationInstructions(prompt);
+  if (wrapFormat === "xml") return wrapConversationInstructions(body);
+  if (!body.trim()) return "";
+  if (wrapFormat === "markdown") return `## Instructions\n${body}`;
+  return body;
+}
 export function buildGenerationGuideInstruction(
   generationGuide: unknown,
   promptMacroContext: MacroContext,
@@ -106,64 +111,9 @@ export function buildGenerationGuideInstruction(
     : null;
 }
 
-export function createLocalSidecarGenerationConnection(): LocalSidecarGenerationConnection {
-  const config = sidecarModelService.getConfig();
-  return {
-    id: LOCAL_SIDECAR_CONNECTION_ID,
-    name: "Local Model (sidecar)",
-    provider: "local_sidecar",
-    baseUrl: "local-sidecar://runtime",
-    apiKey: "",
-    apiKeyEncrypted: "",
-    model: LOCAL_SIDECAR_MODEL,
-    imagePath: null,
-    maxContext: config.contextSize,
-    isDefault: "false",
-    useForRandom: "false",
-    enableCaching: "false",
-    anthropicExtendedCacheTtl: "false",
-    cachingAtDepth: 5,
-    defaultForAgents: "false",
-    embeddingModel: "",
-    embeddingBaseUrl: "",
-    embeddingConnectionId: null,
-    openrouterProvider: null,
-    imageGenerationSource: null,
-    comfyuiWorkflow: null,
-    imageService: null,
-    imageEndpointId: null,
-    defaultParameters: null,
-    promptPresetId: null,
-    maxTokensOverride: null,
-    maxParallelJobs: 1,
-    treatAsLocalEndpoint: "true",
-    claudeFastMode: "false",
-    folderId: null,
-    sortOrder: 0,
-    createdAt: "local-sidecar",
-    updatedAt: "local-sidecar",
-  };
-}
-
 function createEmptyPlayerStats(): PlayerStats {
   return { stats: [], attributes: null, skills: {}, inventory: [], activeQuests: [], status: "" };
 }
-
-const TEXT_ATTACHMENT_CHAR_LIMIT = 60_000;
-const IMAGE_ATTACHMENT_PROVIDER_BYTE_LIMIT = 6 * 1024 * 1024;
-const FILE_ATTACHMENT_PROVIDER_BYTE_LIMIT = 20 * 1024 * 1024;
-const TEXT_ATTACHMENT_EXTENSIONS = new Set([
-  "csv",
-  "json",
-  "jsonl",
-  "log",
-  "markdown",
-  "md",
-  "txt",
-  "xml",
-  "yaml",
-  "yml",
-]);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -301,16 +251,12 @@ export function parseSnapshotPlayerStats(snapshot: { playerStats?: unknown } | n
   }
 }
 
-export function shouldAbortOnPassiveGenerationDisconnect(args: { chatMode: string; impersonate?: boolean }): boolean {
-  return args.chatMode !== "conversation" || args.impersonate === true;
+export function shouldAbortOnPassiveGenerationDisconnect(args: { impersonate?: boolean }): boolean {
+  return args.impersonate === true;
 }
 
-export function resolveProviderTopK(provider: unknown, topK: number): number | undefined {
+export function resolveProviderTopK(topK: number): number | undefined {
   const normalized = Number.isFinite(topK) ? Math.max(0, Math.trunc(topK)) : 0;
-  const providerId = typeof provider === "string" ? provider.toLowerCase() : "";
-  if (providerId === "google" || providerId === "google_vertex") {
-    return normalized > 0 ? normalized : undefined;
-  }
   return normalized > 0 ? normalized : undefined;
 }
 
@@ -388,23 +334,47 @@ export function findLastIndex(messages: SimpleMessage[], role: string): number {
 
 function isLastMessagePromptBlock(content: unknown): boolean {
   if (typeof content !== "string") return false;
-  return /<\/?last_message>/i.test(content) || /(?:^|\n)\s*##\s+Last Message\s*(?:\n|$)/i.test(content);
+  const trimmed = content.trim();
+  const lowerContent = trimmed.toLowerCase();
+  if (lowerContent.startsWith("<last_message>") || lowerContent.endsWith("</last_message>")) return true;
+  const firstNewline = trimmed.indexOf("\n");
+  return isLastMessageHeadingLine(firstNewline >= 0 ? trimmed.slice(0, firstNewline) : trimmed);
+}
+
+function isLastMessageHeadingLine(line: string): boolean {
+  const heading = line.trim();
+  if (!heading.startsWith("##") || !/\s/u.test(heading[2] ?? "")) return false;
+  return heading.slice(2).trim().toLowerCase() === "last message";
 }
 
 function stripBoundaryLastMessageWrapper(content: string): string {
-  return content
-    .replace(/^\s*<last_message>\s*\n?/i, "")
-    .replace(/\n?\s*<\/last_message>\s*$/i, "")
-    .replace(/^\s*##\s+Last Message\s*\n/i, "")
-    .trim();
+  let stripped = content.trim();
+  if (stripped.toLowerCase().startsWith("<last_message>")) {
+    stripped = stripped.slice("<last_message>".length).trimStart();
+  }
+  if (stripped.toLowerCase().endsWith("</last_message>")) {
+    stripped = stripped.slice(0, -"</last_message>".length).trimEnd();
+  }
+  const firstNewline = stripped.indexOf("\n");
+  const firstLine = firstNewline >= 0 ? stripped.slice(0, firstNewline) : stripped;
+  if (isLastMessageHeadingLine(firstLine)) {
+    stripped = firstNewline >= 0 ? stripped.slice(firstNewline + 1) : "";
+  }
+  return stripped.trim();
 }
 
 function hasBoundaryChatHistoryClose(content: string): boolean {
-  return /\n?\s*<\/chat_history>\s*$/i.test(content);
+  const trimmed = content.trimEnd();
+  const closingTag = "</chat_history>";
+  return trimmed.slice(-closingTag.length).toLowerCase() === closingTag;
 }
 
 function stripBoundaryChatHistoryClose(content: string): string {
-  return content.replace(/\n?\s*<\/chat_history>\s*$/i, "").trimEnd();
+  const trimmed = content.trimEnd();
+  const closingTag = "</chat_history>";
+  return trimmed.slice(-closingTag.length).toLowerCase() === closingTag
+    ? trimmed.slice(0, -closingTag.length).trimEnd()
+    : trimmed;
 }
 
 function appendBoundaryChatHistoryClose(content: string): string {
@@ -563,22 +533,46 @@ export function appendNonLeadingSystemMessagesToLastUser<T extends PromptRoleMes
   return result;
 }
 
-/** Parse a JSON extra field safely. */
-export function parseExtra(extra: unknown): Record<string, unknown> {
-  if (!extra) return {};
-  try {
-    return typeof extra === "string" ? JSON.parse(extra) : (extra as Record<string, unknown>);
-  } catch {
-    return {};
-  }
-}
-
 export function isMessageHiddenFromAI(message: { extra?: unknown }): boolean {
   return parseExtra(message.extra).hiddenFromAI === true;
 }
 
+export function getMessageHiddenFromAICharacterIds(message: { extra?: unknown }): string[] {
+  const value = parseExtra(message.extra).hiddenFromAICharacterIds;
+  if (!Array.isArray(value)) return [];
+  return Array.from(
+    new Set(
+      value
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+export function getMessageConversationStartCharacterIds(message: { extra?: unknown }): string[] {
+  const value = parseExtra(message.extra).conversationStartForCharacterIds;
+  if (!Array.isArray(value)) return [];
+  return Array.from(
+    new Set(
+      value
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+export function isMessageHiddenFromAIForCharacter(
+  message: { extra?: unknown },
+  characterId: string | null | undefined,
+): boolean {
+  if (isMessageHiddenFromAI(message)) return true;
+  return typeof characterId === "string" && getMessageHiddenFromAICharacterIds(message).includes(characterId);
+}
+
 export function isRoleplaySummaryMode(chatMode: string): boolean {
-  return chatMode === "roleplay" || chatMode === "visual_novel";
+  return chatMode === "roleplay";
 }
 
 /**
@@ -587,14 +581,10 @@ export function isRoleplaySummaryMode(chatMode: string): boolean {
  * `DEFAULT` only when the value is genuinely unset; an explicit `MIN` (0) means
  * "hide the whole batch". A present-but-invalid value (NaN, negative) fails
  * closed to `MIN` so corrupt metadata hides more rather than silently leaking
- * extra context. Clamped to [MIN, MAX].
+ * extra context. There is intentionally no upper cap.
  */
 export function resolveRoleplaySummaryTail(value: unknown): number {
-  const { MIN, MAX, DEFAULT } = SUMMARY_TAIL_MESSAGES;
-  if (value === undefined || value === null) return DEFAULT;
-  const n = Math.floor(Number(value));
-  if (!Number.isFinite(n) || n < MIN) return MIN;
-  return Math.min(MAX, n);
+  return normalizeSummaryTailMessages(value);
 }
 
 /**
@@ -610,14 +600,30 @@ export function computeSummaryHideIds(args: {
 }): string[] {
   const { messages, entryMessageIds, tail } = args;
   if (entryMessageIds.length === 0) return [];
-  const { MIN, MAX } = SUMMARY_TAIL_MESSAGES;
-  const clampedTail = Number.isFinite(tail) ? Math.max(MIN, Math.min(MAX, Math.floor(tail))) : MIN;
+  const { MIN } = SUMMARY_TAIL_MESSAGES;
+  const clampedTail = Number.isFinite(tail) ? Math.max(MIN, Math.floor(tail)) : MIN;
   const visible = messages.filter((message) => !isMessageHiddenFromAI(message));
   const tailIdSet = new Set(clampedTail > 0 ? visible.slice(-clampedTail).map((message) => message.id) : []);
   const entryIdSet = new Set(entryMessageIds);
   return messages
     .filter((message) => entryIdSet.has(message.id) && !tailIdSet.has(message.id))
     .map((message) => message.id);
+}
+
+/** Return the one-based range covered by selected messages in the full chat order. */
+export function computeSummaryMessageRange(
+  allMessages: readonly { id: string }[],
+  selectedMessages: readonly { id: string }[],
+): { startIndex: number; endIndex: number } | null {
+  const messageIndexes = new Map(allMessages.map((message, index) => [message.id, index + 1]));
+  const selectedIndexes = selectedMessages
+    .map((message) => messageIndexes.get(message.id))
+    .filter((index): index is number => index !== undefined);
+  if (selectedIndexes.length === 0) return null;
+  return {
+    startIndex: Math.min(...selectedIndexes),
+    endIndex: Math.max(...selectedIndexes),
+  };
 }
 
 /**
@@ -679,9 +685,25 @@ export function selectRollingSummaryMessages<T extends { id: string; extra?: unk
   return visible.slice(-Math.max(size, sinceBoundary));
 }
 
-export function resolveRoleplayChatSummary(chatMode: string, chatMetadata: Record<string, unknown>): string | null {
+export function resolveRoleplayChatSummary(
+  chatMode: string,
+  chatMetadata: Record<string, unknown>,
+  options: { excludeMessageIds?: readonly string[] } = {},
+): string | null {
   if (!isRoleplaySummaryMode(chatMode)) return null;
-  return ((chatMetadata.summary as string) ?? "").trim() || null;
+  const summary = ((chatMetadata.summary as string) ?? "").trim() || null;
+  const excludedMessageIds = new Set((options.excludeMessageIds ?? []).filter(Boolean));
+  if (excludedMessageIds.size === 0) return summary;
+
+  const entries = normalizeChatSummaryEntries(chatMetadata.summaryEntries);
+  // Legacy summaries have no per-message provenance, so they cannot be
+  // safely retained while regenerating a historical message.
+  if (entries.length === 0) return null;
+  const retainedEntries = entries.filter((entry) => {
+    const coveredMessageIds = [...(entry.messageIds ?? []), ...(entry.hiddenMessageIds ?? [])];
+    return !coveredMessageIds.some((messageId) => excludedMessageIds.has(messageId));
+  });
+  return retainedEntries.length === entries.length ? summary : compileChatSummaryEntries(retainedEntries);
 }
 
 function escapeRegex(value: string): string {
@@ -723,6 +745,13 @@ function prefixSpeakerName(content: string, speakerName: string): string {
   return trimmed ? `${speaker}: ${trimmed}` : `${speaker}:`;
 }
 
+export function readPersonaSnapshotName(extra: unknown): string | null {
+  const snapshot = parseExtra(extra).personaSnapshot;
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return null;
+  const name = (snapshot as { name?: unknown }).name;
+  return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
 export function prefixGroupIndividualHistorySpeakers<T extends SpeakerPrefixMessage>(
   messages: T[],
   options: {
@@ -735,7 +764,7 @@ export function prefixGroupIndividualHistorySpeakers<T extends SpeakerPrefixMess
   return messages.map((message) => {
     let speakerName: string | null = null;
     if (message.role === "user") {
-      speakerName = personaName;
+      speakerName = message.personaSnapshotName?.trim() || personaName;
     } else if (message.role === "assistant") {
       speakerName =
         (message.characterId ? (options.characterNamesById.get(message.characterId) ?? null) : null) ??
@@ -891,6 +920,29 @@ export function resolveActiveCharacterIds(
   return characterIds;
 }
 
+export type GroupGenerationMode = "merged" | "individual";
+
+/** Resolve the stored generation mode for every group-capable chat mode. */
+export function resolveGroupGenerationMode(
+  _chatMode: string | null | undefined,
+  configuredMode: unknown,
+): GroupGenerationMode {
+  return configuredMode === "individual" ? "individual" : "merged";
+}
+
+export function shouldRestoreRegenerationCharacterTarget(
+  chatMode: string | null | undefined,
+  configuredMode: unknown,
+  characterIds: string[],
+): boolean {
+  const isRoleplayGroup = chatMode === "roleplay";
+  return !(
+    isRoleplayGroup &&
+    characterIds.length > 1 &&
+    resolveGroupGenerationMode(chatMode, configuredMode) === "merged"
+  );
+}
+
 export function resolvePromptCharacterIdsForTarget(
   characterIds: string[],
   targetCharacterId: string | null | undefined,
@@ -912,11 +964,15 @@ export function shouldPreferLatestVisibleGameState(input: {
 }
 
 export function resolveVisibleGameStateAnchor(
-  messages: Array<{ role?: unknown; id?: unknown; activeSwipeIndex?: unknown }>,
+  messages: Array<{ role?: unknown; id?: unknown; activeSwipeIndex?: unknown; extra?: unknown }>,
 ): { messageId: string; swipeIndex: number } | null {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]!;
-    if (message.role !== "assistant" || typeof message.id !== "string" || !message.id) continue;
+    const markedSystemAnchor =
+      message.role === "system" && parseExtra(message.extra).gameStateAnchor === "checkpoint_restore";
+    if ((message.role !== "assistant" && !markedSystemAnchor) || typeof message.id !== "string" || !message.id) {
+      continue;
+    }
     const swipeIndex =
       typeof message.activeSwipeIndex === "number" &&
       Number.isInteger(message.activeSwipeIndex) &&
@@ -954,135 +1010,6 @@ export function resolveRegenerationGameStateFallbackMessageIds(
   return Array.from(ids);
 }
 
-export function getAttachmentFilename(attachment: PromptAttachment): string {
-  const rawName = attachment.filename ?? attachment.name;
-  return typeof rawName === "string" && rawName.trim() ? rawName.trim() : "attachment";
-}
-
-export function extractImageAttachmentDataUrls(attachments: PromptAttachment[] | undefined): string[] {
-  return (attachments ?? [])
-    .filter((attachment) => typeof attachment.type === "string" && attachment.type.startsWith("image/"))
-    .map((attachment) => attachment.data)
-    .filter((data): data is string => typeof data === "string" && data.length > 0)
-    .filter((data) => estimateDataUrlBytes(data) <= IMAGE_ATTACHMENT_PROVIDER_BYTE_LIMIT);
-}
-
-export function extractFileAttachmentInputs(
-  attachments: PromptAttachment[] | undefined,
-): Array<{ type: string; data: string; filename: string }> {
-  return (attachments ?? []).flatMap((attachment) => {
-    const type = normalizeProviderFileAttachmentType(attachment);
-    if (!type || typeof attachment.data !== "string") return [];
-    if (estimateDataUrlBytes(attachment.data) > FILE_ATTACHMENT_PROVIDER_BYTE_LIMIT) return [];
-    const data = normalizeDataUrlMimeType(attachment.data, type);
-    if (!data) return [];
-    return [{ type, data, filename: getAttachmentFilename(attachment) }];
-  });
-}
-
-function normalizeProviderFileAttachmentType(attachment: PromptAttachment): string | null {
-  const type = typeof attachment.type === "string" ? attachment.type.toLowerCase().trim() : "";
-  const filename = getAttachmentFilename(attachment).toLowerCase();
-  if (type === "application/pdf" || filename.endsWith(".pdf")) return "application/pdf";
-  return null;
-}
-
-function normalizeDataUrlMimeType(dataUrl: string, mimeType: string): string | null {
-  const commaIndex = dataUrl.indexOf(",");
-  if (!dataUrl.startsWith("data:") || commaIndex < 0) return null;
-  const meta = dataUrl.slice(5, commaIndex).toLowerCase();
-  if (!meta.includes(";base64")) return null;
-  return `data:${mimeType};base64,${dataUrl.slice(commaIndex + 1)}`;
-}
-
-function estimateDataUrlBytes(dataUrl: string): number {
-  const commaIndex = dataUrl.indexOf(",");
-  if (!dataUrl.startsWith("data:") || commaIndex < 0) return Buffer.byteLength(dataUrl, "utf8");
-
-  const meta = dataUrl.slice(0, commaIndex).toLowerCase();
-  const payload = dataUrl.slice(commaIndex + 1);
-  if (!meta.includes(";base64")) {
-    try {
-      return Buffer.byteLength(decodeURIComponent(payload), "utf8");
-    } catch {
-      return Buffer.byteLength(payload, "utf8");
-    }
-  }
-
-  const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
-  return Math.max(0, Math.floor((payload.length * 3) / 4) - padding);
-}
-
-function isReadableTextAttachment(attachment: PromptAttachment): boolean {
-  const type = typeof attachment.type === "string" ? attachment.type.toLowerCase() : "";
-  if (type.startsWith("text/")) return true;
-  if (
-    type === "application/json" ||
-    type === "application/ld+json" ||
-    type === "application/xml" ||
-    type === "application/x-yaml" ||
-    type === "application/yaml"
-  ) {
-    return true;
-  }
-
-  const name = getAttachmentFilename(attachment).toLowerCase();
-  const extension = name.includes(".") ? name.split(".").pop() : "";
-  return !!extension && TEXT_ATTACHMENT_EXTENSIONS.has(extension);
-}
-
-function decodeDataUrlText(dataUrl: string): string | null {
-  const commaIndex = dataUrl.indexOf(",");
-  if (!dataUrl.startsWith("data:") || commaIndex < 0) return null;
-
-  const meta = dataUrl.slice(0, commaIndex).toLowerCase();
-  const payload = dataUrl.slice(commaIndex + 1);
-  try {
-    if (meta.includes(";base64")) {
-      return Buffer.from(payload, "base64").toString("utf8");
-    }
-    return decodeURIComponent(payload);
-  } catch {
-    return null;
-  }
-}
-
-export function escapeXmlAttribute(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-export function buildReadableAttachmentBlocks(attachments: PromptAttachment[] | undefined): string[] {
-  return (attachments ?? []).flatMap((attachment) => {
-    if (!isReadableTextAttachment(attachment) || typeof attachment.data !== "string") return [];
-    const decoded = decodeDataUrlText(attachment.data);
-    if (!decoded?.trim()) return [];
-
-    const filename = getAttachmentFilename(attachment);
-    const type = typeof attachment.type === "string" && attachment.type.trim() ? attachment.type.trim() : "text/plain";
-    const trimmed =
-      decoded.length > TEXT_ATTACHMENT_CHAR_LIMIT
-        ? `${decoded.slice(0, TEXT_ATTACHMENT_CHAR_LIMIT)}\n\n[Attachment truncated after ${TEXT_ATTACHMENT_CHAR_LIMIT} characters.]`
-        : decoded;
-
-    return [
-      [
-        `<attached_file name="${escapeXmlAttribute(filename)}" type="${escapeXmlAttribute(type)}">`,
-        trimmed,
-        `</attached_file>`,
-      ].join("\n"),
-    ];
-  });
-}
-
-export function appendReadableAttachmentsToContent(
-  content: string,
-  attachments: PromptAttachment[] | undefined,
-): string {
-  const blocks = buildReadableAttachmentBlocks(attachments);
-  if (blocks.length === 0) return content;
-  return `${content}${content.trim() ? "\n\n" : ""}${blocks.join("\n\n")}`;
-}
-
 export function formatSeparateAgentInjection(agentType: string, text: string, wrapFormat: string): string {
   const meta =
     agentType === "knowledge-router"
@@ -1091,7 +1018,9 @@ export function formatSeparateAgentInjection(agentType: string, text: string, wr
         ? { heading: "Knowledge Retrieval", tag: "knowledge_retrieval" }
         : agentType === "director"
           ? { heading: "Narrative Director", tag: "narrative_director" }
-          : { heading: agentType, tag: agentType.replace(/[^a-z0-9_-]/gi, "_") };
+          : agentType === "long-term-memory"
+            ? { heading: "Long-Term Memory", tag: "long_term_memory" }
+            : { heading: agentType, tag: agentType.replace(/[^a-z0-9_-]/gi, "_") };
 
   if (wrapFormat === "none") return `${meta.heading}:\n${text}`;
   if (wrapFormat === "markdown") return `## ${meta.heading}\n${text}`;
@@ -1111,30 +1040,16 @@ export function appendSeparateAgentInjectionMessage(
   });
 }
 
-/** Resolve the base URL for a connection, falling back to the provider default. */
-export function resolveBaseUrl(connection: { baseUrl: string | null; provider: string }): string {
-  if (connection.baseUrl) return connection.baseUrl.replace(/\/+$/, "");
-  // Subscription/login-backed providers own their endpoint internally, but
-  // downstream callers gate on a non-empty baseUrl. Return a sentinel so the
-  // gate passes; the provider ignores the value.
-  if (connection.provider === "claude_subscription") return "claude-agent-sdk://local";
-  if (connection.provider === "openai_chatgpt") return "openai-chatgpt://codex-auth";
-  const providerDef = PROVIDERS[connection.provider as keyof typeof PROVIDERS];
-  return providerDef?.defaultBaseUrl ?? "";
-}
-
 export function shouldEnableAgentsForGeneration({
   chatEnableAgents,
-  chatMode,
   impersonate,
   impersonateBlockAgents,
 }: {
   chatEnableAgents: boolean;
-  chatMode: string;
   impersonate: boolean;
   impersonateBlockAgents: boolean;
 }): boolean {
-  return chatEnableAgents && chatMode !== "conversation" && !(impersonate && impersonateBlockAgents);
+  return chatEnableAgents && !(impersonate && impersonateBlockAgents);
 }
 
 export function shouldInjectIdentityFallback({
@@ -1228,6 +1143,12 @@ export function parseStoredGenerationParameters(raw: unknown): StoredGenerationP
   if (isPlainRecord(source.customParameters)) {
     out.customParameters = mergeCustomParameters({}, source.customParameters);
   }
+  if (isPlainRecord(source.managedCustomParameters)) {
+    const managedCustomParameters = generationParametersSchema.shape.managedCustomParameters.safeParse(
+      source.managedCustomParameters,
+    );
+    if (managedCustomParameters.success) out.managedCustomParameters = managedCustomParameters.data;
+  }
   if (isPlainRecord(source.enabledParameters)) {
     const enabledParameters: GenerationParameterSendMap = {};
     for (const key of GENERATION_PARAMETER_SEND_KEYS) {
@@ -1272,9 +1193,35 @@ export function injectIntoOutputFormatOrLastUser(
     }
   }
 
-  const lastIdx = Math.max(findLastIndex(messages, "user"), messages.length - 1);
+  const lastUserIdx = findLastIndex(messages, "user");
+  const lastIdx = lastUserIdx >= 0 ? lastUserIdx : messages.length - 1;
+  if (lastIdx < 0) {
+    messages.push({ role: "user", content: block });
+    return;
+  }
   const target = messages[lastIdx]!;
   messages[lastIdx] = { ...target, content: target.content + "\n\n" + block };
+}
+
+/**
+ * Remove speaker wrappers from older group-chat history while preserving the
+ * latest assistant turn as a concrete formatting example for the model.
+ */
+export function stripSpeakerTagsExceptLastAssistant(messages: SimpleMessage[]): void {
+  const lastAssistantIdx = findLastIndex(messages, "assistant");
+  const speakerCloseRegex = /<\/speaker>/g;
+
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    if (message.role === "system" || i === lastAssistantIdx || !message.content.includes("<speaker=")) continue;
+
+    const content = message.content
+      .replace(/<speaker="[^"]*">/g, "")
+      .replace(speakerCloseRegex, "")
+      .replace(/^\s*\n/gm, "")
+      .trim();
+    messages[i] = { ...message, content };
+  }
 }
 
 /** Build wrapped field parts from a record of { fieldName: value }. */
@@ -1341,11 +1288,162 @@ export function isManualTrackerCharacterId(value: unknown): boolean {
   return typeof value === "string" && value.trim().startsWith("manual-");
 }
 
-function canUseManualTrackerNameFallback(character: Record<string, unknown>) {
-  const id = trackerCharacterIdKey(character);
-  if (!id || isManualTrackerCharacterId(id)) return true;
-  const name = trackerCharacterNameKey(character);
-  return !!name && id === name;
+function mergeTrackerStats(previous: unknown, next: unknown) {
+  if (!Array.isArray(previous) || previous.length === 0) return next;
+  const nextStats = Array.isArray(next) ? next : [];
+  const nextNames = new Set(
+    nextStats.map((stat) => normalizeTextForMatch(isPlainRecord(stat) ? stat.name : "")).filter(Boolean),
+  );
+  return [
+    ...nextStats,
+    ...previous.filter((stat) => {
+      const name = normalizeTextForMatch(isPlainRecord(stat) ? stat.name : "");
+      return name && !nextNames.has(name);
+    }),
+  ];
+}
+
+const MAX_TRACKER_CHARACTER_HISTORY = 50;
+
+/** Collect the most recently seen distinct tracker characters within a prompt-safe bound. */
+export function collectLatestTrackerCharacterHistory(
+  snapshots: Array<{ presentCharacters?: unknown }>,
+): Array<Record<string, unknown>> {
+  const history: Array<Record<string, unknown>> = [];
+  const seenIds = new Set<string>();
+  const seenNames = new Set<string>();
+  for (const snapshot of snapshots) {
+    const characters = parseJsonField<unknown[]>(snapshot.presentCharacters, []);
+    for (const value of characters) {
+      if (!isPlainRecord(value)) continue;
+      const id = trackerCharacterIdKey(value);
+      const name = trackerCharacterNameKey(value);
+      if ((id && seenIds.has(id)) || (!id && name && seenNames.has(name))) continue;
+      history.push(value);
+      if (id) seenIds.add(id);
+      if (name) seenNames.add(name);
+      if (history.length >= MAX_TRACKER_CHARACTER_HISTORY) return history;
+    }
+  }
+  return history;
+}
+
+type TrackerCharacterCardIdentity = {
+  id: string;
+  name: string;
+  avatarPath?: string | null;
+  avatarCrop?: unknown;
+};
+
+function getExplicitNameAliases(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+  const aliases = new Set<string>();
+  const patterns = [
+    /"([^"\n]{1,80})"/gu,
+    /“([^”\n]{1,80})”/gu,
+    /'([^'\n]{1,80})'/gu,
+    /‘([^’\n]{1,80})’/gu,
+    /\(([^()\n]{1,80})\)/gu,
+  ];
+  for (const pattern of patterns) {
+    for (const match of value.matchAll(pattern)) {
+      const alias = normalizeTextForMatch(match[1]);
+      if (alias) aliases.add(alias);
+    }
+  }
+  return [...aliases];
+}
+
+function buildUniqueCanonicalNames(names: readonly string[]): Map<string, string> {
+  const namesByKey = new Map<string, string>();
+  const duplicateKeys = new Set<string>();
+  for (const name of names) {
+    const trimmedName = name.trim();
+    const key = normalizeTextForMatch(trimmedName);
+    if (!key) continue;
+    if (namesByKey.has(key)) duplicateKeys.add(key);
+    else namesByKey.set(key, trimmedName);
+  }
+  for (const key of duplicateKeys) namesByKey.delete(key);
+  return namesByKey;
+}
+
+function resolveExplicitCanonicalName(value: unknown, namesByKey: Map<string, string>): string | null {
+  const exactName = namesByKey.get(normalizeTextForMatch(value));
+  if (exactName) return exactName;
+
+  const aliasMatches = getExplicitNameAliases(value)
+    .map((alias) => namesByKey.get(alias))
+    .filter((candidate): candidate is string => !!candidate);
+  const uniqueMatches = new Set(aliasMatches);
+  return uniqueMatches.size === 1 ? aliasMatches[0]! : null;
+}
+
+/** Canonicalize only structured Game Mode VN speaker labels, leaving prose and ambiguous aliases unchanged. */
+export function canonicalizeGamePartySpeakerLabels(content: string, canonicalNames: readonly string[]): string {
+  const namesByKey = buildUniqueCanonicalNames(canonicalNames);
+  if (!content || namesByKey.size === 0) return content;
+
+  return content.replace(
+    /^(\s*)\[([^\]\r\n]+)\](\s+\[(?:main|side|thought|whisper:[^\]\r\n]+)\]\s+\[[^\]\r\n]+\]\s*:)/gmu,
+    (line, indentation: string, speakerName: string, suffix: string) => {
+      const canonicalName = resolveExplicitCanonicalName(speakerName, namesByKey);
+      return canonicalName ? `${indentation}[${canonicalName}]${suffix}` : line;
+    },
+  );
+}
+
+export function applyTrackerCharacterCardIdentity(
+  characters: Array<Record<string, unknown>>,
+  cards: TrackerCharacterCardIdentity[],
+): Set<string> {
+  const cardsById = new Map(cards.map((card) => [card.id.trim().toLowerCase(), card]));
+  const cardsByName = new Map<string, TrackerCharacterCardIdentity>();
+  const duplicateNames = new Set<string>();
+  for (const card of cards) {
+    const name = normalizeTextForMatch(card.name);
+    if (!name) continue;
+    if (cardsByName.has(name)) duplicateNames.add(name);
+    else cardsByName.set(name, card);
+  }
+  for (const name of duplicateNames) cardsByName.delete(name);
+  const canonicalCardNamesByKey = new Map([...cardsByName].map(([key, card]) => [key, card.name]));
+
+  const matchedIds = new Set<string>();
+  const canonicalCharacters: Array<Record<string, unknown>> = [];
+  const canonicalIndexByCardId = new Map<string, number>();
+  for (const character of characters) {
+    const explicitCanonicalName = resolveExplicitCanonicalName(character.name, canonicalCardNamesByKey);
+    const card =
+      cardsById.get(trackerCharacterIdKey(character)) ??
+      cardsByName.get(trackerCharacterNameKey(character)) ??
+      (explicitCanonicalName ? cardsByName.get(normalizeTextForMatch(explicitCanonicalName)) : undefined);
+    if (!card) {
+      canonicalCharacters.push(character);
+      continue;
+    }
+
+    const canonicalCharacter = {
+      ...character,
+      characterId: card.id,
+      name: card.name,
+      avatarPath: card.avatarPath ?? null,
+      avatarCrop: card.avatarCrop ?? null,
+    };
+    const existingIndex = canonicalIndexByCardId.get(card.id);
+    if (existingIndex === undefined) {
+      canonicalIndexByCardId.set(card.id, canonicalCharacters.length);
+      canonicalCharacters.push(canonicalCharacter);
+    } else {
+      canonicalCharacters[existingIndex] = {
+        ...canonicalCharacters[existingIndex],
+        ...canonicalCharacter,
+      };
+    }
+    matchedIds.add(card.id);
+  }
+  characters.splice(0, characters.length, ...canonicalCharacters);
+  return matchedIds;
 }
 
 export function preserveTrackerCharacterUiFields(
@@ -1353,16 +1451,14 @@ export function preserveTrackerCharacterUiFields(
   previousCharacters: Array<Record<string, unknown>>,
 ): void {
   const previousByKey = new Map<string, Record<string, unknown>>();
-  const previousManualByName = new Map<string, Record<string, unknown>>();
+  const previousByName = new Map<string, Record<string, unknown>>();
   const previousNameCounts = new Map<string, number>();
   for (const character of previousCharacters) {
     const key = trackerCharacterKey(character);
     if (key) previousByKey.set(key, character);
     const name = trackerCharacterNameKey(character);
     if (name) previousNameCounts.set(name, (previousNameCounts.get(name) ?? 0) + 1);
-    if (name && isManualTrackerCharacterId(character.characterId)) {
-      previousManualByName.set(name, character);
-    }
+    if (name) previousByName.set(name, character);
   }
 
   for (const character of nextCharacters) {
@@ -1370,14 +1466,20 @@ export function preserveTrackerCharacterUiFields(
     const name = trackerCharacterNameKey(character);
     const previous =
       (key ? previousByKey.get(key) : null) ??
-      (name && previousNameCounts.get(name) === 1 && canUseManualTrackerNameFallback(character)
-        ? previousManualByName.get(name)
-        : null);
+      (name && previousNameCounts.get(name) === 1 ? previousByName.get(name) : null);
     const previousPortraitFocusX = previous?.portraitFocusX;
     const previousPortraitFocusY = previous?.portraitFocusY;
     const previousPortraitZoom = previous?.portraitZoom;
     const previousAvatarPath = previous?.avatarPath;
     const previousAvatarCrop = previous?.avatarCrop;
+    const previousCustomFields = isPlainRecord(previous?.customFields) ? previous.customFields : null;
+    const nextCustomFields = isPlainRecord(character.customFields) ? character.customFields : null;
+    if (previousCustomFields) {
+      // Character custom fields are user-defined tracker structure. Merge model
+      // values over it so an omitted field cannot erase the user's configuration.
+      character.customFields = { ...previousCustomFields, ...(nextCustomFields ?? {}) };
+    }
+    character.stats = mergeTrackerStats(previous?.stats, character.stats);
     if (
       (typeof character.avatarPath !== "string" || !character.avatarPath.trim()) &&
       isNpcTrackerAvatarPath(previousAvatarPath)
@@ -1425,6 +1527,7 @@ export function parseJsonField<T>(value: unknown, fallback: T): T {
 export function parseGameStateRow(row: Record<string, unknown>): GameState {
   const manualOverrides = parseJsonField<Record<string, string> | null>(row.manualOverrides, null);
   const fieldLocks = parseTrackerFieldLocks(row.fieldLocks);
+  const hiddenTrackerFields = parseTrackerHiddenFields(row.hiddenTrackerFields);
   return {
     id: row.id as string,
     chatId: row.chatId as string,
@@ -1435,12 +1538,14 @@ export function parseGameStateRow(row: Record<string, unknown>): GameState {
     location: row.location as string | null,
     weather: row.weather as string | null,
     temperature: row.temperature as string | null,
+    worldCustomFields: normalizeWorldCustomFields(parseJsonField<unknown[]>(row.worldCustomFields, [])),
     presentCharacters: parseJsonField<any[]>(row.presentCharacters, []),
     recentEvents: parseJsonField<string[]>(row.recentEvents, []),
     playerStats: parseJsonField<PlayerStats | null>(row.playerStats, null),
     personaStats: parseJsonField<any[] | null>(row.personaStats, null),
     manualOverrides,
     fieldLocks,
+    hiddenTrackerFields,
     createdAt: row.createdAt as string,
   };
 }

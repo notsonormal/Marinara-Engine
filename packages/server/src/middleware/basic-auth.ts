@@ -34,6 +34,12 @@
 //     you don't need a password.
 //   • Any IP that matches IP_ALLOWLIST is also exempt — if you've already
 //     vouched for a network, requiring a second factor would be noise.
+//   • Direct Tailscale and Docker traffic is detected from the request's local
+//     socket or the container's actual networks. Set the matching BYPASS_AUTH_*
+//     flag to true for the legacy broad-CIDR bypass, or false to require auth.
+//     Docker traffic carrying proxy-forwarding headers requires normal auth
+//     by default. Set REQUIRE_AUTH_FOR_DOCKER_PROXY=false only when every
+//     forwarded client is trusted.
 //   • Use a strong, random password — Basic Auth sends credentials on
 //     every request, only base64-encoded. Always pair with HTTPS in
 //     production (see SSL_CERT / SSL_KEY).
@@ -255,7 +261,7 @@ function renderLockdownPage(clientIp: string): string {
     <header>
       <span class="badge">Access blocked</span>
       <h1>This Marinara Engine install needs access control before remote devices can connect.</h1>
-      <p class="lede">You're connecting from <span class="ip-pill">${safeIp}</span>, which isn't loopback. To protect your data, the server refuses non-local traffic until you choose how this device should authenticate. Pick one of the options below, restart Marinara, then refresh this page.</p>
+      <p class="lede">You're connecting from <span class="ip-pill">${safeIp}</span>, which isn't loopback. To protect your data, the server refuses non-local traffic until you choose how this device should authenticate. Pick one of the options below, save <code>.env</code>, wait a couple of seconds, then refresh this page.</p>
     </header>
 
     <section class="panel">
@@ -267,7 +273,7 @@ function renderLockdownPage(clientIp: string): string {
           <pre>BASIC_AUTH_USER=yourname
 BASIC_AUTH_PASS=a-long-random-password</pre>
         </li>
-        <li>Restart Marinara Engine. Refresh this page and enter the credentials.</li>
+        <li>Save <code>.env</code>, wait a couple of seconds, then refresh this page and enter the credentials.</li>
       </ol>
       <a class="detail" href="https://github.com/Pasta-Devs/Marinara-Engine/blob/main/docs/REMOTE_ACCESS.md#option-1-basic-auth-recommended" target="_blank" rel="noopener noreferrer">Detailed walkthrough →</a>
     </section>
@@ -280,7 +286,7 @@ BASIC_AUTH_PASS=a-long-random-password</pre>
         <li>Add this line. Your current IP is already filled in — add more entries (comma-separated, CIDR allowed) for other devices:
           <pre>IP_ALLOWLIST=${safeIp}</pre>
         </li>
-        <li>Restart Marinara Engine and refresh this page.</li>
+        <li>Save <code>.env</code>, wait a couple of seconds, then refresh this page.</li>
       </ol>
       <a class="detail" href="https://github.com/Pasta-Devs/Marinara-Engine/blob/main/docs/REMOTE_ACCESS.md#option-2-ip-allowlist" target="_blank" rel="noopener noreferrer">Detailed walkthrough →</a>
     </section>

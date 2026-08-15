@@ -3,7 +3,8 @@
 // ──────────────────────────────────────────────
 import type { DB } from "../../db/connection.js";
 import { createChatsStorage } from "../storage/chats.storage.js";
-import type { ChatMode } from "@marinara-engine/shared";
+import { createSpatialContextStorage } from "../storage/spatial-context.storage.js";
+import { SPATIAL_CONTEXT_LIMITS, type ChatMode } from "@marinara-engine/shared";
 import {
   latestTrustedTimestamp,
   normalizeTimestampOverrides,
@@ -150,7 +151,6 @@ function normalizeImportedMode(value: unknown): ChatMode | null {
   switch (normalized) {
     case "conversation":
     case "roleplay":
-    case "visual_novel":
     case "game":
       return normalized;
     default:
@@ -249,6 +249,9 @@ function sanitizeImportedMarinaraMetadata(
   delete sanitized.activeSceneChatId;
   delete sanitized.sceneOriginChatId;
   delete sanitized.sceneStatus;
+  delete sanitized.branchParentChatId;
+  delete sanitized.branchParentMessageId;
+  delete sanitized.branchMessageId;
 
   if (typeof sanitized.gameId === "string" && sanitized.gameId.trim().length > 0) {
     sanitized.gameId = localGameId;
@@ -276,6 +279,9 @@ export async function importSTChat(jsonlContent: string, db: DB, opts?: ImportST
   const userName = header.user_name ?? "User";
   const headerMetadata = isRecord(header.chat_metadata) ? header.chat_metadata : {};
   const marinaraMetadata = isRecord(headerMetadata.marinara_metadata) ? headerMetadata.marinara_metadata : {};
+  const importedSpatialHistory = Array.isArray(marinaraMetadata.spatialContextHistory)
+    ? marinaraMetadata.spatialContextHistory
+    : [];
   const importedBranchName =
     opts?.branchName ??
     (typeof headerMetadata.branchName === "string"
@@ -284,7 +290,10 @@ export async function importSTChat(jsonlContent: string, db: DB, opts?: ImportST
         ? marinaraMetadata.branchName
         : null);
   const importedMode =
-    opts?.mode ?? normalizeImportedMode(headerMetadata.mode) ?? normalizeImportedMode(marinaraMetadata.mode) ?? "roleplay";
+    opts?.mode ??
+    normalizeImportedMode(headerMetadata.mode) ??
+    normalizeImportedMode(marinaraMetadata.mode) ??
+    "roleplay";
 
   // Build characterIds array. Caller-supplied list wins so an import-into-group
   // can fully inherit the existing chat's roster instead of being limited to a
@@ -417,6 +426,7 @@ export async function importSTChat(jsonlContent: string, db: DB, opts?: ImportST
       marinaraMetadata,
       opts?.groupId ?? chat.groupId ?? chat.id,
     );
+    delete importedMetadata.spatialContextHistory;
     await storage.patchMetadata(
       chat.id,
       {
@@ -428,7 +438,47 @@ export async function importSTChat(jsonlContent: string, db: DB, opts?: ImportST
     );
   }
 
-  await storage.createMessagesBatch(chat.id, msgInputs, chatTimestamps);
+  const importedMessageIds = await storage.createMessagesBatch(chat.id, msgInputs, chatTimestamps);
+  const spatialStorage = createSpatialContextStorage();
+  for (const candidate of importedSpatialHistory) {
+    if (!isRecord(candidate)) continue;
+    const messageIndex = candidate.messageIndex;
+    const swipeIndex = candidate.swipeIndex;
+    const definitionRevision = candidate.definitionRevision;
+    const currentLocationId = candidate.currentLocationId;
+    if (
+      !Number.isSafeInteger(messageIndex) ||
+      typeof messageIndex !== "number" ||
+      messageIndex < -1 ||
+      !Number.isSafeInteger(swipeIndex) ||
+      typeof swipeIndex !== "number" ||
+      swipeIndex < 0 ||
+      !Number.isSafeInteger(definitionRevision) ||
+      typeof definitionRevision !== "number" ||
+      definitionRevision < 0 ||
+      (currentLocationId !== null &&
+        (typeof currentLocationId !== "string" ||
+          currentLocationId.length === 0 ||
+          currentLocationId.length > SPATIAL_CONTEXT_LIMITS.maxIdLength ||
+          currentLocationId !== currentLocationId.trim()))
+    ) {
+      continue;
+    }
+    if (messageIndex === -1 && swipeIndex !== 0) continue;
+    if (messageIndex >= 0 && !msgInputs[messageIndex]?.swipes?.some((swipe) => swipe.index === swipeIndex)) continue;
+    const messageId = messageIndex === -1 ? "" : importedMessageIds[messageIndex];
+    if (messageId === undefined) continue;
+    await spatialStorage.replaceAtAnchor({
+      chatId: chat.id,
+      messageId,
+      swipeIndex,
+      currentLocationId,
+      definitionRevision,
+      source: "branch_copy",
+      transitionCommandId: null,
+      transitionPayloadHash: null,
+    });
+  }
 
   return {
     success: true,

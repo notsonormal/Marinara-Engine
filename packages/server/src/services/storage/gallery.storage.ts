@@ -1,7 +1,7 @@
 // ──────────────────────────────────────────────
 // Storage: Chat Gallery Images
 // ──────────────────────────────────────────────
-import { and, eq, desc, inArray } from "drizzle-orm";
+import { and, eq, desc, inArray } from "../../db/file-query.js";
 import type { DB } from "../../db/connection.js";
 import { chatImages } from "../../db/schema/index.js";
 import { newId, now } from "../../utils/id-generator.js";
@@ -29,6 +29,10 @@ export function createGalleryStorage(db: DB) {
         .from(chatImages)
         .where(inArray(chatImages.chatId, chatIds))
         .orderBy(desc(chatImages.createdAt));
+    },
+
+    async listByFilePath(filePath: string) {
+      return db.select().from(chatImages).where(eq(chatImages.filePath, filePath)).orderBy(desc(chatImages.createdAt));
     },
 
     async getById(id: string) {

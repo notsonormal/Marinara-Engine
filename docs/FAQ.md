@@ -1,223 +1,207 @@
 # Frequently Asked Questions
 
----
+This guide answers the questions people ask most about Marinara Engine. Answers are grouped by topic. Each one links to a full guide when you want more detail.
 
-<a id="how-do-i-access-marinara-engine-from-my-phone-or-another-device"></a>
+## How do I access Marinara Engine from my phone or another device?
 
-<details>
-<summary><strong>How do I access Marinara Engine from my phone or another device?</strong></summary>
-<br>
+Marinara Engine runs as a local server on one computer. You open it in a web browser. This answer covers access from phone, tablet, or another computer on the same network.
 
-If Marinara Engine is running on one device (your PC, a server, etc.) and you want to use it from a phone, tablet, or another computer on the same network:
+The start scripts (`start.sh`, `start.bat`, and `start-termux.sh`) already bind the server to all network interfaces (`0.0.0.0`). Other devices can reach the server over the network, but access control blocks them by default. Until you set up access on the host computer, a remote device only sees an **Access blocked** page with setup instructions.
 
-## 1. Make sure the server is bound to all interfaces
+Follow these steps:
 
-The shell launchers (`start.sh`, `start.bat`, `start-termux.sh`) already bind to `0.0.0.0` by default. If you started manually with `pnpm start`, set `HOST=0.0.0.0` in your `.env` file first. See the [Configuration Reference](CONFIGURATION.md) for details.
-
-## 2. Configure access control
-
-Loopback (`127.0.0.1`) works without a password, ordinary LAN clients require authentication by default, and Tailscale plus Docker bridge clients are trusted by default for private installs. Set `BASIC_AUTH_USER` and `BASIC_AUTH_PASS` in `.env`, then restart Marinara if you want LAN users to sign in. Set `BYPASS_AUTH_TAILSCALE=false` or `BYPASS_AUTH_DOCKER=false` if you want those clients to sign in too. For privileged actions from that browser, also set `ADMIN_SECRET` and save it in **Settings -> Advanced -> Admin Access**.
-
-You can restore the old unauthenticated LAN behavior with `ALLOW_UNAUTHENTICATED_PRIVATE_NETWORK=true`, but only do this on a network you fully trust. For a step-by-step walkthrough covering Basic Auth, IP Allowlist, and the private-network bypass, see [Remote Access — Setting Up Basic Auth or an IP Allowlist](REMOTE_ACCESS.md).
-
-## 3. Find your host device's local IP address
-
-| Platform | Command                                                                 |
-| -------- | ----------------------------------------------------------------------- |
-| Windows  | `ipconfig` → look for **IPv4 Address**                                  |
-| macOS    | System Settings → Wi-Fi → your network, or run `ipconfig getifaddr en0` |
-| Linux    | `hostname -I` or `ip addr`                                              |
-| Android  | Settings → Wi-Fi → tap your network to see the IP                       |
-
-### 4. Open a browser on the other device
-
-Navigate to:
+1. Keep Marinara running on the host computer.
+2. On the host computer, set up access control: Basic Auth (a username and password) or an IP allowlist (a list of trusted device addresses). [Remote Access](REMOTE_ACCESS.md) walks through each option, including a bypass for fully trusted private networks.
+3. Find the host computer's local IP address. On Windows, run this command and read the **IPv4 Address**:
 
 ```
-http://<host-ip>:7860
+ipconfig
 ```
 
-For example: `http://192.168.1.42:7860`
+On macOS or Linux, run this command:
 
-## 5. (Optional) Install the PWA
+```
+hostname -I
+```
 
-Most mobile browsers will offer an **"Add to Home Screen"** or **"Install App"** prompt, giving you a more native app experience without browser chrome. On iPhone and iPad, see the [iOS / iPadOS PWA Guide](installation/ios-pwa.md).
+4. On the other device, open a web browser and go to your host IP followed by the port. The default port is `7860`:
 
-### Not on the same network?
+```
+http://192.168.1.42:7860
+```
 
-Tools like [Tailscale](https://tailscale.com/) give each device a stable IP address on a private overlay network, so you can access Marinara Engine from anywhere without exposing it to the public internet.
+Replace `192.168.1.42` with your own host IP address.
 
-### Still not connecting?
+5. Sign in if the browser asks for the Basic Auth username and password. If you see an **Access blocked** page instead, finish step 2 on the host first.
 
-- Verify both devices are on the same Wi-Fi network.
-- Confirm `HOST=0.0.0.0` and, for ordinary LAN access, Basic Auth credentials are set on the server.
-- Check that no firewall is blocking the configured port (default `7860`).
-- See the [Troubleshooting](TROUBLESHOOTING.md#app-not-loading-on-mobile--another-device) page for more help.
+On ordinary desktop installs, the same computer (`127.0.0.1`) does not need a password. APK-managed Android installs add a private localhost login so another Android app cannot impersonate Marinara. Other devices are blocked until you set up access control (Basic Auth or an IP allowlist). Each option is explained in [Remote Access](REMOTE_ACCESS.md).
 
-### Using Music DJ with Spotify on a LAN install?
+If the two devices are not on the same network, a tool like Tailscale can help. Tailscale gives each device a stable private address. You can then connect from anywhere without exposing Marinara to the public internet. If you cannot connect, see [Troubleshooting](TROUBLESHOOTING.md).
 
-Spotify's OAuth rules only allow `https://` or `http://127.0.0.1` redirect URIs, so the agent editor will show a `127.0.0.1` URI even when you're accessing Marinara from another device. Either put the server behind HTTPS or use the paste-back fallback in the agent editor — both flows are covered in [Music DJ Spotify login fails on a remote or LAN install](TROUBLESHOOTING.md#music-dj-spotify-login-fails-on-a-remote-or-lan-install).
+## Is there a mobile app for Marinara?
 
-</details>
+There is no separate native mobile app. On a phone or tablet, you use the same web app in a browser. Most mobile browsers offer an **Add to Home Screen** or **Install App** option that makes it feel like a real app, with no browser bar. This is called a PWA (Progressive Web App, a website you can install like an app).
 
----
+On Android, you can also install an APK, the installable app file for Android. It runs Marinara locally on the phone. See [Android Installation](installation/android-termux.md). On iPhone and iPad, see the [iOS PWA Guide](installation/ios-pwa.md).
 
-<details>
-<summary><strong>Is the Android APK a standalone app?</strong></summary>
-<br>
+The Android wrapper signs in automatically when it opens its APK-managed Termux server. To use another browser on that phone, open `/android-login`, run `cat ~/.marinara-engine/android-secret` in Termux, and paste the displayed secret. The local `mari` CLI reads that same launcher-managed secret automatically. Manual Termux installs keep the normal localhost and network-access rules.
 
-Not exactly. The Android APK is a Termux bootstrap + WebView shell, not a native Android server build.
+## What are the three chat modes?
 
-The APK opens `http://127.0.0.1:<PORT>` on the same Android device. If the Termux server is already running, it loads immediately. If not, the APK can help launch setup through Termux.
+Marinara has three chat modes, shown as tabs when you open the chat list:
 
-Fast path:
+- **Conversation**: a texting or direct-message style chat, like messaging a character in a chat app.
+- **Roleplay**: an immersive story scene with narration, character avatars, and optional character art.
+- **Game Mode**: a guided text adventure run by a game master, with optional scene images and video.
 
-1. Install the APK from GitHub Releases.
-2. Open it and tap **Install / Start Marinara**.
-3. Approve Android's install prompts if Marinara needs to install Termux from F-Droid.
-4. Grant **Run commands in Termux environment** if Android asks.
-5. If Termux blocks external commands, paste the copied `allow-external-apps` command into Termux once.
-6. Wait for Termux to install/build/start Marinara Engine, then return to the APK.
+Each mode has its own getting-started guide. Start with the mode you want, then explore its deep-dive guides.
 
-Manual fallback: follow the [Android (Termux) Installation Guide](installation/android-termux.md) so Termux creates or enters the `Marinara-Engine` folder first, then run `./start-termux.sh` from inside that folder and open the APK as a dedicated home-screen shell.
+## How do I change the timezone used by Conversation schedules?
 
-</details>
+Open a Conversation and choose **Schedule timezone** in Chat Settings, or choose it while creating schedules in the Conversation setup flow. Marinara starts with the timezone reported by your device, but you can select any supported IANA timezone or choose **Use device** to reset it. This is one global preference for all Conversation chats, including server-side autonomous messages, and it syncs to other devices connected to the same Marinara server.
 
----
+## Do I need an API key to use Marinara?
 
-<details>
-<summary><strong>What can Professor Mari do?</strong></summary>
-<br>
+Almost always, yes. A **connection** is a saved link that tells Marinara how to reach one AI service: which provider, which model, and your login for it. An **API key** is a secret code, a bit like a password. You get it from an AI provider so Marinara can talk to that provider for you.
 
-Professor Mari is Marinara Engine's built-in assistant character. She can explain the app, help with setup, create characters and personas, create lorebooks, start new Conversation or Roleplay chats, navigate panels, fetch existing items so she can review or update them, and use read-only Fandom/MediaWiki lookups. She is a guide and helper, not a replacement for the docs or release notes when something is version-specific or recently changed.
+You need at least one connection before you can start any chat. To make one, open the **Connections** panel, click **New**, pick a provider, paste your **API Key**, and pick a model. For the full walkthrough, see [Connecting to an AI Provider](connections/connecting-to-a-provider.md).
 
-Editing existing content needs more care than creating new content. Ask Mari to fetch the character, persona, lorebook, chat, or preset before editing it, and give her the specific field or behavior you want changed. Character edits keep a recoverable version snapshot, but persona edits overwrite without a snapshot, so back up personas before asking her to change one.
+A few providers do not use an API key at all. The subscription options (Claude, ChatGPT, and Grok) log in through a command-line tool instead, and the built-in Local Model runs on your own machine with no key.
 
-She cannot currently submit GitHub issues from inside the app, complete the whole Game Setup Wizard through hidden commands, or automatically ingest the latest GitHub docs into her own prompt.
+## Which AI providers are supported?
 
-See [Professor Mari](PROFESSOR_MARI.md) for the full capabilities and safety notes.
+Marinara supports many providers. You pick one per connection.
 
-</details>
+For chat and roleplay text, the choices are **OpenAI**, **OpenAI (ChatGPT)**, **Anthropic**, **Claude (Subscription)**, **Grok CLI (Subscription)**, **Google Gemini**, **Google Vertex AI**, **Mistral**, **Cohere**, **OpenRouter**, **NanoGPT**, **xAI / Grok**, and **Custom (OAI-Compatible)** for local or self-hosted models such as Ollama, LM Studio, and KoboldCpp.
 
----
+For image generation, the choices include **OpenAI (DALL-E)**, **Stability AI**, **Together AI**, **NovelAI**, **OpenRouter Images**, **xAI / Grok Imagine**, **Venice.ai**, **Atlas Cloud**, **Pollinations**, **Stable Horde**, **SD Web UI (AUTOMATIC1111 / Forge)**, **ComfyUI**, **RunPod Serverless (ComfyUI)**, **Draw Things**, **NanoGPT**, and **Block Entropy**.
 
-<details>
-<summary><strong>Which AI providers are supported?</strong></summary>
-<br>
+For video generation, the choices are **Google AI Studio**, **xAI Imagine**, **OpenRouter Video**, **Atlas Cloud**, **Seedance 2.0**, and local **ComfyUI** API-format workflows.
 
-Marinara Engine supports a wide range of LLM and image generation providers:
+You can save many connections at once and assign a different one to each chat. See [Connecting to an AI Provider](connections/connecting-to-a-provider.md).
 
-- **LLM:** OpenAI, Anthropic, Anthropic via Claude Pro / Max subscription (through the local Claude Agent SDK), Google Gemini, Google Vertex AI, OpenRouter, NanoGPT, Mistral, Cohere, Pollinations, Together AI, NovelAI, and any custom OpenAI-compatible endpoint (Ollama, LM Studio, KoboldCpp, etc.)
-- **Image generation:** Stability AI, ComfyUI, AUTOMATIC1111 / SD Web UI, Draw Things (Apple Silicon Macs — runs locally on Metal + Apple Neural Engine), and providers that support image output through their chat API
+## Do I have to pay to use Marinara?
 
-You can configure multiple connections at once and assign different providers per chat. API keys are encrypted at rest with AES-256.
+Marinara itself is free and runs on your own computer. You pay whatever your chosen AI provider charges, which varies by provider and model.
 
-</details>
+Some options cost nothing to try. **Pollinations** image generation needs no key. **Stable Horde** is free, and a key is optional for faster priority. The built-in **Local Model** runs on your machine with no key. The subscription options (Claude, ChatGPT, and Grok) use a paid plan you may already have, instead of a pay-per-use API key.
 
----
+## Are my API keys safe?
 
-<a id="why-doesnt-my-roleplay-character-remember-the-messages-from-our-connected-conversation"></a>
+Yes. Every API key is encrypted with AES-256 before it is saved on disk. Connection and profile exports strip secret
+values. A full backup is different: it contains the encrypted records and, when present, the encryption-key file
+needed to unlock them, so keep full backup ZIPs private.
 
-<details>
-<summary><strong>Why doesn't my roleplay character remember the messages from our connected conversation?</strong></summary>
-<br>
+Because profile import intentionally leaves secret values out, you must re-enter each API key after importing a
+profile, including when you use **Import Profile** on a full backup ZIP. A manual full data-folder restore preserves
+the encrypted keys when its matching encryption-key file is restored too.
 
-Connected chats (the link between a conversation and a roleplay or game) are intentionally **asymmetric** in how context flows:
+## What is a character card?
 
-**Roleplay → Conversation (automatic):** the roleplay's summary and recent messages are pulled into the conversation's context every turn, so DM characters always know what's happening in the story. Roleplay characters can also break the fourth wall back into the DM by wrapping text in `<ooc>...</ooc>` tags.
+A **character card** is the saved profile of an AI character: its name, avatar, personality, backstory, and greeting. You create and edit cards in the **Character Editor**. You can also import cards made in other apps. See [Creating and Editing Characters](characters/creating-and-editing-characters.md).
 
-**Conversation → Roleplay (manual, via tags):** the conversation's raw messages are _not_ injected into the roleplay. To bridge content the other direction, the conversation character uses one of two OOC tags:
+## What is a lorebook, and how do I use one with several characters?
 
-- `<influence>...</influence>` — one-shot steer for the _next_ roleplay turn, then consumed.
-- `<note>...</note>` — durable; appears on every roleplay turn until you clear it from the chat settings drawer. Use this for facts the roleplay character should keep remembering.
+A **lorebook** is a set of world-info entries. Each entry adds facts to the prompt only when its trigger words appear in the chat. This saves tokens and keeps lore consistent. There are three ways to scope one lorebook. Pick the one that fits:
 
-This is by design — pulling raw DM messages into every roleplay turn would inflate the prompt and dilute the story. If you want something from the DM to stick in the roleplay, ask the conversation character to wrap it in a `<note>`.
+1. Link it to characters or personas. In the lorebook editor, fill in **Linked Characters** or **Linked Personas**. The lorebook then activates in any chat that includes a linked character or uses a linked persona. Both fields accept more than one entry, so add every character you want.
+2. Attach it to one chat. Open **Chat Settings**, find the **Lorebooks** section, and use **Add Lorebook**. Use this when the lore belongs to one specific chat.
+3. Filter single entries by character. Inside a shared lorebook, you can mark each entry to fire only when certain characters are present. This suits a large world lorebook where some entries are character-specific.
 
-</details>
+For the full feature, see [Lorebooks](lorebooks/overview.md).
 
----
+## What is an agent?
 
-<a id="how-do-i-use-one-lorebook-with-multiple-characters"></a>
+An **agent** is an optional AI helper that runs during a chat to do a focused job. Examples include tracking the current scene, watching writing quality, adding maps or calls, or running a Conversation table game. Fresh installations have no optional agents. Open the **Agents** panel, click **Download Agents**, read an item's details, and install it. Then enable compatible agents per chat in **Chat Settings**. When an installed official package has a compatible update, Marinara asks before downloading it. Choosing **No** keeps the current version and leaves **Update** available in Download Agents for later. If the host is offline or verification fails, the installed version keeps working. The catalog also handles complete package removal. See [Agents](agents/agents-overview.md) and the public [Marinara-Agents repository](https://github.com/Pasta-Devs/Marinara-Agents).
 
-<details>
-<summary><strong>How do I use one lorebook with multiple characters, or scope it to a specific chat?</strong></summary>
-<br>
+## How do I set up Noodle?
 
-Marinara has three different ways to scope a lorebook, each at a different level. Pick whichever matches your use case:
+Noodle is Marinara's local, fictional social network for your characters. First open **Agents** → **Download Agents** and install **Noodle & NoodleR**, then restart Marinara when prompted. Open **Home** → **Noodle**, enter its **Settings**, invite characters or character folders, choose a generation connection under **Refresh**, then select **Refresh now** to generate the first activity. You can also set automatic refresh times, image generation, random users, and carryover into your chats.
 
-**1. Bind a lorebook to one character or persona** (lorebook editor → `Linked Character` / `Linked Persona`).
+See [Noodle: The In-App Social Timeline](noodle/overview.md) and [Noodle Settings and Chat Carryover](noodle/settings.md) for the full guides.
 
-The lorebook auto-activates in any chat that includes that character or uses that persona. Best when the lore is specifically _about_ that character (e.g., their backstory, their world). The two link types are mutually exclusive — pick one or the other, not both. Each link is single-value, so this is the right tool for one lorebook ↔ one character.
+## Why doesn't my character remember earlier messages?
 
-**2. Attach lorebooks per-chat via the chat settings drawer** (gear icon → **Lorebooks** section → **+ Add Lorebook**).
+AI models can only hold so much text at once, so old messages fall out of view in long chats. Marinara has two memory systems that help:
 
-Multi-select. Use this when you want one lorebook active across multiple characters, or scoped to just one specific chat, or when you want several lorebooks layered together for a single chat. The lorebook's `Linked Character` / `Linked Persona` fields can be empty for this — chat attachment is independent of those links.
+- **Memory Recall** searches earlier messages and quietly adds the most relevant bits back into the prompt. Turn it on in **Chat Settings** under **Memory Recall**.
+- Summaries compress old messages into short recaps. Roleplay chats use **Chat Summary**, and Conversation chats use **Automatic Summarization**.
 
-**3. Filter individual entries by character** (lorebook entry editor → `Character Filters`).
+For setup and details, see [Memory and Summaries](agents/memory.md).
 
-Inside a single shared lorebook, you can mark each entry as only firing when specific characters (or character tags) are present in the chat. Best for a "world bible" lorebook shared across many chats where some entries are character-specific.
+## How do I back up my data?
 
-**Common scenario — "I want this lorebook for Character A _and_ Character B":** leave the lorebook's character link empty, and attach the lorebook via the chat settings drawer in any chat that includes either character. The same lorebook can be attached to as many chats as you want.
+Open **Settings**, go to the **Advanced** tab, find the **Backup & Export** section, and click **Download Backup**. This saves a single `.zip` archive with your data and your uploaded files. To restore it later, use **Import Profile (JSON/ZIP)** in **Settings** under the **Imports** tab and choose the same `.zip`.
 
-</details>
+You can also enable a rotating daily, weekly, or monthly automatic backup in the same section. Full backup ZIPs can
+contain the encrypted records and the key file needed to unlock them, so keep them private. **Import Profile** still
+leaves provider secrets blank, so re-enter keys after importing. For the full guide, see
+[Backing Up and Restoring](data/backup-and-restore.md).
 
----
+## How do extensions work, and can I import third-party code?
 
-<details>
-<summary><strong>Does retrying agents rerun every agent or just one?</strong></summary>
-<br>
+By default, only Professor Mari can create a Personal Extension draft for you. It starts disabled, and you must inspect its code and approve the exact SHA-256 hash before it runs.
 
-It depends which retry button you use.
+Browser code uses a dedicated Worker inside an opaque-origin iframe by default. In addition to narrow logging, private-storage, timer, cleanup, and declarative UI capabilities, it receives the opaque IDs of the currently active chat and Characters so extensions such as Notepad can keep chat-specific state. A Browser Extension may separately request bounded snapshots of only the Character cards participating in that chat and/or the Persona selected for it. Those permissions are shown during exact-hash approval; without them, the corresponding records are absent. Sandboxed extensions never receive messages, whole Character or Persona libraries, undeclared fields, chat metadata, DOM access, network access, or mutation APIs. Server code runs in a separate OS-sandboxed process on supported macOS and Linux hosts and does not receive browser chat context.
 
-**Re-run Trackers** in the Roleplay HUD's Agents menu keeps the original broad behavior: it reruns all active tracker agents for that chat. Use this when the overall HUD state feels stale.
+Third-party imports are hidden by default. The host operator must set `ENABLE_EXTERNAL_EXTENSIONS=true` in `.env`, then the user must accept the warning under **Settings → Advanced → Danger Zone**. Until both gates are open, external records—including manually stored and profile-imported records—do not appear, cannot be approved, and cannot execute.
 
-Individual tracker controls are narrower. If you open a specific HUD widget and rerun it from there, Marinara sends only that tracker through the retry pipeline.
+An External Extension may request **Full page access** when legacy compatibility genuinely requires Marinara's DOM. This is not sandboxed: the exact approved code runs in Marinara's page and can access page content, browser storage, network APIs, and the current same-origin session. Professor Mari drafts cannot request it. Enable it only after inspecting and trusting that exact version; reload after disabling if unregistered changes remain. See [Personal Extensions](extending/personal-extensions.md).
 
-Other retry controls are also scoped to what they say on the button: **Retry Failed Agents** retries the failed agents from the last generation, while Injections-tab re-runs only refresh the selected cached prompt injection for the current assistant message.
+## Where is my data stored?
 
-</details>
+Everything lives on the computer running Marinara, inside the `data` folder in your install. Your characters, chats, personas, lorebooks, presets, and settings are all saved there. Nothing is stored in the cloud. See [Where Your Data Is Stored](data/where-data-is-stored.md).
 
----
+## Will I lose my data when I update?
 
-<details>
-<summary><strong>Does Marinara Engine have Guided Generation / Swipes / Regen?</strong></summary>
-<br>
+No. Updating Marinara keeps your characters, chats, and settings in place. It is still smart to make a backup before a big update, just in case. For update steps on each platform, see [Upgrading](UPGRADING.md).
 
-Yes. Use `/guided <direction>` when you want to steer the AI's next reply without speaking as your persona. It sends your text as hidden story direction, like `/guided make Alex interrupt` or `/guided move the scene toward the market`.
+## What can Professor Mari do?
 
-For swipes and regens, enable **Settings -> Advanced -> Guide swipes/regens with chat input**. Then the current chat-box draft is used as guidance when you click **Regenerate**, create a new swipe/reroll, or manually trigger a character response in a group chat.
+Professor Mari is the built-in assistant on the Home screen. Open her with the **Ask Professor Mari** button. She can explain the app and help with setup. She can also create or edit your data when you ask in plain language: characters, personas, lorebooks, prompt presets (saved instruction templates), and new chats.
 
-Guided `/guided` requests and guided manual character replies use Chat reply lorebook triggers. If an older lorebook entry was attached to Continue or Autonomous only so it could steer guided replies, move that entry to Chat reply.
+She also shows quick-reply suggestion chips above the input to guide multi-step creation and edits without making you type every detail by hand.
 
-If you want to post your persona message first without triggering a reply, enable **Settings -> Advanced -> Quick replies menu** and include **Post only**. The same settings submenu can include **Guide reply** for a quick `/guided` send and **Impersonate** for generating as your persona.
+When she changes your data, a review card appears with **Keep** and **Restore** buttons, so you can undo anything you do not want. She is a helper, not a replacement for these guides when something is version-specific. For the full list of what she can do, see [Professor Mari](home/professor-mari.md).
 
-</details>
+Professor Mari can still edit ordinary Marinara source files. Dependency files, launchers, installers, and CI workflows wait for an explicit review instead. If her change needs a public npm library, Marinara shows the exact resolved version and registry integrity before installing it with lifecycle scripts disabled.
 
----
+Note: on an ordinary remote address, Professor Mari's data-changing actions need both Basic Auth and an admin secret. Trusted or allowlisted network routes can use the bypasses described in [Remote Access](REMOTE_ACCESS.md).
 
-<a id="what-happens-if-i-enable-an-agent-and-also-have-similar-instructions-in-my-preset"></a>
-<a id="what-happens-if-i-add-an-agent-and-also-have-similar-instructions-in-my-preset"></a>
+## What is the Storyboard Agent, and how do I use it in Game Mode?
 
-<details>
-<summary><strong>What happens if I add an agent to a chat and also have similar instructions in my preset?</strong></summary>
-<br>
+The downloadable **Storyboard** Agent turns completed story text into an ordered sequence of keyframe images and can animate each keyframe into a short clip. In **Game Mode**, it storyboards one finished GM narration turn and displays the frames in a floating viewer or as the Game background. In **Roleplay**, it combines newly completed exchanges into an inline episode.
 
-Both contribute to the prompt, but in different ways: a preset section is static text concatenated every turn, while an agent runs at request time and produces its own output. If both target the same behavior, the model receives both — usually redundant, occasionally conflicting, and always extra tokens.
+To use it in Game Mode, install **Storyboard** from **Agents > Download Agents**. Open the Game, go to **Chat Settings > Agents**, turn on **Enable Agents** and **Enable Storyboards**, and set an image connection in the Game or the global Storyboard setup. Finish a GM narration turn, then open the **Gallery** and click **Create storyboard**. Use **View storyboard** to reopen its viewer.
 
-Common overlaps to watch for:
+For automatic Game Storyboards, turn on **Automatic Storyboard Illustrations**. Also turn on **Automatic Storyboard Animations** and select a Video Generation connection when you want clips. The new-game wizard's **Storyboard Optimized** presentation only shapes GM narration; it does not install or activate the Agent. For Game and Roleplay setup, prompts, viewers, migration behavior, and troubleshooting, see the [Storyboard Agent Guide](game/storyboard.md).
 
-- Writing-style or anti-repetition directives in the preset and the **Prose Guardian** agent.
-- Plot-steering, twist, pacing, or "what should happen next" directives in the preset and the **Narrative Director** agent, including its Secret Plot option.
-- "Track time / weather / location" instructions and the **World State** agent.
-- "Track character mood / outfit / stats" instructions and the **Character Tracker** agent.
-- Quest-tracking, combat-mechanics, or persona-stat instructions and their respective agents.
-- HTML/CSS visual-styling prompts and the **Immersive HTML** agent.
-- "Summarize past events" instructions and the manual or automated summary tools.
+## Can characters talk out loud in a call?
 
-**The general rule:** pick one place to express each behavior. If you've added an agent that covers a behavior, you can usually remove the matching preset directive. If you'd rather keep your preset version (e.g., it's tuned for a particular character), remove the corresponding agent from that chat or turn off the related chat-level option.
+Yes, in **Conversation** mode. Audio and video calls are a Conversation-only feature. To hear a character speak, first set up **Text to Speech** under the **Connections** panel.
 
-For story direction, choose the tool by how persistent you want the guidance to be. Use **Narrative Director** for occasional next-beat steering. Turn on its **Secret Plot** option when you want hidden long-term arc memory and scene directions across turns. Use a preset only when the instruction should be static every turn.
+If you want to talk back with your microphone and the browser's own speech recognition is unreliable, first install **Calls** from **Agents > Download Agents**. Then open the **Connections** panel, expand the **Local Model** card, find **Local Speech Model**, pick **Whisper Tiny (Multilingual)** or **Whisper Base (Multilingual)**, and click **Download Whisper**. Uninstalling Calls also removes its Whisper downloads to reclaim disk space. For the full call setup, see [Calls](conversation/calls.md).
 
-**One important exception:** the `agent_data` marker section, and the `{{agent::TYPE}}` macro, are the _intended_ way to thread an agent's output into a specific spot in the preset. That's wiring, not overlap — several agents (World State, Quest Tracker, Character Tracker, and others) set this up for you by default. The pattern to avoid is hand-writing preset sections that duplicate an agent's _behavior_, not using the marker section that carries the agent's _output_.
+## Can Marinara generate images?
 
-</details>
+Yes. Add an image generation connection, for example **Pollinations** (needs no key) or a paid provider. Marinara can then create character avatars, scene art, selfies, and Storyboard Agent keyframes in Roleplay or Game Mode. See [Connecting to an AI Provider](connections/connecting-to-a-provider.md) to add one.
+
+## How do I read the documentation inside the app?
+
+Every install ships with the full set of guides. You can read them without leaving the app:
+
+- On the Home screen, click the **Documentation** button in the footer, next to **Replay Tutorial**.
+- In the Home FAQ, open the documentation question and click **Open Documentation**.
+
+Both buttons open the same in-app viewer. It lists every guide and renders it inside Marinara.
+
+## Where do I get help or report a bug?
+
+Start with [Troubleshooting](TROUBLESHOOTING.md), which is organized by symptom. On the Home screen footer, the **Discord** button opens the community chat and the **Support** button opens the project's support page. For bugs and feature requests, use the project's GitHub page.
+
+## Related guides
+
+- [Troubleshooting](TROUBLESHOOTING.md)
+- [Installation](INSTALLATION.md)
+- [Remote Access](REMOTE_ACCESS.md)
+- [Connecting to an AI Provider](connections/connecting-to-a-provider.md)

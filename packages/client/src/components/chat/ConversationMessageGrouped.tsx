@@ -1,7 +1,7 @@
 // ──────────────────────────────────────────────
 // Grouped multi-speaker message layout (merged group chat / Name: text format)
 // ──────────────────────────────────────────────
-import { type RefObject } from "react";
+import { Fragment, type RefObject } from "react";
 import { normalizeTextForMatch } from "@marinara-engine/shared";
 import { cn, getAvatarCropStyle } from "../../lib/utils";
 import {
@@ -10,11 +10,20 @@ import {
   ConversationMessageAttachments,
   ConversationMessageTranslation,
   ConversationMessageSwipes,
+  IMAGE_URL_RE,
   nameColorStyle,
   formatTimestamp,
   type MessageRenderContext,
 } from "./ConversationMessageShared";
 import { ConversationMessageActions } from "./ConversationMessageActions";
+import { MessageReactions } from "./MessageReactions";
+import { ReactionAddButton } from "./ReactionAddButton";
+import {
+  MESSAGE_SELECTION_CHECKBOX_CLASS,
+  MESSAGE_SELECTION_CHECKBOX_SELECTED_CLASS,
+  MESSAGE_SELECTION_SURFACE_CLASS,
+} from "./message-selection-styles";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 export function ConversationMessageGrouped({
   ctx,
@@ -23,6 +32,7 @@ export function ConversationMessageGrouped({
   ctx: MessageRenderContext;
   msgRef: RefObject<HTMLDivElement | null>;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const {
     message,
     extra,
@@ -37,6 +47,9 @@ export function ConversationMessageGrouped({
     groupedSegments,
     visibleSegments,
     charByName,
+    charIdByName,
+    selfCharacterId,
+    galleryIndex,
     mentionNames,
     emojiMap,
     stickerMap,
@@ -60,7 +73,9 @@ export function ConversationMessageGrouped({
     isHiddenFromAI,
     canRegenerate,
     isLastAssistantMessage,
-    thinking,
+    hasReasoning,
+    reasoningSummaryUnavailable,
+    thinkingButtonRef,
     generationReplay,
     isGuided,
     regenerateButtonTitle,
@@ -74,24 +89,54 @@ export function ConversationMessageGrouped({
     onDelete,
     onShowGenerationReplay,
     onShowThinking,
-    onPickReaction,
+    segmentReactions,
+    resolveReactorName,
+    onPickSegmentReaction,
+    onToggleReactionEntry,
     onToggleSelect,
     isBubbleStyle,
   } = ctx;
 
+  // Per-segment add-reaction affordance: always visible on compact/mobile
+  // layouts, while desktop retains the existing hover/focus behavior.
+  const segActionsVisible = showActions || forceShowActions;
+  const segAddButtonClass = cn(
+    "shrink-0 self-center -my-0.5 transition-opacity",
+    segActionsVisible
+      ? "opacity-100"
+      : "pointer-events-auto opacity-100 md:pointer-events-none md:opacity-0 md:focus:pointer-events-auto md:focus:opacity-100 md:group-hover:pointer-events-auto md:group-hover:opacity-100",
+  );
+
+  // Card CSS (character bubble themes) is scoped to [data-card-css] subtrees. The
+  // root deliberately does NOT carry the attribute: each segment's themable
+  // content gets its own [data-card-css] wrapper below, so the per-segment
+  // reaction chip rows can render as siblings OUTSIDE card-CSS reach — the same
+  // invariant the shell keeps for the whole-message reaction row.
+  const cardCssProps = {
+    "data-card-css": message.characterId ?? undefined,
+    "data-grouped": isGrouped || undefined,
+  };
+  const hasTranslationContent = Boolean(translatedText || isTranslating);
+  const hasAttachmentContent = (extra.attachments?.length ?? 0) > 0 && !IMAGE_URL_RE.test(renderedContent.trim());
+  const hasSwipeContent = !hideActions && (hasSwipes || Boolean(canRegenerate && onRegenerate));
+  const hasTrailingContent =
+    isStreaming || (!isHiddenCollapsed && (hasTranslationContent || hasAttachmentContent || hasSwipeContent));
+
   return (
     <div
       ref={msgRef}
+      data-component="ConversationMessage.Grouped"
+      data-message-id={message.id}
+      data-message-role={message.role}
       className={cn(
         "relative px-4 py-0.5 transition-colors hover:bg-[var(--secondary)]/30",
         isBubbleStyle && "hover:bg-transparent",
         !noHoverGroup && "group",
         isGrouped ? "mt-0" : "mt-3",
         isStreaming && "bg-[var(--secondary)]/20",
-        multiSelectMode && isSelected && "bg-[var(--destructive)]/10",
+        multiSelectMode && isSelected && MESSAGE_SELECTION_SURFACE_CLASS,
+        hideActions && hasReasoning && "max-sm:pb-8",
       )}
-      data-card-css={message.characterId ?? undefined}
-      data-grouped={isGrouped || undefined}
       onClick={handleMobileTap}
     >
       {/* Multi-select checkbox */}
@@ -101,19 +146,20 @@ export function ConversationMessageGrouped({
             type="button"
             role="checkbox"
             aria-checked={isSelected}
-            aria-label={isSelected ? "Deselect message" : "Select message"}
+            aria-label={isSelected ?localizeUi("ui.chat.chatmessage.deselectMessage") :localizeUi("ui.chat.chatmessage.selectMessage")}
             onClick={(e) => {
               e.stopPropagation();
               onToggleSelect?.();
             }}
             className={cn(
-              "h-5 w-5 rounded border-2 flex items-center justify-center transition-colors cursor-pointer",
-              isSelected
-                ? "border-[var(--destructive)] bg-[var(--destructive)]"
-                : "border-[var(--muted-foreground)]/40 bg-[var(--secondary)]",
+              MESSAGE_SELECTION_CHECKBOX_CLASS,
+              "flex items-center justify-center",
+              isSelected && MESSAGE_SELECTION_CHECKBOX_SELECTED_CLASS,
             )}
           >
-            {isSelected && <span className="text-white text-xs font-bold">✓</span>}
+            {isSelected && (
+              <span className="text-xs font-bold text-[var(--marinara-chat-chrome-panel-bg)]">✓</span>
+            )}
           </button>
         </div>
       )}
@@ -121,7 +167,7 @@ export function ConversationMessageGrouped({
       {hiddenFromAIHeader && !isHiddenCollapsed && (
         <div className="mb-1 flex items-center gap-1 pl-14 text-[0.6875rem] text-amber-500/80">
           {hiddenFromAIHeader}
-          <span>Hidden from AI</span>
+          <span>{localizeUi("ui.chat.conversationmessagegrouped.hiddenFromAi")}</span>
         </div>
       )}
 
@@ -132,17 +178,49 @@ export function ConversationMessageGrouped({
       ) : (
         (groupedSegments ?? []).slice(0, visibleSegments).map((grp, i) => {
           const segChar = grp.speaker && charByName ? charByName.get(normalizeTextForMatch(grp.speaker)) : null;
+          const segSelfId =
+            (grp.speaker && charIdByName ? charIdByName.get(normalizeTextForMatch(grp.speaker)) : null) ??
+            selfCharacterId;
           const segAvatar = segChar?.avatarUrl ?? null;
           const segAvatarCropStyle = getAvatarCropStyle(segChar?.avatarCrop);
-          const segName = segChar?.name ?? grp.speaker ?? "";
+          const segName = segChar?.convoDisplayName?.trim() || segChar?.name || grp.speaker || "";
           const segColor = segChar?.nameColor;
           const isFirst = i === 0;
           const combinedText = grp.lines.join("\n");
+          // Reactions aimed at this segment (issue #3210). The add affordance sits
+          // in the speaker's name row; the chip row renders under the segment text,
+          // outside the segment's [data-card-css] wrapper. The target key is the
+          // parsed speaker (not the resolved character name) so it stays derivable
+          // from content alone. Empty-text segments are not targetable — the
+          // classic layout doesn't render them, so a reaction there would vanish
+          // (splitReactionsBySegment applies the same rule).
+          const segHasText = combinedText.trim().length > 0;
+          const segReactions = segmentReactions?.[i] ?? [];
+          const segAddButton =
+            !hideActions && onPickSegmentReaction && grp.speaker && segHasText ? (
+              <ReactionAddButton
+                onPick={(emoji, imageUrl) => onPickSegmentReaction({ segment: i, speaker: grp.speaker }, emoji, imageUrl)}
+                className={segAddButtonClass}
+              />
+            ) : null;
+          const segReactionRow =
+            segReactions.length > 0 ? (
+              <MessageReactions
+                reactions={segReactions}
+                resolveReactorName={resolveReactorName}
+                onToggle={onToggleReactionEntry}
+              />
+            ) : null;
 
           if (!grp.speaker) {
+            // Whitespace-only narration: render nothing — an empty
+            // [data-card-css] wrapper would paint a phantom themed box, the
+            // same invariant the speaker branches guard with segHasText.
+            if (!segHasText) return null;
             return (
               <div
                 key={i}
+                {...cardCssProps}
                 className="pl-14 py-0.5 text-[0.875rem] leading-relaxed break-words whitespace-pre-wrap text-[var(--muted-foreground)] italic animate-[fadeSlideIn_0.4s_ease-out]"
                 style={messageTextStyle}
               >
@@ -152,19 +230,23 @@ export function ConversationMessageGrouped({
                   emojiMap={emojiMap}
                   stickerMap={stickerMap}
                   onImageOpen={(url) => onImageOpen(url)}
+                  selfCharacterId={selfCharacterId}
+                galleryIndex={galleryIndex}
                 />
               </div>
             );
           }
 
           if (isBubbleStyle) {
+            if (!segHasText) return null;
             return (
-              <div
-                key={i}
-                className={["animate-[fadeSlideIn_0.4s_ease-out]", i > 0 && "mt-2"].filter(Boolean).join(" ")}
-              >
+              <Fragment key={i}>
+                <div
+                  {...cardCssProps}
+                  className={["animate-[fadeSlideIn_0.4s_ease-out]", i > 0 && "mt-2"].filter(Boolean).join(" ")}
+                >
                 <div className="flex items-end gap-2">
-                  <div className="h-8 w-8 shrink-0 overflow-hidden rounded-full bg-[var(--accent)]">
+                  <div className="relative h-8 w-8 shrink-0 overflow-hidden rounded-full bg-[var(--accent)]">
                     {segAvatar ? (
                       <img
                         src={segAvatar}
@@ -189,6 +271,7 @@ export function ConversationMessageGrouped({
                           {formatTimestamp(message.createdAt)}
                         </span>
                       )}
+                      {segAddButton}
                     </div>
                     <div
                       className="mari-message-bubble texting-bubble texting-bubble-other rounded-2xl px-3.5 py-2 text-[0.9375rem] leading-relaxed break-words whitespace-pre-wrap shadow-sm"
@@ -200,24 +283,36 @@ export function ConversationMessageGrouped({
                         emojiMap={emojiMap}
                         stickerMap={stickerMap}
                         onImageOpen={(url) => onImageOpen(url)}
+                        selfCharacterId={segSelfId}
+                      galleryIndex={galleryIndex}
                       />
                     </div>
                   </div>
+                  </div>
                 </div>
-              </div>
+                {segReactionRow && (
+                  <div className="mari-message-reactions-row ml-10 mt-1 max-w-[min(32rem,calc(100%-2.5rem))]">
+                    {segReactionRow}
+                  </div>
+                )}
+              </Fragment>
             );
           }
 
+          const paragraphs = combinedText
+            .split(/\n{2,}/)
+            .map((p) => p.trim())
+            .filter(Boolean);
+          // Whitespace-only segment: render nothing — an empty [data-card-css]
+          // wrapper would let container-styling themes paint a phantom box.
+          if (paragraphs.length === 0) return null;
+
           return (
-            <div key={i} className={["animate-[fadeSlideIn_0.4s_ease-out]", i > 0 && "mt-3"].filter(Boolean).join(" ")}>
-              {(() => {
-                const paragraphs = combinedText
-                  .split(/\n{2,}/)
-                  .map((p) => p.trim())
-                  .filter(Boolean);
-                if (paragraphs.length === 0) return null;
-                return (
-                  <>
+            <Fragment key={i}>
+              <div
+                {...cardCssProps}
+                className={["animate-[fadeSlideIn_0.4s_ease-out]", i > 0 && "mt-3"].filter(Boolean).join(" ")}
+              >
                     <div className="flex gap-4">
                       <div className="w-10 flex-shrink-0">
                         <div className="relative h-10 w-10 overflow-hidden rounded-full bg-[var(--accent)]">
@@ -254,6 +349,7 @@ export function ConversationMessageGrouped({
                               {formatTimestamp(message.createdAt)}
                             </span>
                           )}
+                          {segAddButton}
                         </div>
                         <div
                           className="text-[0.9375rem] leading-relaxed break-words whitespace-pre-wrap"
@@ -265,6 +361,8 @@ export function ConversationMessageGrouped({
                             emojiMap={emojiMap}
                             stickerMap={stickerMap}
                             onImageOpen={(url) => onImageOpen(url)}
+                            selfCharacterId={segSelfId}
+                          galleryIndex={galleryIndex}
                           />
                         </div>
                       </div>
@@ -281,67 +379,85 @@ export function ConversationMessageGrouped({
                           emojiMap={emojiMap}
                           stickerMap={stickerMap}
                           onImageOpen={(url) => onImageOpen(url)}
+                          selfCharacterId={segSelfId}
+                        galleryIndex={galleryIndex}
                         />
                       </div>
                     ))}
-                  </>
-                );
-              })()}
-            </div>
+              </div>
+              {segReactionRow && <div className="mari-message-reactions-row pl-14 mt-1">{segReactionRow}</div>}
+            </Fragment>
           );
         })
       )}
 
-      {/* Streaming cursor */}
-      {isStreaming && (
-        <span className="ml-14 inline-block h-4 w-[0.125rem] animate-pulse rounded-full bg-[var(--foreground)]/50" />
-      )}
+      {/* Trailing content (cursor, translation, attachments, swipes): kept in a
+          [data-card-css] wrapper so themes retain the reach they had when the
+          attribute lived on the block root — but only rendered when it has
+          content, so container-styling themes can't paint an empty box. The
+          hover action bar stays OUTSIDE the wrapper: it's chrome (like the chip
+          rows), and its absolute positioning must keep resolving against the
+          relative block root even if a theme makes the wrapper positioned. */}
+      {hasTrailingContent && (
+        <div {...cardCssProps}>
+          {/* Streaming cursor */}
+          {isStreaming && (
+            <span className="ml-14 inline-block h-4 w-[0.125rem] animate-pulse rounded-full bg-[var(--foreground)]/50" />
+          )}
 
-      {!isHiddenCollapsed && (
-        <div className="ml-14">
-          <ConversationMessageTranslation translatedText={translatedText} isTranslating={isTranslating} />
-        </div>
-      )}
-
-      {!isHiddenCollapsed && (
-        <>
-          {/* Image attachments */}
-          <div className="ml-14">
-            <ConversationMessageAttachments
-              attachments={extra.attachments ?? []}
-              renderedContent={renderedContent}
-              onImageOpen={onImageOpen}
-              onRemove={onRemoveAttachment}
-            />
-          </div>
-
-          {!hideActions && (hasSwipes || (canRegenerate && onRegenerate)) && (
-            <div className="ml-14 mt-1.5">
-              <ConversationMessageSwipes
-                messageId={message.id}
-                activeSwipeIndex={message.activeSwipeIndex}
-                swipeCount={swipeCount}
-                onSetActiveSwipe={(idx) => onSetActiveSwipe?.(message.id, idx)}
-                onCreateNextSwipe={canRegenerate && onRegenerate ? () => onRegenerate(message.id) : undefined}
+          {!isHiddenCollapsed && (
+            <div className="ml-14">
+              <ConversationMessageTranslation
+                translatedText={ctx.showTranslationOnly ? null : translatedText}
+                isTranslating={isTranslating}
               />
             </div>
           )}
-        </>
+
+          {!isHiddenCollapsed && (
+            <>
+              {/* Image attachments */}
+              <div className="ml-14">
+                <ConversationMessageAttachments
+                  attachments={extra.attachments ?? []}
+                  renderedContent={renderedContent}
+                  onImageOpen={onImageOpen}
+                  onRemove={onRemoveAttachment}
+                />
+              </div>
+
+              {!hideActions && (hasSwipes || (canRegenerate && onRegenerate)) && (
+                <div className="ml-14 mt-1.5">
+                  <ConversationMessageSwipes
+                    messageId={message.id}
+                    activeSwipeIndex={message.activeSwipeIndex}
+                    swipeCount={swipeCount}
+                    onSetActiveSwipe={(idx) => onSetActiveSwipe?.(message.id, idx)}
+                    onCreateNextSwipe={canRegenerate && onRegenerate ? () => onRegenerate(message.id) : undefined}
+                  />
+                </div>
+              )}
+            </>
+          )}
+        </div>
       )}
 
       {/* Action bar */}
-      {!hideActions && (
+      {(!hideActions || hasReasoning) && (
         <ConversationMessageActions
           isBubbleStyle={isBubbleStyle}
           isUser={false}
           showActions={showActions}
-          forceShowActions={forceShowActions}
+          forceShowActions={hideActions && hasReasoning ? true : forceShowActions}
+          thinkingOnly={hideActions && hasReasoning}
           copied={copied}
           translatedText={translatedText}
           isHiddenFromAI={isHiddenFromAI}
           canRegenerate={canRegenerate}
           isLastAssistantMessage={isLastAssistantMessage}
-          thinking={thinking}
+          hasReasoning={hasReasoning}
+          reasoningSummaryUnavailable={reasoningSummaryUnavailable}
+          thinkingButtonRef={thinkingButtonRef}
           generationReplay={generationReplay}
           isGuided={isGuided}
           regenerateButtonTitle={regenerateButtonTitle}
@@ -357,7 +473,10 @@ export function ConversationMessageGrouped({
           onDelete={onDelete ? () => onDelete(message.id) : undefined}
           onShowGenerationReplay={onShowGenerationReplay}
           onShowThinking={onShowThinking}
-          onPickReaction={onPickReaction}
+          // A grouped block has one precise reaction affordance per speaker.
+          // Omitting the ambiguous whole-block picker prevents mobile taps from
+          // reacting to the final segment instead of the intended speaker.
+          onPickReaction={undefined}
         />
       )}
     </div>

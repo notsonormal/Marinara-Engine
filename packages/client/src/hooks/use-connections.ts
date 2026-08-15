@@ -6,7 +6,7 @@ import { api } from "../lib/api-client";
 import { useUIStore } from "../stores/ui.store";
 import { useChatStore } from "../stores/chat.store";
 import { chatKeys } from "./use-chats";
-import type { APIProvider, Chat, ConnectionTestResult } from "@marinara-engine/shared";
+import type { APIProvider, Chat, ConnectionTestResult, ImageGenerationQuality } from "@marinara-engine/shared";
 
 export const connectionKeys = {
   all: ["connections"] as const,
@@ -39,8 +39,10 @@ export type CreateConnectionPayload = {
   model?: string;
   maxContext?: number;
   isDefault?: boolean;
+  fallbackForMain?: boolean;
   useForRandom?: boolean;
   defaultForAgents?: boolean;
+  fallbackForAgents?: boolean;
   enableCaching?: boolean;
   anthropicExtendedCacheTtl?: boolean;
   cachingAtDepth?: number;
@@ -52,6 +54,10 @@ export type CreateConnectionPayload = {
   comfyuiWorkflow?: string | null;
   imageService?: string | null;
   imageEndpointId?: string | null;
+  imagePromptInstructions?: string | null;
+  imageGenerationQuality?: ImageGenerationQuality;
+  videoGenerationSource?: string | null;
+  videoService?: string | null;
   promptPresetId?: string | null;
   maxTokensOverride?: number | null;
   maxParallelJobs?: number;
@@ -168,6 +174,20 @@ export function useTestImageGeneration() {
   });
 }
 
+export function useTestVideoGeneration() {
+  return useMutation({
+    mutationFn: (id: string) =>
+      api.post<{
+        success: boolean;
+        base64: string | null;
+        mimeType: string | null;
+        latencyMs: number;
+        prompt: string;
+        error?: string;
+      }>(`/connections/${id}/test-video`),
+  });
+}
+
 export type RemoteConnectionModel = {
   id: string;
   name: string;
@@ -177,7 +197,8 @@ export type RemoteConnectionModel = {
 
 export function useFetchModels() {
   return useMutation({
-    mutationFn: (id: string) => api.get<{ models: RemoteConnectionModel[] }>(`/connections/${id}/models`),
+    mutationFn: (id: string) =>
+      api.get<{ models: RemoteConnectionModel[]; loras?: RemoteConnectionModel[] }>(`/connections/${id}/models`),
   });
 }
 
@@ -186,9 +207,12 @@ export function useSaveConnectionDefaults() {
   return useMutation({
     mutationFn: ({ id, params }: { id: string; params: Record<string, unknown> | null }) =>
       api.put(`/connections/${id}/default-parameters`, params),
-    onSuccess: (_data, variables) => {
-      qc.invalidateQueries({ queryKey: connectionKeys.list() });
-      qc.invalidateQueries({ queryKey: connectionKeys.detail(variables.id) });
-    },
+    // Returning the promise makes mutateAsync wait for the refetches, so the
+    // follow-up connection save cannot race in an older defaults snapshot.
+    onSuccess: (_data, variables) =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: connectionKeys.list() }),
+        qc.invalidateQueries({ queryKey: connectionKeys.detail(variables.id) }),
+      ]),
   });
 }

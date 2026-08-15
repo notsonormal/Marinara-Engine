@@ -1,6 +1,7 @@
 import { useUIStore, type MusicPlayerSource } from "../../stores/ui.store";
 import { cn } from "../../lib/utils";
 import { Play } from "lucide-react";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 function SpotifyGlyph({ className }: { className?: string }) {
   return (
@@ -37,6 +38,7 @@ export function MusicSourceGlyph({ source, className }: { source: MusicPlayerSou
 }
 
 export function MusicSourceButton({ source, className }: { source: MusicPlayerSource; className?: string }) {
+  const { t: localizeUi } = useUiTranslation();
   const setMusicPlayerSource = useUIStore((s) => s.setMusicPlayerSource);
   const sourceOrder: MusicPlayerSource[] = ["spotify", "youtube", "custom"];
   const nextSource = sourceOrder[(sourceOrder.indexOf(source) + 1) % sourceOrder.length] ?? "spotify";
@@ -46,7 +48,7 @@ export function MusicSourceButton({ source, className }: { source: MusicPlayerSo
     custom: "Custom",
   };
   const sourceClasses = cn(
-    "border-[#f7f3ef]/15 bg-[#f7f3ef]/5 hover:border-[#f7f3ef]/30 hover:bg-[#f7f3ef]/10",
+    "border-[var(--marinara-music-player-button-border)] bg-[var(--marinara-music-player-button-bg)] hover:border-[var(--marinara-music-player-button-border-hover)] hover:bg-[var(--marinara-music-player-button-bg-hover)]",
     source === "spotify" && "text-[#1DB954]",
     source === "youtube" && "text-[#FF0000]",
     source === "custom" && "text-[var(--primary)]",
@@ -64,8 +66,8 @@ export function MusicSourceButton({ source, className }: { source: MusicPlayerSo
         sourceClasses,
         className,
       )}
-      title={`Switch to ${labels[nextSource]} player`}
-      aria-label={`Switch to ${labels[nextSource]} player`}
+      title={localizeUi("ui.music.musicsourcebutton.switchToValue1Player", { value1: labels[nextSource] })}
+      aria-label={localizeUi("ui.music.musicsourcebutton.switchToValue1Player", { value1: labels[nextSource] })}
     >
       <MusicSourceGlyph source={source} />
     </button>

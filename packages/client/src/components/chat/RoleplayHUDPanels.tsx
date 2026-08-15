@@ -44,15 +44,18 @@ import type {
   InventoryItem,
   PresentCharacter,
   QuestProgress,
+  WorldCustomField,
 } from "@marinara-engine/shared";
 import {
   characterStatTrackerLockKey,
+  characterCustomFieldTrackerLockKey,
   characterTrackerLockKey,
   characterTrackerLockPrefix,
   customTrackerFieldLockPrefix,
   customTrackerLockKey,
   inventoryItemTrackerLockPrefix,
   inventoryTrackerLockKey,
+  isTrackerFieldHidden,
   isTrackerFieldLocked,
   personaStatTrackerLockPrefix,
   personaStatTrackerLockKey,
@@ -64,9 +67,13 @@ import {
   removeTrackerFieldLockPrefix,
   removeTrackerQuestLocks,
   renameTrackerFieldLockPrefix,
+  worldCustomFieldTrackerLockKey,
   worldTrackerLockKey,
 } from "@marinara-engine/shared";
 import { useTrackerLockContext } from "../../features/tracker-panel/components/TrackerLockContext";
+import { WorldCustomFieldIcon } from "../../features/tracker-panel/lib/world-custom-field-icons";
+import { trackerEditableText } from "../../features/tracker-panel/lib/tracker-display";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 interface CombinedPlayerPanelProps {
   showPersona: boolean;
@@ -143,6 +150,7 @@ function HudFieldLockButton({
   persistentLocked?: boolean;
   className?: string;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const { lockMode } = useTrackerLockContext();
   if (!lockMode) return null;
 
@@ -150,8 +158,8 @@ function HudFieldLockButton({
     <button
       type="button"
       onClick={onToggle}
-      title={locked ? "Unlock field" : "Lock field"}
-      aria-label={`${locked ? "Unlock" : "Lock"} ${label}`}
+      title={locked ?localizeUi("ui.chat.hudfieldlockbutton.unlockField") :localizeUi("ui.chat.hudfieldlockbutton.lockField")}
+      aria-label={localizeUi("ui.chat.scheduletimeline.value1Value2", { value1: locked ?localizeUi("ui.noodle.lockednoodlerpostcard.unlock") :localizeUi("ui.chat.hudfieldlockbutton.lock"), value2: label })}
       aria-pressed={locked}
       className={cn(
         "flex h-4 w-4 shrink-0 items-center justify-center rounded text-[var(--muted-foreground)]/55 opacity-70 ring-1 ring-transparent transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-[var(--border)] active:scale-90 max-md:opacity-100",
@@ -166,6 +174,7 @@ function HudFieldLockButton({
 }
 
 function HudLockModeToggle() {
+  const { t: localizeUi } = useUiTranslation();
   const { lockMode, onSetLockMode } = useTrackerLockContext();
   if (!onSetLockMode) return null;
 
@@ -173,8 +182,8 @@ function HudLockModeToggle() {
     <button
       type="button"
       onClick={() => onSetLockMode(!lockMode)}
-      title={lockMode ? "Exit lock mode" : "Enter lock mode"}
-      aria-label={lockMode ? "Exit HUD lock mode" : "Enter HUD lock mode"}
+      title={lockMode ?localizeUi("ui.chat.hudlockmodetoggle.exitLockMode") :localizeUi("ui.chat.hudlockmodetoggle.enterLockMode")}
+      aria-label={lockMode ?localizeUi("ui.chat.hudlockmodetoggle.exitHudLockMode") :localizeUi("ui.chat.hudlockmodetoggle.enterHudLockMode")}
       aria-pressed={!!lockMode}
       className={cn(
         "flex h-5 w-5 shrink-0 items-center justify-center rounded p-0.5 transition-all active:scale-90",
@@ -199,6 +208,11 @@ function useHudFieldLockResolver() {
   );
 }
 
+function useHudFieldHiddenResolver() {
+  const { hiddenTrackerFields } = useTrackerLockContext();
+  return useCallback((key: string) => isTrackerFieldHidden(hiddenTrackerFields, key), [hiddenTrackerFields]);
+}
+
 export function CombinedPlayerPanel({
   showPersona,
   showCharacters,
@@ -221,7 +235,8 @@ export function CombinedPlayerPanel({
   onRerunSingleTracker,
   isTrackerRetryBusy,
 }: CombinedPlayerPanelProps) {
-  const { onUpdateFieldLocks } = useTrackerLockContext();
+  const { t: localizeUi } = useUiTranslation();
+  const { onUpdateFieldLocks, onUpdateHiddenFields } = useTrackerLockContext();
   const updateBar = (idx: number, field: "value" | "max" | "name", val: number | string) => {
     const previous = personaStats[idx];
     const next = [...personaStats];
@@ -256,7 +271,10 @@ export function CombinedPlayerPanel({
   };
   const removeCharacter = (idx: number) => {
     const removed = characters[idx];
-    if (removed) onUpdateFieldLocks?.((locks) => removeTrackerCharacterLocks(locks, removed, idx));
+    if (removed) {
+      onUpdateFieldLocks?.((locks) => removeTrackerCharacterLocks(locks, removed, idx));
+      onUpdateHiddenFields?.((hiddenFields) => removeTrackerCharacterLocks(hiddenFields, removed, idx));
+    }
     onUpdateCharacters(characters.filter((_, i) => i !== idx));
   };
   const updateCharacter = (idx: number, updated: PresentCharacter) => {
@@ -265,6 +283,13 @@ export function CombinedPlayerPanel({
       onUpdateFieldLocks?.((locks) =>
         renameTrackerFieldLockPrefix(
           locks,
+          characterTrackerLockPrefix(previous, idx),
+          characterTrackerLockPrefix(updated, idx),
+        ),
+      );
+      onUpdateHiddenFields?.((hiddenFields) =>
+        renameTrackerFieldLockPrefix(
+          hiddenFields,
           characterTrackerLockPrefix(previous, idx),
           characterTrackerLockPrefix(updated, idx),
         ),
@@ -352,14 +377,14 @@ export function CombinedPlayerPanel({
     onUpdateCustomTracker(next);
   };
   const lockFor = useHudFieldLockResolver();
+  const hiddenFor = useHudFieldHiddenResolver();
   const personaStatusLock = lockFor(personaStatusTrackerLockKey());
 
   return (
     <>
       <div className={cn(ROLEPLAY_POPOVER_HEADER, "flex items-center justify-between")}>
         <span className={ROLEPLAY_POPOVER_TITLE}>
-          <Swords size="0.625rem" className="text-orange-400/80" /> Trackers
-        </span>
+          <Swords size="0.625rem" className="text-orange-400/80" /> {localizeUi("ui.chat.combinedplayerpanel.trackers")}</span>
         <span className="flex items-center gap-1">
           <HudLockModeToggle />
           <button
@@ -380,18 +405,16 @@ export function CombinedPlayerPanel({
               onToggleLock={personaStatusLock.onToggle}
             />
             <div className="flex items-center justify-between px-1 pb-1">
-              <span className="text-[0.625rem] font-semibold text-[var(--muted-foreground)] uppercase tracking-wider">
-                Persona Stats
-              </span>
+              <span className="text-[0.625rem] font-semibold text-[var(--muted-foreground)] uppercase tracking-wider">{localizeUi("ui.chat.personastatswidget.personaStats")}</span>
               <TrackerSectionRefresh
                 agentType="persona-stats"
                 onRerunSingleTracker={onRerunSingleTracker}
                 busy={isTrackerRetryBusy}
-                title="Re-run persona tracker (stats + inventory)"
+                title={localizeUi("ui.chat.combinedplayerpanel.reRunPersonaTrackerStatsInventory")}
               />
             </div>
             <div className="space-y-2">
-              {personaStats.length === 0 && <div className={EMPTY_STATE}>No stats tracked</div>}
+              {personaStats.length === 0 && <div className={EMPTY_STATE}>{localizeUi("ui.chat.combinedplayerpanel.noStatsTracked")}</div>}
               {personaStats.map((bar, idx) => {
                 const nameLock = lockFor(personaStatTrackerLockKey(bar, "name", idx));
                 const valueLock = lockFor(personaStatTrackerLockKey(bar, "value", idx));
@@ -420,25 +443,24 @@ export function CombinedPlayerPanel({
           <div className="p-2">
             <div className="flex items-center justify-between px-1 pb-1">
               <span className={TRACKER_SECTION_TITLE}>
-                <Users size="0.5625rem" className="text-sky-400/80" /> Characters ({characters.length})
+                <Users size="0.5625rem" className="text-sky-400/80" /> {localizeUi("ui.panels.characterspanel.characters")}{characters.length})
               </span>
               <span className="flex items-center gap-1">
                 <TrackerSectionRefresh
                   agentType="character-tracker"
                   onRerunSingleTracker={onRerunSingleTracker}
                   busy={isTrackerRetryBusy}
-                  title="Re-run character tracker only"
+                  title={localizeUi("ui.chat.combinedplayerpanel.reRunCharacterTrackerOnly")}
                 />
                 <button
                   onClick={addCharacter}
                   className="flex items-center gap-0.5 text-[0.625rem] text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
                 >
-                  <Plus size="0.625rem" /> Add
-                </button>
+                  <Plus size="0.625rem" /> {localizeUi("ui.characters.metadatatab.add")}</button>
               </span>
             </div>
             <div className="space-y-2">
-              {characters.length === 0 && <div className={EMPTY_STATE}>No characters in scene</div>}
+              {characters.length === 0 && <div className={EMPTY_STATE}>{localizeUi("ui.chat.combinedplayerpanel.noCharactersInScene")}</div>}
               {characters.map((char, idx) => {
                 const emojiLock = lockFor(characterTrackerLockKey(char, idx, "emoji"));
                 const nameLock = lockFor(characterTrackerLockKey(char, idx, "name"));
@@ -446,6 +468,11 @@ export function CombinedPlayerPanel({
                 const appearanceLock = lockFor(characterTrackerLockKey(char, idx, "appearance"));
                 const outfitLock = lockFor(characterTrackerLockKey(char, idx, "outfit"));
                 const thoughtsLock = lockFor(characterTrackerLockKey(char, idx, "thoughts"));
+                const showMood = !hiddenFor(characterTrackerLockKey(char, idx, "mood"));
+                const showAppearance = !hiddenFor(characterTrackerLockKey(char, idx, "appearance"));
+                const showOutfit = !hiddenFor(characterTrackerLockKey(char, idx, "outfit"));
+                const showThoughts = !hiddenFor(characterTrackerLockKey(char, idx, "thoughts"));
+                const hasVisibleDefaultFields = showMood || showAppearance || showOutfit || showThoughts;
                 return (
                   <div key={char.characterId ?? idx} className="rounded-lg bg-[var(--muted)]/20 p-2 space-y-1">
                   <div className="group/field flex items-center gap-1.5">
@@ -455,53 +482,81 @@ export function CombinedPlayerPanel({
                       className="w-8 text-center !text-sm"
                       locked={emojiLock.locked}
                     />
-                    <HudFieldLockButton {...emojiLock} label={`${char.name || "character"} emoji`} />
+                    <HudFieldLockButton {...emojiLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Emoji", { value1: char.name ||localizeUi("ui.noodle.noodlehome.character") })} />
                     <InlineEdit
                       value={char.name}
                       onSave={(value) => updateCharacter(idx, { ...char, name: value })}
                       className="flex-1 !font-medium"
-                      placeholder="Name"
+                      placeholder={localizeUi("ui.characters.metadatatab.name")}
                       locked={nameLock.locked}
                     />
-                    <HudFieldLockButton {...nameLock} label={`${char.name || "character"} name`} />
+                    <HudFieldLockButton {...nameLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Name", { value1: char.name ||localizeUi("ui.noodle.noodlehome.character") })} />
                     <button
                       onClick={() => removeCharacter(idx)}
                       className="text-[var(--muted-foreground)]/40 hover:text-red-500 transition-colors shrink-0"
-                      title="Remove character"
+                      title={localizeUi("ui.chat.combinedplayerpanel.removeCharacter")}
                     >
                       <X size="0.625rem" />
                     </button>
                   </div>
-                  <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 pl-1">
-                    <LabeledEdit
-                      label="Mood"
-                      value={char.mood}
-                      onSave={(value) => updateCharacter(idx, { ...char, mood: value })}
-                      locked={moodLock.locked}
-                      onToggleLock={moodLock.onToggle}
-                    />
-                    <LabeledEdit
-                      label="Look"
-                      value={char.appearance ?? ""}
-                      onSave={(value) => updateCharacter(idx, { ...char, appearance: value || null })}
-                      locked={appearanceLock.locked}
-                      onToggleLock={appearanceLock.onToggle}
-                    />
-                    <LabeledEdit
-                      label="Outfit"
-                      value={char.outfit ?? ""}
-                      onSave={(value) => updateCharacter(idx, { ...char, outfit: value || null })}
-                      locked={outfitLock.locked}
-                      onToggleLock={outfitLock.onToggle}
-                    />
-                    <LabeledEdit
-                      label="Thinks"
-                      value={char.thoughts ?? ""}
-                      onSave={(value) => updateCharacter(idx, { ...char, thoughts: value || null })}
-                      locked={thoughtsLock.locked}
-                      onToggleLock={thoughtsLock.onToggle}
-                    />
-                  </div>
+                  {(hasVisibleDefaultFields || Object.keys(char.customFields ?? {}).length > 0) && (
+                    <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 pl-1">
+                      {showMood && (
+                        <LabeledEdit
+                          label={localizeUi("ui.chat.combinedplayerpanel.mood")}
+                          value={char.mood}
+                          onSave={(value) => updateCharacter(idx, { ...char, mood: value })}
+                          locked={moodLock.locked}
+                          onToggleLock={moodLock.onToggle}
+                        />
+                      )}
+                      {showAppearance && (
+                        <LabeledEdit
+                          label={localizeUi("ui.chat.combinedplayerpanel.look")}
+                          value={char.appearance ?? ""}
+                          onSave={(value) => updateCharacter(idx, { ...char, appearance: value || null })}
+                          locked={appearanceLock.locked}
+                          onToggleLock={appearanceLock.onToggle}
+                        />
+                      )}
+                      {showOutfit && (
+                        <LabeledEdit
+                          label={localizeUi("ui.chat.combinedplayerpanel.outfit")}
+                          value={char.outfit ?? ""}
+                          onSave={(value) => updateCharacter(idx, { ...char, outfit: value || null })}
+                          locked={outfitLock.locked}
+                          onToggleLock={outfitLock.onToggle}
+                        />
+                      )}
+                      {showThoughts && (
+                        <LabeledEdit
+                          label={localizeUi("ui.chat.combinedplayerpanel.thinks")}
+                          value={char.thoughts ?? ""}
+                          onSave={(value) => updateCharacter(idx, { ...char, thoughts: value || null })}
+                          locked={thoughtsLock.locked}
+                          onToggleLock={thoughtsLock.onToggle}
+                        />
+                      )}
+                      {Object.entries(char.customFields ?? {}).map(([name, value]) => {
+                        const valueLock = lockFor(characterCustomFieldTrackerLockKey(char, idx, name, "value"));
+                        return (
+                          <LabeledEdit
+                            key={name}
+                            label={name}
+                            value={trackerEditableText(value)}
+                            onSave={(nextValue) =>
+                              updateCharacter(idx, {
+                                ...char,
+                                customFields: { ...(char.customFields ?? {}), [name]: nextValue },
+                              })
+                            }
+                            locked={valueLock.locked}
+                            onToggleLock={valueLock.onToggle}
+                          />
+                        );
+                      })}
+                    </div>
+                  )}
                   {Array.isArray(char.stats) && char.stats.length > 0 && (
                     <div className="space-y-1 pt-1 border-t border-[var(--border)]">
                       {char.stats.map((stat, statIndex) => {
@@ -541,14 +596,13 @@ export function CombinedPlayerPanel({
           <div className="p-2">
             <div className="flex items-center justify-between px-1 pb-1">
               <span className={TRACKER_SECTION_TITLE}>
-                <Package size="0.5625rem" className="text-amber-400/80" /> Inventory ({inventory.length})
+                <Package size="0.5625rem" className="text-amber-400/80" /> {localizeUi("ui.chat.combinedplayerpanel.inventory")}{inventory.length})
               </span>
               <button onClick={addItem} className={TRACKER_SECTION_ACTION}>
-                <Plus size="0.625rem" /> Add
-              </button>
+                <Plus size="0.625rem" /> {localizeUi("ui.characters.metadatatab.add")}</button>
             </div>
             <div className="space-y-1">
-              {inventory.length === 0 && <div className={EMPTY_STATE}>Inventory empty</div>}
+              {inventory.length === 0 && <div className={EMPTY_STATE}>{localizeUi("ui.chat.combinedplayerpanel.inventoryEmpty")}</div>}
               {inventory.map((item, idx) => {
                 const nameLock = lockFor(inventoryTrackerLockKey(item, "name", idx));
                 const quantityLock = lockFor(inventoryTrackerLockKey(item, "quantity", idx));
@@ -562,10 +616,10 @@ export function CombinedPlayerPanel({
                       value={item.name}
                       onSave={(value) => updateItem(idx, { ...item, name: value })}
                       className="flex-1"
-                      placeholder="Item name"
+                      placeholder={localizeUi("ui.chat.combinedplayerpanel.itemName")}
                       locked={nameLock.locked}
                     />
-                    <HudFieldLockButton {...nameLock} label={`${item.name || "item"} name`} />
+                    <HudFieldLockButton {...nameLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Name", { value1: item.name ||localizeUi("ui.chat.databaseworkspaceapprovalcard.item") })} />
                     <input
                       type="number"
                       value={item.quantity}
@@ -574,13 +628,13 @@ export function CombinedPlayerPanel({
                         "w-8 rounded bg-transparent text-center text-[0.5625rem] text-[var(--foreground)]/60 outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none",
                         quantityLock.locked && HUD_LOCKED_FIELD_CLASS,
                       )}
-                      title="Quantity"
+                      title={localizeUi("ui.chat.combinedplayerpanel.quantity")}
                     />
-                    <HudFieldLockButton {...quantityLock} label={`${item.name || "item"} quantity`} />
+                    <HudFieldLockButton {...quantityLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Quantity", { value1: item.name ||localizeUi("ui.chat.databaseworkspaceapprovalcard.item") })} />
                     <button
                       onClick={() => removeItem(idx)}
                       className="text-[var(--muted-foreground)]/40 hover:text-red-500 transition-colors shrink-0"
-                      title="Remove item"
+                      title={localizeUi("ui.chat.combinedplayerpanel.removeItem")}
                     >
                       <X size="0.5625rem" />
                     </button>
@@ -595,22 +649,21 @@ export function CombinedPlayerPanel({
           <div className="p-2">
             <div className="flex items-center justify-between px-1 pb-1">
               <span className={TRACKER_SECTION_TITLE}>
-                <Scroll size="0.5625rem" className="text-emerald-400/80" /> Quests ({quests.length})
+                <Scroll size="0.5625rem" className="text-emerald-400/80" /> {localizeUi("ui.chat.combinedplayerpanel.quests")}{quests.length})
               </span>
               <span className="flex items-center gap-1">
                 <TrackerSectionRefresh
                   agentType="quest"
                   onRerunSingleTracker={onRerunSingleTracker}
                   busy={isTrackerRetryBusy}
-                  title="Re-run quest tracker only"
+                  title={localizeUi("ui.chat.combinedplayerpanel.reRunQuestTrackerOnly")}
                 />
                 <button onClick={addQuest} className={TRACKER_SECTION_ACTION}>
-                  <Plus size="0.625rem" /> Add
-                </button>
+                  <Plus size="0.625rem" /> {localizeUi("ui.characters.metadatatab.add")}</button>
               </span>
             </div>
             <div className="space-y-2">
-              {quests.length === 0 && <div className={EMPTY_STATE}>No active quests</div>}
+              {quests.length === 0 && <div className={EMPTY_STATE}>{localizeUi("ui.chat.combinedplayerpanel.noActiveQuests")}</div>}
               {quests.map((quest, idx) => (
                 <QuestCardEditable
                   key={quest.questEntryId || idx}
@@ -629,22 +682,21 @@ export function CombinedPlayerPanel({
             <div className="flex items-center justify-between px-1 pb-1">
               <span className={TRACKER_SECTION_TITLE}>
                 <SlidersHorizontal size="0.5625rem" className="text-[var(--muted-foreground)]" />{" "}
-                {`Custom (${customTrackerFields.length})`}
+                {localizeUi("ui.chat.combinedplayerpanel.customValue1", { value1: customTrackerFields.length })}
               </span>
               <span className="flex items-center gap-1">
                 <TrackerSectionRefresh
                   agentType="custom-tracker"
                   onRerunSingleTracker={onRerunSingleTracker}
                   busy={isTrackerRetryBusy}
-                  title="Re-run custom tracker only"
+                  title={localizeUi("ui.chat.combinedplayerpanel.reRunCustomTrackerOnly")}
                 />
                 <button onClick={addCustomField} className={TRACKER_SECTION_ACTION}>
-                  <Plus size="0.625rem" /> Add
-                </button>
+                  <Plus size="0.625rem" /> {localizeUi("ui.characters.metadatatab.add")}</button>
               </span>
             </div>
             <div className="space-y-1">
-              {customTrackerFields.length === 0 && <div className={EMPTY_STATE}>No fields tracked</div>}
+              {customTrackerFields.length === 0 && <div className={EMPTY_STATE}>{localizeUi("ui.chat.combinedplayerpanel.noFieldsTracked")}</div>}
               {customTrackerFields.map((field, idx) => {
                 const nameLock = lockFor(customTrackerLockKey(field, "name", idx));
                 const valueLock = lockFor(customTrackerLockKey(field, "value", idx));
@@ -662,27 +714,27 @@ export function CombinedPlayerPanel({
                       value={field.name}
                       onSave={(value) => updateCustomField(idx, { ...field, name: value })}
                       className="flex-1 min-w-0"
-                      placeholder="Field name"
+                      placeholder={localizeUi("ui.chat.combinedplayerpanel.fieldName")}
                       locked={nameLock.locked}
                     />
-                    <HudFieldLockButton {...nameLock} label={`${field.name || "field"} name`} />
+                    <HudFieldLockButton {...nameLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Name", { value1: field.name ||localizeUi("ui.chat.combinedplayerpanel.field") })} />
                     <span className="text-[var(--muted-foreground)]/40 text-[0.5rem]">=</span>
                     <InlineEdit
                       value={field.value}
                       onSave={(value) => updateCustomField(idx, { ...field, value })}
                       className="flex-1 min-w-0"
-                      placeholder="Value"
+                      placeholder={localizeUi("ui.chat.combinedplayerpanel.value")}
                       locked={valueLock.locked || field.locked}
                     />
                     <HudFieldLockButton
                       locked={valueLock.locked || field.locked}
                       onToggle={toggleValueLock}
-                      label={`${field.name || "field"} value`}
+                      label={localizeUi("ui.chat.combinedplayerpanel.value1Value", { value1: field.name ||localizeUi("ui.chat.combinedplayerpanel.field") })}
                     />
                     <button
                       onClick={() => removeCustomField(idx)}
                       className="text-[var(--muted-foreground)]/40 hover:text-red-500 transition-colors shrink-0"
-                      title="Remove field"
+                      title={localizeUi("ui.chat.combinedplayerpanel.removeField")}
                     >
                       <X size="0.5625rem" />
                     </button>
@@ -714,6 +766,7 @@ export function PersonaStatsPanel({
   onRerunSingleTracker,
   isTrackerRetryBusy,
 }: PersonaStatsPanelProps) {
+  const { t: localizeUi } = useUiTranslation();
   const { onUpdateFieldLocks } = useTrackerLockContext();
   const updateBar = (idx: number, field: "value" | "max" | "name", val: number | string) => {
     const previous = bars[idx];
@@ -750,13 +803,13 @@ export function PersonaStatsPanel({
         />
       </div>
       <div className={cn(ROLEPLAY_POPOVER_HEADER, "flex items-center justify-between")}>
-        <span className={ROLEPLAY_POPOVER_TITLE}>Persona Stats</span>
+        <span className={ROLEPLAY_POPOVER_TITLE}>{localizeUi("ui.chat.personastatswidget.personaStats")}</span>
         <span className="flex items-center gap-1">
           <TrackerSectionRefresh
             agentType="persona-stats"
             onRerunSingleTracker={onRerunSingleTracker}
             busy={isTrackerRetryBusy}
-            title="Re-run persona tracker (stats + inventory)"
+            title={localizeUi("ui.chat.combinedplayerpanel.reRunPersonaTrackerStatsInventory")}
           />
           <HudLockModeToggle />
         </span>
@@ -803,7 +856,8 @@ export function CharactersPanel({
   onRerunSingleTracker,
   isTrackerRetryBusy,
 }: CharactersPanelProps) {
-  const { onUpdateFieldLocks } = useTrackerLockContext();
+  const { t: localizeUi } = useUiTranslation();
+  const { onUpdateFieldLocks, onUpdateHiddenFields } = useTrackerLockContext();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadIdx, setUploadIdx] = useState<number | null>(null);
 
@@ -874,7 +928,10 @@ export function CharactersPanel({
 
   const removeCharacter = (idx: number) => {
     const removed = characters[idx];
-    if (removed) onUpdateFieldLocks?.((locks) => removeTrackerCharacterLocks(locks, removed, idx));
+    if (removed) {
+      onUpdateFieldLocks?.((locks) => removeTrackerCharacterLocks(locks, removed, idx));
+      onUpdateHiddenFields?.((hiddenFields) => removeTrackerCharacterLocks(hiddenFields, removed, idx));
+    }
     onUpdate(characters.filter((_, i) => i !== idx));
   };
 
@@ -888,25 +945,32 @@ export function CharactersPanel({
           characterTrackerLockPrefix(updated, idx),
         ),
       );
+      onUpdateHiddenFields?.((hiddenFields) =>
+        renameTrackerFieldLockPrefix(
+          hiddenFields,
+          characterTrackerLockPrefix(previous, idx),
+          characterTrackerLockPrefix(updated, idx),
+        ),
+      );
     }
     const next = [...characters];
     next[idx] = updated;
     onUpdate(next);
   };
   const lockFor = useHudFieldLockResolver();
+  const hiddenFor = useHudFieldHiddenResolver();
 
   return (
     <>
       <div className={cn(ROLEPLAY_POPOVER_HEADER, "flex items-center justify-between")}>
         <span className={ROLEPLAY_POPOVER_TITLE}>
-          <Users size="0.625rem" className="text-sky-400/80" /> Present Characters
-        </span>
+          <Users size="0.625rem" className="text-sky-400/80" /> {localizeUi("ui.chat.characterswidget.presentCharacters")}</span>
         <div className="flex items-center gap-2">
           <TrackerSectionRefresh
             agentType="character-tracker"
             onRerunSingleTracker={onRerunSingleTracker}
             busy={isTrackerRetryBusy}
-            title="Re-run character tracker only"
+            title={localizeUi("ui.chat.combinedplayerpanel.reRunCharacterTrackerOnly")}
           />
           <HudLockModeToggle />
           {trackerConfig && (
@@ -918,22 +982,21 @@ export function CharactersPanel({
                   ? "text-[var(--foreground)]"
                   : "text-[var(--muted-foreground)]/50 hover:text-[var(--muted-foreground)]",
               )}
-              title={autoGenEnabled ? "Auto-generate avatars: ON" : "Auto-generate avatars: OFF"}
+              title={autoGenEnabled ?localizeUi("ui.chat.characterspanel.autoGenerateAvatarsOn") :localizeUi("ui.chat.characterspanel.autoGenerateAvatarsOff")}
             >
               <Sparkles size="0.5625rem" />
-              <span className="hidden sm:inline">Auto</span>
+              <span className="hidden sm:inline">{localizeUi("ui.chat.characterspanel.auto")}</span>
             </button>
           )}
           <button
             onClick={addCharacter}
             className="flex items-center gap-0.5 text-[0.625rem] text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
           >
-            <Plus size="0.625rem" /> Add
-          </button>
+            <Plus size="0.625rem" /> {localizeUi("ui.characters.metadatatab.add")}</button>
         </div>
       </div>
       <div className="p-2 space-y-2">
-        {characters.length === 0 && <div className={cn(EMPTY_STATE, "py-2")}>No characters in scene</div>}
+        {characters.length === 0 && <div className={cn(EMPTY_STATE, "py-2")}>{localizeUi("ui.chat.combinedplayerpanel.noCharactersInScene")}</div>}
         {characters.map((char, idx) => {
           const emojiLock = lockFor(characterTrackerLockKey(char, idx, "emoji"));
           const nameLock = lockFor(characterTrackerLockKey(char, idx, "name"));
@@ -941,6 +1004,11 @@ export function CharactersPanel({
           const appearanceLock = lockFor(characterTrackerLockKey(char, idx, "appearance"));
           const outfitLock = lockFor(characterTrackerLockKey(char, idx, "outfit"));
           const thoughtsLock = lockFor(characterTrackerLockKey(char, idx, "thoughts"));
+          const showMood = !hiddenFor(characterTrackerLockKey(char, idx, "mood"));
+          const showAppearance = !hiddenFor(characterTrackerLockKey(char, idx, "appearance"));
+          const showOutfit = !hiddenFor(characterTrackerLockKey(char, idx, "outfit"));
+          const showThoughts = !hiddenFor(characterTrackerLockKey(char, idx, "thoughts"));
+          const hasVisibleDefaultFields = showMood || showAppearance || showOutfit || showThoughts;
           return (
             <div key={char.characterId ?? idx} className="rounded-lg bg-[var(--muted)]/20 p-2 space-y-1">
             <div className="group/field flex items-center gap-1.5">
@@ -952,7 +1020,7 @@ export function CharactersPanel({
                     fileInputRef.current?.click();
                   }}
                   className="shrink-0 overflow-hidden rounded-full ring-1 ring-[var(--border)] transition-all hover:ring-[var(--foreground)]/30"
-                  title="Change avatar"
+                  title={localizeUi("ui.panels.personaspanel.changeAvatar")}
                 >
                   <img src={char.avatarPath} alt={char.name} className="w-8 h-8 object-cover" />
                 </button>
@@ -963,7 +1031,7 @@ export function CharactersPanel({
                     fileInputRef.current?.click();
                   }}
                   className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--muted)]/30 text-[var(--muted-foreground)]/50 ring-1 ring-[var(--border)] transition-all hover:bg-[var(--muted)]/50 hover:text-[var(--foreground)]"
-                  title="Upload avatar"
+                  title={localizeUi("editor.avatar.upload")}
                 >
                   <ImagePlus size="0.75rem" />
                 </button>
@@ -975,53 +1043,81 @@ export function CharactersPanel({
                 placeholder="👤"
                 locked={emojiLock.locked}
               />
-              <HudFieldLockButton {...emojiLock} label={`${char.name || "character"} emoji`} />
+              <HudFieldLockButton {...emojiLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Emoji", { value1: char.name ||localizeUi("ui.noodle.noodlehome.character") })} />
               <InlineEdit
                 value={char.name}
                 onSave={(value) => updateCharacter(idx, { ...char, name: value })}
                 className="flex-1 !font-medium"
-                placeholder="Name"
+                placeholder={localizeUi("ui.characters.metadatatab.name")}
                 locked={nameLock.locked}
               />
-              <HudFieldLockButton {...nameLock} label={`${char.name || "character"} name`} />
+              <HudFieldLockButton {...nameLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Name", { value1: char.name ||localizeUi("ui.noodle.noodlehome.character") })} />
               <button
                 onClick={() => removeCharacter(idx)}
                 className="text-[var(--muted-foreground)]/40 hover:text-red-500 transition-colors shrink-0"
-                title="Remove character"
+                title={localizeUi("ui.chat.combinedplayerpanel.removeCharacter")}
               >
                 <X size="0.625rem" />
               </button>
             </div>
-            <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 pl-1">
-              <LabeledEdit
-                label="Mood"
-                value={char.mood}
-                onSave={(value) => updateCharacter(idx, { ...char, mood: value })}
-                locked={moodLock.locked}
-                onToggleLock={moodLock.onToggle}
-              />
-              <LabeledEdit
-                label="Look"
-                value={char.appearance ?? ""}
-                onSave={(value) => updateCharacter(idx, { ...char, appearance: value || null })}
-                locked={appearanceLock.locked}
-                onToggleLock={appearanceLock.onToggle}
-              />
-              <LabeledEdit
-                label="Outfit"
-                value={char.outfit ?? ""}
-                onSave={(value) => updateCharacter(idx, { ...char, outfit: value || null })}
-                locked={outfitLock.locked}
-                onToggleLock={outfitLock.onToggle}
-              />
-              <LabeledEdit
-                label="Thinks"
-                value={char.thoughts ?? ""}
-                onSave={(value) => updateCharacter(idx, { ...char, thoughts: value || null })}
-                locked={thoughtsLock.locked}
-                onToggleLock={thoughtsLock.onToggle}
-              />
-            </div>
+            {(hasVisibleDefaultFields || Object.keys(char.customFields ?? {}).length > 0) && (
+              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 pl-1">
+                {showMood && (
+                  <LabeledEdit
+                    label={localizeUi("ui.chat.combinedplayerpanel.mood")}
+                    value={char.mood}
+                    onSave={(value) => updateCharacter(idx, { ...char, mood: value })}
+                    locked={moodLock.locked}
+                    onToggleLock={moodLock.onToggle}
+                  />
+                )}
+                {showAppearance && (
+                  <LabeledEdit
+                    label={localizeUi("ui.chat.combinedplayerpanel.look")}
+                    value={char.appearance ?? ""}
+                    onSave={(value) => updateCharacter(idx, { ...char, appearance: value || null })}
+                    locked={appearanceLock.locked}
+                    onToggleLock={appearanceLock.onToggle}
+                  />
+                )}
+                {showOutfit && (
+                  <LabeledEdit
+                    label={localizeUi("ui.chat.combinedplayerpanel.outfit")}
+                    value={char.outfit ?? ""}
+                    onSave={(value) => updateCharacter(idx, { ...char, outfit: value || null })}
+                    locked={outfitLock.locked}
+                    onToggleLock={outfitLock.onToggle}
+                  />
+                )}
+                {showThoughts && (
+                  <LabeledEdit
+                    label={localizeUi("ui.chat.combinedplayerpanel.thinks")}
+                    value={char.thoughts ?? ""}
+                    onSave={(value) => updateCharacter(idx, { ...char, thoughts: value || null })}
+                    locked={thoughtsLock.locked}
+                    onToggleLock={thoughtsLock.onToggle}
+                  />
+                )}
+                {Object.entries(char.customFields ?? {}).map(([name, value]) => {
+                  const valueLock = lockFor(characterCustomFieldTrackerLockKey(char, idx, name, "value"));
+                  return (
+                    <LabeledEdit
+                      key={name}
+                      label={name}
+                      value={trackerEditableText(value)}
+                      onSave={(nextValue) =>
+                        updateCharacter(idx, {
+                          ...char,
+                          customFields: { ...(char.customFields ?? {}), [name]: nextValue },
+                        })
+                      }
+                      locked={valueLock.locked}
+                      onToggleLock={valueLock.onToggle}
+                    />
+                  );
+                })}
+              </div>
+            )}
             {Array.isArray(char.stats) && char.stats.length > 0 && (
               <div className="space-y-1 pt-1 border-t border-[var(--border)]">
                 {char.stats.map((stat, statIndex) => {
@@ -1081,6 +1177,7 @@ export function InventoryPanel({
   onUpdate,
   onRemoveItem,
 }: InventoryPanelProps) {
+  const { t: localizeUi } = useUiTranslation();
   const { onUpdateFieldLocks } = useTrackerLockContext();
   const addItem = () => {
     onUpdate([...items, { name: "New Item", description: "", quantity: 1, location: "on_person" }]);
@@ -1118,17 +1215,16 @@ export function InventoryPanel({
     <>
       <div className={cn(ROLEPLAY_POPOVER_HEADER, "flex items-center justify-between")}>
         <span className={ROLEPLAY_POPOVER_TITLE}>
-          <Package size="0.625rem" className="text-amber-400/80" /> Inventory ({items.length})
+          <Package size="0.625rem" className="text-amber-400/80" /> {localizeUi("ui.chat.combinedplayerpanel.inventory")}{items.length})
         </span>
         <span className="flex items-center gap-1">
           <HudLockModeToggle />
           <button onClick={addItem} className={TRACKER_SECTION_ACTION}>
-            <Plus size="0.625rem" /> Add
-          </button>
+            <Plus size="0.625rem" /> {localizeUi("ui.characters.metadatatab.add")}</button>
         </span>
       </div>
       <div className="p-2 space-y-1">
-        {items.length === 0 && <div className={cn(EMPTY_STATE, "py-2")}>Inventory empty</div>}
+        {items.length === 0 && <div className={cn(EMPTY_STATE, "py-2")}>{localizeUi("ui.chat.combinedplayerpanel.inventoryEmpty")}</div>}
         {items.map((item, idx) => {
           const nameLock = lockFor(inventoryTrackerLockKey(item, "name", idx));
           const quantityLock = lockFor(inventoryTrackerLockKey(item, "quantity", idx));
@@ -1139,10 +1235,10 @@ export function InventoryPanel({
                 value={item.name}
                 onSave={(value) => updateItem(idx, { ...item, name: value })}
                 className="flex-1 min-w-0"
-                placeholder="Item name"
+                placeholder={localizeUi("ui.chat.combinedplayerpanel.itemName")}
                 locked={nameLock.locked}
               />
-              <HudFieldLockButton {...nameLock} label={`${item.name || "item"} name`} />
+              <HudFieldLockButton {...nameLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Name", { value1: item.name ||localizeUi("ui.chat.databaseworkspaceapprovalcard.item") })} />
               <input
                 type="number"
                 value={item.quantity}
@@ -1151,13 +1247,13 @@ export function InventoryPanel({
                   "w-8 rounded bg-transparent text-center text-[0.5625rem] text-[var(--foreground)]/60 outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none",
                   quantityLock.locked && HUD_LOCKED_FIELD_CLASS,
                 )}
-                title="Quantity"
+                title={localizeUi("ui.chat.combinedplayerpanel.quantity")}
               />
-              <HudFieldLockButton {...quantityLock} label={`${item.name || "item"} quantity`} />
+              <HudFieldLockButton {...quantityLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Quantity", { value1: item.name ||localizeUi("ui.chat.databaseworkspaceapprovalcard.item") })} />
               <button
                 onClick={() => removeItem(idx)}
                 className="text-[var(--muted-foreground)]/40 hover:text-red-500 transition-colors shrink-0"
-                title="Remove item"
+                title={localizeUi("ui.chat.combinedplayerpanel.removeItem")}
               >
                 <X size="0.5625rem" />
               </button>
@@ -1182,6 +1278,7 @@ export function QuestsPanel({
   onRerunSingleTracker,
   isTrackerRetryBusy,
 }: QuestsPanelProps) {
+  const { t: localizeUi } = useUiTranslation();
   const { onUpdateFieldLocks } = useTrackerLockContext();
   const addQuest = () => {
     onUpdate([
@@ -1212,23 +1309,22 @@ export function QuestsPanel({
     <>
       <div className={cn(ROLEPLAY_POPOVER_HEADER, "flex items-center justify-between")}>
         <span className={ROLEPLAY_POPOVER_TITLE}>
-          <Scroll size="0.625rem" className="text-emerald-400/80" /> Quests ({quests.length})
+          <Scroll size="0.625rem" className="text-emerald-400/80" /> {localizeUi("ui.chat.combinedplayerpanel.quests")}{quests.length})
         </span>
         <span className="flex items-center gap-1">
           <TrackerSectionRefresh
             agentType="quest"
             onRerunSingleTracker={onRerunSingleTracker}
             busy={isTrackerRetryBusy}
-            title="Re-run quest tracker only"
+            title={localizeUi("ui.chat.combinedplayerpanel.reRunQuestTrackerOnly")}
           />
           <HudLockModeToggle />
           <button onClick={addQuest} className={TRACKER_SECTION_ACTION}>
-            <Plus size="0.625rem" /> Add
-          </button>
+            <Plus size="0.625rem" /> {localizeUi("ui.characters.metadatatab.add")}</button>
         </span>
       </div>
       <div className="p-2 space-y-2">
-        {quests.length === 0 && <div className={cn(EMPTY_STATE, "py-2")}>No active quests</div>}
+        {quests.length === 0 && <div className={cn(EMPTY_STATE, "py-2")}>{localizeUi("ui.chat.combinedplayerpanel.noActiveQuests")}</div>}
         {quests.map((quest, idx) => (
           <QuestCardEditable
             key={quest.questEntryId || idx}
@@ -1256,6 +1352,7 @@ export function CustomTrackerPanel({
   onRerunSingleTracker,
   isTrackerRetryBusy,
 }: CustomTrackerPanelProps) {
+  const { t: localizeUi } = useUiTranslation();
   const { onUpdateFieldLocks } = useTrackerLockContext();
   const addField = () => {
     onUpdate([...fields, { name: "New Field", value: "" }]);
@@ -1290,23 +1387,22 @@ export function CustomTrackerPanel({
       <div className={cn(ROLEPLAY_POPOVER_HEADER, "flex items-center justify-between")}>
         <span className={ROLEPLAY_POPOVER_TITLE}>
           <SlidersHorizontal size="0.625rem" className="text-[var(--muted-foreground)]" />{" "}
-          {`Custom Tracker (${fields.length})`}
+          {localizeUi("ui.chat.customtrackerpanel.customTrackerValue1", { value1: fields.length })}
         </span>
         <span className="flex items-center gap-1">
           <TrackerSectionRefresh
             agentType="custom-tracker"
             onRerunSingleTracker={onRerunSingleTracker}
             busy={isTrackerRetryBusy}
-            title="Re-run custom tracker only"
+            title={localizeUi("ui.chat.combinedplayerpanel.reRunCustomTrackerOnly")}
           />
           <HudLockModeToggle />
           <button onClick={addField} className={TRACKER_SECTION_ACTION}>
-            <Plus size="0.625rem" /> Add
-          </button>
+            <Plus size="0.625rem" /> {localizeUi("ui.characters.metadatatab.add")}</button>
         </span>
       </div>
       <div className="p-2 space-y-1">
-        {fields.length === 0 && <div className={cn(EMPTY_STATE, "py-2")}>No fields tracked — add one above</div>}
+        {fields.length === 0 && <div className={cn(EMPTY_STATE, "py-2")}>{localizeUi("ui.chat.customtrackerpanel.noFieldsTrackedAddOneAbove")}</div>}
         {fields.map((field, idx) => {
           const nameLock = lockFor(customTrackerLockKey(field, "name", idx));
           const valueLock = lockFor(customTrackerLockKey(field, "value", idx));
@@ -1324,27 +1420,27 @@ export function CustomTrackerPanel({
                 value={field.name}
                 onSave={(value) => updateField(idx, { ...field, name: value })}
                 className="flex-1 min-w-0"
-                placeholder="Field name"
+                placeholder={localizeUi("ui.chat.combinedplayerpanel.fieldName")}
                 locked={nameLock.locked}
               />
-              <HudFieldLockButton {...nameLock} label={`${field.name || "field"} name`} />
+              <HudFieldLockButton {...nameLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Name", { value1: field.name ||localizeUi("ui.chat.combinedplayerpanel.field") })} />
               <span className="text-[var(--muted-foreground)]/40 text-[0.5rem]">=</span>
               <InlineEdit
                 value={field.value}
                 onSave={(value) => updateField(idx, { ...field, value })}
                 className="flex-1 min-w-0"
-                placeholder="Value"
+                placeholder={localizeUi("ui.chat.combinedplayerpanel.value")}
                 locked={valueLock.locked || field.locked}
               />
               <HudFieldLockButton
                 locked={valueLock.locked || field.locked}
                 onToggle={toggleValueLock}
-                label={`${field.name || "field"} value`}
+                label={localizeUi("ui.chat.combinedplayerpanel.value1Value", { value1: field.name ||localizeUi("ui.chat.combinedplayerpanel.field") })}
               />
               <button
                 onClick={() => removeField(idx)}
                 className="text-[var(--muted-foreground)]/40 hover:text-red-500 transition-colors shrink-0"
-                title="Remove field"
+                title={localizeUi("ui.chat.combinedplayerpanel.removeField")}
               >
                 <X size="0.5625rem" />
               </button>
@@ -1362,11 +1458,13 @@ interface CombinedWorldPanelProps {
   time: string;
   weather: string;
   temperature: string;
+  worldCustomFields: WorldCustomField[];
   onSaveLocation: (v: string) => void;
   onSaveDate: (v: string) => void;
   onSaveTime: (v: string) => void;
   onSaveWeather: (v: string) => void;
   onSaveTemperature: (v: string) => void;
+  onUpdateWorldCustomFields: (fields: WorldCustomField[]) => void;
   weatherEmoji: string;
   pinColor: string;
   dateColor: string;
@@ -1384,11 +1482,13 @@ export function CombinedWorldPanel({
   time,
   weather,
   temperature,
+  worldCustomFields,
   onSaveLocation,
   onSaveDate,
   onSaveTime,
   onSaveWeather,
   onSaveTemperature,
+  onUpdateWorldCustomFields,
   weatherEmoji,
   pinColor,
   dateColor,
@@ -1399,6 +1499,7 @@ export function CombinedWorldPanel({
   onRerunSingleTracker,
   isTrackerRetryBusy,
 }: CombinedWorldPanelProps) {
+  const { t: localizeUi } = useUiTranslation();
   const lockFor = useHudFieldLockResolver();
   const locationLock = lockFor(worldTrackerLockKey("location"));
   const dateLock = lockFor(worldTrackerLockKey("date"));
@@ -1410,14 +1511,13 @@ export function CombinedWorldPanel({
     <>
       <div className={cn(ROLEPLAY_POPOVER_HEADER, "flex items-center justify-between")}>
         <span className={ROLEPLAY_POPOVER_TITLE}>
-          <CloudSun size="0.625rem" className="text-sky-400/80" /> World State
-        </span>
+          <CloudSun size="0.625rem" className="text-sky-400/80" /> {localizeUi("ui.panels.appearancesettings.worldState")}</span>
         <span className="flex items-center gap-1">
           <TrackerSectionRefresh
             agentType="world-state"
             onRerunSingleTracker={onRerunSingleTracker}
             busy={isTrackerRetryBusy}
-            title="Re-run world state tracker only"
+            title={localizeUi("ui.chat.combinedworldpanel.reRunWorldStateTrackerOnly")}
           />
           <HudLockModeToggle />
           <button
@@ -1431,7 +1531,7 @@ export function CombinedWorldPanel({
       <div className="divide-y divide-[var(--border)]">
         <WorldFieldRow
           icon={<MapPin size="0.8125rem" className={pinColor} />}
-          label="Location"
+          label={localizeUi("ui.noodle.noodleprofilesurface.location")}
           value={location}
           onSave={onSaveLocation}
           accent="text-[var(--foreground)]/80"
@@ -1440,7 +1540,7 @@ export function CombinedWorldPanel({
         />
         <WorldFieldRow
           icon={<CalendarDays size="0.8125rem" className={dateColor} />}
-          label="Date"
+          label={localizeUi("ui.agents.tooleditor.date")}
           value={date}
           onSave={onSaveDate}
           accent="text-[var(--foreground)]"
@@ -1449,7 +1549,7 @@ export function CombinedWorldPanel({
         />
         <WorldFieldRow
           icon={<Clock size="0.8125rem" className={timeColor} />}
-          label="Time"
+          label={localizeUi("ui.chat.combinedworldpanel.time")}
           value={time}
           onSave={onSaveTime}
           accent="text-[var(--foreground)]/80"
@@ -1464,7 +1564,7 @@ export function CombinedWorldPanel({
               {weatherEmoji}
             </span>
           }
-          label="Weather"
+          label={localizeUi("ui.chat.combinedworldpanel.weather")}
           value={weather}
           onSave={onSaveWeather}
           accent="text-[var(--foreground)]/80"
@@ -1472,14 +1572,34 @@ export function CombinedWorldPanel({
           onToggleLock={weatherLock.onToggle}
         />
         <WorldFieldRow
-          icon={<Thermometer size="0.8125rem" className={tempColor} />}
-          label="Temperature"
+          icon={<Thermometer size="0.8125rem" style={{ color: tempColor }} />}
+          label={localizeUi("ui.chat.combinedworldpanel.temperature")}
           value={temperature}
           onSave={onSaveTemperature}
           accent="text-[var(--foreground)]"
           locked={temperatureLock.locked}
           onToggleLock={temperatureLock.onToggle}
         />
+        {worldCustomFields.map((field, index) => {
+          const name = field.name?.trim() || "Field";
+          const valueLock = lockFor(worldCustomFieldTrackerLockKey(field, "value", index));
+          return (
+            <WorldFieldRow
+              key={`${name}-${index}`}
+              icon={<WorldCustomFieldIcon icon={field.icon} />}
+              label={name}
+              value={field.value ?? ""}
+              onSave={(value) => {
+                const next = [...worldCustomFields];
+                next[index] = { ...field, value };
+                onUpdateWorldCustomFields(next);
+              }}
+              accent="text-[var(--foreground)]/80"
+              locked={valueLock.locked}
+              onToggleLock={valueLock.onToggle}
+            />
+          );
+        })}
       </div>
     </>
   );
@@ -1773,20 +1893,19 @@ function PersonaStatusField({
   locked?: boolean;
   onToggleLock?: () => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   return (
     <div className="mb-2 rounded-lg border border-[var(--border)]/60 bg-[var(--muted)]/10 px-2 py-1.5">
       <div className="group/field mb-0.5 flex items-center gap-1.5">
         <Sparkles size="0.5625rem" className="text-[var(--muted-foreground)]/60" />
-        <span className="text-[0.5625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]/70">
-          Current Status
-        </span>
-        <HudFieldLockButton locked={locked} onToggle={onToggleLock} label="persona status" />
+        <span className="text-[0.5625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]/70">{localizeUi("ui.chat.personastatusfield.currentStatus")}</span>
+        <HudFieldLockButton locked={locked} onToggle={onToggleLock} label={localizeUi("ui.chat.personastatusfield.personaStatus")} />
       </div>
       <InlineEdit
         value={value}
         onSave={onSave ?? (() => {})}
         className="w-full !text-[0.6875rem] !text-[var(--foreground)]/85"
-        placeholder="Status not tracked"
+        placeholder={localizeUi("ui.chat.personastatusfield.statusNotTracked")}
         scrollOnHover
         locked={locked}
       />
@@ -1819,6 +1938,7 @@ function StatBarEditable({
   onToggleValueLock?: () => void;
   onToggleMaxLock?: () => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const { lockMode } = useTrackerLockContext();
   const pct = getStatPercent(stat);
   const value = coerceStatNumber(stat.value);
@@ -1827,8 +1947,8 @@ function StatBarEditable({
     <button
       type="button"
       onClick={onRemove}
-      title="Remove stat"
-      aria-label={`Remove ${stat.name || "stat"}`}
+      title={localizeUi("ui.chat.statbareditable.removeStat")}
+      aria-label={localizeUi("ui.chat.professormariattachmentpreviews.removeValue1", { value1: stat.name ||localizeUi("ui.chat.statbareditable.stat") })}
       className={cn(
         "flex h-4 w-4 items-center justify-center rounded bg-[var(--popover)]/90 text-[var(--muted-foreground)]/45 shadow-sm ring-1 ring-[var(--border)]/70 transition-all hover:text-[var(--destructive)] hover:opacity-100 focus-visible:opacity-100",
         lockMode ? "shrink-0 opacity-70" : "absolute -right-1 -top-1 opacity-0 group-hover/stat:opacity-80 max-md:opacity-80",
@@ -1847,10 +1967,10 @@ function StatBarEditable({
               value={stat.name}
               onSave={onUpdateName}
               className="!text-[0.625rem] !font-medium !text-[var(--foreground)]/80"
-              placeholder="Stat name"
+              placeholder={localizeUi("ui.personas.personastatstab.statName")}
               locked={nameLocked}
             />
-            <HudFieldLockButton locked={nameLocked} onToggle={onToggleNameLock} label={`${stat.name || "stat"} name`} />
+            <HudFieldLockButton locked={nameLocked} onToggle={onToggleNameLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Name", { value1: stat.name ||localizeUi("ui.chat.statbareditable.stat") })} />
           </span>
         ) : (
           <span className="text-[0.625rem] font-medium text-[var(--foreground)]/80">{stat.name}</span>
@@ -1865,7 +1985,7 @@ function StatBarEditable({
               valueLocked && HUD_LOCKED_FIELD_CLASS,
             )}
           />
-          <HudFieldLockButton locked={valueLocked} onToggle={onToggleValueLock} label={`${stat.name || "stat"} value`} />
+          <HudFieldLockButton locked={valueLocked} onToggle={onToggleValueLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Value", { value1: stat.name ||localizeUi("ui.chat.statbareditable.stat") })} />
           <span>/</span>
           <input
             type="number"
@@ -1876,7 +1996,7 @@ function StatBarEditable({
               maxLocked && HUD_LOCKED_FIELD_CLASS,
             )}
           />
-          <HudFieldLockButton locked={maxLocked} onToggle={onToggleMaxLock} label={`${stat.name || "stat"} max`} />
+          <HudFieldLockButton locked={maxLocked} onToggle={onToggleMaxLock} label={localizeUi("ui.chat.statbareditable.value1Max", { value1: stat.name ||localizeUi("ui.chat.statbareditable.stat") })} />
           {lockMode && removeButton}
         </div>
       </div>
@@ -1902,6 +2022,7 @@ function QuestCardEditable({
   onUpdate: (q: QuestProgress) => void;
   onRemove: () => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const { onUpdateFieldLocks } = useTrackerLockContext();
   const addObjective = () => {
     onUpdate({
@@ -1950,7 +2071,7 @@ function QuestCardEditable({
       <div className="group/field flex items-center gap-1.5">
         <button
           onClick={() => onUpdate({ ...quest, completed: !quest.completed })}
-          title={quest.completed ? "Mark incomplete" : "Mark complete"}
+          title={quest.completed ?localizeUi("ui.chat.questcardeditable.markIncomplete") :localizeUi("ui.chat.questcardeditable.markComplete")}
           className={cn("rounded-sm", questCompletedLock.locked && HUD_LOCKED_FIELD_CLASS)}
         >
           {quest.completed ? (
@@ -1961,16 +2082,16 @@ function QuestCardEditable({
         </button>
         <HudFieldLockButton
           {...questCompletedLock}
-          label={`${quest.name || "quest"} completion`}
+          label={localizeUi("ui.chat.questcardeditable.value1Completion", { value1: quest.name ||localizeUi("ui.chat.questcardeditable.quest") })}
         />
         <InlineEdit
           value={quest.name}
           onSave={(value) => onUpdate({ ...quest, name: value })}
           className={cn("flex-1 !font-medium", quest.completed && "line-through opacity-50")}
-          placeholder="Quest name"
+          placeholder={localizeUi("ui.chat.questcardeditable.questName")}
           locked={questNameLock.locked}
         />
-        <HudFieldLockButton {...questNameLock} label={`${quest.name || "quest"} name`} />
+        <HudFieldLockButton {...questNameLock} label={localizeUi("ui.chat.combinedplayerpanel.value1Name", { value1: quest.name ||localizeUi("ui.chat.questcardeditable.quest") })} />
         {total > 0 && (
           <span className="text-[0.5625rem] text-[var(--muted-foreground)]/60">
             {completed}/{total}
@@ -1979,7 +2100,7 @@ function QuestCardEditable({
         <button
           onClick={onRemove}
           className="text-[var(--muted-foreground)]/40 hover:text-red-500 transition-colors shrink-0"
-          title="Remove quest"
+          title={localizeUi("ui.chat.questcardeditable.removeQuest")}
         >
           <X size="0.5625rem" />
         </button>
@@ -2001,15 +2122,15 @@ function QuestCardEditable({
                     <Circle size="0.5rem" className="text-[var(--muted-foreground)]/40 shrink-0" />
                   )}
                 </button>
-                <HudFieldLockButton {...completedLock} label="objective completion" />
+                <HudFieldLockButton {...completedLock} label={localizeUi("ui.chat.questcardeditable.objectiveCompletion")} />
                 <InlineEdit
                   value={objective.text}
                   onSave={(value) => updateObjectiveText(idx, value)}
                   className={cn("flex-1", objective.completed && "line-through opacity-50")}
-                  placeholder="Objective"
+                  placeholder={localizeUi("ui.chat.questcardeditable.objective")}
                   locked={textLock.locked}
                 />
-                <HudFieldLockButton {...textLock} label="objective text" />
+                <HudFieldLockButton {...textLock} label={localizeUi("ui.chat.questcardeditable.objectiveText")} />
                 <button
                   onClick={() => removeObjective(idx)}
                   className="opacity-0 group-hover:opacity-100 text-[var(--muted-foreground)]/40 hover:text-red-500 transition-all shrink-0"
@@ -2023,8 +2144,7 @@ function QuestCardEditable({
             onClick={addObjective}
             className="flex items-center gap-0.5 text-[0.5rem] text-[var(--muted-foreground)]/40 hover:text-[var(--muted-foreground)] transition-colors mt-0.5"
           >
-            <Plus size="0.4375rem" /> objective
-          </button>
+            <Plus size="0.4375rem" /> {localizeUi("ui.chat.questcardeditable.objective_d2dc873")}</button>
         </div>
       )}
     </div>
@@ -2091,6 +2211,7 @@ function WorldFieldRow({
   locked?: boolean;
   onToggleLock?: () => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -2154,7 +2275,7 @@ function WorldFieldRow({
         <button
           onClick={() => setEditing(true)}
           className="shrink-0 text-[var(--muted-foreground)]/30 opacity-0 group-hover/row:opacity-100 transition-opacity"
-          title={`Edit ${label.toLowerCase()}`}
+          title={localizeUi("ui.chat.worldfieldrow.editValue1", { value1: label.toLowerCase() })}
         >
           <Pencil size="0.625rem" />
         </button>

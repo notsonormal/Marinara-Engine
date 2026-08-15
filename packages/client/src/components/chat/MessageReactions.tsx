@@ -11,13 +11,14 @@ import { createPortal } from "react-dom";
 import type { MessageReaction } from "@marinara-engine/shared";
 import { cn } from "../../lib/utils";
 import { USER_REACTOR, customEmojiReactionName } from "../../lib/reactions";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 interface MessageReactionsProps {
   reactions: MessageReaction[];
   /** Resolve a reactor id ("user" or a character id) to a display name for tooltips. */
   resolveReactorName: (reactorId: string) => string;
-  /** Toggle the user's reaction with this emoji token (unicode or `:name:`) + its image url. */
-  onToggle: (emoji: string, imageUrl: string | null) => void;
+  /** Toggle the user's membership in this reaction entry (identity: emoji + segment). */
+  onToggle: (reaction: MessageReaction) => void;
 }
 
 export function MessageReactions({ reactions, resolveReactorName, onToggle }: MessageReactionsProps) {
@@ -26,11 +27,13 @@ export function MessageReactions({ reactions, resolveReactorName, onToggle }: Me
     <div className="mari-message-reactions flex flex-wrap items-center gap-1">
       {reactions.map((reaction) => (
         <ReactionPill
-          key={reaction.emoji}
+          // A whole-message row can also hold orphaned segment entries, so the same
+          // emoji may legitimately appear more than once — key by segment too.
+          key={`${reaction.segment ?? "m"}:${reaction.segmentSpeaker ?? ""}:${reaction.emoji}`}
           reaction={reaction}
           mine={reaction.by.includes(USER_REACTOR)}
           who={reaction.by.map(resolveReactorName).join(", ")}
-          onToggle={() => onToggle(reaction.emoji, reaction.imageUrl ?? null)}
+          onToggle={() => onToggle(reaction)}
         />
       ))}
     </div>
@@ -48,6 +51,7 @@ function ReactionPill({
   who: string;
   onToggle: () => void;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   const [show, setShow] = useState(false);
   const wrapRef = useRef<HTMLButtonElement>(null);
   const tipRef = useRef<HTMLDivElement>(null);
@@ -81,7 +85,7 @@ function ReactionPill({
         }}
         onMouseEnter={() => setShow(true)}
         onMouseLeave={() => setShow(false)}
-        aria-label={`${who} reacted with ${name ? `:${name}:` : reaction.emoji}`}
+        aria-label={localizeUi("ui.chat.reactionpill.value1ReactedWithValue2", { value1: who, value2: name ?localizeUi("ui.chat.conversationinput.value1", { value1: name }) : reaction.emoji })}
         aria-pressed={mine}
         className={cn(
           "flex items-center gap-1 rounded-md border px-1.5 py-0.5 leading-none transition-colors",
@@ -119,10 +123,10 @@ function ReactionPill({
             <span className="leading-snug">
               {name ? (
                 <>
-                  <span className="font-semibold text-[var(--foreground)]">:{name}:</span> reacted by {who}
+                  <span className="font-semibold text-[var(--foreground)]">:{name}:</span> {localizeUi("ui.chat.reactionpill.reactedBy")} {who}
                 </>
               ) : (
-                <>reacted by {who}</>
+                <>{localizeUi("ui.chat.reactionpill.reactedBy")} {who}</>
               )}
             </span>
           </div>,

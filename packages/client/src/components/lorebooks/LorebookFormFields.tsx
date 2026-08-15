@@ -11,6 +11,8 @@ import { HelpTooltip } from "../ui/HelpTooltip";
 import { MacroTextarea } from "../ui/MacroTextarea";
 import { DraftNumberInput } from "../ui/DraftNumberInput";
 import { SettingsSwitch } from "../panels/settings/SettingControls";
+import { appendLorebookActivationKeys } from "../../lib/lorebook-keys";
+import { useTranslation as useUiTranslation } from "react-i18next";
 
 export function FieldGroup({
   label,
@@ -36,24 +38,20 @@ export function FieldGroup({
 }
 
 export function KeysEditor({ keys, onChange }: { keys: string[]; onChange: (keys: string[]) => void }) {
+  const { t: localizeUi } = useUiTranslation();
   const [input, setInput] = useState("");
 
   const addKey = () => {
-    const trimmed = input.trim();
-    if (trimmed && !keys.includes(trimmed)) {
-      onChange([...keys, trimmed]);
-      setInput("");
-    }
+    const nextKeys = appendLorebookActivationKeys(keys, input);
+    if (nextKeys.length !== keys.length) onChange(nextKeys);
+    if (input.trim()) setInput("");
   };
 
   return (
     <div>
       <div className="flex flex-wrap gap-1.5">
         {keys.map((key, i) => (
-          <span
-            key={i}
-            className="mari-editor-chip mari-editor-chip--accent px-2 py-1 text-[0.6875rem]"
-          >
+          <span key={i} className="mari-editor-chip mari-editor-chip--accent px-2 py-1 text-[0.6875rem]">
             {key}
             <button
               onClick={() => onChange(keys.filter((_, j) => j !== i))}
@@ -71,14 +69,14 @@ export function KeysEditor({ keys, onChange }: { keys: string[]; onChange: (keys
           onBlur={addKey}
           onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addKey())}
           className="mari-editor-field flex-1 px-2 py-1.5 text-xs"
-          placeholder="Type a keyword, press Enter, or click away…"
+          placeholder={localizeUi("ui.lorebooks.keyseditor.typeKeywordsSeparatedByCommasThenPressEnter")}
         />
         <button
           type="button"
           onClick={addKey}
           className="mari-editor-action mari-editor-action--compact px-2 py-1.5 text-[0.6875rem]"
         >
-          Add
+          {localizeUi("ui.lorebooks.keyseditor.add")}
         </button>
       </div>
     </div>
@@ -172,6 +170,7 @@ export function ExpandableTextarea({
       placeholder={placeholder}
       title={title ?? "Edit"}
       showMacroReference={showMacroReference}
+      showMarkdownPreview
       className="mari-editor-field w-full resize-y p-2.5 text-sm"
     />
   );

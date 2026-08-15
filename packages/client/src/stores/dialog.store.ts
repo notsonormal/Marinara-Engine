@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-export type AppDialogTone = "default" | "destructive";
+export type AppDialogTone = "default" | "destructive" | "accent";
 
 type AppDialogCommon = {
   title?: string;
@@ -16,8 +16,6 @@ export type AlertDialogState = AppDialogCommon & {
 
 export type ConfirmDialogState = AppDialogCommon & {
   kind: "confirm";
-  /** When set, the confirm dialog shows an opt-in checkbox whose state is returned. */
-  checkboxLabel?: string;
 };
 
 export type PromptDialogState = AppDialogCommon & {

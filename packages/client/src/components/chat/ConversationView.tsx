@@ -13,24 +13,22 @@ import {
   useState,
   type MouseEvent as ReactMouseEvent,
 } from "react";
+import { useTranslation, useTranslation as useUiTranslation } from "react-i18next";
 import { Loader2, ChevronUp, Settings2, Image as ImageIcon, ArrowRightLeft } from "lucide-react";
 import { ConversationMessage } from "./ConversationMessage";
 import { ConversationInput } from "./ConversationInput";
-import { UnoBoard } from "./UnoBoard";
-import { UnoSetup } from "./UnoSetup";
-import { ChessBoard } from "./ChessBoard";
-import { ChessSetup } from "./ChessSetup";
+import { ConversationGamesPicker } from "./ConversationGamesPicker";
 import { SceneBanner, EndSceneBar } from "./SceneBanner";
 import { ChatBranchSelector } from "./ChatBranchSelector";
+import { ChatMessageSearch } from "./ChatMessageSearch";
 import { ActiveLorebookEntriesButton } from "./ActiveLorebookEntriesButton";
-import { ChatToolbarButton, ChatToolbarMenu } from "./ChatToolbarControls";
-import { groupConsecutiveSegments, parseNamePrefixFormat, parseSpeakerTags } from "./ConversationMessageShared";
+import { ChatToolbarButton, ChatToolbarMenu, getChatToolbarButtonClass } from "./ChatToolbarControls";
 import { ConversationPresenceCard } from "./ConversationPresenceCard";
+import { PendingTypingDots } from "./PendingTypingDots";
 import { TranscriptWindowControls } from "./TranscriptWindowControls";
 import { PinnedImageOverlay } from "./PinnedImageOverlay";
 import { useChatStore } from "../../stores/chat.store";
-import { useUnoGameStore } from "../../stores/uno-game.store";
-import { useChessGameStore } from "../../stores/chess-game.store";
+import { useConversationGamesStore } from "../../stores/conversation-games.store";
 import { useUIStore } from "../../stores/ui.store";
 import { playConfiguredNotificationPing } from "../../lib/notification-sound";
 import { useRenderTimer } from "../../lib/perf-diagnostics";
@@ -40,7 +38,21 @@ import { useThrottledStreamBuffer } from "../../hooks/use-throttled-stream-buffe
 import { useConversationCustomEmojis } from "../../hooks/use-conversation-custom-emojis";
 import { useConversationCustomStickers } from "../../hooks/use-conversation-custom-stickers";
 import type { CharacterMap, MessageSelectionToggle, PersonaInfo } from "./chat-area.types";
-import { normalizeTextForMatch, type Message } from "@marinara-engine/shared";
+import {
+  normalizeTextForMatch,
+  parseGroupedSpeakerSegments,
+  stripLeadingMessageTimestamps,
+  type Message,
+} from "@marinara-engine/shared";
+import { useInstalledCapabilityPackages } from "../../hooks/use-capability-packages";
+import { CapabilityElement } from "../capabilities/CapabilityElement";
+import { TURN_GAME_BOT_REQUEST_EVENT } from "../../lib/capability-turn-game-events";
+import { useGenerate } from "../../hooks/use-generate";
+import {
+  useChatComposerFocused,
+  useChatKeyboardOpen,
+  useKeepLatestChatMessageVisible,
+} from "../../hooks/use-visual-viewport-chat-bottom";
 
 const ConversationAutonomousEffects = lazy(async () => {
   const module = await import("./ConversationAutonomousEffects");
@@ -69,8 +81,11 @@ interface ConversationViewProps {
   onSetActiveSwipe: (messageId: string, index: number) => void;
   onToggleHiddenFromAI: (messageId: string, current: boolean) => void;
   onPeekPrompt: () => void;
+  onIllustrate?: () => void | Promise<void>;
+  onGenerateSelfie?: (characterId?: string) => void | Promise<void>;
   lastAssistantMessageId: string | null;
   onOpenSettings: (event?: ReactMouseEvent<HTMLElement>, options?: { initialSection?: "autonomous" | null }) => void;
+  onOpenScheduleEditor?: (characterId: string, options?: { initialDay?: string | null }) => void;
   onOpenGallery: (event?: ReactMouseEvent<HTMLElement>) => void;
   onBranch?: (messageId: string) => void;
   multiSelectMode?: boolean;
@@ -110,11 +125,14 @@ function getDayKey(dateStr: string): string {
 
 /** Check if a message's content uses "Name: text" format with known chat-member character names */
 function getKnownChatMemberNames(characterMap: CharacterMap, chatCharacterIds: string[]): Set<string> {
-  return new Set(
-    chatCharacterIds
-      .map((id) => normalizeTextForMatch(characterMap.get(id)?.name))
-      .filter((name): name is string => typeof name === "string" && name.length > 0),
-  );
+  const names = new Set<string>();
+  for (const id of chatCharacterIds) {
+    const character = characterMap.get(id);
+    for (const candidate of [character?.name, character?.convoDisplayName]) {
+      if (candidate?.trim()) names.add(normalizeTextForMatch(candidate));
+    }
+  }
+  return names;
 }
 
 function hasNamePrefixFormat(content: string, knownNames: Set<string>): boolean {
@@ -132,10 +150,7 @@ function hasNamePrefixFormat(content: string, knownNames: Set<string>): boolean 
 }
 
 function getGroupedSegmentCount(content: string, knownNames: Set<string>): number {
-  const speakerSegments = parseSpeakerTags(content, knownNames);
-  if (speakerSegments) return groupConsecutiveSegments(speakerSegments).length;
-  const nameSegments = parseNamePrefixFormat(content, knownNames);
-  return nameSegments ? groupConsecutiveSegments(nameSegments).length : 0;
+  return parseGroupedSpeakerSegments(content, knownNames)?.length ?? 0;
 }
 
 function isHiddenFromUser(message: Message) {
@@ -275,8 +290,11 @@ export function ConversationView({
   onSetActiveSwipe,
   onToggleHiddenFromAI,
   onPeekPrompt,
+  onIllustrate,
+  onGenerateSelfie,
   lastAssistantMessageId,
   onOpenSettings,
+  onOpenScheduleEditor,
   onOpenGallery,
   onBranch,
   multiSelectMode,
@@ -288,15 +306,34 @@ export function ConversationView({
   onConcludeScene,
   onAbandonScene,
 }: ConversationViewProps) {
+  const { t: localizeUi } = useUiTranslation();
+  const { t } = useTranslation();
   useRenderTimer("convo-messages"); // [#3104 diagnostic]
   const streamingChatId = useChatStore((s) => s.streamingChatId);
   const isStreaming = useChatStore((s) => s.isStreaming) && streamingChatId === chatId;
-  const unoGameActive = useUnoGameStore((s) => s.current?.chatId === chatId && s.current?.status !== "finished");
-  const unoSetupOpen = useUnoGameStore((s) => s.setupChatId === chatId);
-  const closeUnoSetup = useUnoGameStore((s) => s.closeSetup);
-  const chessGameActive = useChessGameStore((s) => s.current?.chatId === chatId && s.current?.status !== "finished");
-  const chessSetupOpen = useChessGameStore((s) => s.setupChatId === chatId);
-  const closeChessSetup = useChessGameStore((s) => s.closeSetup);
+  const { generate: generateTurnGameBots } = useGenerate();
+  useEffect(() => {
+    const handleBotRequest = (event: Event) => {
+      const requestedChatId = (event as CustomEvent<{ chatId?: string }>).detail?.chatId;
+      if (requestedChatId !== chatId) return;
+      const activeChat = useChatStore.getState().activeChat;
+      generateTurnGameBots({
+        chatId,
+        connectionId: activeChat?.id === chatId ? (activeChat.connectionId ?? null) : null,
+        turnGameBots: true,
+      });
+    };
+    window.addEventListener(TURN_GAME_BOT_REQUEST_EVENT, handleBotRequest);
+    return () => window.removeEventListener(TURN_GAME_BOT_REQUEST_EVENT, handleBotRequest);
+  }, [chatId, generateTurnGameBots]);
+  const gamesPickerOpen = useConversationGamesStore((s) => s.pickerChatId === chatId);
+  const closeGamesPicker = useConversationGamesStore((s) => s.closePicker);
+  const gameSetup = useConversationGamesStore((s) => (s.setup?.chatId === chatId ? s.setup : null));
+  const closeGameSetup = useConversationGamesStore((s) => s.closeSetup);
+  const { data: installedCapabilities = [] } = useInstalledCapabilityPackages();
+  const turnGamePackages = installedCapabilities.filter(
+    (item) => item.status === "active" && item.manifest.kind.includes("turn-game") && item.manifest.entrypoints.client,
+  );
   const isStreamCommitted = useChatStore((s) => s.committedStreamChatIds.has(chatId));
   const hasLiveStream = isStreaming && !isStreamCommitted;
   const streamBuffer = useThrottledStreamBuffer();
@@ -306,15 +343,20 @@ export function ConversationView({
   const typingCharacterName = useChatStore((s) => s.typingCharacterName);
   const delayedCharacterInfo = useChatStore((s) => s.delayedCharacterInfo);
   const conversationMessageStyle = useUIStore((s) => s.conversationMessageStyle);
-  const hasDraftInput = useChatStore((s) => s.currentInput.trim().length > 0);
+  const hasDraftInput = useChatStore((s) => s.hasCurrentInput);
+  const isGroupConversation = chatCharIds.length > 1;
   const liveTypingName = useMemo(() => {
+    if (isGroupConversation) return "Multiple people";
     if (typingCharacterName) return typingCharacterName;
     if (streamingCharacterId) return characterMap.get(streamingCharacterId)?.name ?? "Character";
     if (chatCharIds.length === 1) return characterMap.get(chatCharIds[0]!)?.name ?? "Character";
     if (characterNames.length > 0) return characterNames.join(", ");
     return "Character";
-  }, [characterMap, characterNames, chatCharIds, streamingCharacterId, typingCharacterName]);
-  const liveTypingVerb = liveTypingName.includes(",") || liveTypingName.includes(" & ") ? "are" : "is";
+  }, [characterMap, characterNames, chatCharIds, isGroupConversation, streamingCharacterId, typingCharacterName]);
+  const liveTypingVerb =
+    isGroupConversation || liveTypingName.includes(",") || liveTypingName.includes(" & ") ? "are" : "is";
+  const liveTypingLabel = `${liveTypingName} ${liveTypingVerb} typing`;
+  const liveTypingText = `${liveTypingName} ${liveTypingVerb} typing...`;
   const delayedDisplayName = useMemo(() => {
     if (!delayedCharacterInfo) return "";
     const ids = delayedCharacterInfo.characterIds ?? [];
@@ -342,7 +384,9 @@ export function ConversationView({
   const delayedDisplayVerb = delayedDisplayName.includes(",") || delayedDisplayName.includes(" & ") ? "are" : "is";
   // Single typer → tag the typing row so exclusive-mode card CSS can target it via
   // `[data-card-css="<id>"] .mari-typing-*`. Multiple/unknown typers stay untagged.
-  const typingCardCssId = streamingCharacterId ?? (chatCharIds.length === 1 ? chatCharIds[0] : undefined);
+  const typingCardCssId = isGroupConversation
+    ? undefined
+    : (streamingCharacterId ?? (chatCharIds.length === 1 ? chatCharIds[0] : undefined));
 
   // Track whether the current generation has produced any content. When the stream
   // buffer clears (stream finished) but isStreaming hasn't cleared yet, this ref lets
@@ -371,21 +415,43 @@ export function ConversationView({
   const showTypingIndicator =
     hasLiveStream && !delayedCharacterInfo && !streamBuffer && !thinkingBuffer && conversationMessageStyle !== "bubble";
 
-  // Per-scheme conversation gradient from settings.
-  // When a scheme's values are still the defaults (user hasn't customized), use
-  // a CSS variable so custom themes can override the conversation background.
+  // Per-scheme conversation gradient from settings. When a scheme's values are
+  // still the defaults, use CSS variables so visual themes can override the
+  // default stops without collapsing Marinara's two-color background.
   const convoGradient = useUIStore((s) => s.convoGradient);
   const theme = useUIStore((s) => s.theme);
   const gradientStyle = useMemo(() => {
     const g = convoGradient[theme];
-    const isDefaultDark = convoGradient.dark.from === "#0a0a0e" && convoGradient.dark.to === "#1c2133";
-    const isDefaultLight = convoGradient.light.from === "#f2eff7" && convoGradient.light.to === "#eae6f0";
-    if ((theme === "dark" && isDefaultDark) || (theme === "light" && isDefaultLight)) {
-      return { background: "var(--secondary)" };
+    const defaults = theme === "dark" ? { from: "#0a0a0e", to: "#1c2133" } : { from: "#f2eff7", to: "#eae6f0" };
+    if (g.from === defaults.from && g.to === defaults.to) {
+      return {
+        background: `linear-gradient(135deg, var(--marinara-conversation-gradient-from, ${g.from}), var(--marinara-conversation-gradient-to, ${g.to}))`,
+      };
     }
     return { background: `linear-gradient(135deg, ${g.from}, ${g.to})` };
   }, [convoGradient, theme]);
   const hasAutonomousMessaging = !!chatMeta.autonomousMessages || !!chatMeta.characterExchanges;
+  const callsPackage = installedCapabilities.find(
+    (item) =>
+      item.status === "active" && item.manifest.kind.includes("conversation-calls") && item.manifest.entrypoints.client,
+  );
+  const callCapabilityProps = { chatId, metadata: chatMeta, characterMap, chatCharIds, personaInfo };
+  const activeAgentIds = chatMeta.activeAgentIds;
+  const enabledConversationCapabilities = chatMeta.enableAgents === true
+    ? installedCapabilities.filter((item) => {
+        if (item.status !== "active" || !item.manifest.entrypoints.client) return false;
+        if (item.manifest.kind.includes("conversation-calls")) return false;
+        const contributedAgentIds = item.manifest.contributions?.agentDetail?.agentIds ?? [];
+        return activeAgentIds.includes(item.id) || contributedAgentIds.some((id) => activeAgentIds.includes(id));
+      })
+    : [];
+  const conversationToolbarPackages = enabledConversationCapabilities.filter((item) =>
+    item.manifest.contributions?.slots?.includes("conversation-toolbar"),
+  );
+  const conversationSurfacePackages = enabledConversationCapabilities.filter((item) =>
+    item.manifest.contributions?.slots?.includes("conversation-surface"),
+  );
+  const conversationCapabilityProps = { chatId, metadata: chatMeta, characterMap, chatCharIds, personaInfo };
   const renderToolbarActions = (compact = false) => (
     <>
       <ChatBranchSelector
@@ -396,18 +462,73 @@ export function ConversationView({
         compact={compact}
       />
       <ActiveLorebookEntriesButton chatId={chatId} />
-      <ChatToolbarButton icon={<ImageIcon size="0.875rem" />} title="Gallery" onClick={onOpenGallery} />
+      <ChatToolbarButton
+        icon={<ImageIcon size="0.875rem" />}
+        title={t("chat.toolbar.gallery")}
+        panelAction="gallery"
+        onClick={onOpenGallery}
+      />
       {onSwitchChat && (
         <ChatToolbarButton
           icon={<ArrowRightLeft size="0.875rem" />}
-          title={connectedChatName ? `Switch to ${connectedChatName}` : "Switch to connected chat"}
+          title={
+            connectedChatName
+              ? t("chat.toolbar.switchTo", { name: connectedChatName })
+              : t("chat.toolbar.switchToConnected")
+          }
           onClick={onSwitchChat}
         />
       )}
-      <ChatToolbarButton icon={<Settings2 size="0.875rem" />} title="Chat Settings" onClick={onOpenSettings} />
+      <ChatMessageSearch chatId={chatId} />
+      <ChatToolbarButton
+        icon={<Settings2 size="0.875rem" />}
+        title={t("chat.toolbar.settings")}
+        panelAction="settings"
+        onClick={onOpenSettings}
+      />
     </>
   );
+  const renderHeader = () => (
+    <div className="sticky top-0 z-30 flex items-center justify-between px-4 py-2">
+      <ConversationPresenceCard
+        chatId={chatId}
+        chatMeta={chatMeta}
+        chatCharIds={chatCharIds}
+        characterMap={characterMap}
+        messages={messages}
+        onOpenSettings={onOpenSettings}
+        onOpenScheduleEditor={onOpenScheduleEditor}
+      />
 
+      <div className="ml-2 flex min-w-0 flex-1 items-center justify-end gap-2">
+        {conversationToolbarPackages.map((item) => (
+          <CapabilityElement
+            key={`${item.id}-toolbar`}
+            packageId={item.id}
+            view="toolbar"
+            capabilityProps={{
+              ...conversationCapabilityProps,
+              toolbarButtonClass: getChatToolbarButtonClass(),
+            }}
+            className="contents"
+          />
+        ))}
+        {callsPackage && (
+          <CapabilityElement
+            packageId={callsPackage.id}
+            view="toolbar"
+            capabilityProps={callCapabilityProps}
+            className="contents"
+          />
+        )}
+        <ChatToolbarMenu
+          className="flex-1"
+          desktopChildren={renderToolbarActions()}
+          mobileChildren={renderToolbarActions(true)}
+        />
+      </div>
+    </div>
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [mobileHistoryComposerCollapsed, setMobileHistoryComposerCollapsed] = useState(false);
@@ -420,7 +541,47 @@ export function ConversationView({
   const lastScrollTopRef = useRef(0);
   const composerScrollTopRef = useRef(0);
   const userScrolledAtRef = useRef(0);
-  const shouldKeepMobileComposerOpen = hasLiveStream || hasDraftInput || isFetchingNextPage;
+  const openedAtBottomChatIdRef = useRef<string | null>(null);
+  const streamScrollFrameRef = useRef(0);
+  const keyboardOpen = useChatKeyboardOpen();
+  const composerFocused = useChatComposerFocused();
+  const shouldKeepMobileComposerOpen =
+    keyboardOpen || composerFocused || hasLiveStream || hasDraftInput || isFetchingNextPage;
+
+  const scrollToMessagesBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const el = scrollRef.current;
+    if (el) {
+      el.scrollTo({ top: el.scrollHeight, behavior });
+      return;
+    }
+    messagesEndRef.current?.scrollIntoView({ behavior });
+  }, []);
+  const scheduleStreamScrollToBottom = useCallback(() => {
+    if (streamScrollFrameRef.current) return;
+    streamScrollFrameRef.current = requestAnimationFrame(() => {
+      streamScrollFrameRef.current = 0;
+      if (isLoadingMoreRef.current || !isNearBottomRef.current || userScrolledAwayRef.current) return;
+      scrollToMessagesBottom("auto");
+    });
+  }, [scrollToMessagesBottom]);
+  useEffect(
+    () => () => {
+      if (streamScrollFrameRef.current) cancelAnimationFrame(streamScrollFrameRef.current);
+    },
+    [],
+  );
+
+  const scheduleScrollToMessagesBottom = useCallback(
+    (behavior: ScrollBehavior = "smooth") => {
+      scrollToMessagesBottom(behavior);
+      requestAnimationFrame(() => {
+        scrollToMessagesBottom(behavior);
+        requestAnimationFrame(() => scrollToMessagesBottom(behavior));
+      });
+    },
+    [scrollToMessagesBottom],
+  );
+  useKeepLatestChatMessageVisible(scrollRef, scheduleScrollToMessagesBottom);
 
   useEffect(() => {
     if (shouldKeepMobileComposerOpen) setMobileHistoryComposerCollapsed(false);
@@ -436,7 +597,8 @@ export function ConversationView({
       const currentTop = el.scrollTop;
       const previousComposerTop = composerScrollTopRef.current;
       const isMobile = typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches;
-      if (!isMobile || shouldKeepMobileComposerOpen || nearBottom) {
+      const composerHasFocus = document.activeElement?.matches("[data-chat-composer]") === true;
+      if (!isMobile || shouldKeepMobileComposerOpen || composerHasFocus || nearBottom) {
         setMobileHistoryComposerCollapsed(false);
       } else if (currentTop > previousComposerTop + 18) {
         setMobileHistoryComposerCollapsed(false);
@@ -483,8 +645,11 @@ export function ConversationView({
   useEffect(() => {
     if (isLoadingMoreRef.current) return;
     // Always scroll when the user just sent a message (optimistic msg)
-    if (isOptimistic || (isNearBottomRef.current && !userScrolledAwayRef.current)) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (isOptimistic) {
+      scrollToMessagesBottom("smooth");
+    } else if (isNearBottomRef.current && !userScrolledAwayRef.current) {
+      if (hasLiveStream) scheduleStreamScrollToBottom();
+      else scrollToMessagesBottom("smooth");
     }
   }, [
     newestMsgId,
@@ -494,6 +659,8 @@ export function ConversationView({
     delayedCharacterInfo,
     typingCharacterName,
     isOptimistic,
+    scheduleStreamScrollToBottom,
+    scrollToMessagesBottom,
   ]);
 
   // Preserve scroll on load-more
@@ -514,7 +681,7 @@ export function ConversationView({
 
   const [transcriptWindowStart, setTranscriptWindowStart] = useState<number | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setTranscriptWindowStart(null);
   }, [chatId]);
 
@@ -522,6 +689,30 @@ export function ConversationView({
     () => getTranscriptRenderWindow(messages, { startIndex: transcriptWindowStart }),
     [messages, transcriptWindowStart],
   );
+  const gotoRequest = useChatStore((state) => state.gotoRequest);
+  // ChatArea clears the request after scrolling; only reveal its transcript window once.
+  const handledTranscriptGotoRef = useRef<typeof gotoRequest>(null);
+
+  useLayoutEffect(() => {
+    handledTranscriptGotoRef.current = null;
+  }, [chatId]);
+
+  useLayoutEffect(() => {
+    if (
+      !gotoRequest ||
+      gotoRequest.chatId !== chatId ||
+      !messages ||
+      handledTranscriptGotoRef.current === gotoRequest
+    ) {
+      return;
+    }
+    const loadedMessageOffset = totalMessageCount - messages.length;
+    const localIndex = gotoRequest.messageNumber - 1 - loadedMessageOffset;
+    if (localIndex >= 0 && localIndex < messages.length) {
+      handledTranscriptGotoRef.current = gotoRequest;
+      setTranscriptWindowStart(localIndex);
+    }
+  }, [chatId, gotoRequest, messages, totalMessageCount]);
 
   const showOlderTranscriptMessages = useCallback(() => {
     setTranscriptWindowStart((current) => {
@@ -541,15 +732,32 @@ export function ConversationView({
     setTranscriptWindowStart(null);
   }, []);
 
+  useLayoutEffect(() => {
+    if (!chatId || isFetchingNextPage || isLoadingMoreRef.current) return;
+    if (openedAtBottomChatIdRef.current === chatId) return;
+    if (isLoading && (messages?.length ?? 0) === 0) return;
+    if (transcriptWindow.hiddenAfterCount > 0) return;
+
+    openedAtBottomChatIdRef.current = chatId;
+    userScrolledAwayRef.current = false;
+    isNearBottomRef.current = true;
+    scheduleScrollToMessagesBottom("auto");
+  }, [
+    chatId,
+    isFetchingNextPage,
+    isLoading,
+    messages?.length,
+    scheduleScrollToMessagesBottom,
+    transcriptWindow.hiddenAfterCount,
+  ]);
+
   // ── Build message list with day separators ──
   // Assistant multi-line reveal is presentation-only: a real message can carry
   // display parts, but actions/edit/delete/regenerate still target one message.
   // Strip leaked timestamps like [16:08] or [18.03.2026] from assistant content.
-  const stripTimestamps = (text: string) =>
-    text
-      .replace(/^(\s*\[\d{1,2}[:.]\d{2}\]\s*)+/gm, "")
-      .replace(/^(\s*\[\d{1,2}\.\d{1,2}\.\d{4}\]\s*)+/gm, "")
-      .trim();
+  // Shared with the server (reaction segment-index resolution segments the same
+  // stripped shape) — don't reintroduce a local variant.
+  const stripTimestamps = stripLeadingMessageTimestamps;
 
   const renderedItems = useMemo(() => {
     const visibleMessages = transcriptWindow.messages;
@@ -618,7 +826,9 @@ export function ConversationView({
       const groupSegmentCount =
         msg.role === "assistant" && groupingContent ? getGroupedSegmentCount(groupingContent, knownNames) : 0;
       const hasGroupFormat =
-        groupingContent.includes("<speaker=") || groupSegmentCount > 0 || hasNamePrefixFormat(groupingContent, knownNames);
+        groupingContent.includes("<speaker=") ||
+        groupSegmentCount > 0 ||
+        hasNamePrefixFormat(groupingContent, knownNames);
       let contentParts: string[] | undefined;
       if (conversationMessageStyle === "classic" && msg.role === "assistant" && msg.content && !hasGroupFormat) {
         const cleaned = stripTimestamps(msg.content);
@@ -662,6 +872,7 @@ export function ConversationView({
     chatCharIds,
     totalMessageCount,
     conversationMessageStyle,
+    stripTimestamps,
   ]);
 
   const liveStreamCharacterId = streamingCharacterId ?? (chatCharIds.length === 1 ? chatCharIds[0]! : null);
@@ -915,6 +1126,9 @@ export function ConversationView({
           if (!renderedMessageKeysRef.current.has(key)) {
             staggerTimersRef.current[key]?.forEach(clearTimeout);
             delete staggerTimersRef.current[key];
+            // Reveal fully so an interrupted stagger never leaves the message
+            // permanently truncated at a part boundary (#4039).
+            setVisiblePartCounts((prev) => ({ ...prev, [key]: count }));
             return;
           }
           setVisiblePartCounts((prev) => ({ ...prev, [key]: partIndex }));
@@ -938,6 +1152,9 @@ export function ConversationView({
           if (!renderedMessageKeysRef.current.has(key)) {
             staggerTimersRef.current[key]?.forEach(clearTimeout);
             delete staggerTimersRef.current[key];
+            // Reveal fully so an interrupted stagger never leaves the message
+            // permanently truncated at a speaker-segment boundary (#4039).
+            setVisibleSegmentCounts((prev) => ({ ...prev, [key]: count }));
             return;
           }
           setVisibleSegmentCounts((prev) => ({ ...prev, [key]: segmentIndex }));
@@ -970,9 +1187,9 @@ export function ConversationView({
   // Auto-scroll when staggered parts are revealed
   useEffect(() => {
     if (!isLoadingMoreRef.current && isNearBottomRef.current && !userScrolledAwayRef.current) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      scrollToMessagesBottom("smooth");
     }
-  }, [visiblePartCounts, visibleSegmentCounts]);
+  }, [scrollToMessagesBottom, visiblePartCounts, visibleSegmentCounts]);
 
   return (
     <div
@@ -981,24 +1198,14 @@ export function ConversationView({
       style={{ ...gradientStyle, isolation: "isolate" }}
     >
       {/* ── Messages scroll area ── */}
-      <div ref={scrollRef} className="mari-messages-scroll flex-1 overflow-y-auto overflow-x-hidden">
+      <div
+        ref={scrollRef}
+        data-chat-scroll
+        data-chat-resource-drop-surface
+        className="mari-messages-scroll flex-1 overflow-y-auto overflow-x-hidden"
+      >
         {/* Floating header — character info + action buttons */}
-        <div className="sticky top-0 z-30 flex items-center justify-between px-4 py-2">
-          <ConversationPresenceCard
-            chatId={chatId}
-            chatMeta={chatMeta}
-            chatCharIds={chatCharIds}
-            characterMap={characterMap}
-            messages={messages}
-            onOpenSettings={onOpenSettings}
-          />
-
-          <ChatToolbarMenu
-            className="flex-1"
-            desktopChildren={renderToolbarActions()}
-            mobileChildren={renderToolbarActions(true)}
-          />
-        </div>
+        {renderHeader()}
 
         {/* Load More */}
         {hasNextPage && (
@@ -1009,7 +1216,7 @@ export function ConversationView({
               className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--secondary)] px-3 py-1.5 text-xs font-medium text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)] disabled:opacity-50"
             >
               {isFetchingNextPage ? <Loader2 size="0.75rem" className="animate-spin" /> : <ChevronUp size="0.75rem" />}
-              Load More
+              {localizeUi("ui.chat.chatroleplaysurface.loadMore")}
             </button>
           </div>
         )}
@@ -1029,9 +1236,9 @@ export function ConversationView({
         {/* Welcome message at the start of a conversation */}
         {!isLoading && !hasNextPage && messages && messages.length === 0 && (
           <div className="px-4 pt-2">
-            <p className="text-xs text-[var(--muted-foreground)]">
-              This is the start of your conversation with{" "}
-              <span className="font-medium text-[var(--foreground)]">
+            <p className="text-xs text-[var(--marinara-chat-chrome-panel-muted)]">
+              {localizeUi("ui.chat.conversationview.thisIsTheStartOfYourConversationWith")}{" "}
+              <span className="font-medium text-[var(--marinara-chat-chrome-panel-title)]">
                 {(() => {
                   const names = chatCharIds.map((id) => characterMap.get(id)?.name).filter(Boolean) as string[];
                   if (names.length === 0) return "this group";
@@ -1039,7 +1246,7 @@ export function ConversationView({
                   return names.slice(0, -1).join(", ") + " & " + names[names.length - 1];
                 })()}
               </span>
-              . Say hi!
+              {localizeUi("ui.chat.conversationview.sayHi")}
             </p>
           </div>
         )}
@@ -1050,7 +1257,9 @@ export function ConversationView({
             return (
               <div key={item.key} className="relative my-4 flex items-center px-4">
                 <div className="flex-1 border-t border-[var(--border)]/40" />
-                <span className="mx-4 text-[0.6875rem] font-semibold text-[var(--muted-foreground)]">{item.label}</span>
+                <span className="mx-4 text-[0.6875rem] font-semibold text-[var(--marinara-chat-chrome-panel-muted)]">
+                  {item.label}
+                </span>
                 <div className="flex-1 border-t border-[var(--border)]/40" />
               </div>
             );
@@ -1070,8 +1279,11 @@ export function ConversationView({
                   const parsed = typeof msg.extra === "string" ? JSON.parse(msg.extra) : (msg.extra ?? {});
                   return {
                     ...msg,
-                    content: streamBuffer || (thinkingBuffer ? "Thinking..." : msg.content),
-                    extra: { ...parsed, attachments: null, thinking: thinkingBuffer || parsed.thinking },
+                    content: streamBuffer || (thinkingBuffer ? t("chat.message.thinking") : msg.content),
+                    // Only the live buffer belongs here: falling back to the
+                    // previous swipe's thinking would show stale thoughts in
+                    // the viewer while the replacement is still streaming.
+                    extra: { ...parsed, attachments: null, thinking: thinkingBuffer || null },
                   };
                 })()
               : msg;
@@ -1081,6 +1293,7 @@ export function ConversationView({
             !contentParts && item.groupSegmentCount && item.groupSegmentCount > 1
               ? (visibleSegmentCounts[item.key] ?? item.groupSegmentCount)
               : undefined;
+          const messageDepth = Math.max(0, totalMessageCount - 1 - item.index);
           const originalContent = item.rawContent ?? (displayMsg.content !== msg.content ? msg.content : undefined);
           const regenerationDraftMessage =
             isBubbleRegenerating && !isStreamWindingDown
@@ -1120,6 +1333,7 @@ export function ConversationView({
                 chatCharacterIds={chatCharIds}
                 messageIndex={item.index + 1}
                 messageOrderIndex={item.index}
+                messageDepth={messageDepth}
                 multiSelectMode={multiSelectMode}
                 isSelected={selectedMessageIds?.has(msg.id)}
                 onToggleSelect={onToggleSelectMessage}
@@ -1131,6 +1345,7 @@ export function ConversationView({
                 visibleSegmentCount={visibleSegmentCount}
                 bubbleGroupPosition={item.bubbleGroupPosition}
                 originalContent={originalContent}
+                translationDisplayOnly={chatMeta.translationDisplayOnly === true}
               />
               {regenerationDraftMessage && (
                 <ConversationMessage
@@ -1151,11 +1366,13 @@ export function ConversationView({
                   emojiMap={conversationEmojiMap}
                   stickerMap={conversationStickerMap}
                   chatCharacterIds={chatCharIds}
+                  messageDepth={messageDepth}
                   hasDraftInput={hasDraftInput}
                   messageStyle={conversationMessageStyle}
                   contentParts={liveStreamContentParts}
                   visiblePartCount={liveStreamContentParts?.length}
                   bubbleGroupPosition="single"
+                  translationDisplayOnly={chatMeta.translationDisplayOnly === true}
                 />
               )}
             </Fragment>
@@ -1181,11 +1398,13 @@ export function ConversationView({
             emojiMap={conversationEmojiMap}
             stickerMap={conversationStickerMap}
             chatCharacterIds={chatCharIds}
+            messageDepth={0}
             hasDraftInput={hasDraftInput}
             messageStyle={conversationMessageStyle}
             contentParts={liveStreamContentParts}
             visiblePartCount={liveStreamContentParts?.length}
             bubbleGroupPosition="single"
+            translationDisplayOnly={chatMeta.translationDisplayOnly === true}
           />
         )}
 
@@ -1201,8 +1420,14 @@ export function ConversationView({
           <div className="flex items-center gap-2 px-4 py-1.5 text-[0.8125rem] text-[var(--text-secondary)]">
             <span className="italic">
               {delayedCharacterInfo.status === "dnd"
-                ? `${delayedDisplayName} ${delayedDisplayVerb} busy — they'll respond when they're back`
-                : `${delayedDisplayName} ${delayedDisplayVerb} away — they'll respond in a moment`}
+                ? localizeUi("ui.chat.conversationview.value1Value2BusyTheyLlRespondWhenTheyRe", {
+                    value1: delayedDisplayName,
+                    value2: delayedDisplayVerb,
+                  })
+                : localizeUi("ui.chat.conversationview.value1Value2AwayTheyLlRespondInAMoment", {
+                    value1: delayedDisplayName,
+                    value2: delayedDisplayVerb,
+                  })}
             </span>
           </div>
         )}
@@ -1214,28 +1439,18 @@ export function ConversationView({
             data-typing-name={liveTypingName}
             data-card-css={typingCardCssId}
           >
-            <span className="mari-typing-dots flex gap-0.5">
-              <span
-                className="inline-block h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--text-secondary)]"
-                style={{ animationDelay: "0ms" }}
-              />
-              <span
-                className="inline-block h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--text-secondary)]"
-                style={{ animationDelay: "150ms" }}
-              />
-              <span
-                className="inline-block h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--text-secondary)]"
-                style={{ animationDelay: "300ms" }}
-              />
-            </span>
-            <span className="mari-typing-text italic">
-              {liveTypingName} {liveTypingVerb} typing...
-            </span>
+            <PendingTypingDots
+              className="mari-typing-dots gap-0.5"
+              dotClassName="bg-[var(--text-secondary)]"
+              label={liveTypingLabel}
+              small
+            />
+            <span className="mari-typing-text italic">{liveTypingText}</span>
           </div>
         )}
 
         {/* Scene banner — inline at bottom of messages (origin variant only); hidden during a turn-game */}
-        {sceneInfo?.variant === "origin" && !unoGameActive && !chessGameActive && (
+        {sceneInfo?.variant === "origin" && (
           <SceneBanner variant="origin" sceneChatId={sceneInfo.sceneChatId} sceneChatName={sceneInfo.sceneChatName} />
         )}
 
@@ -1266,9 +1481,27 @@ export function ConversationView({
         />
       )}
 
-      {/* ── Turn-game boards (UNO, chess) — each self-hides when no game is active ── */}
-      <UnoBoard chatId={chatId} />
-      <ChessBoard chatId={chatId} />
+      {/* Downloaded games own their board and setup UI. The base client only provides stable slots. */}
+      {turnGamePackages.map((game) => (
+        <CapabilityElement key={`${game.id}-surface`} packageId={game.id} view="surface" capabilityProps={{ chatId }} />
+      ))}
+      {callsPackage && (
+        <CapabilityElement
+          packageId={callsPackage.id}
+          view="surface"
+          capabilityProps={callCapabilityProps}
+          className="contents"
+        />
+      )}
+      {conversationSurfacePackages.map((item) => (
+        <CapabilityElement
+          key={`${item.id}-conversation-surface`}
+          packageId={item.id}
+          view="surface"
+          capabilityProps={conversationCapabilityProps}
+          className="contents"
+        />
+      ))}
       {/* Setup modals mounted once here (stable position) so they never double-render.
           Keyed by chatId so their internal selection state resets on a chat switch
           (matches ConversationInput below) — otherwise stale selected ids would
@@ -1276,8 +1509,20 @@ export function ConversationView({
       {/* Keys must be unique across this whole children list — ConversationInput
           below is also keyed by chatId, and duplicate sibling keys make React
           duplicate/orphan the setup modals (stuck un-closable "Start UNO"). */}
-      <UnoSetup key={`uno-${chatId}`} chatId={chatId} open={unoSetupOpen} onClose={closeUnoSetup} />
-      <ChessSetup key={`chess-${chatId}`} chatId={chatId} open={chessSetupOpen} onClose={closeChessSetup} />
+      <ConversationGamesPicker
+        key={`games-${chatId}`}
+        chatId={chatId}
+        open={gamesPickerOpen}
+        onClose={closeGamesPicker}
+      />
+      {gameSetup && turnGamePackages.some((game) => game.id === gameSetup.packageId) && (
+        <CapabilityElement
+          key={`${gameSetup.packageId}-setup-${chatId}`}
+          packageId={gameSetup.packageId}
+          view="setup"
+          capabilityProps={{ chatId, open: true, onClose: closeGameSetup }}
+        />
+      )}
 
       {/* ── Input area ── */}
       <ConversationInput
@@ -1285,13 +1530,6 @@ export function ConversationView({
         mobileHistoryCollapsed={mobileHistoryComposerCollapsed}
         onMobileHistoryCollapsedChange={setMobileHistoryComposerCollapsed}
         characterNames={characterNames}
-        groupResponseOrder={
-          chatMeta.groupResponseOrder === "manual"
-            ? "manual"
-            : chatCharIds.length > 1
-              ? (chatMeta.groupResponseOrder ?? "sequential")
-              : undefined
-        }
         chatCharacters={chatCharIds
           .filter((id) => characterMap.has(id))
           .map((id) => {
@@ -1306,6 +1544,8 @@ export function ConversationView({
             };
           })}
         onPeekPrompt={onPeekPrompt}
+        onIllustrate={onIllustrate}
+        onGenerateSelfie={onGenerateSelfie}
       />
     </div>
   );

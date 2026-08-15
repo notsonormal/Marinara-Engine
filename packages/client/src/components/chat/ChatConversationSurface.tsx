@@ -62,13 +62,16 @@ type ConversationSurfaceProps = {
   onAbandonScene?: () => void;
   onOpenSettings: ComponentProps<typeof ConversationView>["onOpenSettings"];
   onOpenGallery: ComponentProps<typeof ConversationView>["onOpenGallery"];
+  onOpenScheduleEditor?: ComponentProps<typeof ConversationView>["onOpenScheduleEditor"];
   onCloseSettings: () => void;
   onCloseGallery: () => void;
   onIllustrate?: () => void;
+  onIllustrateWithAgent?: (agentType: string) => void | Promise<void>;
+  onGenerateSelfie?: (characterId?: string) => void | Promise<void>;
   onWizardFinish: () => void;
   onClosePeekPrompt: () => void;
   onResetSpritePlacements: () => void;
-  onSpriteSideChange: (side: SpriteSide) => void;
+  onSpriteSideChange: (side: SpriteSide, characterId?: string) => void;
   onToggleSpriteArrange: () => void;
   onDeleteConfirm: () => void;
   onDeleteSwipe: () => void;
@@ -126,9 +129,12 @@ export function ChatConversationSurface({
   onAbandonScene,
   onOpenSettings,
   onOpenGallery,
+  onOpenScheduleEditor,
   onCloseSettings,
   onCloseGallery,
   onIllustrate,
+  onIllustrateWithAgent,
+  onGenerateSelfie,
   onWizardFinish,
   onClosePeekPrompt,
   onResetSpritePlacements,
@@ -171,9 +177,12 @@ export function ChatConversationSurface({
           onSetActiveSwipe={onSetActiveSwipe}
           onToggleHiddenFromAI={onToggleHiddenFromAI}
           onPeekPrompt={onPeekPrompt}
+          onIllustrate={onIllustrate}
+          onGenerateSelfie={onGenerateSelfie}
           lastAssistantMessageId={lastAssistantMessageId}
           onOpenSettings={onOpenSettings}
           onOpenGallery={onOpenGallery}
+          onOpenScheduleEditor={onOpenScheduleEditor}
           onBranch={onBranch}
           multiSelectMode={multiSelectMode}
           selectedMessageIds={selectedMessageIds}
@@ -209,7 +218,16 @@ export function ChatConversationSurface({
         }}
         onCloseSettings={onCloseSettings}
         onCloseGallery={onCloseGallery}
+        onOpenScheduleEditor={onOpenScheduleEditor}
         onIllustrate={onIllustrate}
+        onIllustrateWithAgent={onIllustrateWithAgent}
+        onGenerateSelfie={onGenerateSelfie}
+        selfieCharacters={chatCharIds
+          .map((id) => {
+            const character = characterMap.get(id);
+            return character ? { id, name: character.name } : null;
+          })
+          .filter((character): character is { id: string; name: string } => Boolean(character))}
         onWizardFinish={onWizardFinish}
         onClosePeekPrompt={onClosePeekPrompt}
         onDeleteConfirm={onDeleteConfirm}

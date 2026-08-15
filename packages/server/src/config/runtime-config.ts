@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import { logger as sharedLogger } from "../lib/logger.js";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,14 +14,61 @@ const DEFAULT_DOCKER_DATA_DIR = "/app/data";
 const DEFAULT_PORT = 7860;
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_DATA_DIR = resolve(SERVER_ROOT, "data");
-const REGRESSION_DATA_DIR = resolve(MONOREPO_ROOT, "data");
-const DEFAULT_DATABASE_FILE = "marinara-engine.db";
-const DEFAULT_DATABASE_PATH = resolve(DEFAULT_DATA_DIR, DEFAULT_DATABASE_FILE);
-const REGRESSION_DATABASE_PATH = resolve(REGRESSION_DATA_DIR, DEFAULT_DATABASE_FILE);
 const DEFAULT_MAX_TOOL_ROUNDS = 100;
 const MAX_CONFIGURED_TOOL_ROUNDS = 10_000;
 const DEFAULT_CUSTOM_TOOL_TIMEOUT_MS = 60_000;
+export const DEFAULT_CHAT_GENERATION_TIMEOUT_MS = 300_000;
+const MIN_CHAT_GENERATION_TIMEOUT_MS = 10_000;
+const MAX_CHAT_GENERATION_TIMEOUT_MS = 3_600_000;
+export const DEFAULT_AGENT_CALL_TIMEOUT_MS = 300_000;
+export const DEFAULT_GAME_DYNAMIC_IMAGE_PROMPT_TIMEOUT_MS = 45_000;
 const MAX_TIMEOUT_MS = 2_147_483_647;
+
+function createValidatedTimeoutGetter(envVar: string, defaultMs: number, minMs: number, maxMs: number) {
+  let lastInvalid: string | null = null;
+  return () => {
+    const raw = normalizeEnvValue(process.env[envVar]);
+    if (raw === null) return defaultMs;
+
+    const parsed = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+    if (Number.isSafeInteger(parsed) && parsed >= minMs && parsed <= maxMs) {
+      lastInvalid = null;
+      return parsed;
+    }
+
+    if (lastInvalid !== raw) {
+      lastInvalid = raw;
+      sharedLogger.warn(
+        "[runtime-config] Ignoring invalid %s=%s; expected %d-%d milliseconds, using %d",
+        envVar,
+        raw,
+        minMs,
+        maxMs,
+        defaultMs,
+      );
+    }
+    return defaultMs;
+  };
+}
+
+const readChatGenerationTimeoutMs = createValidatedTimeoutGetter(
+  "CHAT_GENERATION_TIMEOUT_MS",
+  DEFAULT_CHAT_GENERATION_TIMEOUT_MS,
+  MIN_CHAT_GENERATION_TIMEOUT_MS,
+  MAX_CHAT_GENERATION_TIMEOUT_MS,
+);
+const readAgentCallTimeoutMs = createValidatedTimeoutGetter(
+  "AGENT_CALL_TIMEOUT_MS",
+  DEFAULT_AGENT_CALL_TIMEOUT_MS,
+  MIN_CHAT_GENERATION_TIMEOUT_MS,
+  MAX_CHAT_GENERATION_TIMEOUT_MS,
+);
+const readGameDynamicImagePromptTimeoutMs = createValidatedTimeoutGetter(
+  "GAME_DYNAMIC_IMAGE_PROMPT_TIMEOUT_MS",
+  DEFAULT_GAME_DYNAMIC_IMAGE_PROMPT_TIMEOUT_MS,
+  MIN_CHAT_GENERATION_TIMEOUT_MS,
+  MAX_CHAT_GENERATION_TIMEOUT_MS,
+);
 
 let envLoaded = false;
 // Keys that the .env file currently contributes to process.env. Tracked so a
@@ -60,12 +107,31 @@ const EMPTY_ENV_HEADER = `# Marinara Engine - runtime configuration.
  * the same as today.
  */
 function ensureEnvFileExists(envPath: string) {
-  if (existsSync(envPath)) return;
+  if (existsSync(envPath)) {
+    if (process.platform !== "win32") {
+      try {
+        if ((statSync(envPath).mode & 0o077) !== 0) chmodSync(envPath, 0o600);
+      } catch (error) {
+        // Read-only mounts may reject chmod even when the mounted file is
+        // already private. Only fail when the resulting mode is unsafe.
+        try {
+          if ((statSync(envPath).mode & 0o077) === 0) return;
+        } catch {
+          // The original chmod failure remains the useful startup error.
+        }
+        throw new Error(`Cannot enforce private permissions on ${envPath}`, { cause: error });
+      }
+      if ((statSync(envPath).mode & 0o077) !== 0) {
+        throw new Error(`Cannot enforce private permissions on ${envPath}`);
+      }
+    }
+    return;
+  }
   try {
     mkdirSync(dirname(envPath), { recursive: true });
     // 'wx' = exclusive create. Race-safe across concurrent startups: a second
     // process that loses the race gets EEXIST, which we ignore.
-    writeFileSync(envPath, EMPTY_ENV_HEADER, { flag: "wx" });
+    writeFileSync(envPath, EMPTY_ENV_HEADER, { flag: "wx", mode: 0o600 });
   } catch (err) {
     const code = (err as NodeJS.ErrnoException | null)?.code;
     if (code === "EEXIST") return;
@@ -95,6 +161,8 @@ export function loadRuntimeEnv() {
   } else {
     dotenv.config();
   }
+
+  normalizeRuntimeTimezoneEnv();
 
   envLoaded = true;
 }
@@ -158,8 +226,20 @@ export function reloadRuntimeEnv(): EnvReloadResult {
     }
   }
 
+  normalizeRuntimeTimezoneEnv();
   envFileKeys = newKeys;
   return { added, updated, removed, unchanged };
+}
+
+/**
+ * Node interprets an explicitly empty TZ as Etc/Unknown (UTC), which is not
+ * equivalent to leaving TZ unset. Treat whitespace-only values as absent so
+ * schedules continue to inherit the host timezone.
+ */
+export function normalizeRuntimeTimezoneEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!("TZ" in env) || env.TZ?.trim()) return false;
+  delete env.TZ;
+  return true;
 }
 
 function normalizeEnvValue(value: string | undefined | null) {
@@ -220,6 +300,10 @@ export function getHost() {
   return normalizeEnvValue(process.env.HOST) ?? DEFAULT_HOST;
 }
 
+export function getTrustedHosts() {
+  return parseCsv(process.env.TRUSTED_HOSTS);
+}
+
 export function getPort() {
   const parsed = Number.parseInt(process.env.PORT ?? "", 10);
   return Number.isFinite(parsed) ? parsed : DEFAULT_PORT;
@@ -274,62 +358,10 @@ export function getDataDir() {
   return DEFAULT_DATA_DIR;
 }
 
-export function getDatabaseDriver() {
-  return normalizeEnvValue(process.env.DATABASE_DRIVER);
-}
-
-export function getStorageBackend() {
-  const raw = normalizeEnvValue(process.env.STORAGE_BACKEND ?? process.env.MARINARA_STORAGE_BACKEND);
-  if (raw) return raw.toLowerCase();
-
-  // New default for v1.5.7+: user data is persisted as files. Advanced users
-  // can opt back into the legacy persistent SQLite database with
-  // STORAGE_BACKEND=sqlite.
-  return "files";
-}
-
-export function isFileStorageBackend() {
-  return getStorageBackend() !== "sqlite";
-}
-
 export function getFileStorageDir() {
   const raw = normalizeEnvValue(process.env.FILE_STORAGE_DIR ?? process.env.MARINARA_FILE_STORAGE_DIR);
   if (raw) return resolveFromServerRoot(raw);
   return resolve(getDataDir(), "storage");
-}
-
-export function getDatabaseUrl() {
-  const raw = normalizeEnvValue(process.env.DATABASE_URL);
-  if (!raw) {
-    return `file:${resolve(getDataDir(), "marinara-engine.db")}`;
-  }
-
-  if (!raw.startsWith("file:")) {
-    return raw;
-  }
-
-  const rawPath = raw.slice("file:".length);
-  if (!rawPath || rawPath === ":memory:" || rawPath.startsWith(":memory:")) {
-    return raw;
-  }
-
-  return `file:${resolveFromServerRoot(rawPath)}`;
-}
-
-export function getDatabaseFilePath() {
-  const url = getDatabaseUrl();
-  if (!url.startsWith("file:")) return null;
-
-  const filePath = url.slice("file:".length);
-  if (!filePath || filePath === ":memory:" || filePath.startsWith(":memory:")) return null;
-  return filePath;
-}
-
-export function getLegacyDatabaseImportPaths() {
-  const candidates = [getDatabaseFilePath(), DEFAULT_DATABASE_PATH, REGRESSION_DATABASE_PATH].filter(
-    (path): path is string => Boolean(path),
-  );
-  return [...new Set(candidates)];
 }
 
 export function getIpAllowlist() {
@@ -374,51 +406,40 @@ export function getTrustedPrivateNetworksOverride() {
 }
 
 /**
- * Trust traffic from the Tailscale CGNAT range (100.64.0.0/10) unconditionally.
- * When enabled, those clients skip both the IP allowlist and Basic Auth, the
- * same way loopback does.
+ * Choose how direct Tailscale traffic may skip the IP allowlist and Basic Auth.
  *
- * Default: ON. Joining a tailnet already requires authentication via the
- * operator's Tailscale account, which is a stronger trust signal than "any
- * LAN." Set BYPASS_AUTH_TAILSCALE=false to require Basic Auth from your
- * Tailnet too.
- *
- * Caveat: if your server's public connection is itself behind a CGNAT'd ISP
- * that uses 100.64.0.0/10, an internet client can appear with a source IP in
- * this range. Bind HOST to your tailscale0 IP (or use a host firewall) for
- * hard isolation when that risk applies, or set the flag to false.
+ * Default: automatic. A Tailscale-shaped client is trusted only when its
+ * connection also arrived on a local 100.64.0.0/10 address. Set the flag to
+ * true for the legacy broad range bypass, or false to disable it.
  */
-export function isTailscaleBypassEnabled() {
-  // Default-on: only an explicit disable flag turns it off.
-  return !isDisabledFlag(process.env.BYPASS_AUTH_TAILSCALE);
+export function getTailscaleBypassMode(): "auto" | "enabled" | "disabled" {
+  const raw = normalizeEnvValue(process.env.BYPASS_AUTH_TAILSCALE);
+  if (raw === null) return "auto";
+  return isEnabledFlag(raw) ? "enabled" : "disabled";
 }
 
 /**
- * Trust traffic from the Docker bridge range (172.16.0.0/12) unconditionally.
- * When enabled, those clients skip both the IP allowlist and Basic Auth.
+ * Choose how direct Docker traffic may skip the IP allowlist and Basic Auth.
  *
- * Default: ON. Docker bridge IPs are unreachable from outside the host —
- * external traffic is NAT'd through the bridge gateway, so a request that
- * actually arrives with a 172.16.0.0/12 source IP genuinely came from a
- * container on this host. Set BYPASS_AUTH_DOCKER=false to require auth from
- * containers as well.
- *
- * Caveat: 172.16.0.0/12 also covers some private LAN deployments. If your
- * non-Docker LAN uses 172.16.x.x or 172.20.x.x addresses, set the flag to
- * false.
+ * Default: automatic. Docker clients are trusted only when they match this
+ * container's actual interface networks or exact default gateway. Set the
+ * flag to true for the legacy broad range bypass, or false to disable it.
  */
-export function isDockerBypassEnabled() {
-  return !isDisabledFlag(process.env.BYPASS_AUTH_DOCKER);
+export function getDockerBypassMode(): "auto" | "enabled" | "disabled" {
+  const raw = normalizeEnvValue(process.env.BYPASS_AUTH_DOCKER);
+  if (raw === null) return "auto";
+  return isEnabledFlag(raw) ? "enabled" : "disabled";
 }
 
 /**
  * Require normal auth/allowlist handling for Docker bridge requests that look
  * like they were forwarded by a reverse proxy or tunnel container.
  *
- * Default: OFF for compatibility with existing Docker installs.
+ * Default: ON. Set REQUIRE_AUTH_FOR_DOCKER_PROXY=false only when every client
+ * behind the Docker proxy is intentionally inside the trusted boundary.
  */
 export function isDockerProxyAuthRequired() {
-  return isEnabledFlag(process.env.REQUIRE_AUTH_FOR_DOCKER_PROXY);
+  return !isDisabledFlag(process.env.REQUIRE_AUTH_FOR_DOCKER_PROXY);
 }
 
 export function isDebugAgentsEnabled() {
@@ -461,6 +482,26 @@ export function getEmbeddingRequestTimeoutMs() {
   return parsePositiveIntEnv(process.env.EMBEDDING_TIMEOUT_MS, 300_000, MAX_TIMEOUT_MS);
 }
 
+/** Main-chat provider timeout. Read per request so .env hot reloads apply without a restart. */
+export function getChatGenerationTimeoutMs() {
+  return readChatGenerationTimeoutMs();
+}
+
+/**
+ * Per-call timeout for agent LLM requests (trackers, HTML reformatter, …).
+ * Unlike the main chat path, these are total-duration caps, so slow local
+ * models need a higher value here even when streaming (#3958). Read per
+ * request so .env hot reloads apply without a restart.
+ */
+export function getAgentCallTimeoutMs() {
+  return readAgentCallTimeoutMs();
+}
+
+/** Dynamic Game image-prompt LLM timeout. Read per request so .env hot reloads apply without a restart. */
+export function getGameDynamicImagePromptTimeoutMs() {
+  return readGameDynamicImagePromptTimeoutMs();
+}
+
 export function getMaxToolRounds() {
   return parsePositiveIntEnv(process.env.MAX_TOOL_ROUNDS, DEFAULT_MAX_TOOL_ROUNDS, MAX_CONFIGURED_TOOL_ROUNDS);
 }
@@ -487,6 +528,14 @@ export function isWebhookLocalUrlsEnabled() {
 
 export function isCustomToolScriptEnabled() {
   return isEnabledFlag(process.env.CUSTOM_TOOL_SCRIPT_ENABLED);
+}
+
+export function isCustomAgentRepositoriesEnabled() {
+  return isEnabledFlag(process.env.ENABLE_CUSTOM_AGENT_REPOS);
+}
+
+export function isExternalExtensionsEnvEnabled() {
+  return isEnabledFlag(process.env.ENABLE_EXTERNAL_EXTENSIONS);
 }
 
 export function isSidecarRuntimeInstallEnabled() {
@@ -633,47 +682,7 @@ export function isAutoCreateDefaultConnectionDisabled(value = process.env.AUTO_C
   return isDisabledFlag(value);
 }
 
-export function logStorageDiagnostics(
-  logger: { info(...args: any[]): void; warn(...args: any[]): void } = sharedLogger,
-) {
-  const dataDir = getDataDir();
-  const dbPath = getDatabaseFilePath();
-  const backend = getStorageBackend();
-  const legacyImportPaths = getLegacyDatabaseImportPaths();
-
-  logger.info(`[storage] DATA_DIR=${dataDir}`);
-  logger.info(`[storage] STORAGE_BACKEND=${backend}`);
-  if (backend !== "sqlite") {
-    logger.info(`[storage] FILE_STORAGE_DIR=${getFileStorageDir()}`);
-    if (legacyImportPaths.length > 0) {
-      logger.info(`[storage] LEGACY_DATABASE_IMPORT_SOURCES=${legacyImportPaths.join(", ")}`);
-    }
-  } else if (dbPath) {
-    logger.info(`[storage] DATABASE_FILE=${dbPath}`);
-  } else {
-    logger.info(`[storage] DATABASE_URL=${getDatabaseUrl()}`);
-  }
-
-  if (existsSync(DEFAULT_DATABASE_PATH) && existsSync(REGRESSION_DATABASE_PATH)) {
-    if (dbPath === DEFAULT_DATABASE_PATH) {
-      logger.warn(
-        `[storage] Both database locations exist: ${DEFAULT_DATABASE_PATH} and ${REGRESSION_DATABASE_PATH}. ` +
-          `Using ${DEFAULT_DATABASE_PATH} for compatibility. The repo-root database may contain data written during the recent path regression. ` +
-          `Do not delete either file until recovery is confirmed.`,
-      );
-      return;
-    }
-
-    logger.warn(
-      `[storage] Both database locations exist: ${DEFAULT_DATABASE_PATH} and ${REGRESSION_DATABASE_PATH}. ` +
-        `The current database resolves to ${dbPath ?? getDatabaseUrl()}. Do not delete either file until recovery is confirmed.`,
-    );
-  }
-
-  if (dbPath === DEFAULT_DATABASE_PATH && !existsSync(DEFAULT_DATABASE_PATH) && existsSync(REGRESSION_DATABASE_PATH)) {
-    logger.warn(
-      `[storage] Found a repo-root database at ${REGRESSION_DATABASE_PATH}, but the current compatibility path resolves to ${DEFAULT_DATABASE_PATH}. ` +
-        `If data appears missing, inspect both locations and do not delete either file until recovery is confirmed.`,
-    );
-  }
+export function logStorageDiagnostics(logger: { info(...args: any[]): void } = sharedLogger) {
+  logger.info("[storage] DATA_DIR=%s", getDataDir());
+  logger.info("[storage] FILE_STORAGE_DIR=%s", getFileStorageDir());
 }

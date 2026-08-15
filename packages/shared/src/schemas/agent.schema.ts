@@ -3,38 +3,11 @@
 // ──────────────────────────────────────────────
 import { z } from "zod";
 import { MAX_CUSTOM_AGENT_ACTIVATION_SCAN_DEPTH } from "../constants/agent-activation.js";
+import { AGENT_RESULT_TYPE_VALUES, CUSTOM_AGENT_CAPABILITY_IDS } from "../types/agent.js";
 
 export const agentPhaseSchema = z.enum(["pre_generation", "parallel", "post_processing"]);
 
-export const agentResultTypeSchema = z.enum([
-  "game_state_update",
-  "text_rewrite",
-  "sprite_change",
-  "echo_message",
-  "quest_update",
-  "image_prompt",
-  "context_injection",
-  "continuity_check",
-  "director_event",
-  "lorebook_update",
-  "character_card_update",
-  "background_change",
-  "character_tracker_update",
-  "persona_stats_update",
-  "custom_tracker_update",
-  "spotify_control",
-  "youtube_control",
-  "local_music_control",
-  "haptic_command",
-  "cyoa_choices",
-  "secret_plot",
-  "game_master_narration",
-  "party_action",
-  "game_map_update",
-  "game_state_transition",
-  "prompt_patch",
-  "frontend_theme_update",
-]);
+export const agentResultTypeSchema = z.enum(AGENT_RESULT_TYPE_VALUES);
 
 export const customAgentActivationSettingsSchema = z.object({
   activationKeywords: z.array(z.string().trim().min(1)).max(100).optional(),
@@ -57,5 +30,42 @@ export const createAgentConfigSchema = z.object({
 
 export const updateAgentConfigSchema = createAgentConfigSchema.partial();
 
+export const customAgentImportPolicyUpdateSchema = z.object({
+  enabled: z.boolean(),
+});
+
+export const importAgentConfigSchema = z.object({
+  agent: createAgentConfigSchema,
+  source: z.enum(["file", "folder"]),
+  approvedCapabilities: z.array(z.enum(CUSTOM_AGENT_CAPABILITY_IDS)).max(CUSTOM_AGENT_CAPABILITY_IDS.length),
+  acknowledgePermissions: z.literal(true),
+});
+
+/** AI-assisted rewrite of a fragment of stored agent data (Agent Suite). */
+export const agentSuiteRewriteSchema = z.object({
+  connectionId: z.string().min(1),
+  instruction: z.string().min(1).max(4000),
+  selectedText: z.string().min(1).max(50000),
+  /** Full document the excerpt was selected from — context only, never rewritten. */
+  documentText: z.string().max(100000).optional(),
+  agentName: z.string().max(200).optional(),
+  dataLabel: z.string().max(200).optional(),
+  /** User-selected grounding context (character cards, lorebook entries) — never rewritten. */
+  contextSections: z
+    .array(
+      z.object({
+        label: z.string().min(1).max(200),
+        content: z.string().min(1).max(20000),
+      }),
+    )
+    .max(20)
+    .refine((sections) => sections.reduce((total, section) => total + section.content.length, 0) <= 100000, {
+      message: "Combined context is too large (max 100,000 characters)",
+    })
+    .optional(),
+});
+
 export type CreateAgentConfigInput = z.infer<typeof createAgentConfigSchema>;
 export type UpdateAgentConfigInput = z.infer<typeof updateAgentConfigSchema>;
+export type ImportAgentConfigInput = z.infer<typeof importAgentConfigSchema>;
+export type AgentSuiteRewriteInput = z.infer<typeof agentSuiteRewriteSchema>;

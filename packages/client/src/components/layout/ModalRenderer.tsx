@@ -3,8 +3,12 @@
 // ──────────────────────────────────────────────
 import { lazy, Suspense } from "react";
 import { useUIStore } from "../../stores/ui.store";
-import type { AgentData } from "../modals/EditAgentModal";
-import type { LorebookCategory, LorebookScope } from "@marinara-engine/shared";
+import {
+  normalizeAvatarCrop,
+  type LorebookCategory,
+  type LorebookScope,
+  type ScenePromptPreferences,
+} from "@marinara-engine/shared";
 
 const CreateCharacterModal = lazy(() =>
   import("../modals/CreateCharacterModal").then((module) => ({ default: module.CreateCharacterModal })),
@@ -23,9 +27,6 @@ const CreatePresetModal = lazy(() =>
 );
 const ImportPresetModal = lazy(() =>
   import("../modals/ImportPresetModal").then((module) => ({ default: module.ImportPresetModal })),
-);
-const EditAgentModal = lazy(() =>
-  import("../modals/EditAgentModal").then((module) => ({ default: module.EditAgentModal })),
 );
 const STBulkImportModal = lazy(() =>
   import("../modals/STBulkImportModal").then((module) => ({ default: module.STBulkImportModal })),
@@ -47,6 +48,22 @@ const CharacterCardUpdateModal = lazy(() =>
 );
 const AgentWriteApprovalModal = lazy(() =>
   import("../modals/AgentWriteApprovalModal").then((module) => ({ default: module.AgentWriteApprovalModal })),
+);
+const DocsViewerModal = lazy(() =>
+  import("../modals/DocsViewerModal").then((module) => ({ default: module.DocsViewerModal })),
+);
+const AboutMeViewerModal = lazy(() =>
+  import("../modals/AboutMeViewerModal").then((module) => ({ default: module.AboutMeViewerModal })),
+);
+const ScenePromptPreferencesModal = lazy(() =>
+  import("../modals/ScenePromptPreferencesModal").then((module) => ({
+    default: module.ScenePromptPreferencesModal,
+  })),
+);
+const StartCharacterChatModal = lazy(() =>
+  import("../modals/StartCharacterChatModal").then((module) => ({
+    default: module.StartCharacterChatModal,
+  })),
 );
 
 export function ModalRenderer() {
@@ -85,9 +102,6 @@ export function ModalRenderer() {
     case "import-preset":
       content = <ImportPresetModal open onClose={closeModal} />;
       break;
-    case "edit-agent":
-      content = <EditAgentModal open onClose={closeModal} agent={(modal?.props?.agent as AgentData | null) ?? null} />;
-      break;
     case "import-persona":
       content = <ImportPersonaModal open onClose={closeModal} />;
       break;
@@ -108,6 +122,59 @@ export function ModalRenderer() {
       break;
     case "agent-write-approval":
       content = <AgentWriteApprovalModal open onClose={closeModal} />;
+      break;
+    case "docs-viewer":
+      content = (
+        <DocsViewerModal open onClose={closeModal} initialDoc={(modal?.props?.initialDoc as string | null) ?? null} />
+      );
+      break;
+    case "about-me-viewer":
+      content = (
+        <AboutMeViewerModal
+          open
+          onClose={closeModal}
+          kind={(modal?.props?.kind as "character" | "persona") ?? "character"}
+          id={(modal?.props?.id as string) ?? ""}
+          anchorRect={
+            (modal?.props?.anchorRect as {
+              top: number;
+              left: number;
+              right: number;
+              bottom: number;
+              width: number;
+              height: number;
+            } | null) ?? null
+          }
+          avatarUrl={(modal?.props?.avatarUrl as string | null) ?? null}
+          avatarCrop={normalizeAvatarCrop(modal?.props?.avatarCrop)}
+          displayName={(modal?.props?.displayName as string | null) ?? null}
+          nameColor={(modal?.props?.nameColor as string | null) ?? null}
+          status={(modal?.props?.status as "online" | "idle" | "dnd" | "offline" | null) ?? null}
+          activity={(modal?.props?.activity as string | null) ?? null}
+        />
+      );
+      break;
+    case "scene-prompt-preferences":
+      content = (
+        <ScenePromptPreferencesModal
+          open
+          onClose={closeModal}
+          initialPreferences={modal?.props?.initialPreferences as ScenePromptPreferences}
+          sourceLabel={(modal?.props?.sourceLabel as string | null) ?? null}
+          onSubmit={modal?.props?.onSubmit as (preferences: ScenePromptPreferences) => void}
+          onCancel={modal?.props?.onCancel as (() => void) | undefined}
+        />
+      );
+      break;
+    case "start-character-chat":
+      content = (
+        <StartCharacterChatModal
+          open
+          onClose={closeModal}
+          characterId={(modal?.props?.characterId as string) ?? ""}
+          characterName={(modal?.props?.characterName as string) ?? ""}
+        />
+      );
       break;
     default:
       content = null;

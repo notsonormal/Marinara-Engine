@@ -2,13 +2,18 @@
 // Routes: Admin (clear data, maintenance)
 // ──────────────────────────────────────────────
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { eq, ne } from "drizzle-orm";
+import { eq, ne } from "../db/file-query.js";
 import { existsSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { PROFESSOR_MARI_ID, TTS_SETTINGS_KEY } from "@marinara-engine/shared";
 import { DATA_DIR } from "../utils/data-dir.js";
 import * as schema from "../db/schema/index.js";
 import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
+import {
+  collectCharacterAvatarPaths,
+  collectPersonaAvatarPaths,
+  mutateAvatarReferencesAndCleanup,
+} from "../services/image/avatar-file-lifecycle.js";
 
 type ExpungeScope =
   | "chats"
@@ -78,27 +83,70 @@ export async function adminRoutes(app: FastifyInstance) {
       await runDelete("agent_runs", () => db.delete(schema.agentRuns).run());
       await runDelete("agent_memory", () => db.delete(schema.agentMemory).run());
       await runDelete("game_state_snapshots", () => db.delete(schema.gameStateSnapshots).run());
+      await runDelete("game_scene_videos", () => db.delete(schema.gameSceneVideos).run());
       await runDelete("chat_images", () => db.delete(schema.chatImages).run());
       await runDelete("chat_folders", () => db.delete(schema.chatFolders).run());
       await runDelete("chats", () => db.delete(schema.chats).run());
       filesDeleted.gallery = clearDirectory(join(DATA_DIR, "gallery"));
+      filesDeleted.gameSceneVideos = clearDirectory(join(DATA_DIR, "game-scene-videos"));
     }
 
     if (requestedScopes.includes("characters")) {
-      await runDelete("character_groups", () => db.delete(schema.characterGroups).run());
-      await runDelete("characters", () =>
-        db.delete(schema.characters).where(ne(schema.characters.id, PROFESSOR_MARI_ID)).run(),
-      );
+      const cleanup = await mutateAvatarReferencesAndCleanup({
+        db,
+        collectAvatarPaths: async () => {
+          const [deletedCharacters, deletedGroups] = await Promise.all([
+            db
+              .select({ id: schema.characters.id })
+              .from(schema.characters)
+              .where(ne(schema.characters.id, PROFESSOR_MARI_ID)),
+            db.select({ avatarPath: schema.characterGroups.avatarPath }).from(schema.characterGroups),
+          ]);
+          const characterAvatarPaths = await collectCharacterAvatarPaths(
+            db,
+            deletedCharacters.map((row) => row.id),
+          );
+          return [
+            ...characterAvatarPaths,
+            ...deletedGroups.flatMap((row) => (row.avatarPath ? [row.avatarPath] : [])),
+          ];
+        },
+        mutateReferences: async () => {
+          await runDelete("character_groups", () => db.delete(schema.characterGroups).run());
+          await runDelete("characters", () =>
+            db.delete(schema.characters).where(ne(schema.characters.id, PROFESSOR_MARI_ID)).run(),
+          );
+        },
+        cleanupFiles: !requestedScopes.includes("media"),
+      });
+      filesDeleted.avatars = (filesDeleted.avatars ?? 0) + cleanup.filesDeleted;
     }
 
     if (requestedScopes.includes("personas")) {
-      await runDelete("persona_groups", () => db.delete(schema.personaGroups).run());
-      await runDelete("personas", () => db.delete(schema.personas).run());
+      const cleanup = await mutateAvatarReferencesAndCleanup({
+        db,
+        collectAvatarPaths: async () => {
+          const deletedPersonas = await db.select({ id: schema.personas.id }).from(schema.personas);
+          return collectPersonaAvatarPaths(
+            db,
+            deletedPersonas.map((row) => row.id),
+          );
+        },
+        mutateReferences: async () => {
+          await runDelete("persona_groups", () => db.delete(schema.personaGroups).run());
+          await runDelete("personas", () => db.delete(schema.personas).run());
+        },
+        cleanupFiles: !requestedScopes.includes("media"),
+      });
+      filesDeleted.avatars = (filesDeleted.avatars ?? 0) + cleanup.filesDeleted;
     }
 
     if (requestedScopes.includes("lorebooks")) {
       await runDelete("lorebook_entries", () => db.delete(schema.lorebookEntries).run());
       await runDelete("lorebooks", () => db.delete(schema.lorebooks).run());
+      await runDelete("library_folders:lorebooks", () =>
+        db.delete(schema.libraryFolders).where(eq(schema.libraryFolders.scope, "lorebooks")).run(),
+      );
     }
 
     if (requestedScopes.includes("presets")) {
@@ -106,6 +154,9 @@ export async function adminRoutes(app: FastifyInstance) {
       await runDelete("prompt_groups", () => db.delete(schema.promptGroups).run());
       await runDelete("choice_blocks", () => db.delete(schema.choiceBlocks).run());
       await runDelete("prompt_presets", () => db.delete(schema.promptPresets).run());
+      await runDelete("library_folders:presets", () =>
+        db.delete(schema.libraryFolders).where(eq(schema.libraryFolders.scope, "presets")).run(),
+      );
     }
 
     if (requestedScopes.includes("connections")) {
@@ -122,12 +173,17 @@ export async function adminRoutes(app: FastifyInstance) {
       await runDelete("custom_tools", () => db.delete(schema.customTools).run());
       await runDelete("regex_scripts", () => db.delete(schema.regexScripts).run());
       await runDelete("custom_themes", () => db.delete(schema.customThemes).run());
+      await runDelete("library_folders:agents", () =>
+        db.delete(schema.libraryFolders).where(eq(schema.libraryFolders.scope, "agents")).run(),
+      );
     }
 
     if (requestedScopes.includes("media")) {
       await runDelete("assets", () => db.delete(schema.assets).run());
+      await runDelete("game_scene_videos", () => db.delete(schema.gameSceneVideos).run());
       await runDelete("chat_images", () => db.delete(schema.chatImages).run());
       filesDeleted.backgrounds = clearDirectory(join(DATA_DIR, "backgrounds"));
+      filesDeleted.gameSceneVideos = clearDirectory(join(DATA_DIR, "game-scene-videos"));
       filesDeleted.avatars = clearDirectory(join(DATA_DIR, "avatars"));
       filesDeleted.sprites = clearDirectory(join(DATA_DIR, "sprites"));
       filesDeleted.gallery = clearDirectory(join(DATA_DIR, "gallery"));
