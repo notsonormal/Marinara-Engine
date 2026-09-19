@@ -1,6 +1,7 @@
 // ──────────────────────────────────────────────
 // Layout: Chat Sidebar (polished with rich buttons)
 // ──────────────────────────────────────────────
+import { hasEditorLeaveHandler } from "../../lib/editor-leave";
 import {
   MessageSquareText,
   Search,
@@ -25,6 +26,7 @@ import {
   Tag,
   Loader2,
   PhoneIncoming,
+  CalendarClock,
 } from "lucide-react";
 import { useBulkExportChats, useChats, useCreateChat, useDeleteChat, useDeleteChatGroup } from "../../hooks/use-chats";
 import { useChatPresets, useApplyChatPreset } from "../../hooks/use-chat-presets";
@@ -77,6 +79,7 @@ import { useTranslation, useTranslation as useUiTranslation } from "react-i18nex
 import { useLocalizedUiText } from "../../localization/use-localized-ui-text";
 import { PersonalExtensionContributionSlot } from "../extensions/PersonalExtensionContributionSlot";
 import { ChatModeIcon } from "../chat/ChatModeIcon";
+import { CharacterScheduleManagerModal } from "../chat/CharacterScheduleManagerModal";
 
 type ChatSortOption = "recent" | "newest" | "oldest" | "name-asc" | "name-desc";
 const CHAT_LIST_PAGE_SIZE = 100;
@@ -115,9 +118,7 @@ function getConversationPresenceState(
   }
 
   const convoMeta = parseChatMetadata(chatMetadata);
-  const chatCharStatuses = convoMeta?.conversationCharacterStatuses as
-    | Record<string, { status?: unknown }>
-    | undefined;
+  const chatCharStatuses = convoMeta?.conversationCharacterStatuses as Record<string, { status?: unknown }> | undefined;
   const conversationStatuses: Array<{
     id: string;
     status: ConversationPresenceStatus;
@@ -132,7 +133,10 @@ function getConversationPresenceState(
     conversationStatuses.push({
       id,
       status:
-        live?.status ?? asConversationStatus(snapshot?.status) ?? asConversationStatus(base.conversationStatus) ?? "online",
+        live?.status ??
+        asConversationStatus(snapshot?.status) ??
+        asConversationStatus(base.conversationStatus) ??
+        "online",
     });
   }
 
@@ -269,6 +273,7 @@ export function ChatSidebar() {
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const [tagsExpanded, setTagsExpanded] = useState(false);
   const [activeTab, setActiveTab] = useState<"conversation" | "roleplay" | "game">("conversation");
+  const [scheduleManagerOpen, setScheduleManagerOpen] = useState(false);
   const [visibleChatLimit, setVisibleChatLimit] = useState(CHAT_LIST_PAGE_SIZE);
   const [deleteTarget, setDeleteTarget] = useState<{
     chatId: string;
@@ -331,9 +336,7 @@ export function ChatSidebar() {
   const modeChats = useMemo(
     () =>
       (chats ?? []).filter(
-        (chat) =>
-          chat.mode === activeTab &&
-          !(chat.mode === "conversation" && chat.metadata?.gameId),
+        (chat) => chat.mode === activeTab && !(chat.mode === "conversation" && chat.metadata?.gameId),
       ),
     [chats, activeTab],
   );
@@ -473,9 +476,7 @@ export function ChatSidebar() {
   // ── Folder grouping ──
   const modeFolders = useMemo(() => {
     if (!folders) return [] as ChatFolder[];
-    return folders
-      .filter((f) => f.mode === activeTab)
-      .sort((a, b) => a.sortOrder - b.sortOrder);
+    return folders.filter((f) => f.mode === activeTab).sort((a, b) => a.sortOrder - b.sortOrder);
   }, [folders, activeTab]);
 
   const { unfiledChats, folderChatsMap } = useMemo(() => {
@@ -713,15 +714,25 @@ export function ChatSidebar() {
           messagesImported?: number;
         }>("/import/st-chat", formData);
         if (data.success === false || data.error) {
-          toast.error(localizeUi("ui.layout.chatsidebar.importFailedValue1", { value1: data.error ??localizeUi("ui.layout.chatsidebar.unknownError") }));
+          toast.error(
+            localizeUi("ui.layout.chatsidebar.importFailedValue1", {
+              value1: data.error ?? localizeUi("ui.layout.chatsidebar.unknownError"),
+            }),
+          );
           return;
         }
 
-        toast.success(localizeUi("ui.layout.chatsidebar.importedValue1Messages", { value1: data.messagesImported ?? 0 }));
+        toast.success(
+          localizeUi("ui.layout.chatsidebar.importedValue1Messages", { value1: data.messagesImported ?? 0 }),
+        );
         await refetchChats();
         if (data.chatId) setActiveChatId(data.chatId);
       } catch (error) {
-        toast.error(error instanceof Error ?localizeUi("ui.layout.chatsidebar.importFailedValue1", { value1: error.message }) :localizeUi("chat.branches.importFailed"));
+        toast.error(
+          error instanceof Error
+            ? localizeUi("ui.layout.chatsidebar.importFailedValue1", { value1: error.message })
+            : localizeUi("chat.branches.importFailed"),
+        );
       } finally {
         setIsImportingChat(false);
       }
@@ -850,9 +861,12 @@ export function ChatSidebar() {
     if (selectedChatIds.size === 0) return;
     if (
       !(await showConfirmDialog({
-        title:localizeUi("ui.layout.chatsidebar.deleteChats"),
-        message:localizeUi("ui.layout.chatsidebar.deleteValue1ChatValue2", { value1: selectedChatIds.size, value2: selectedChatIds.size > 1 ?localizeUi("ui.noodle.stageprofileview.s") : "" }),
-        confirmLabel:localizeUi("lorebook.editor.batch.delete"),
+        title: localizeUi("ui.layout.chatsidebar.deleteChats"),
+        message: localizeUi("ui.layout.chatsidebar.deleteValue1ChatValue2", {
+          value1: selectedChatIds.size,
+          value2: selectedChatIds.size > 1 ? localizeUi("ui.noodle.stageprofileview.s") : "",
+        }),
+        confirmLabel: localizeUi("lorebook.editor.batch.delete"),
         tone: "accent",
       }))
     ) {
@@ -875,13 +889,18 @@ export function ChatSidebar() {
       });
       exitMultiSelect();
     } catch (err) {
-      toast.error(err instanceof Error ?localizeUi("ui.layout.chatsidebar.exportFailedValue1", { value1: err.message }) :localizeUi("ui.layout.chatsidebar.exportFailed"));
+      toast.error(
+        err instanceof Error
+          ? localizeUi("ui.layout.chatsidebar.exportFailedValue1", { value1: err.message })
+          : localizeUi("ui.layout.chatsidebar.exportFailed"),
+      );
     }
   }, [selectedChatIds, bulkExportChats, exitMultiSelect, localizeUi]);
 
   // ── Chat row renderer (shared between unfiled + folder sections) ──
   const renderChatRow = ({ chat, branchCount }: (typeof displayChats)[number]) => {
     const cfg = MODE_CONFIG[chat.mode] ?? MODE_CONFIG.conversation;
+    const displayName = chat.name;
     const isActive = activeChatId === chat.id || (chat.groupId != null && chat.groupId === activeGroupId);
     const isSelected = selectedChatIds.has(chat.id);
     const charIds = normalizeChatCharacterIds((chat as { characterIds?: unknown }).characterIds);
@@ -973,12 +992,12 @@ export function ChatSidebar() {
             return;
           }
           if (hasAnyDetailOpen()) {
-            if (editorDirty) {
+            if (editorDirty && !hasEditorLeaveHandler(useUIStore.getState())) {
               if (
                 !(await showConfirmDialog({
-                  title:localizeUi("ui.layout.chatsidebar.unsavedChanges"),
-                  message:localizeUi("ui.layout.chatsidebar.youHaveUnsavedChangesDiscardAndContinue"),
-                  confirmLabel:localizeUi("ui.agents.agenteditor.discard"),
+                  title: localizeUi("ui.layout.chatsidebar.unsavedChanges"),
+                  message: localizeUi("ui.layout.chatsidebar.youHaveUnsavedChangesDiscardAndContinue"),
+                  confirmLabel: localizeUi("ui.agents.agenteditor.discard"),
                   tone: "destructive",
                 }))
               ) {
@@ -1086,8 +1105,8 @@ export function ChatSidebar() {
                 <span
                   className={cn(
                     "absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-[0.1875rem] ring-[1.5px] ring-[var(--sidebar-background)]",
-                  conversationStatusDotClass(status),
-                )}
+                    conversationStatusDotClass(status),
+                  )}
                 />
               );
             };
@@ -1193,16 +1212,13 @@ export function ChatSidebar() {
               isActive ? "mari-chrome-text-strong font-medium" : "mari-chrome-text",
             )}
           >
-            {chat.name}
+            {displayName}
           </span>
           {subtitle && (
             <span className="mari-chrome-accent-text-muted flex items-center gap-1 truncate text-[0.6875rem] leading-tight">
               {SubtitleIcon && (
                 <SubtitleIcon
-                  className={cn(
-                    "h-2.5 w-2.5 shrink-0",
-                    SubtitleIcon === Loader2 ? "animate-spin" : "animate-pulse",
-                  )}
+                  className={cn("h-2.5 w-2.5 shrink-0", SubtitleIcon === Loader2 ? "animate-spin" : "animate-pulse")}
                 />
               )}
               <span className="truncate">{subtitle}</span>
@@ -1226,22 +1242,22 @@ export function ChatSidebar() {
         {/* Delete button */}
         {!multiSelectMode && (
           <button
-            aria-label={localizeUi("chat.branches.deleteLabel", { name: chat.name })}
+            aria-label={localizeUi("chat.branches.deleteLabel", { name: displayName })}
             onClick={async (e) => {
               e.stopPropagation();
               if (branchCount > 1 && chat.groupId) {
                 setDeleteTarget({
                   chatId: chat.id,
-                  chatName: chat.name,
+                  chatName: displayName,
                   groupId: chat.groupId,
                   branchCount,
                 });
               } else {
                 if (
                   await showConfirmDialog({
-                    title:localizeUi("ui.layout.chatsidebar.deleteChat"),
-                    message: localizeUi("dialog.delete.namedPermanent", { name: chat.name }),
-                    confirmLabel:localizeUi("lorebook.editor.batch.delete"),
+                    title: localizeUi("ui.layout.chatsidebar.deleteChat"),
+                    message: localizeUi("dialog.delete.namedPermanent", { name: displayName }),
+                    confirmLabel: localizeUi("lorebook.editor.batch.delete"),
                     tone: "destructive",
                   })
                 ) {
@@ -1298,9 +1314,7 @@ export function ChatSidebar() {
             const cfg = MODE_CONFIG[tab];
             const isActive = activeTab === tab;
             const tabUnread =
-              chats
-                ?.filter((c) => c.mode === tab)
-                .reduce((sum, c) => sum + (unreadCounts.get(c.id) || 0), 0) ?? 0;
+              chats?.filter((c) => c.mode === tab).reduce((sum, c) => sum + (unreadCounts.get(c.id) || 0), 0) ?? 0;
             return (
               <button
                 key={tab}
@@ -1421,7 +1435,9 @@ export function ChatSidebar() {
             >
               <Tag size="0.6875rem" className="shrink-0" />
               <span className="max-w-full truncate">
-                {activeTag ?localizeUi("ui.layout.chatsidebar.tagValue1", { value1: activeTag }) :localizeUi("ui.layout.chatsidebar.tagsValue1", { value1: allTags.length })}
+                {activeTag
+                  ? localizeUi("ui.layout.chatsidebar.tagValue1", { value1: activeTag })
+                  : localizeUi("ui.layout.chatsidebar.tagsValue1", { value1: allTags.length })}
               </span>
               {tagsExpanded ? (
                 <ChevronUp size="0.625rem" className="shrink-0" />
@@ -1457,7 +1473,8 @@ export function ChatSidebar() {
                 onClick={() => setTagsExpanded(true)}
                 className="mari-chrome-control mari-chrome-control--compact"
               >
-                +{allTags.length - 4} {localizeUi("ui.layout.chatsidebar.more")}</button>
+                +{allTags.length - 4} {localizeUi("ui.layout.chatsidebar.more")}
+              </button>
             )}
           </div>
         )}
@@ -1518,7 +1535,9 @@ export function ChatSidebar() {
             <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[var(--destructive)]/10">
               <AlertTriangle size="1.25rem" className="text-[var(--destructive)]" />
             </div>
-            <p className="text-xs text-[var(--muted-foreground)]">{localizeUi("ui.layout.chatsidebar.marinaraIsStillWakingUpChatsShouldAppearIn")}</p>
+            <p className="text-xs text-[var(--muted-foreground)]">
+              {localizeUi("ui.layout.chatsidebar.marinaraIsStillWakingUpChatsShouldAppearIn")}
+            </p>
             <button
               onClick={() => void refetchChats()}
               disabled={isFetching}
@@ -1640,10 +1659,20 @@ export function ChatSidebar() {
       />
 
       {/* ── User Status Selector ── */}
-      <UserStatusFooter />
+      <UserStatusFooter
+        showScheduleManager={activeTab === "conversation"}
+        onOpenScheduleManager={() => setScheduleManagerOpen(true)}
+      />
+
+      {scheduleManagerOpen && <CharacterScheduleManagerModal open onClose={() => setScheduleManagerOpen(false)} />}
 
       {/* ── Delete Branch Modal ── */}
-      <Modal open={deleteTarget !== null} onClose={() => setDeleteTarget(null)} title={localizeUi("ui.layout.chatsidebar.deleteChat")} width="max-w-sm">
+      <Modal
+        open={deleteTarget !== null}
+        onClose={() => setDeleteTarget(null)}
+        title={localizeUi("ui.layout.chatsidebar.deleteChat")}
+        width="max-w-sm"
+      >
         {deleteTarget && (
           <div className="flex flex-col gap-4">
             <div className="flex items-start gap-3">
@@ -1666,7 +1695,9 @@ export function ChatSidebar() {
                 }}
                 className="mari-chrome-control mari-chrome-control--primary w-full text-xs"
               >
-                <Trash2 size="0.8125rem" />{localizeUi("ui.layout.chatsidebar.deleteThisBranchOnly")}</button>
+                <Trash2 size="0.8125rem" />
+                {localizeUi("ui.layout.chatsidebar.deleteThisBranchOnly")}
+              </button>
               <button
                 onClick={() => {
                   if (deleteTarget.groupId) {
@@ -1677,7 +1708,10 @@ export function ChatSidebar() {
                 }}
                 className="mari-chrome-control mari-chrome-control--primary w-full text-xs"
               >
-                <Trash2 size="0.8125rem" />{localizeUi("ui.characters.spritestab.deleteAll")} {deleteTarget.branchCount} {localizeUi("ui.layout.chatsidebar.branches_f578227")}</button>
+                <Trash2 size="0.8125rem" />
+                {localizeUi("ui.characters.spritestab.deleteAll")} {deleteTarget.branchCount}{" "}
+                {localizeUi("ui.layout.chatsidebar.branches_f578227")}
+              </button>
             </div>
           </div>
         )}
@@ -1785,7 +1819,12 @@ function FolderRow({
           role="button"
           tabIndex={0}
           aria-expanded={isExpanded}
-          aria-label={localizeUi("ui.layout.folderrow.value1FolderValue2DoubleTapOrPressF2To", { value1: isExpanded ?localizeUi("ui.panels.ttsconfigcard.collapse") :localizeUi("ui.panels.ttsconfigcard.expand"), value2: folder.name })}
+          aria-label={localizeUi("ui.layout.folderrow.value1FolderValue2DoubleTapOrPressF2To", {
+            value1: isExpanded
+              ? localizeUi("ui.panels.ttsconfigcard.collapse")
+              : localizeUi("ui.panels.ttsconfigcard.expand"),
+            value2: folder.name,
+          })}
           title={localizeUi("ui.panels.backgroundpicker.doubleClickDoubleTapOrPressF2ToRename")}
           onClick={(e) =>
             handleFolderRenameGesture(folder.id, e, {
@@ -1906,7 +1945,13 @@ const STATUS_OPTIONS: Array<{
   },
 ];
 
-function UserStatusFooter() {
+function UserStatusFooter({
+  showScheduleManager,
+  onOpenScheduleManager,
+}: {
+  showScheduleManager: boolean;
+  onOpenScheduleManager: () => void;
+}) {
   const { t: localizeUi } = useUiTranslation();
   const userStatus = useUIStore((s) => s.userStatus);
   const userActivity = useUIStore((s) => s.userActivity);
@@ -1979,7 +2024,9 @@ function UserStatusFooter() {
       )}
       {activityFocused && !open && recentActivitySuggestions.length > 0 && (
         <div className="absolute bottom-full left-2 right-2 mb-1 rounded-xl bg-[var(--popover)] p-1.5 shadow-xl ring-1 ring-[var(--border)]/40">
-          <div className="px-2 pb-1 pt-0.5 text-[0.625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">{localizeUi("ui.layout.userstatusfooter.recentStatus")}</div>
+          <div className="px-2 pb-1 pt-0.5 text-[0.625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
+            {localizeUi("ui.layout.userstatusfooter.recentStatus")}
+          </div>
           {recentActivitySuggestions.map((activity) => (
             <button
               key={activity}
@@ -1997,7 +2044,7 @@ function UserStatusFooter() {
       <div className="flex min-w-0 items-center gap-1.5">
         <button
           onClick={() => setOpen((v) => !v)}
-          className="mari-chrome-control mari-chrome-control--small min-w-0 shrink-0 px-2 py-1.5 max-md:h-9 max-md:min-h-9"
+          className="mari-chrome-control mari-chrome-control--small min-w-0 shrink-0 px-1.5 py-1 max-md:h-9 max-md:min-h-9"
           title={localizeUi("ui.layout.userstatusfooter.changeActivityStatus")}
           aria-label={localizeUi("ui.layout.userstatusfooter.changeActivityStatus")}
         >
@@ -2023,8 +2070,19 @@ function UserStatusFooter() {
           maxLength={120}
           placeholder={localizeUi("ui.layout.userstatusfooter.whatAreYouDoing")}
           aria-label={localizeUi("ui.layout.userstatusfooter.customActivity")}
-          className="mari-chrome-field mari-chrome-field--compact min-w-0 flex-1 px-2 py-1.5 text-xs max-md:h-9 max-md:min-h-9"
+          className="mari-chrome-field mari-chrome-field--compact min-w-0 flex-1 px-2 py-1 text-xs max-md:h-9 max-md:min-h-9"
         />
+        {showScheduleManager && (
+          <button
+            type="button"
+            onClick={onOpenScheduleManager}
+            title={localizeUi("ui.layout.chatsidebar.characterScheduleManager")}
+            aria-label={localizeUi("ui.layout.chatsidebar.characterScheduleManager")}
+            className="mari-chrome-control mari-chrome-control--small ml-1 h-7 w-7 shrink-0 justify-center p-0 max-md:h-9 max-md:min-h-9 max-md:w-9"
+          >
+            <CalendarClock size="1.25rem" strokeWidth={2.25} />
+          </button>
+        )}
       </div>
     </div>
   );

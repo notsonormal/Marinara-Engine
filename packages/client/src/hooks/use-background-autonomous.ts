@@ -15,7 +15,7 @@ import { useChatStore } from "../stores/chat.store";
 import { useUIStore } from "../stores/ui.store";
 import { showLocalMessageNotification, showNativeMessageNotification } from "../lib/local-notifications";
 import { playConfiguredNotificationPing } from "../lib/notification-sound";
-import { chatKeys } from "./use-chats";
+import { captureChatMetadataVersion, chatKeys, guardServerChatSnapshot } from "./use-chats";
 import { characterKeys } from "./use-characters";
 import { upsertPersistedMessages } from "./use-generate";
 
@@ -79,7 +79,9 @@ async function fetchAutonomousCandidates(): Promise<Array<{ id: string }>> {
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
         candidatesEndpointUnavailable = true;
-        console.debug("[background-autonomous] Server predates /chats/autonomous-candidates; using legacy chat-list polling");
+        console.debug(
+          "[background-autonomous] Server predates /chats/autonomous-candidates; using legacy chat-list polling",
+        );
       }
       // Fall through to the legacy path either way.
     }
@@ -278,10 +280,14 @@ export function useBackgroundAutonomousPolling() {
                 upsertPersistedMessages(qc, chat.id, Array.from(savedMessages.values()));
                 void qc.invalidateQueries({ queryKey: chatKeys.messages(chat.id) });
                 qc.invalidateQueries({ queryKey: characterKeys.list() });
+                const unreadMetadataVersion = captureChatMetadataVersion(chat.id);
                 void api
                   .post<Chat>(`/chats/${chat.id}/autonomous-unread`, { characterId })
                   .then((updatedChat) => {
-                    qc.setQueryData(chatKeys.detail(chat.id), updatedChat);
+                    qc.setQueryData(
+                      chatKeys.detail(chat.id),
+                      guardServerChatSnapshot(qc, updatedChat, unreadMetadataVersion),
+                    );
                     qc.invalidateQueries({ queryKey: chatKeys.list() });
                   })
                   .catch(() => {

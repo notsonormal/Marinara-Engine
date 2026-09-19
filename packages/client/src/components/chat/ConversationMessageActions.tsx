@@ -1,5 +1,5 @@
 // ──────────────────────────────────────────────
-// Hover action bar — floats above the message row
+// Message action row — follows the message content
 // ──────────────────────────────────────────────
 import {
   Brain,
@@ -14,16 +14,18 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
-import type { MessageExtra } from "@marinara-engine/shared";
+import { ReplyToMessageButton } from "./MessageReplyPreview";
+import type { Message, MessageExtra } from "@marinara-engine/shared";
 import type { RefObject } from "react";
 import { useTranslation, useTranslation as useUiTranslation } from "react-i18next";
 import { cn } from "../../lib/utils";
 import { MsgAction } from "./ConversationMessageShared";
+import { MESSAGE_ACTION_ICON_SIZE } from "./MessageActionButton";
 import { ReactionAddButton } from "./ReactionAddButton";
 
 export interface ConversationMessageActionsProps {
-  // Positioning
-  isBubbleStyle: boolean;
+  message: Pick<Message, "id" | "chatId" | "content">;
+  name: string;
   isUser: boolean;
   // Visibility
   showActions: boolean;
@@ -58,7 +60,8 @@ export interface ConversationMessageActionsProps {
 }
 
 export function ConversationMessageActions({
-  isBubbleStyle,
+  message,
+  name,
   isUser,
   showActions,
   forceShowActions,
@@ -89,55 +92,49 @@ export function ConversationMessageActions({
   const { t: localizeUi } = useUiTranslation();
   const { t } = useTranslation();
   const visible = showActions || forceShowActions;
-  const tabIdx = visible ? undefined : -1;
   return (
     <div
       className={cn(
-        "mari-message-actions absolute -top-3 flex items-center gap-0.5 rounded-md border border-[var(--border)] bg-[var(--card)]/90 px-1 py-0.5 shadow-sm backdrop-blur-sm transition-all dark:border-white/20 dark:bg-black/40",
+        "mari-message-actions flex w-full min-w-0 flex-wrap items-center justify-between gap-1 px-1 transition-all md:justify-start md:gap-x-2",
         visible
           ? "visible pointer-events-auto opacity-100"
-          : "invisible pointer-events-none opacity-0 group-hover:visible group-hover:pointer-events-auto group-hover:opacity-100 focus-within:visible focus-within:pointer-events-auto focus-within:opacity-100",
-        isBubbleStyle && !isUser ? "left-12" : "right-4",
-        thinkingOnly &&
-          "max-sm:bottom-1 max-sm:left-12 max-sm:right-auto max-sm:top-auto [&>*:not(.mari-message-thinking-action)]:hidden",
+          : "invisible pointer-events-none opacity-0 max-md:hidden max-md:group-hover:flex max-md:group-focus-within:flex group-hover:visible group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:visible group-focus-within:pointer-events-auto group-focus-within:opacity-100",
+        thinkingOnly && "max-sm:[&>*:not(.mari-message-thinking-action)]:hidden",
       )}
-      aria-hidden={!visible}
+      data-component="ConversationMessage.Actions"
     >
       <MsgAction
-        icon={copied ? "✓" : <Copy size="0.75rem" />}
+        icon={copied ? "✓" : <Copy size={MESSAGE_ACTION_ICON_SIZE} />}
         onClick={onCopy}
         title={localizeUi("lorebook.editor.batch.copy")}
-        tabIndex={tabIdx}
       />
-      {onPickReaction && <ReactionAddButton onPick={onPickReaction} tabIndex={tabIdx} />}
+      {!thinkingOnly && <ReplyToMessageButton message={message} name={name} />}
+      {onPickReaction && <ReactionAddButton onPick={onPickReaction} />}
       <MsgAction
-        icon={<Languages size="0.75rem" />}
+        icon={<Languages size={MESSAGE_ACTION_ICON_SIZE} />}
         onClick={onTranslate}
         title={
           translatedText
             ? localizeUi("ui.chat.chatmessage.hideTranslation")
             : localizeUi("ui.chat.chatmessage.translate")
         }
-        tabIndex={tabIdx}
       />
       <MsgAction
-        icon={<Pencil size="0.75rem" />}
+        icon={<Pencil size={MESSAGE_ACTION_ICON_SIZE} />}
         onClick={onEdit}
         title={localizeUi("ui.noodle.noodlepostcard.edit")}
-        tabIndex={tabIdx}
       />
       {canRegenerate && onRegenerate && (
         <MsgAction
-          icon={<RefreshCw size="0.75rem" />}
+          icon={<RefreshCw size={MESSAGE_ACTION_ICON_SIZE} />}
           onClick={onRegenerate}
           title={regenerateButtonTitle}
           className={regenerateGuidedClass}
-          tabIndex={tabIdx}
         />
       )}
       {onToggleHiddenFromAI && (
         <MsgAction
-          icon={isHiddenFromAI ? <Eye size="0.75rem" /> : <EyeOff size="0.75rem" />}
+          icon={isHiddenFromAI ? <Eye size={MESSAGE_ACTION_ICON_SIZE} /> : <EyeOff size={MESSAGE_ACTION_ICON_SIZE} />}
           onClick={onToggleHiddenFromAI}
           title={
             isHiddenFromAI
@@ -149,49 +146,45 @@ export function ConversationMessageActions({
               ? "text-[var(--marinara-chat-chrome-button-text-active)] hover:text-[var(--marinara-chat-chrome-button-text-hover)]"
               : undefined
           }
-          tabIndex={tabIdx}
         />
       )}
       {isLastAssistantMessage && !isUser && onPeekPrompt && (
         <MsgAction
-          icon={<Search size="0.75rem" />}
+          icon={<Search size={MESSAGE_ACTION_ICON_SIZE} />}
           onClick={onPeekPrompt}
           title={localizeUi("ui.chat.chatmessage.peekPrompt")}
-          tabIndex={tabIdx}
         />
       )}
       {onBranch && (
         <MsgAction
-          icon={<GitBranch size="0.75rem" />}
+          icon={<GitBranch size={MESSAGE_ACTION_ICON_SIZE} />}
           onClick={onBranch}
           title={localizeUi("ui.chat.chatmessage.branchFromHere")}
-          tabIndex={tabIdx}
         />
       )}
       {generationReplay && (
         <MsgAction
-          icon={<ScrollText size="0.75rem" />}
+          icon={<ScrollText size={MESSAGE_ACTION_ICON_SIZE} />}
           onClick={onShowGenerationReplay}
           title={localizeUi("ui.chat.chatmessage.storedGuidance")}
-          tabIndex={tabIdx}
         />
       )}
       {hasReasoning && !isUser && (
         <MsgAction
-          icon={<Brain size="0.75rem" />}
+          icon={<Brain size={MESSAGE_ACTION_ICON_SIZE} />}
           onClick={onShowThinking}
-          title={t(reasoningSummaryUnavailable ? "chat.message.thoughts.unavailable.view" : "chat.message.thoughts.view")}
-          tabIndex={tabIdx}
+          title={t(
+            reasoningSummaryUnavailable ? "chat.message.thoughts.unavailable.view" : "chat.message.thoughts.view",
+          )}
           className="mari-message-thinking-action"
           buttonRef={thinkingButtonRef}
         />
       )}
       {onDelete && (
         <MsgAction
-          icon={<Trash2 size="0.75rem" />}
+          icon={<Trash2 size={MESSAGE_ACTION_ICON_SIZE} />}
           onClick={onDelete}
           title={localizeUi("lorebook.editor.batch.delete")}
-          tabIndex={tabIdx}
         />
       )}
     </div>

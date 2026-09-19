@@ -19,12 +19,21 @@ import {
   inferImageSource,
   inferVideoSource,
   isLocalAuthProvider,
+  isOpenAIGpt6AstraModel,
   localAuthProviderBaseUrl,
   normalizeVideoGenerationProfile,
 } from "@marinara-engine/shared";
 import { createConnectionsStorage } from "../services/storage/connections.storage.js";
+import {
+  allowsDefaultChatModel,
+  canRefreshLocalContext,
+  fetchLocalContextLimit,
+} from "../services/llm/local-context-limit.js";
 import { resetMemoryRecallVectorizerCache } from "../services/memory-recall-embedding.js";
 import { createLLMProvider } from "../services/llm/provider-registry.js";
+import { resolveStoredChatOptions, resolveStoredMaxTokens } from "../services/generation/generation-parameters.js";
+import { describeEmptyModelResponse, sentOutputBudget } from "../services/generation/empty-response-reason.js";
+import { isGlm53MandatoryReasoningModel } from "../services/llm/providers/glm-request-compat.js";
 import { fetchOpenAIChatGPTModels, getOpenAIChatGPTAuth } from "../services/llm/openai-chatgpt-auth.js";
 import { fetchGrokCliModels } from "../services/llm/providers/grok-subscription.provider.js";
 import {
@@ -47,6 +56,11 @@ import {
   safeFetch,
 } from "../utils/security.js";
 import { DATA_DIR } from "../utils/data-dir.js";
+import {
+  buildNanoGptVideoUrl,
+  fetchNanoGptVideoModels,
+  normalizeVideoService,
+} from "../services/video/video-generation.js";
 
 const CONNECTION_TEST_ERROR_PREVIEW_CHARS = 2000;
 const CONNECTION_IMAGES_DIR = join(DATA_DIR, "connections", "images");
@@ -61,6 +75,7 @@ const DEFAULT_XAI_VIDEO_MODEL = "grok-imagine-video-1.5";
 const DEFAULT_XAI_VIDEO_BASE_URL = "https://api.x.ai/v1";
 const DEFAULT_OPENROUTER_VIDEO_MODEL = "google/veo-3.1";
 const DEFAULT_OPENROUTER_VIDEO_BASE_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_NANOGPT_VIDEO_BASE_URL = "https://nano-gpt.com/api";
 const DEFAULT_ATLAS_CLOUD_VIDEO_MODEL = "google/veo3.1/text-to-video";
 const DEFAULT_ATLAS_CLOUD_VIDEO_BASE_URL = "https://api.atlascloud.ai/api/v1";
 const DEFAULT_SEEDANCE_VIDEO_MODEL = "seedance-2-0";
@@ -121,13 +136,14 @@ function formatProviderErrorBody(body: string): string {
 }
 
 function isOpenAICompatibleProvider(provider: string): boolean {
-  return ["openai", "openrouter", "nanogpt", "xai", "mistral", "custom", "cohere", "arli"].includes(provider);
+  return ["openai", "openrouter", "nanogpt", "xai", "mistral", "custom", "cohere", "arli", "zai"].includes(provider);
 }
 
 function usesResponsesEndpointForTestMessage(provider: string, model: string): boolean {
   if (!isOpenAICompatibleProvider(provider) || provider === "custom") return false;
   const normalized = model.toLowerCase();
   return (
+    isOpenAIGpt6AstraModel(normalized) ||
     normalized.startsWith("gpt-5.6") ||
     normalized.startsWith("gpt-5.5") ||
     normalized.startsWith("gpt-5.4") ||
@@ -165,6 +181,19 @@ function resolveVideoGenerationSource(conn: Record<string, unknown>, baseUrl: st
   const serviceHint = typeof conn.videoService === "string" ? conn.videoService : "";
   const model = typeof conn.model === "string" ? conn.model : "";
   return inferVideoSource(explicitSource || serviceHint || model, baseUrl);
+}
+
+function nanoGptVideoConnectionError(conn: Record<string, unknown>): string | null {
+  if (conn.provider !== "video_generation") return null;
+  const baseUrl =
+    typeof conn.baseUrl === "string" && conn.baseUrl.trim() ? conn.baseUrl : DEFAULT_NANOGPT_VIDEO_BASE_URL;
+  if (resolveVideoGenerationSource(conn, baseUrl) !== "nanogpt") return null;
+  try {
+    buildNanoGptVideoUrl(baseUrl, "generate-video");
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : "Invalid NanoGPT video endpoint";
+  }
 }
 
 // Returns the model-name options a ComfyUI loader node exposes through
@@ -252,6 +281,19 @@ async function createSwarmUiSession(baseUrl: string, apiKey: string): Promise<st
 
 export function buildGoogleModelsPageUrl(baseUrl: string, modelsEndpoint: string, pageToken = ""): string {
   return `${baseUrl}${modelsEndpoint}?pageSize=1000` + (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+}
+
+export function buildConnectionTestCatalogUrl(
+  baseUrl: string,
+  provider: string,
+  modelsEndpoint = "/models",
+  audioSource?: string | null,
+): string {
+  const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
+  if (provider === "audio" && (audioSource || "elevenlabs") === "elevenlabs") {
+    return `${normalizedBaseUrl.replace(/\/v\d+$/, "")}/v1/models`;
+  }
+  return `${normalizedBaseUrl}${modelsEndpoint}`;
 }
 
 function normalizeConnectionTestBaseUrl(baseUrl: string, provider: string): string {
@@ -372,6 +414,26 @@ export async function connectionsRoutes(app: FastifyInstance) {
     return storage.list();
   });
 
+  app.post("/refresh-local-context", async () => {
+    const candidates = (await storage.list()).filter(canRefreshLocalContext);
+    const updated: string[] = [];
+    // Each connection makes four bounded metadata probes; keep only three connections active at once.
+    for (let index = 0; index < candidates.length; index += 3) {
+      await Promise.all(
+        candidates.slice(index, index + 3).map(async (candidate) => {
+          const connection = await storage.getWithKey(candidate.id);
+          if (!connection) return;
+          const maxContext = await fetchLocalContextLimit(connection);
+          if (maxContext === null || maxContext === connection.maxContext) return;
+          if (await storage.updateContextIfUnchanged(connection, maxContext)) {
+            updated.push(connection.id);
+          }
+        }),
+      );
+    }
+    return { updated };
+  });
+
   app.get<{ Params: { filename: string } }>("/images/file/:filename", async (req, reply) => {
     const filepath = getSafeConnectionImagePath(req.params.filename);
     if (!filepath || !existsSync(filepath)) return reply.status(404).send({ error: "Image not found" });
@@ -393,15 +455,21 @@ export async function connectionsRoutes(app: FastifyInstance) {
     return maskConnection(conn);
   });
 
-  app.post("/", async (req) => {
+  app.post("/", async (req, reply) => {
     const input = createConnectionSchema.parse(req.body);
+    const validationError = nanoGptVideoConnectionError(input);
+    if (validationError) return reply.status(400).send({ error: validationError });
     const created = await storage.create(input);
     resetMemoryRecallVectorizerCache();
     return maskConnection(created);
   });
 
-  app.patch<{ Params: { id: string } }>("/:id", async (req) => {
+  app.patch<{ Params: { id: string } }>("/:id", async (req, reply) => {
     const data = createConnectionSchema.partial().parse(req.body);
+    const current = await storage.getById(req.params.id);
+    if (!current) return reply.status(404).send({ error: "Connection not found" });
+    const validationError = nanoGptVideoConnectionError({ ...current, ...data });
+    if (validationError) return reply.status(400).send({ error: validationError });
     const updated = await storage.update(req.params.id, data);
     resetMemoryRecallVectorizerCache();
     return maskConnection(updated);
@@ -663,7 +731,12 @@ export async function connectionsRoutes(app: FastifyInstance) {
       } else if (conn.provider === "google_vertex") {
         testUrl = buildGoogleVertexModelUrl(baseUrl, conn.model, "models");
       } else {
-        testUrl = `${baseUrl}${provider?.modelsEndpoint || "/models"}`;
+        testUrl = buildConnectionTestCatalogUrl(
+          baseUrl,
+          conn.provider,
+          provider?.modelsEndpoint || "/models",
+          conn.audioSource,
+        );
       }
 
       const testHeaders =
@@ -746,6 +819,13 @@ export async function connectionsRoutes(app: FastifyInstance) {
       if (conn.provider === "video_generation") {
         if (videoSource === "atlas") {
           return { models: ATLAS_CLOUD_VIDEO_MODELS.map((model) => ({ id: model.id, name: model.name })) };
+        }
+        if (videoSource === "nanogpt") {
+          const models = await fetchNanoGptVideoModels(
+            conn.baseUrl || DEFAULT_NANOGPT_VIDEO_BASE_URL,
+            conn.apiKey || "",
+          );
+          return { models };
         }
         if (videoSource !== "comfyui" && videoSource !== "swarmui") {
           const models = MODEL_LISTS.video_generation.map((m) => ({ id: m.id, name: m.name }));
@@ -1213,9 +1293,10 @@ export async function connectionsRoutes(app: FastifyInstance) {
       : createDefaultVideoGenerationProfile();
     const inferredVideoSource = resolveVideoGenerationSource(conn as any, conn.baseUrl || "");
     const explicitVideoSource = conn.videoGenerationSource || conn.videoService || "";
-    const videoSource =
-      explicitVideoSource || (inferredVideoSource !== "gemini_omni" ? inferredVideoSource : defaults.service);
-    const rawVideoServiceHint = conn.videoService || videoSource;
+    const videoSource = normalizeVideoService(
+      explicitVideoSource || (inferredVideoSource !== "gemini_omni" ? inferredVideoSource : defaults.service),
+    );
+    const rawVideoServiceHint = normalizeVideoService(conn.videoService || videoSource);
     const videoServiceHint =
       videoSource === "swarmui"
         ? "swarmui"
@@ -1224,7 +1305,8 @@ export async function connectionsRoutes(app: FastifyInstance) {
           : rawVideoServiceHint;
     const isXaiVideo = videoSource === "xai" || videoServiceHint === "xai";
     const isGoogleVeoVideo = videoSource === "google_veo" || videoServiceHint === "google_veo";
-    const isOpenRouterVideo = videoSource === "openrouter" || videoServiceHint === "openrouter";
+    const isNanoGptVideo = videoSource === "nanogpt";
+    const isOpenRouterVideo = !isNanoGptVideo && (videoSource === "openrouter" || videoServiceHint === "openrouter");
     const isAtlasVideo = videoSource === "atlas" || videoServiceHint === "atlas";
     const isSeedanceVideo = videoSource === "seedance" || videoServiceHint === "seedance";
     const isSwarmUiVideo = videoSource === "swarmui" || videoServiceHint === "swarmui";
@@ -1237,15 +1319,17 @@ export async function connectionsRoutes(app: FastifyInstance) {
           ? DEFAULT_GOOGLE_VEO_VIDEO_BASE_URL
           : isOpenRouterVideo
             ? DEFAULT_OPENROUTER_VIDEO_BASE_URL
-            : isAtlasVideo
-              ? DEFAULT_ATLAS_CLOUD_VIDEO_BASE_URL
-              : isSeedanceVideo
-                ? DEFAULT_SEEDANCE_VIDEO_BASE_URL
-                : isSwarmUiVideo
-                  ? DEFAULT_SWARMUI_VIDEO_BASE_URL
-                  : isComfyUiVideo
-                    ? DEFAULT_COMFYUI_VIDEO_BASE_URL
-                    : providerDef?.defaultBaseUrl || DEFAULT_GEMINI_OMNI_VIDEO_BASE_URL)
+            : isNanoGptVideo
+              ? DEFAULT_NANOGPT_VIDEO_BASE_URL
+              : isAtlasVideo
+                ? DEFAULT_ATLAS_CLOUD_VIDEO_BASE_URL
+                : isSeedanceVideo
+                  ? DEFAULT_SEEDANCE_VIDEO_BASE_URL
+                  : isSwarmUiVideo
+                    ? DEFAULT_SWARMUI_VIDEO_BASE_URL
+                    : isComfyUiVideo
+                      ? DEFAULT_COMFYUI_VIDEO_BASE_URL
+                      : providerDef?.defaultBaseUrl || DEFAULT_GEMINI_OMNI_VIDEO_BASE_URL)
     ).replace(/\/+$/, "");
     const videoModel =
       conn.model ||
@@ -1255,26 +1339,30 @@ export async function connectionsRoutes(app: FastifyInstance) {
           ? DEFAULT_GOOGLE_VEO_VIDEO_MODEL
           : isOpenRouterVideo
             ? DEFAULT_OPENROUTER_VIDEO_MODEL
-            : isAtlasVideo
-              ? DEFAULT_ATLAS_CLOUD_VIDEO_MODEL
-              : isSeedanceVideo
-                ? DEFAULT_SEEDANCE_VIDEO_MODEL
-                : isComfyUiVideo
-                  ? ""
-                  : DEFAULT_GEMINI_OMNI_VIDEO_MODEL);
+            : isNanoGptVideo
+              ? ""
+              : isAtlasVideo
+                ? DEFAULT_ATLAS_CLOUD_VIDEO_MODEL
+                : isSeedanceVideo
+                  ? DEFAULT_SEEDANCE_VIDEO_MODEL
+                  : isComfyUiVideo
+                    ? ""
+                    : DEFAULT_GEMINI_OMNI_VIDEO_MODEL);
     const activeDefaults = isXaiVideo
       ? defaults.xai
       : isGoogleVeoVideo
         ? defaults.googleVeo
         : isOpenRouterVideo
           ? defaults.openrouter
-          : isAtlasVideo
-            ? defaults.atlas
-            : isSeedanceVideo
-              ? defaults.seedance
-              : isComfyUiVideo
-                ? defaults.comfyui
-                : defaults.geminiOmni;
+          : isNanoGptVideo
+            ? defaults.openrouter
+            : isAtlasVideo
+              ? defaults.atlas
+              : isSeedanceVideo
+                ? defaults.seedance
+                : isComfyUiVideo
+                  ? defaults.comfyui
+                  : defaults.geminiOmni;
 
     const prompt =
       "Create a concise cinematic 16:9 game scene video: a plate of spaghetti with marinara sauce on a table, gentle steam rising, warm kitchen light, slow push-in camera, no text or logos.";
@@ -1294,13 +1382,15 @@ export async function connectionsRoutes(app: FastifyInstance) {
             ? defaults.googleVeo.resolution
             : isOpenRouterVideo
               ? defaults.openrouter.resolution
-              : isAtlasVideo
-                ? defaults.atlas.resolution
-                : isSeedanceVideo
-                  ? defaults.seedance.resolution
-                  : isComfyUiVideo
-                    ? defaults.comfyui.resolution
-                    : undefined,
+              : isNanoGptVideo
+                ? defaults.openrouter.resolution
+                : isAtlasVideo
+                  ? defaults.atlas.resolution
+                  : isSeedanceVideo
+                    ? defaults.seedance.resolution
+                    : isComfyUiVideo
+                      ? defaults.comfyui.resolution
+                      : undefined,
         comfyWorkflow: conn.comfyuiWorkflow || undefined,
         comfyLoras: isComfyUiVideo ? defaults.comfyui.loras : [],
         fps: isComfyUiVideo ? defaults.comfyui.fps : undefined,
@@ -1425,7 +1515,7 @@ export async function connectionsRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: "This provider does not support chat test messages." });
     }
 
-    if (!conn.model && conn.provider !== "grok_subscription") {
+    if (!conn.model && !allowsDefaultChatModel(conn)) {
       return reply.status(400).send({ error: "No model configured. Set a model first." });
     }
 
@@ -1459,26 +1549,42 @@ export async function connectionsRoutes(app: FastifyInstance) {
         conn.id,
       );
 
+      const storedOptions = resolveStoredChatOptions(conn.defaultParameters, conn.provider, model);
+      // Always-reasoning models (GLM 5.3) spend one output budget on thinking and
+      // on text. At 200 tokens the whole budget is thinking and the test reports
+      // success with nothing to show, so give them room for a one-line answer.
+      const maxTokens = resolveStoredMaxTokens(
+        conn.defaultParameters,
+        isGlm53MandatoryReasoningModel(model) ? 1024 : 200,
+      );
       let fullResponse = "";
-      for await (const chunk of provider.chat([{ role: "user", content: "hi" }], {
+      const generation = provider.chat([{ role: "user", content: "hi" }], {
         model,
-        temperature: 0.7,
-        maxTokens: 200,
+        ...storedOptions,
+        temperature: storedOptions.temperature ?? 0.7,
+        maxTokens,
         stream: false,
-      })) {
-        fullResponse += chunk;
+      });
+      let step = await generation.next();
+      while (!step.done) {
+        fullResponse += step.value;
+        step = await generation.next();
       }
+      const usage = step.value || undefined;
+      const response = fullResponse.trim()
+        ? fullResponse.slice(0, 500)
+        : describeEmptyModelResponse({
+            finishReason: usage?.finishReason,
+            usage,
+            maxTokens: sentOutputBudget(maxTokens, conn.maxTokensOverride),
+            hadThinking: (usage?.completionReasoningTokens ?? 0) > 0,
+          });
 
       const latencyMs = Date.now() - start;
-      debugLog(
-        "[connections/test-message] url=%s success in %dms: %s",
-        targetUrl,
-        latencyMs,
-        fullResponse.slice(0, 500),
-      );
+      debugLog("[connections/test-message] url=%s success in %dms: %s", targetUrl, latencyMs, response);
       return {
         success: true,
-        response: fullResponse.slice(0, 500),
+        response,
         latencyMs,
         model: model || "Grok CLI default",
       };

@@ -11,8 +11,16 @@ import { useSidecarStore } from "../../stores/sidecar.store";
 import { appendLocalSidecarConnectionOption, isLocalSidecarConnectionOption } from "../../lib/connection-filters";
 import { cn } from "../../lib/utils";
 import { useTranslation as useUiTranslation } from "react-i18next";
+import type { ProfessorMariContextBudget } from "../../lib/professor-mari-context-budget";
+import { ContextBudgetGauge, ContextBudgetIndicator } from "./ContextBudgetIndicator";
 
-export function QuickConnectionSwitcher({ className }: { className?: string }) {
+export function QuickConnectionSwitcher({
+  className,
+  contextBudget,
+}: {
+  className?: string;
+  contextBudget?: ProfessorMariContextBudget | null;
+}) {
   const { t: localizeUi } = useUiTranslation();
   const [open, setOpen] = useState(false);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -79,13 +87,13 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
     const frame = window.requestAnimationFrame(() => {
       const menu = menuRef.current;
       const focusTarget =
-        menu?.querySelector<HTMLElement>('button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])') ??
-        menu;
+        menu?.querySelector<HTMLElement>('button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])') ?? menu;
       focusTarget?.focus();
     });
     return () => window.cancelAnimationFrame(frame);
   }, [open]);
 
+  const hasContextBudget = Boolean(contextBudget);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
   useEffect(() => {
     if (!open || !btnRef.current) return;
@@ -101,7 +109,7 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
       if (left < 8) left = 8;
       setPos({ left, top: Math.max(8, anchorTop - menuHeight - 4) });
     });
-  }, [open]);
+  }, [open, hasContextBudget]);
 
   if (!activeChatId) return null;
 
@@ -121,7 +129,10 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
                 btnRef.current?.focus();
               }
             }}
-            className="fixed z-[9999] flex min-w-[280px] max-w-[340px] max-h-[360px] flex-col overflow-hidden rounded-xl border border-foreground/10 bg-[var(--card)] shadow-2xl"
+            className={cn(
+              "fixed z-[9999] flex min-w-[280px] max-w-[340px] max-h-[360px] flex-col overflow-hidden rounded-xl border border-foreground/10 shadow-2xl",
+              chatMode === "roleplay" ? "bg-[var(--card)]" : "bg-[var(--background)]",
+            )}
             style={pos ? { left: pos.left, top: pos.top } : { visibility: "hidden" as const }}
           >
             <div className="flex items-center justify-between gap-2 border-b border-foreground/10 px-3 py-2">
@@ -129,7 +140,11 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
               <button
                 type="button"
                 onClick={handleToggleRandom}
-                title={isRandom ?localizeUi("ui.chat.quickconnectionswitcher.randomPoolActiveClickToDisable") :localizeUi("ui.chat.quickconnectionswitcher.useRandomConnectionFromPool")}
+                title={
+                  isRandom
+                    ? localizeUi("ui.chat.quickconnectionswitcher.randomPoolActiveClickToDisable")
+                    : localizeUi("ui.chat.quickconnectionswitcher.useRandomConnectionFromPool")
+                }
                 className={cn(
                   "flex h-6 w-6 items-center justify-center rounded-md transition-all active:scale-90",
                   isRandom
@@ -140,6 +155,11 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
                 <Dices size="0.875rem" />
               </button>
             </div>
+            {contextBudget && (
+              <div className="border-b border-foreground/10 px-3 pt-2">
+                <ContextBudgetIndicator budget={contextBudget} />
+              </div>
+            )}
             <div className="overflow-y-auto p-1">
               {sorted.map((conn) => {
                 const inPool = conn.useForRandom === "true";
@@ -151,7 +171,11 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
                       key={conn.id}
                       onClick={() => handleTogglePool(conn.id, inPool)}
                       className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs transition-colors hover:bg-foreground/10"
-                      title={inPool ?localizeUi("ui.chat.quickconnectionswitcher.inRandomPoolClickToRemove") :localizeUi("ui.chat.quickconnectionswitcher.clickToAddToRandomPool")}
+                      title={
+                        inPool
+                          ? localizeUi("ui.chat.quickconnectionswitcher.inRandomPoolClickToRemove")
+                          : localizeUi("ui.chat.quickconnectionswitcher.clickToAddToRandomPool")
+                      }
                     >
                       <span className="flex-1 truncate">{conn.name || conn.id}</span>
                       <span
@@ -184,7 +208,9 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
               })}
 
               {sorted.length === 0 && (
-                <div className="px-3 py-4 text-center text-[0.6875rem] italic text-foreground/45">{localizeUi("ui.chat.quickconnectionswitcher.noConnectionsFound")}</div>
+                <div className="px-3 py-4 text-center text-[0.6875rem] italic text-foreground/45">
+                  {localizeUi("ui.chat.quickconnectionswitcher.noConnectionsFound")}
+                </div>
               )}
             </div>
           </div>,
@@ -207,7 +233,10 @@ export function QuickConnectionSwitcher({ className }: { className?: string }) {
           className,
         )}
       >
-        <Link size="1rem" />
+        <span className="relative flex h-[1.875rem] w-[1.875rem] items-center justify-center">
+          {contextBudget && <ContextBudgetGauge percentage={contextBudget.percentage} />}
+          <Link size="1rem" />
+        </span>
       </button>
       {menu}
     </>

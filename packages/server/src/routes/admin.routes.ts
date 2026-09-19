@@ -5,14 +5,22 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import { eq, ne } from "../db/file-query.js";
 import { existsSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
-import { PROFESSOR_MARI_ID, TTS_SETTINGS_KEY } from "@marinara-engine/shared";
+import { MARINARA_UNIVERSAL_PRESET_SYSTEM_KEY, PROFESSOR_MARI_ID, TTS_SETTINGS_KEY } from "@marinara-engine/shared";
 import { DATA_DIR } from "../utils/data-dir.js";
 import * as schema from "../db/schema/index.js";
 import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
+import { ADMIN_RESTART_RATE_LIMIT, AVATAR_STORAGE_RATE_LIMIT } from "../middleware/rate-limit.js";
+import { logger } from "../lib/logger.js";
+import { isDockerRuntime } from "../config/runtime-config.js";
+import { noteSessionExitKind } from "../lib/session-postmortem.js";
+import { armShutdownDeadline } from "../lib/shutdown-deadline.js";
 import {
+  ABANDONED_AVATAR_MIN_AGE_MS,
   collectCharacterAvatarPaths,
   collectPersonaAvatarPaths,
+  deleteAbandonedAvatarFiles,
   mutateAvatarReferencesAndCleanup,
+  scanAbandonedAvatarFiles,
 } from "../services/image/avatar-file-lifecycle.js";
 
 type ExpungeScope =
@@ -57,6 +65,70 @@ function isValidScope(scope: unknown): scope is ExpungeScope {
 }
 
 export async function adminRoutes(app: FastifyInstance) {
+  let restartScheduled = false;
+
+  app.post<{ Body: { confirm?: boolean } }>(
+    "/restart",
+    { config: { rateLimit: ADMIN_RESTART_RATE_LIMIT } },
+    async (req, reply) => {
+      if (!requirePrivilegedAccess(req, reply, { feature: "Server restart" })) return;
+      if (req.body?.confirm !== true) {
+        return reply.status(400).send({ error: "Must send { confirm: true } to restart the server" });
+      }
+      if (restartScheduled) {
+        return reply.status(409).send({ error: "Server restart is already scheduled" });
+      }
+      const docker = isDockerRuntime();
+      if (!docker && process.env.MARINARA_RESTART_SUPERVISOR !== String(process.ppid)) {
+        return reply.status(409).send({
+          error:
+            "Restart is unavailable for an unmanaged server. Start Marinara with its platform launcher or pnpm start; restart a development watcher from its terminal.",
+        });
+      }
+      const exitCode = docker ? 0 : 75;
+
+      restartScheduled = true;
+      setTimeout(() => {
+        void (async () => {
+          armShutdownDeadline(app, "restart", { exitCode });
+          try {
+            // #5506 diagnostics: name this ending so the next startup reports
+            // an operator restart instead of an external kill.
+            noteSessionExitKind("restart");
+            await app.close();
+            logger.info("Server restart requested from Advanced Settings");
+            process.exit(exitCode);
+          } catch (error) {
+            logger.error(error, "Graceful server restart failed");
+            process.exit(1);
+          }
+        })();
+      }, 750);
+
+      return reply.status(202).send({ status: "restarting" });
+    },
+  );
+
+  app.get("/avatar-storage/abandoned", { config: { rateLimit: AVATAR_STORAGE_RATE_LIMIT } }, async (req, reply) => {
+    if (!requirePrivilegedAccess(req, reply, { feature: "Avatar storage scan" })) return;
+    const result = await scanAbandonedAvatarFiles({ db: app.db });
+    return { ...result, minimumAgeMinutes: ABANDONED_AVATAR_MIN_AGE_MS / 60_000 };
+  });
+
+  app.post<{ Body: { confirm: boolean } }>(
+    "/avatar-storage/cleanup",
+    { config: { rateLimit: AVATAR_STORAGE_RATE_LIMIT } },
+    async (req, reply) => {
+      if (!requirePrivilegedAccess(req, reply, { feature: "Avatar storage cleanup" })) return;
+      if (req.body?.confirm !== true) {
+        return reply.status(400).send({ error: "Must send { confirm: true } to proceed" });
+      }
+      const result = await deleteAbandonedAvatarFiles({ db: app.db });
+      logger.info("Removed %d abandoned avatar files (%d bytes)", result.files, result.bytes);
+      return { ...result, minimumAgeMinutes: ABANDONED_AVATAR_MIN_AGE_MS / 60_000 };
+    },
+  );
+
   const runExpunge = async (requestedScopes: ExpungeScope[], reply: FastifyReply) => {
     if (requestedScopes.length === 0) {
       return reply.status(400).send({ error: "At least one valid scope is required" });
@@ -106,10 +178,7 @@ export async function adminRoutes(app: FastifyInstance) {
             db,
             deletedCharacters.map((row) => row.id),
           );
-          return [
-            ...characterAvatarPaths,
-            ...deletedGroups.flatMap((row) => (row.avatarPath ? [row.avatarPath] : [])),
-          ];
+          return [...characterAvatarPaths, ...deletedGroups.flatMap((row) => (row.avatarPath ? [row.avatarPath] : []))];
         },
         mutateReferences: async () => {
           await runDelete("character_groups", () => db.delete(schema.characterGroups).run());
@@ -150,10 +219,47 @@ export async function adminRoutes(app: FastifyInstance) {
     }
 
     if (requestedScopes.includes("presets")) {
-      await runDelete("prompt_sections", () => db.delete(schema.promptSections).run());
-      await runDelete("prompt_groups", () => db.delete(schema.promptGroups).run());
-      await runDelete("choice_blocks", () => db.delete(schema.choiceBlocks).run());
-      await runDelete("prompt_presets", () => db.delete(schema.promptPresets).run());
+      const defaultPreset = (
+        await db
+          .select({ id: schema.promptPresets.id })
+          .from(schema.promptPresets)
+          .where(eq(schema.promptPresets.isDefault, "true"))
+      )[0];
+      const stockPreset = (
+        await db
+          .select({ id: schema.promptPresets.id })
+          .from(schema.promptPresets)
+          .where(eq(schema.promptPresets.systemKey, MARINARA_UNIVERSAL_PRESET_SYSTEM_KEY))
+          .limit(1)
+      )[0];
+      const stockPresetId = stockPreset?.id;
+
+      await runDelete("prompt_sections", () =>
+        stockPresetId
+          ? db.delete(schema.promptSections).where(ne(schema.promptSections.presetId, stockPresetId)).run()
+          : db.delete(schema.promptSections).run(),
+      );
+      await runDelete("prompt_groups", () =>
+        stockPresetId
+          ? db.delete(schema.promptGroups).where(ne(schema.promptGroups.presetId, stockPresetId)).run()
+          : db.delete(schema.promptGroups).run(),
+      );
+      await runDelete("choice_blocks", () =>
+        stockPresetId
+          ? db.delete(schema.choiceBlocks).where(ne(schema.choiceBlocks.presetId, stockPresetId)).run()
+          : db.delete(schema.choiceBlocks).run(),
+      );
+      await runDelete("prompt_presets", () =>
+        stockPresetId
+          ? db.delete(schema.promptPresets).where(ne(schema.promptPresets.id, stockPresetId)).run()
+          : db.delete(schema.promptPresets).run(),
+      );
+      if (stockPresetId && defaultPreset && defaultPreset.id !== stockPresetId) {
+        await db
+          .update(schema.promptPresets)
+          .set({ isDefault: "true" })
+          .where(eq(schema.promptPresets.id, stockPresetId));
+      }
       await runDelete("library_folders:presets", () =>
         db.delete(schema.libraryFolders).where(eq(schema.libraryFolders.scope, "presets")).run(),
       );

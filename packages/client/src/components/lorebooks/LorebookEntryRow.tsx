@@ -15,6 +15,7 @@ import {
   type TouchEvent as ReactTouchEvent,
 } from "react";
 import { createPortal } from "react-dom";
+import { toast } from "sonner";
 import {
   Ban,
   ChevronDown,
@@ -35,7 +36,7 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
-import { cn } from "../../lib/utils";
+import { cn, copyToClipboard } from "../../lib/utils";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { useUpdateLorebookEntry, useDeleteLorebookEntry, useDuplicateLorebookEntry } from "../../hooks/use-lorebooks";
 import { useUIStore } from "../../stores/ui.store";
@@ -97,6 +98,8 @@ interface Props {
   previewMatch?: "matched" | "constant";
   mapBacklinks?: Array<{ chatId: string; locationId: string; locationName: string }>;
   onUpdateEntry?: LorebookEntryUpdateHandler;
+  /** Override only this row's enabled control; content edits keep their existing scope. */
+  chatEnabled?: { enabled: boolean; onChange: (enabled: boolean) => Promise<unknown> };
 }
 
 type LorebookEntryUpdateHandler = (
@@ -224,6 +227,7 @@ export function LorebookEntryRow({
   previewMatch,
   mapBacklinks = [],
   onUpdateEntry,
+  chatEnabled,
 }: Props) {
   const { t: localizeUi } = useUiTranslation();
   const updateEntry = useUpdateLorebookEntry();
@@ -233,7 +237,7 @@ export function LorebookEntryRow({
   // ── Inline-control optimistic state ──
   // We keep a local mirror of the entry's fields so the inputs feel snappy
   // while the mutation flushes. React Query invalidation will reconcile.
-  const [localEnabled, setLocalEnabled] = useState(entry.enabled);
+  const [localEnabled, setLocalEnabled] = useState(entry.enabled && (chatEnabled?.enabled ?? true));
   const [localStatus, setLocalStatus] = useState<EntryStatus>(deriveStatus(entry));
   const [localPosition, setLocalPosition] = useState(entry.position);
   const [localDepth, setLocalDepth] = useState(entry.depth);
@@ -263,7 +267,6 @@ export function LorebookEntryRow({
     if (pendingOutletNameRef.current === previousOutletName) {
       pendingOutletNameRef.current = entry.outletName;
     }
-    setLocalEnabled(entry.enabled);
     setLocalStatus(deriveStatus(entry));
     setLocalPosition(entry.position);
     setLocalDepth(entry.depth);
@@ -272,6 +275,10 @@ export function LorebookEntryRow({
     setLocalName(entry.name);
     setLocalUseRegex(entry.useRegex ?? false);
   }, [entry]);
+
+  useEffect(() => {
+    setLocalEnabled(entry.enabled && (chatEnabled?.enabled ?? true));
+  }, [entry.enabled, chatEnabled?.enabled]);
 
   useEffect(() => {
     if (!showMobileControls) return;
@@ -382,9 +389,10 @@ export function LorebookEntryRow({
     (next: boolean) => {
       const previous = localEnabled;
       setLocalEnabled(next);
-      patch({ enabled: next }, { onError: () => setLocalEnabled(previous) });
+      if (chatEnabled) void chatEnabled.onChange(next).catch(() => setLocalEnabled(previous));
+      else patch({ enabled: next }, { onError: () => setLocalEnabled(previous) });
     },
-    [localEnabled, patch],
+    [localEnabled, patch, chatEnabled],
   );
 
   const handleUseRegexToggle = useCallback(
@@ -459,7 +467,8 @@ export function LorebookEntryRow({
         entry: {
           ...entry,
           name: localName.trim() || entry.name,
-          enabled: localEnabled,
+          // Keep pending shared edits, but do not copy this chat's override into the shared book.
+          enabled: chatEnabled ? entry.enabled : localEnabled,
           constant,
           selective,
           position: localPosition,
@@ -474,8 +483,9 @@ export function LorebookEntryRow({
     [
       lorebookId,
       entry,
-      localName,
+      chatEnabled,
       localEnabled,
+      localName,
       localStatus,
       localPosition,
       localDepth,
@@ -615,13 +625,30 @@ export function LorebookEntryRow({
           onMouseDown={(e) => e.stopPropagation()}
         >
           <SettingsSwitch
-            ariaLabel={localEnabled ? "Disable entry" : "Enable entry"}
+            ariaLabel={
+              chatEnabled
+                ? localizeUi(
+                    localEnabled
+                      ? "chat.settings.inlineLorebook.disableForChat"
+                      : "chat.settings.inlineLorebook.enableForChat",
+                  )
+                : localizeUi(
+                    localEnabled
+                      ? "ui.lorebooks.lorebookentryrow.disableEntry"
+                      : "ui.lorebooks.lorebookentryrow.enableEntry",
+                  )
+            }
             title={
-              localEnabled
-                ? localizeUi("ui.lorebooks.lorebookentryrow.entryEnabled")
-                : localizeUi("ui.lorebooks.lorebookentryrow.entryDisabled")
+              chatEnabled && !entry.enabled
+                ? localizeUi("chat.settings.inlineLorebook.globallyDisabled")
+                : chatEnabled
+                  ? localizeUi("chat.settings.inlineLorebook.chatScope")
+                  : localEnabled
+                    ? localizeUi("ui.lorebooks.lorebookentryrow.entryEnabled")
+                    : localizeUi("ui.lorebooks.lorebookentryrow.entryDisabled")
             }
             checked={localEnabled}
+            disabled={!!chatEnabled && !entry.enabled}
             onChange={handleEnabledChange}
             className="p-0 hover:bg-transparent"
           />
@@ -1517,6 +1544,29 @@ function ExpandedDrawer({
         flushAutosave();
       }}
     >
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-[var(--border)] bg-[var(--secondary)]/70 px-3 py-2">
+        <span className="text-[0.625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
+          {localizeUi("ui.lorebooks.lorebookentryrow.entryId")}
+        </span>
+        <code className="min-w-0 flex-1 break-all rounded-lg bg-[var(--background)] px-2 py-1 text-[0.6875rem] text-[var(--foreground)]">
+          {entry.id}
+        </code>
+        <button
+          type="button"
+          onClick={async () => {
+            const copied = await copyToClipboard(entry.id);
+            if (copied) toast.success(localizeUi("ui.lorebooks.lorebookentryrow.entryIdCopied"));
+            else toast.error(localizeUi("ui.lorebooks.lorebookentryrow.couldNotCopyEntryId"));
+          }}
+          className="mari-editor-action inline-flex h-8 px-2 text-[0.6875rem]"
+          aria-label={localizeUi("ui.lorebooks.lorebookentryrow.copyEntryId")}
+          title={localizeUi("ui.lorebooks.lorebookentryrow.copyEntryId")}
+        >
+          <Copy size="0.75rem" />
+          {localizeUi("lorebook.editor.batch.copy")}
+        </button>
+      </div>
+
       <div
         className={cn(
           "grid items-start gap-3",

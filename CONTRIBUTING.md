@@ -39,6 +39,7 @@ Useful entry points:
 - `pnpm dev:server` builds the shared package, then starts only the API server. If shared source changes while it is running, rerun `pnpm build:shared` and restart the server; the server watcher intentionally ignores shared build output.
 - `pnpm dev:client` starts only the Vite frontend.
 - `start.bat`, `start.sh`, and `start-termux.sh` run the launcher flow, including git-based auto-update and optional browser auto-open.
+- Platform launchers and `pnpm start` supervise explicit in-app restarts in the same console; exit code 75 requests a replacement after the server exits. Development watchers should be restarted from their terminal, not Advanced Settings.
 
 Copy `.env.example` to `.env` when you need to change ports, HTTPS settings, or launcher behavior such as `AUTO_OPEN_BROWSER=false`.
 
@@ -91,28 +92,49 @@ The Engine update channel also selects the official Agent channel. Stable Engine
 
 ## Validation
 
+The POSIX terminal-shutdown regression uses Python 3 from `PATH` (standard-library `pty` only) to verify real terminal closure; no Python package installation is needed.
+
 Baseline validation:
 
 ```bash
 pnpm check
 ```
 
-This runs the Impeccable project-context guard, workspace lint/type checks, and the production build.
+This runs the Impeccable project-context guard, localization checks, Prettier verification, workspace lint/type checks, and the production build.
+
+**Windows note:** the repo checks out with LF line endings on every platform (`.gitattributes` sets `* text=auto eol=lf`, which overrides Git for Windows' `core.autocrlf=true` default), so `pnpm check` behaves identically to CI. A clone made before this rule existed still has CRLF in its working tree and will fail Prettier on every file until you refresh it once — commit or stash any work first, then run:
+
+```bash
+git rm -r --cached . -q && git reset --hard
+```
+
+A fresh clone needs nothing.
+
+Run the individual formatting and lint checks while iterating:
+
+```bash
+pnpm format:check
+pnpm lint
+```
+
+Use `pnpm format` to apply Prettier to the maintained TypeScript and TSX source scope.
 
 Useful follow-up checks:
 
 ```bash
 pnpm version:check
+pnpm regression
 pnpm regression:prompt
-pnpm smoke:ui
+pnpm regression:ui
 ```
 
 Regression guards:
 
+- `pnpm regression` (or `pnpm regression:node`) builds the shared package once, discovers the complete Node regression set from the filesystem, and runs it serially. Pull requests and staging pushes run this complete lane on a hosted runner.
 - `pnpm regression:prompt` runs fast deterministic checks for prompt assembly, lorebook keyword matching, macros, summaries, and mode-specific generation gates.
-- `pnpm smoke:ui` runs the Playwright browser smoke suite against isolated temporary app data.
-  Each run clears `.tmp/playwright-data` and starts separate desktop and mobile app servers so their mutable fixtures cannot overlap. Stop any process already using the configured Playwright ports before running it; existing fixture state is disposable and the smoke suite does not reuse a running development server.
-- `pnpm regression` runs both lanes.
+- `pnpm regression:ui` runs the Playwright browser suite across desktop Chromium, Android-sized Chromium, and iPhone-sized WebKit; `pnpm smoke:ui` remains a compatibility alias for the same full UI lane. Pull requests and staging pushes run the same projects independently on hosted runners.
+  Each run clears `.tmp/playwright-data` and starts separate desktop and mobile app servers so their mutable fixtures cannot overlap. Stop any process already using the configured Playwright ports before running it; existing fixture state is disposable and the suite does not reuse a running development server.
+- `pnpm test` checks the Windows installer layout, then runs the Node regression lane. It does not run the UI lane; invoke `pnpm regression:ui` explicitly for browser validation.
 
 These checks are intentionally small and do not replace manual verification. When you change behavior, include the manual verification you performed and add or update a regression guard for the bug class when practical.
 
@@ -226,12 +248,21 @@ The overlay is not a substitute for this guide. When instructions conflict, foll
 
 ## Localization
 
-UI translations live in one JSON file per locale and fall back to the canonical English catalog. See
+English UI text stays in `packages/client/src/localization/locales/en.json`. Community UI translations live in
+`ui/<BCP-47>.json` on `docs-i18n` and download into `DATA_DIR/ui-packs` only when selected in Settings. They are not
+part of Engine releases or checkouts. Existing downloads work offline; missing packs and keys fall back to English.
+See
 [`docs/development/localization.md`](docs/development/localization.md) for the translation boundary, file format,
 semantic-key conventions, downloadable Agent handoff, and validation command.
 
 Keep prompts, authored content, identifiers, protocol values, and persisted machine values out of UI localization.
-Run `pnpm localization:check` whenever a locale file or localization key changes.
+Run `pnpm localization:check` whenever an English localization key changes; it validates English and audits client
+UI copy without requiring community translation changes. On `docs-i18n`, run
+`node scripts/ui-i18n/validate-packs.mjs <engine-checkout>/packages/client/src/localization/locales/en.json --write-manifest`
+after editing `ui/` packs, then repeat without `--write-manifest` to validate hashes and report coverage/stale keys.
+Submit community translations against `docs-i18n`, not `staging`. When keys are renamed or deleted, mirror the change
+there or open a `[ui-i18n] <affected area or keys>` follow-up so translators can catch up in batches. Missing keys
+fall back to English; stale keys are ignored at runtime and reported by the pack validator.
 
 ## Versioning and Releases
 
@@ -259,12 +290,12 @@ Android policy:
 
 - `versionName` must match the app version.
 - `versionCode` must increase monotonically for every shipped APK.
-- Stable and tagged release APKs require the configured `ANDROID_SIGNING_*` keystore credentials. The manual pre-alpha workflow may publish a debug-signed APK only as a draft, test-only artifact.
+- Stable and tagged release APKs require the repository maintainers' configured `ANDROID_SIGNING_*` keystore credentials. These are CI build inputs, never information requested from APK downloaders. The manual pre-alpha workflow may publish a debug-signed APK only as a draft, test-only artifact.
 
 Release-related behavior already in the repo:
 
 - Docker publishing is triggered by `v*` tags.
-- Tagged releases are published from `CHANGELOG.md` by the GitHub release workflow, with a named versioned source ZIP and a temporary Android APK notice prepended so release-page downloaders know the APK still requires Termux.
+- Tagged releases are published from `CHANGELOG.md` by the GitHub release workflow, with a named versioned source ZIP and a temporary Android APK notice prepended so release-page downloaders know the APK still requires Termux. Android releases attach both the versioned APK and the stable `marinara-engine-android.apk` alias used by the one-click latest-download link.
 - The server update check reads the newest GitHub `v*` tag and uses matching release metadata when it exists.
 - Git-based installs can apply updates automatically; Docker installs are prompted with the pull command instead.
 - Pull request CI runs `pnpm check`, `pnpm version:check`, and the tracked-installer guard.
@@ -275,14 +306,14 @@ Standard release flow:
 1. Bump the canonical version in root `package.json`.
 2. Run `pnpm version:sync -- --android-version-code <next-code>` to sync all derived version fields.
 3. Run `pnpm credits:check`; if it reports stale contributor credits, run `pnpm credits:sync` and include the Credits modal update in the release PR.
-4. Update `CHANGELOG.md`.
+4. Update `CHANGELOG.md`; when publishing a stable release, update README's current-stable-release link to the matching tag.
 5. Merge the release-ready `staging` change to `main`.
 6. Create and push the tag `vX.Y.Z` from the `main` commit that contains that exact version bump.
 7. Let the release workflows publish or update the GitHub Release, named source ZIP, Windows installer, Android WebView shell APK, and GHCR container images (`X.Y.Z`, `X.Y`, `X`, `latest`, plus `X.Y.Z-lite` / `lite`) from the matching changelog entry.
 
 Release helpers now in the repo:
 
-- `pnpm version:sync -- --android-version-code <next-code>` updates the derived version files and README release references from the root `package.json` version.
+- `pnpm version:sync -- --android-version-code <next-code>` updates the derived version files from the root `package.json` version. README's current-stable-release link changes only when that release is published.
 - `pnpm version:check` fails when those derived files drift out of sync.
 - `pnpm credits:check` compares the in-app Credits modal with the GitHub contributors list, and `pnpm credits:sync` refreshes it.
 - `pnpm guard:installer-artifacts` fails when tracked installer binaries appear under `win/installer/*.exe`.

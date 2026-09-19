@@ -20,11 +20,14 @@ export type CharacterMap = Map<
     avatarCrop?: AvatarCrop | null;
     conversationStatus?: "online" | "idle" | "dnd" | "offline";
     conversationActivity?: string;
+    /** Alternative names/nicknames for inline name coloring. */
+    nameAliases?: string[];
   }
 >;
 
 export type PersonaInfo = {
   id?: string;
+  source?: "persona" | "character";
   name: string;
   /** Conversation-only cosmetic display name (persona.convoDisplayName). */
   convoDisplayName?: string;
@@ -39,6 +42,8 @@ export type PersonaInfo = {
   nameColor?: string;
   dialogueColor?: string;
   boxColor?: string;
+  conversationStatus?: "online" | "idle" | "dnd" | "offline";
+  conversationActivity?: string;
 };
 
 export type PeekPromptData = {

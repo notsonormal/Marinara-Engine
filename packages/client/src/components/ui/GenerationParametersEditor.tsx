@@ -1,6 +1,9 @@
-import { useEffect, useState } from "react";
+import type { EffectiveGenerationParameters } from "../../hooks/use-effective-generation-parameters";
+import { useEffect, useRef, useState } from "react";
 import {
   GENERATION_PARAMETER_SEND_KEYS,
+  isZaiMaxReasoningEffortModel,
+  customRequestHeadersSchema,
   normalizeThinkingTagPairs,
   type GenerationParameterSendKey,
   type GenerationParameterSendMap,
@@ -10,7 +13,7 @@ import {
 } from "@marinara-engine/shared";
 import { cn } from "../../lib/utils";
 import { SettingsSwitch } from "../panels/settings/SettingControls";
-import { DraftTextarea } from "./DraftTextarea";
+import { MacroTextarea, type MacroTextareaProps } from "./MacroTextarea";
 import { HelpTooltip } from "./HelpTooltip";
 import { parseGenerationParameterDraft } from "../../lib/generation-parameter-draft";
 import { parseCustomParametersDraft } from "../../lib/generation-custom-parameters";
@@ -28,9 +31,13 @@ export type EditableGenerationParameters = Pick<
   | "reasoningEffort"
   | "verbosity"
   | "serviceTier"
+  | "strictRoleFormatting"
+  | "singleUserMessage"
   | "assistantPrefill"
+  | "assistantReasoningPrefill"
   | "customThinkingTags"
   | "customParameters"
+  | "customHeaders"
   | "managedCustomParameters"
   | "enabledParameters"
 >;
@@ -39,13 +46,13 @@ type EditableGenerationParameterOverrides = Partial<EditableGenerationParameters
 
 const REASONING_LEVELS = [null, "low", "medium", "high", "xhigh", "maximum"] as const;
 const VERBOSITY_LEVELS = [null, "low", "medium", "high"] as const;
-const OPENROUTER_SERVICE_TIERS = [null, "flex", "priority"] as const;
+const SERVICE_TIERS = [null, "flex", "priority"] as const;
 const THINKING_TAG_CONTENT_PLACEHOLDER = "{{thinking}}";
 const PARAM_CHOICE_ACTIVE_CLASS = "bg-[var(--primary)]/15 text-[var(--primary)] ring-1 ring-[var(--primary)]/30";
 const PARAM_CHOICE_IDLE_CLASS =
   "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] hover:bg-[var(--accent)]";
 const PARAM_TEXTAREA_CLASS =
-  "mt-1 w-full resize-y rounded-lg bg-[var(--secondary)] px-3 py-2 text-xs leading-relaxed [text-indent:0] ring-1 ring-[var(--border)] placeholder:text-[var(--muted-foreground)]/60 placeholder:[text-indent:0] focus:outline-none focus:ring-[var(--ring)]";
+  "mari-chrome-field mt-1 w-full !rounded-md px-3 py-2 pr-8 text-xs leading-relaxed [text-indent:0] placeholder:[text-indent:0]";
 
 const LEGACY_PARAMETER_SEND_DEFAULTS: GenerationParameterSendMap = Object.fromEntries(
   GENERATION_PARAMETER_SEND_KEYS.map((key) => [key, true]),
@@ -72,7 +79,10 @@ export const CHAT_PARAMETER_DEFAULTS: EditableGenerationParameters = {
   reasoningEffort: "maximum",
   verbosity: "high",
   serviceTier: null,
+  strictRoleFormatting: true,
+  singleUserMessage: false,
   assistantPrefill: "",
+  assistantReasoningPrefill: "",
   customThinkingTags: [],
   customParameters: {},
   managedCustomParameters: {},
@@ -89,7 +99,10 @@ export const ROLEPLAY_PARAMETER_DEFAULTS: EditableGenerationParameters = {
   reasoningEffort: "maximum",
   verbosity: "high",
   serviceTier: null,
+  strictRoleFormatting: true,
+  singleUserMessage: false,
   assistantPrefill: "",
+  assistantReasoningPrefill: "",
   customThinkingTags: [],
   customParameters: {},
   managedCustomParameters: {},
@@ -161,8 +174,17 @@ export function parseEditableGenerationParameters(raw: unknown): EditableGenerat
   if (source.serviceTier === null || source.serviceTier === "flex" || source.serviceTier === "priority") {
     next.serviceTier = source.serviceTier;
   }
+  if (typeof source.strictRoleFormatting === "boolean") next.strictRoleFormatting = source.strictRoleFormatting;
+  if (typeof source.singleUserMessage === "boolean") next.singleUserMessage = source.singleUserMessage;
+  if (source.customHeaders !== undefined) {
+    const headers = customRequestHeadersSchema.safeParse(source.customHeaders);
+    if (headers.success) next.customHeaders = headers.data;
+  }
   if (typeof source.assistantPrefill === "string") {
     next.assistantPrefill = source.assistantPrefill;
+  }
+  if (typeof source.assistantReasoningPrefill === "string") {
+    next.assistantReasoningPrefill = source.assistantReasoningPrefill;
   }
   if (Array.isArray(source.customThinkingTags)) {
     next.customThinkingTags = normalizeThinkingTagPairs(source.customThinkingTags);
@@ -213,15 +235,50 @@ export function getEditableGenerationParameters(
 export function GenerationParametersFields({
   value,
   onChange,
-  showOpenRouterServiceTier = false,
+  showServiceTier = false,
+  showCustomHeaders = false,
+  effectiveParameters,
+  provider,
+  model,
   enabledParametersFallback = LEGACY_PARAMETER_SEND_DEFAULTS,
 }: {
   value: EditableGenerationParameters;
   onChange: (next: EditableGenerationParameters) => void;
-  showOpenRouterServiceTier?: boolean;
+  showServiceTier?: boolean;
+  showCustomHeaders?: boolean;
+  effectiveParameters?: EffectiveGenerationParameters;
+  provider?: string;
+  model?: string;
   enabledParametersFallback?: GenerationParameterSendMap;
 }) {
   const { t: localizeUi } = useUiTranslation();
+  const effectiveHint = (key: string, displayValue?: string) => {
+    const entry = effectiveParameters?.[key];
+    if (!entry) return undefined;
+    const value =
+      displayValue ??
+      (!entry.enabled
+        ? localizeUi("generationParameters.effective.notSent")
+        : entry.value === null
+          ? localizeUi("generationParameters.effective.providerDefault")
+          : typeof entry.value === "object"
+            ? JSON.stringify(entry.value)
+            : String(entry.value));
+    return localizeUi("generationParameters.effective.value", {
+      value,
+      source: localizeUi(`generationParameters.source.${entry.source}`),
+    });
+  };
+  const effectiveLine = (key: string, displayValue?: string) =>
+    effectiveParameters?.[key] ? (
+      <p className="mt-1 break-words text-[0.625rem] text-[var(--muted-foreground)]" data-effective-parameter={key}>
+        {effectiveHint(key, displayValue)}
+      </p>
+    ) : null;
+  const reasoningLevels =
+    provider === "zai" && isZaiMaxReasoningEffortModel(model ?? "")
+      ? (["low", "high", "maximum"] as const)
+      : REASONING_LEVELS;
   const { data: managedDefinitions = [] } = useCustomGenerationParameters();
   const set = <K extends keyof EditableGenerationParameters>(key: K, nextValue: EditableGenerationParameters[K]) => {
     onChange({ ...value, [key]: nextValue });
@@ -256,6 +313,7 @@ export function GenerationParametersFields({
           help={localizeUi("ui.ui.generationparametersfields.controlsRandomnessLowerValuesMakeOutputMoreFocusedAnd")}
           value={value.temperature}
           onChange={(nextValue) => set("temperature", nextValue)}
+          effective={effectiveHint("temperature")}
           sendEnabled={isSendEnabled("temperature")}
           onSendChange={(enabled) => setSend("temperature", enabled)}
           min={0}
@@ -267,6 +325,7 @@ export function GenerationParametersFields({
           help={localizeUi("ui.ui.generationparametersfields.theMaximumNumberOfTokensTheModelCanGenerate")}
           value={value.maxTokens}
           onChange={(nextValue) => set("maxTokens", nextValue)}
+          effective={effectiveHint("maxTokens")}
           sendEnabled={isSendEnabled("maxTokens")}
           onSendChange={(enabled) => setSend("maxTokens", enabled)}
           min={1}
@@ -274,9 +333,12 @@ export function GenerationParametersFields({
         />
         <ParamInput
           label={localizeUi("ui.ui.generationparametersfields.topP")}
-          help={localizeUi("ui.ui.generationparametersfields.nucleusSamplingOnlyConsidersTokensWhoseCumulativeProbabilityReaches")}
+          help={localizeUi(
+            "ui.ui.generationparametersfields.nucleusSamplingOnlyConsidersTokensWhoseCumulativeProbabilityReaches",
+          )}
           value={value.topP}
           onChange={(nextValue) => set("topP", nextValue)}
+          effective={effectiveHint("topP")}
           sendEnabled={isSendEnabled("topP")}
           onSendChange={(enabled) => setSend("topP", enabled)}
           min={0}
@@ -288,6 +350,7 @@ export function GenerationParametersFields({
           help={localizeUi("ui.ui.generationparametersfields.limitsTheModelToOnlyConsiderTheTopK")}
           value={value.topK}
           onChange={(nextValue) => set("topK", nextValue)}
+          effective={effectiveHint("topK")}
           sendEnabled={isSendEnabled("topK")}
           onSendChange={(enabled) => setSend("topK", enabled)}
           min={0}
@@ -301,6 +364,7 @@ export function GenerationParametersFields({
           help={localizeUi("ui.ui.generationparametersfields.penalizesTokensBasedOnHowOftenTheyVeAlready")}
           value={value.frequencyPenalty}
           onChange={(nextValue) => set("frequencyPenalty", nextValue)}
+          effective={effectiveHint("frequencyPenalty")}
           sendEnabled={isSendEnabled("frequencyPenalty")}
           onSendChange={(enabled) => setSend("frequencyPenalty", enabled)}
           min={-2}
@@ -312,6 +376,7 @@ export function GenerationParametersFields({
           help={localizeUi("ui.ui.generationparametersfields.penalizesTokensThatHaveAppearedAtAllRegardlessOf")}
           value={value.presencePenalty}
           onChange={(nextValue) => set("presencePenalty", nextValue)}
+          effective={effectiveHint("presencePenalty")}
           sendEnabled={isSendEnabled("presencePenalty")}
           onSendChange={(enabled) => setSend("presencePenalty", enabled)}
           min={-2}
@@ -341,69 +406,136 @@ export function GenerationParametersFields({
         </div>
       )}
       <div className="space-y-2">
+        <div className="text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+          <span className="inline-flex items-center gap-1">
+            {localizeUi("settings.generation.postProcessing.label")}
+            <HelpTooltip text={localizeUi("settings.generation.postProcessing.help")} size="0.625rem" />
+          </span>
+          <select
+            aria-label={localizeUi("settings.generation.postProcessing.label")}
+            className="mari-chrome-field mt-1 w-full rounded-md px-3 py-2 text-xs"
+            value={value.singleUserMessage ? "single" : value.strictRoleFormatting ? "apply" : "none"}
+            onChange={(event) =>
+              onChange({
+                ...value,
+                strictRoleFormatting: event.target.value === "apply",
+                singleUserMessage: event.target.value === "single",
+              })
+            }
+          >
+            <option value="apply">{localizeUi("settings.generation.postProcessing.apply")}</option>
+            <option value="none">{localizeUi("settings.generation.postProcessing.none")}</option>
+            <option value="single">{localizeUi("settings.generation.postProcessing.single")}</option>
+          </select>
+          {effectiveLine(
+            effectiveParameters?.singleUserMessage?.value ? "singleUserMessage" : "strictRoleFormatting",
+            localizeUi(
+              effectiveParameters?.singleUserMessage?.value
+                ? "settings.generation.postProcessing.single"
+                : effectiveParameters?.strictRoleFormatting?.value
+                  ? "settings.generation.postProcessing.apply"
+                  : "settings.generation.postProcessing.none",
+            ),
+          )}
+        </div>
         <div>
-          <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">{localizeUi("ui.ui.generationparametersfields.assistantPrefill")}<HelpTooltip
+          <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+            {localizeUi("ui.ui.generationparametersfields.assistantPrefill")}
+            <HelpTooltip
               text={localizeUi("ui.ui.generationparametersfields.optionalAssistantRoleTextAppendedAfterTheFinalUser")}
               size="0.625rem"
             />
           </span>
-          <DraftTextarea
+          <DraftMacroTextarea
             value={value.assistantPrefill ?? ""}
             onCommit={(nextValue) => set("assistantPrefill", nextValue)}
             rows={3}
+            title={localizeUi("ui.ui.generationparametersfields.assistantPrefill")}
             className={PARAM_TEXTAREA_CLASS}
             placeholder={localizeUi("ui.ui.generationparametersfields.thinking", {
               value1: "<",
               value2: ">",
             }).trimStart()}
           />
+          {effectiveLine("assistantPrefill")}
+        </div>
+        <div>
+          <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+            {localizeUi("ui.ui.generationparametersfields.assistantReasoningPrefill")}
+            <HelpTooltip
+              text={localizeUi("ui.ui.generationparametersfields.optionalReasoningContentOnTheFinalAssistantMessage")}
+              size="0.625rem"
+            />
+          </span>
+          <DraftMacroTextarea
+            value={value.assistantReasoningPrefill ?? ""}
+            onCommit={(nextValue) => set("assistantReasoningPrefill", nextValue)}
+            rows={3}
+            title={localizeUi("ui.ui.generationparametersfields.assistantReasoningPrefill")}
+            className={PARAM_TEXTAREA_CLASS}
+            placeholder={localizeUi("generationParameters.assistantReasoningPrefill.placeholder")}
+          />
+          {effectiveLine("assistantReasoningPrefill")}
         </div>
         <ThinkingTagsInput
           value={value.customThinkingTags}
           onChange={(nextValue) => set("customThinkingTags", nextValue)}
         />
+        {effectiveLine("customThinkingTags")}
         <CustomParametersInput
           value={value.customParameters}
           onChange={(nextValue) => set("customParameters", nextValue)}
         />
-        {showOpenRouterServiceTier && (
+        {effectiveLine("customParameters")}
+        {showCustomHeaders && (
+          <CustomParametersInput
+            headers
+            value={value.customHeaders ?? {}}
+            onChange={(nextValue) => set("customHeaders", nextValue as Record<string, string>)}
+          />
+        )}
+        {showServiceTier && (
           <div>
-            <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">{localizeUi("ui.ui.generationparametersfields.openrouterServiceTier")}<HelpTooltip
-                text={localizeUi("ui.ui.generationparametersfields.optionalOpenrouterRoutingTierDefaultSendsNoServiceTier")}
-                size="0.625rem"
-              />
+            <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+              {localizeUi("settings.generation.serviceTier.label")}
+              <HelpTooltip text={localizeUi("settings.generation.serviceTier.help")} size="0.625rem" />
             </span>
             <div className="mt-1 flex flex-wrap gap-1.5">
-              {OPENROUTER_SERVICE_TIERS.map((tier) => (
+              {SERVICE_TIERS.map((tier) => (
                 <button
                   key={tier ?? "default"}
                   type="button"
                   onClick={() => set("serviceTier", tier)}
+                  aria-pressed={value.serviceTier === tier}
                   className={cn(
-                    "rounded-lg px-2 py-1 text-[0.625rem] font-medium transition-all",
+                    "rounded-md px-2 py-1 text-[0.625rem] font-medium transition-all",
                     value.serviceTier === tier ? PARAM_CHOICE_ACTIVE_CLASS : PARAM_CHOICE_IDLE_CLASS,
                   )}
                 >
-                  {tier ? tier.charAt(0).toUpperCase() + tier.slice(1) :localizeUi("ui.noodle.noodlehome.default")}
+                  {tier ? tier.charAt(0).toUpperCase() + tier.slice(1) : localizeUi("ui.noodle.noodlehome.default")}
                 </button>
               ))}
             </div>
+            {effectiveLine("serviceTier")}
           </div>
         )}
         <div>
           <ParameterHeader
             label={localizeUi("ui.ui.generationparametersfields.reasoningEffort")}
             help={localizeUi("ui.ui.generationparametersfields.howMuchReasoningWorkTheProviderShouldSpendBefore")}
+            effective={effectiveHint("reasoningEffort")}
             sendEnabled={isSendEnabled("reasoningEffort")}
             onSendChange={(enabled) => setSend("reasoningEffort", enabled)}
           />
           <div className="mt-1 flex flex-wrap gap-1.5">
-            {REASONING_LEVELS.map((level) => (
+            {reasoningLevels.map((level) => (
               <button
                 key={level ?? "none"}
+                type="button"
                 onClick={() => set("reasoningEffort", level)}
+                aria-pressed={value.reasoningEffort === level}
                 className={cn(
-                  "rounded-lg px-2 py-1 text-[0.625rem] font-medium transition-all",
+                  "rounded-md px-2 py-1 text-[0.625rem] font-medium transition-all",
                   value.reasoningEffort === level ? PARAM_CHOICE_ACTIVE_CLASS : PARAM_CHOICE_IDLE_CLASS,
                 )}
               >
@@ -418,6 +550,7 @@ export function GenerationParametersFields({
           <ParameterHeader
             label={localizeUi("ui.ui.generationparametersfields.verbosity")}
             help={localizeUi("ui.ui.generationparametersfields.controlsHowLongAndDetailedResponsesShouldBeLow")}
+            effective={effectiveHint("verbosity")}
             sendEnabled={isSendEnabled("verbosity")}
             onSendChange={(enabled) => setSend("verbosity", enabled)}
           />
@@ -425,19 +558,80 @@ export function GenerationParametersFields({
             {VERBOSITY_LEVELS.map((level) => (
               <button
                 key={level ?? "none"}
+                type="button"
                 onClick={() => set("verbosity", level)}
+                aria-pressed={value.verbosity === level}
                 className={cn(
-                  "rounded-lg px-2 py-1 text-[0.625rem] font-medium transition-all",
+                  "rounded-md px-2 py-1 text-[0.625rem] font-medium transition-all",
                   value.verbosity === level ? PARAM_CHOICE_ACTIVE_CLASS : PARAM_CHOICE_IDLE_CLASS,
                 )}
               >
-                {level ? level.charAt(0).toUpperCase() + level.slice(1) :localizeUi("ui.game.gamesurfacecomponent.none")}
+                {level
+                  ? level.charAt(0).toUpperCase() + level.slice(1)
+                  : localizeUi("ui.game.gamesurfacecomponent.none")}
               </button>
             ))}
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+function DraftMacroTextarea({
+  value,
+  onCommit,
+  onFocus,
+  onBlur,
+  onExpandedClose,
+  ...props
+}: Omit<MacroTextareaProps, "value" | "onChange"> & {
+  value: string;
+  onCommit: (value: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [focused, setFocused] = useState(false);
+  const draftRef = useRef(draft);
+  const valueRef = useRef(value);
+  const onCommitRef = useRef(onCommit);
+  draftRef.current = draft;
+  valueRef.current = value;
+  onCommitRef.current = onCommit;
+
+  useEffect(() => {
+    if (!focused) setDraft(value);
+  }, [focused, value]);
+
+  const commit = () => {
+    if (draftRef.current !== valueRef.current) onCommitRef.current(draftRef.current);
+  };
+
+  useEffect(
+    () => () => {
+      if (draftRef.current !== valueRef.current) onCommitRef.current(draftRef.current);
+    },
+    [],
+  );
+
+  return (
+    <MacroTextarea
+      {...props}
+      value={draft}
+      onChange={setDraft}
+      onFocus={() => {
+        setFocused(true);
+        onFocus?.();
+      }}
+      onBlur={() => {
+        commit();
+        setFocused(false);
+        onBlur?.();
+      }}
+      onExpandedClose={() => {
+        commit();
+        onExpandedClose?.();
+      }}
+    />
   );
 }
 
@@ -474,22 +668,25 @@ function ThinkingTagsInput({
 
   return (
     <div>
-      <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">{localizeUi("ui.ui.thinkingtagsinput.thinkingTags")}<HelpTooltip
+      <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+        {localizeUi("ui.ui.thinkingtagsinput.thinkingTags")}
+        <HelpTooltip
           text={localizeUi("ui.ui.thinkingtagsinput.thinkingMarksTheHiddenReasoningSlotAndWillBe")}
           size="0.625rem"
         />
       </span>
-      <textarea
+      <MacroTextarea
         value={draft}
         onFocus={() => setFocused(true)}
-        onChange={(event) => {
-          setDraft(event.target.value);
+        onChange={(nextValue) => {
+          setDraft(nextValue);
           setError(null);
         }}
         onBlur={() => {
           setFocused(false);
           commit();
         }}
+        onExpandedClose={commit}
         onKeyDown={(event) => {
           if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
             event.currentTarget.blur();
@@ -497,13 +694,22 @@ function ThinkingTagsInput({
         }}
         rows={2}
         spellCheck={false}
+        title={localizeUi("ui.ui.thinkingtagsinput.thinkingTags")}
+        ariaLabel={localizeUi("ui.ui.thinkingtagsinput.thinkingTags")}
         className={PARAM_TEXTAREA_CLASS}
-        placeholder={focused ? "" :localizeUi("ui.ui.thinkingtagsinput.thinkingValue1Thinking", { value1: THINKING_TAG_CONTENT_PLACEHOLDER })}
+        placeholder={
+          focused
+            ? ""
+            : localizeUi("ui.ui.thinkingtagsinput.thinkingValue1Thinking", { value1: THINKING_TAG_CONTENT_PLACEHOLDER })
+        }
       />
       {error ? (
         <p className="mt-1 text-[0.5625rem] text-amber-500">{error}</p>
       ) : (
-        <p className="mt-1 text-[0.5625rem] text-[var(--muted-foreground)]/70">{localizeUi("ui.ui.thinkingtagsinput.oneWrapperPerLine")} {THINKING_TAG_CONTENT_PLACEHOLDER} {localizeUi("ui.ui.thinkingtagsinput.willBeReplacedByAnyContentBetweenTheSpecified")}</p>
+        <p className="mt-1 text-[0.5625rem] text-[var(--muted-foreground)]/70">
+          {localizeUi("ui.ui.thinkingtagsinput.oneWrapperPerLine")} {THINKING_TAG_CONTENT_PLACEHOLDER}{" "}
+          {localizeUi("ui.ui.thinkingtagsinput.willBeReplacedByAnyContentBetweenTheSpecified")}
+        </p>
       )}
     </div>
   );
@@ -544,18 +750,27 @@ function parseThinkingTagsDraft(draft: string): { ok: true; value: ThinkingTagPa
   return { ok: true, value: normalizeThinkingTagPairs(pairs) };
 }
 
-function CustomParametersInput({
+export function CustomParametersInput({
   value,
   onChange,
+  headers = false,
+  help,
+  placeholder,
 }: {
   value: Record<string, unknown>;
   onChange: (next: Record<string, unknown>) => void;
+  headers?: boolean;
+  help?: string;
+  placeholder?: string;
 }) {
   const { t: localizeUi } = useUiTranslation();
   const serialized = stringifyCustomParameters(value);
   const [draft, setDraft] = useState(serialized);
   const [error, setError] = useState<string | null>(null);
   const [focused, setFocused] = useState(false);
+  const label = localizeUi(
+    headers ? "settings.connection.customHeaders.label" : "ui.ui.customparametersinput.customParameters",
+  );
 
   useEffect(() => {
     if (!focused && error === null) {
@@ -569,6 +784,10 @@ function CustomParametersInput({
       setError(parsed.error);
       return;
     }
+    if (headers && !customRequestHeadersSchema.safeParse(parsed.value).success) {
+      setError(localizeUi("settings.connection.customHeaders.invalid"));
+      return;
+    }
     setError(null);
     onChange(parsed.value);
     setDraft(stringifyCustomParameters(parsed.value));
@@ -576,22 +795,32 @@ function CustomParametersInput({
 
   return (
     <div>
-      <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">{localizeUi("ui.ui.customparametersinput.customParameters")}<HelpTooltip
-          text={localizeUi("ui.ui.customparametersinput.optionalRawJsonObjectMergedIntoTheProviderRequest")}
+      <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+        {label}
+        <HelpTooltip
+          text={
+            help ??
+            localizeUi(
+              headers
+                ? "settings.connection.customHeaders.help"
+                : "ui.ui.customparametersinput.optionalRawJsonObjectMergedIntoTheProviderRequest",
+            )
+          }
           size="0.625rem"
         />
       </span>
-      <textarea
+      <MacroTextarea
         value={draft}
         onFocus={() => setFocused(true)}
-        onChange={(event) => {
-          setDraft(event.target.value);
+        onChange={(nextValue) => {
+          setDraft(nextValue);
           setError(null);
         }}
         onBlur={() => {
           setFocused(false);
           commit();
         }}
+        onExpandedClose={commit}
         onKeyDown={(event) => {
           if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
             event.currentTarget.blur();
@@ -599,14 +828,32 @@ function CustomParametersInput({
         }}
         rows={3}
         spellCheck={false}
-        aria-invalid={error ? true : undefined}
+        ariaInvalid={Boolean(error)}
+        title={label}
+        ariaLabel={label}
         className={PARAM_TEXTAREA_CLASS}
-        placeholder={focused ? "" :localizeUi("ui.ui.customparametersinput.reasoningEffortHigh")}
+        placeholder={
+          focused
+            ? ""
+            : (placeholder ??
+              localizeUi(
+                headers
+                  ? "settings.connection.customHeaders.example"
+                  : "ui.ui.customparametersinput.reasoningEffortHigh",
+              ))
+        }
       />
       {error ? (
         <p className="mt-1 text-[0.5625rem] text-amber-500">{error}</p>
       ) : (
-        <p className="mt-1 text-[0.5625rem] text-[var(--muted-foreground)]/70">{localizeUi("ui.ui.customparametersinput.acceptsStringsNumbersBooleansNullArraysAndNestedObjects")}</p>
+        <p className="mt-1 text-[0.5625rem] text-[var(--muted-foreground)]/70">
+          {help ??
+            localizeUi(
+              headers
+                ? "settings.connection.customHeaders.help"
+                : "ui.ui.customparametersinput.acceptsStringsNumbersBooleansNullArraysAndNestedObjects",
+            )}
+        </p>
       )}
     </div>
   );
@@ -627,6 +874,7 @@ function ParamInput({
   max,
   step,
   help,
+  effective,
 }: {
   label: string;
   value: number;
@@ -637,6 +885,7 @@ function ParamInput({
   max?: number;
   step: number;
   help?: string;
+  effective?: string;
 }) {
   const [draft, setDraft] = useState(String(value));
   const [error, setError] = useState<string | null>(null);
@@ -664,7 +913,13 @@ function ParamInput({
 
   return (
     <div>
-      <ParameterHeader label={label} help={help} sendEnabled={sendEnabled} onSendChange={onSendChange} />
+      <ParameterHeader
+        label={label}
+        help={help}
+        effective={effective}
+        sendEnabled={sendEnabled}
+        onSendChange={onSendChange}
+      />
       <input
         type="text"
         inputMode="decimal"
@@ -683,7 +938,7 @@ function ParamInput({
         min={min}
         {...(max === undefined ? {} : { max })}
         step={step}
-        className="mt-0.5 w-full rounded-lg bg-[var(--secondary)] px-2.5 py-1.5 text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
+        className="mari-chrome-field mari-chrome-field--compact mt-0.5 w-full !rounded-md px-2.5 py-1.5 text-xs"
       />
       {error && <p className="mt-1 text-[0.5625rem] text-amber-500">{error}</p>}
     </div>
@@ -693,29 +948,42 @@ function ParamInput({
 function ParameterHeader({
   label,
   help,
+  effective,
   sendEnabled,
   onSendChange,
 }: {
   label: string;
   help?: string;
+  effective?: string;
   sendEnabled: boolean;
   onSendChange: (enabled: boolean) => void;
 }) {
   const { t: localizeUi } = useUiTranslation();
   return (
-    <div className="flex min-w-0 items-center justify-between gap-2">
-      <span className="inline-flex min-w-0 items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">
-        <span className="truncate">{label}</span>
-        {help && <HelpTooltip text={help} size="0.625rem" />}
-      </span>
-      <SettingsSwitch
-        ariaLabel={`Send ${label} parameter`}
-        checked={sendEnabled}
-        onChange={onSendChange}
-        labelPosition="start"
-        className="!gap-0 !rounded-md !p-0 hover:!bg-transparent"
-        title={sendEnabled ?localizeUi("ui.ui.parameterheader.thisParameterIsSentToTheModel") :localizeUi("ui.ui.parameterheader.thisParameterIsNotSentToTheModel")}
-      />
-    </div>
+    <>
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span className="inline-flex min-w-0 items-center gap-1 text-[0.625rem] font-medium text-[var(--muted-foreground)]">
+          <span className="truncate">{label}</span>
+          {help && <HelpTooltip text={help} size="0.625rem" />}
+        </span>
+        <SettingsSwitch
+          ariaLabel={`Send ${label} parameter`}
+          checked={sendEnabled}
+          onChange={onSendChange}
+          labelPosition="start"
+          className="!gap-0 !rounded-md !p-0 hover:!bg-transparent"
+          title={
+            sendEnabled
+              ? localizeUi("ui.ui.parameterheader.thisParameterIsSentToTheModel")
+              : localizeUi("ui.ui.parameterheader.thisParameterIsNotSentToTheModel")
+          }
+        />
+      </div>
+      {effective && (
+        <p className="mt-1 break-words text-[0.625rem] text-[var(--muted-foreground)]" data-effective-parameter={label}>
+          {effective}
+        </p>
+      )}
+    </>
   );
 }

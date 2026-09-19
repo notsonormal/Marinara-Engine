@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { agentResultTypeSchema } from "./agent.schema.js";
 
+/** Caps mirrored by the Marinara-Agents catalog build. Kept here so a hostile or
+ *  broken notes document cannot push an unbounded string into a modal. */
+export const MAX_RELEASE_NOTE_CHARACTERS = 1000;
+export const MAX_RELEASE_NOTE_VERSIONS = 20;
+
 export const capabilityPackageKindSchema = z.enum(["agent", "maps", "conversation-calls", "turn-game"]);
 export const capabilityPermissionSchema = z.enum([
   "agent-runtime",
@@ -67,12 +72,40 @@ const capabilityPackageManifestBaseSchema = z
               "home-browser-tab",
               // Mounts the package's own game UI over the narration.
               "game-surface",
+              // Compact package-owned tracker controls in Roleplay chat chrome.
+              "roleplay-tracker",
+              // Package-owned content inside the detached or docked Tracker Panel.
+              "tracker-panel",
             ]),
           )
           .optional(),
         /** Options for the `game-surface` slot. */
         gameSurface: z
           .object({
+            /** Mount before the first GM turn and wait for setStartupReady on the surface props. */
+            prepareBeforeStart: z.boolean().optional(),
+            /** Engine-owned setup: one optional seed and package-owned constant defaults. */
+            setup: z
+              .object({
+                seed: z
+                  .object({
+                    key: z
+                      .string()
+                      .regex(/^[a-zA-Z][a-zA-Z0-9_]*$/)
+                      .max(120)
+                      .refine((key) => !["__proto__", "constructor", "prototype"].includes(key)),
+                    label: z.string().min(1).max(100).optional(),
+                  })
+                  .strict()
+                  .optional(),
+                config: z
+                  .record(z.string().max(120), z.unknown())
+                  .refine((value) => JSON.stringify(value).length <= 8_000)
+                  .optional(),
+                requires: z.object({ enableCustomWidgets: z.boolean().optional() }).strict().optional(),
+              })
+              .strict()
+              .optional(),
             /** Class the host puts on the game area while this surface is mounted, so the package can
              *  restyle the shared chrome that renders outside its element. Declared rather than pushed at
              *  runtime, so the theme applies on first paint. */
@@ -101,6 +134,28 @@ const capabilityPackageManifestBaseSchema = z
               .min(1)
               .max(2)
               .optional(),
+          })
+          .strict()
+          .optional(),
+        /** General package-owned static assets (art, sprite atlases, tilemap JSON) served over
+         *  `/api/capability-packages/:id/assets/*` through the same verification chain as
+         *  browser-tab icons: path containment, `files[]` membership, a passive content-type
+         *  allowlist, and hash re-verification on every read. Requires Capability API 1.10. */
+        assets: z
+          .object({
+            paths: z
+              .array(
+                z
+                  .string()
+                  .min(1)
+                  .max(240)
+                  // Passive content only — images plus JSON metadata. Never SVG, HTML, or
+                  // scripts: those are active documents on a same-origin route.
+                  .regex(/\.(?:gif|jpe?g|png|webp|json)$/iu),
+              )
+              .min(1)
+              // Bounded so a manifest cannot enumerate an arbitrarily large tree.
+              .max(256),
           })
           .strict()
           .optional(),
@@ -149,7 +204,26 @@ const capabilityPackageManifestBaseSchema = z
   })
   .strict();
 
-export const supportedCapabilityApi = Object.freeze({ major: 1, minor: 9 } as const);
+// 1.10: contributions.assets — general package-owned static asset delivery.
+// 1.11: Experience combat seam — combatActive/combatStyle/requestCombat on the
+//        game-surface capabilityProps.
+// 1.12: spatial transition commit/reject/refresh capability events are also
+//        addressed to the game-owning Experience package (soft seam: delivered
+//        regardless of declared capabilityApi; declare 1.12 only to REQUIRE it).
+// 1.13: setExperienceChrome accepts requestsCollapsedNarration — a transient request
+//        to fold the Game narration box down to its handle for a cutscene beat. It
+//        never writes the player's stored preference and the engine's safety rules
+//        still force the box open when it holds something to act on.
+// 1.14: roleplay-tracker and tracker-panel UI contribution slots, package-aware
+//        prompt placement, and package-agent post-processing lifecycle hooks.
+// 1.15: packages can resolve their current embedding connection without reactivation.
+// 1.16: package-declared Game Master verbs — a hash-pinned `gm-verbs.json` asset the engine renders
+//        into the GM prompt, parses back out of the turn, and either writes into the package's own
+//        chat-metadata key or delivers live as a `gm_verb` event (soft seam: read from the asset
+//        regardless of declared capabilityApi; declare 1.16 only to REQUIRE it. Needs `chat-write`).
+// 1.17: opted-in Experience surfaces prepare before startup and supply first-turn world context.
+// 1.18: Experience seed/default declarations in the Engine setup wizard.
+export const supportedCapabilityApi = Object.freeze({ major: 1, minor: 18 } as const);
 
 const capabilityApiVersionSchema = z
   .object({
@@ -182,6 +256,41 @@ export const capabilityPackageManifestV2Schema = capabilityPackageManifestBaseSc
 export const capabilityPackageManifestSchema = z
   .discriminatedUnion("schemaVersion", [capabilityPackageManifestV1Schema, capabilityPackageManifestV2Schema])
   .superRefine((manifest, ctx) => {
+    const setup = manifest.contributions?.gameSurface?.setup;
+    if (setup) {
+      const api = manifest.schemaVersion === 2 ? manifest.capabilityApi : null;
+      if (!api || api.major !== 1 || api.minor < 18 || !manifest.contributions?.slots?.includes("game-surface")) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["contributions", "gameSurface", "setup"],
+          message: "Experience setup requires the game-surface slot, schemaVersion 2 and capabilityApi 1.18 or newer",
+        });
+      }
+      if (setup.seed && Object.hasOwn(setup.config ?? {}, setup.seed.key)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["contributions", "gameSurface", "setup", "config"],
+          message: "Experience config cannot override the declared seed key",
+        });
+      }
+    }
+    if (manifest.contributions?.gameSurface?.prepareBeforeStart) {
+      const api = manifest.schemaVersion === 2 ? manifest.capabilityApi : null;
+      if (!api || api.major < 1 || (api.major === 1 && api.minor < 17)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["contributions", "gameSurface", "prepareBeforeStart"],
+          message: "prepareBeforeStart requires schemaVersion 2 and capabilityApi 1.17 or newer",
+        });
+      }
+      if (!manifest.contributions.slots?.includes("game-surface")) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["contributions", "gameSurface", "prepareBeforeStart"],
+          message: 'prepareBeforeStart requires the "game-surface" slot',
+        });
+      }
+    }
     // A game-surface package draws the whole mode from its client bundle: without a client entrypoint the
     // module loader skips it, so it would be offered in the setup wizard and then render nothing. Caught
     // here so it fails at install with a clear reason rather than as an empty screen later.
@@ -207,14 +316,44 @@ export const capabilityPackageManifestSchema = z
           message: 'A package declaring the "home-browser-tab" slot must describe its browser tab',
         });
       }
-      for (const [index, iconPath] of (manifest.contributions.homeBrowserTab?.iconPaths ?? []).entries()) {
-        if (!manifest.files.some((file) => file.path === iconPath)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ["contributions", "homeBrowserTab", "iconPaths", index],
-            message: "A Home browser tab icon must be declared in the package file manifest",
-          });
-        }
+    }
+    // Icon paths feed the same serve-path allowlist as general assets, so they
+    // must be hash-pinned in files[] whether or not the home-browser-tab slot is
+    // declared — an unpinned (or traversal-shaped) icon path would otherwise
+    // reach the resolver unvalidated (review finding on #5091).
+    for (const [index, iconPath] of (manifest.contributions?.homeBrowserTab?.iconPaths ?? []).entries()) {
+      if (!manifest.files.some((file) => file.path === iconPath)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["contributions", "homeBrowserTab", "iconPaths", index],
+          message: "A Home browser tab icon must be declared in the package file manifest",
+        });
+      }
+    }
+    // Every declared asset must be hash-pinned in files[] — the serve path refuses
+    // undeclared files, so an unlisted path would install fine and then 404 at
+    // runtime. Caught here so it fails at install with a clear reason instead.
+    for (const [index, assetPath] of (manifest.contributions?.assets?.paths ?? []).entries()) {
+      if (!manifest.files.some((file) => file.path === assetPath)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["contributions", "assets", "paths", index],
+          message: "A declared package asset must be listed in the package file manifest",
+        });
+      }
+    }
+    // contributions.assets is a Capability API 1.10 feature. Gated here so a
+    // package author gets the versioned message at build/install time instead of
+    // a cryptic unrecognized-key error when an older Engine rejects the manifest.
+    if (manifest.contributions?.assets) {
+      const api = manifest.schemaVersion === 2 ? manifest.capabilityApi : null;
+      const declares110 = api !== null && (api.major > 1 || (api.major === 1 && api.minor >= 10));
+      if (!declares110) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["contributions", "assets"],
+          message: "contributions.assets requires schemaVersion 2 and capabilityApi 1.10 or newer",
+        });
       }
     }
   });
@@ -254,6 +393,50 @@ export const capabilityCatalogSchema = z
   })
   .strict();
 
+/** Envelope-only catalog shape, derived from the real schema so the two cannot
+ *  drift: entries stay unparsed so one package from a NEWER Engine (declaring a
+ *  manifest key this Engine's strict schemas do not know yet) cannot fail the
+ *  whole document, and `.strip()` (not strict, not passthrough) so newer
+ *  TOP-LEVEL fields neither reject the envelope nor leak into the result. */
+const capabilityCatalogEnvelopeSchema = capabilityCatalogSchema.extend({ packages: z.array(z.unknown()) }).strip();
+
+export type CapabilityCatalogParseResult = {
+  catalog: z.infer<typeof capabilityCatalogSchema>;
+  /** Entries this Engine could not understand (newer manifest features). They
+   *  are dropped from the catalog rather than failing it — the polite
+   *  "requires capability API x.y" path only exists for entries that parse.
+   *  Identified best-effort by manifest id so operators can name what vanished. */
+  droppedEntries: number;
+  droppedIds: string[];
+};
+
+function bestEffortCatalogEntryId(entry: unknown): string {
+  if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+    const manifest = (entry as Record<string, unknown>).manifest;
+    if (manifest && typeof manifest === "object" && !Array.isArray(manifest)) {
+      const id = (manifest as Record<string, unknown>).id;
+      if (typeof id === "string" && id) return id;
+    }
+  }
+  return "(unidentifiable entry)";
+}
+
+/** Parse a downloaded catalog, tolerating individual entries this Engine is too
+ *  old to understand. All-or-nothing parsing would brick the ENTIRE Agents
+ *  browser (and every install/update path) the moment the official catalog
+ *  publishes one package using a newer manifest field (#5091 review finding). */
+export function parseCapabilityCatalogWithCompat(input: unknown): CapabilityCatalogParseResult {
+  const envelope = capabilityCatalogEnvelopeSchema.parse(input);
+  const packages: z.infer<typeof capabilityCatalogPackageSchema>[] = [];
+  const droppedIds: string[] = [];
+  for (const entry of envelope.packages) {
+    const parsed = capabilityCatalogPackageSchema.safeParse(entry);
+    if (parsed.success) packages.push(parsed.data);
+    else droppedIds.push(bestEffortCatalogEntryId(entry));
+  }
+  return { catalog: { ...envelope, packages }, droppedEntries: droppedIds.length, droppedIds };
+}
+
 export const capabilityPackageReadinessSchema = z.enum(["pending", "registered", "ready", "error"]);
 
 export const installedCapabilityPackageSchema = z.object({
@@ -267,6 +450,7 @@ export const installedCapabilityPackageSchema = z.object({
   readinessError: z.string().nullable().default(null),
   legacy: z.boolean().default(false),
   previousVersion: z.string().optional(),
+  previousManifest: capabilityPackageManifestSchema.optional(),
 });
 
 export const installedCapabilityRegistrySchema = z
@@ -329,6 +513,20 @@ export const packagedAgentDefinitionsSchema = z.array(packagedAgentDefinitionSch
 export type CapabilityPackageManifest = z.infer<typeof capabilityPackageManifestSchema>;
 export type CapabilityCatalogPackage = z.infer<typeof capabilityCatalogPackageSchema>;
 export type CapabilityCatalog = z.infer<typeof capabilityCatalogSchema>;
+
+/** A catalog entry after the Engine has stamped where it came from.
+ *
+ *  `preview` marks an entry the Engine itself read from the staging preview
+ *  overlay. It is deliberately NOT part of the downloaded-entry schema above:
+ *  that schema is the contract for bytes we fetched, and accepting `preview`
+ *  there would let any published or custom catalog claim preview provenance for
+ *  its own entries. The Engine assigns it from the source URL and nowhere else,
+ *  so a value arriving on the wire is rejected by the strict entry schema and
+ *  can never reach a consumer. */
+export type StampedCapabilityCatalogPackage = CapabilityCatalogPackage & { preview?: true };
+export type StampedCapabilityCatalog = Omit<CapabilityCatalog, "packages"> & {
+  packages: StampedCapabilityCatalogPackage[];
+};
 export type InstalledCapabilityPackage = z.infer<typeof installedCapabilityPackageSchema>;
 export type PackagedAgentDefinition = z.infer<typeof packagedAgentDefinitionSchema>;
 
@@ -339,7 +537,86 @@ export interface CapabilityPackageUpdate {
   version: string;
   artifactSha256: string;
   restartRequired: boolean;
+  /** Release notes published for `version`, when the catalog ships a notes sidecar. */
+  releaseNotes?: string;
+  /** Whether the publisher marked `version` as a change the user will notice. */
+  releaseHighlight?: boolean;
 }
+
+/** Release notes live in a sidecar document next to catalog.json, never inside a
+ *  catalog entry or a package manifest.
+ *
+ *  `capabilityCatalogPackageSchema` is strict and `parseCapabilityCatalogWithCompat`
+ *  DROPS entries carrying keys it does not know. A new key on a catalog entry would
+ *  therefore empty the Agents browser on every already-shipped Engine that predates
+ *  it, not just hide the notes. A sibling document those Engines never fetch has no
+ *  such blast radius: an Engine without this feature simply never asks for it, and an
+ *  Engine with it treats a missing document as "no notes". */
+const capabilityPackageVersionNoteSchema = z
+  .object({
+    // Stricter than the manifest's version field, and deliberately so. Ordering
+    // here runs through compareCapabilityPackageVersions, which turns each
+    // component and each numeric prerelease identifier into a Number. That makes
+    // two preconditions load-bearing, and neither is checked there:
+    //   * every numeric part must stay inside the safe integer range, or two
+    //     different versions compare equal and newest-first quietly stops holding;
+    //   * numeric prerelease identifiers must be canonical, or "01" and "1"
+    //     compare as different versions while meaning the same one.
+    // Leading zeros matter for the same reason: 01.2.3 and 1.2.3 compare equal
+    // numerically but differ as strings, so the duplicate check and the lookup in
+    // attachCapabilityReleaseNotes would disagree with the ordering — two notes
+    // for one version, or a note that never attaches because the catalog spells
+    // the version differently.
+    // Nine digits is far beyond any real version, and this is canonical SemVer
+    // otherwise.
+    version: z
+      .string()
+      .max(64)
+      .regex(
+        /^(?:0|[1-9]\d{0,8})\.(?:0|[1-9]\d{0,8})\.(?:0|[1-9]\d{0,8})(?:-(?:0|[1-9]\d{0,8}|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d{0,8}|\d*[A-Za-z-][0-9A-Za-z-]*))*)?$/,
+      ),
+    // Round-tripped, not just shape-matched: a plain regex accepts 2026-02-30,
+    // which would reach the UI as a date that does not exist.
+    date: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .refine((value) => new Date(`${value}T00:00:00.000Z`).toISOString().startsWith(value), {
+        message: "must be a real calendar date",
+      }),
+    /** Plain text. Rendered verbatim and never as markdown or HTML: the catalog URL
+     *  is operator-configurable, so this is untrusted remote content. */
+    notes: z.string().min(1).max(MAX_RELEASE_NOTE_CHARACTERS),
+    /** Published by the catalog build, never recomputed here. */
+    highlight: z.boolean().default(false),
+  })
+  .strict();
+
+export const capabilityReleaseNotesSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    packages: z.record(
+      z
+        .string()
+        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
+        .max(80),
+      z
+        .object({
+          versions: z
+            .array(capabilityPackageVersionNoteSchema)
+            .max(MAX_RELEASE_NOTE_VERSIONS)
+            // A repeated version would make the two readers disagree: the update
+            // prompt takes the first match, the history sheet shows every one.
+            .refine((versions) => new Set(versions.map((note) => note.version)).size === versions.length, {
+              message: "must not list the same version twice",
+            }),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+
+export type CapabilityPackageVersionNote = z.infer<typeof capabilityPackageVersionNoteSchema>;
+export type CapabilityReleaseNotes = z.infer<typeof capabilityReleaseNotesSchema>;
 
 export interface CustomAgentRepository {
   id: string;

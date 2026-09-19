@@ -8,7 +8,7 @@ import { resolveStoredChatOptions } from "../generation/generation-parameters.js
 
 type ConnectionsStorage = ReturnType<typeof createConnectionsStorage>;
 type ConnectionWithKey = NonNullable<Awaited<ReturnType<ConnectionsStorage["getWithKey"]>>>;
-type SummaryConnectionSource = "summary" | "agent-default" | "chat";
+type SummaryConnectionSource = "summary" | "agent-default" | "default" | "chat";
 
 type SummaryConnectionCandidate = {
   id: string;
@@ -81,6 +81,7 @@ async function loadSummaryConnection(
 
 export async function resolveChatSummaryConnection(args: {
   chatConnectionId?: string | null;
+  defaultConnectionId?: string | null;
   chatMetadata: Record<string, unknown>;
   connections: ConnectionsStorage;
   resolveBaseUrl: (connection: Pick<ConnectionWithKey, "baseUrl" | "provider">) => string;
@@ -103,6 +104,10 @@ export async function resolveChatSummaryConnection(args: {
   pushUniqueCandidate(
     candidates,
     defaultAgentConnection?.id ? { id: defaultAgentConnection.id, source: "agent-default" } : null,
+  );
+  pushUniqueCandidate(
+    candidates,
+    args.defaultConnectionId ? { id: args.defaultConnectionId, source: "default" } : null,
   );
   pushUniqueCandidate(candidates, args.chatConnectionId ? { id: args.chatConnectionId, source: "chat" } : null);
 
@@ -139,8 +144,7 @@ export async function resolveChatSummaryConnection(args: {
       continue;
     }
     const storedOptions = resolveStoredChatOptions(conn.defaultParameters, conn.provider, conn.model);
-    const temperature =
-      storedOptions.enabledParameters?.temperature === false ? undefined : storedOptions.temperature;
+    const temperature = storedOptions.enabledParameters?.temperature === false ? undefined : storedOptions.temperature;
 
     return {
       ok: true,

@@ -35,6 +35,7 @@ import {
   sceneAnalysisRequestSchema,
   scoreAmbient,
   scoreMusic,
+  musicAreaSlug,
   type GameActiveState,
   type SidecarDownloadProgress,
   type SidecarQuantization,
@@ -42,6 +43,7 @@ import {
 } from "@marinara-engine/shared";
 import { isSidecarRuntimeInstallEnabled } from "../config/runtime-config.js";
 import { isAdminAuthorized, requirePrivilegedAccess } from "../middleware/privileged-gate.js";
+import { registerSequentialGameTasks } from "../services/game/sequential-tasks.js";
 
 const quantizationSchema = z.enum(["q8_0", "q4_k_m"]);
 const speechModelIdSchema = z.enum(
@@ -88,6 +90,7 @@ async function requireConversationCallsForSpeech(reply: FastifyReply): Promise<b
 }
 
 export const sidecarRoutes: FastifyPluginAsync = async (app) => {
+  registerSequentialGameTasks(app, ["/analyze-scene"]);
   app.get("/status", async () => {
     void sidecarProcessService
       .syncForCurrentConfig({ suppressKnownFailure: true, allowRuntimeInstall: false })
@@ -111,6 +114,7 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
 
   const configSchema = z.object({
     useForTrackers: z.boolean().optional(),
+    useAsAgentsDefault: z.boolean().optional(),
     useForGameScene: z.boolean().optional(),
     contextSize: z.number().int().min(512).optional(),
     maxTokens: z.number().int().min(64).optional(),
@@ -379,7 +383,9 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
   }>("/download", async (req, reply) => {
     if (!requirePrivilegedAccess(req, reply, { feature: "Sidecar model download" })) return;
     if (isInferenceBusy()) {
-      return reply.status(409).send({ error: "Cannot download or switch sidecar models while inference is in progress" });
+      return reply
+        .status(409)
+        .send({ error: "Cannot download or switch sidecar models while inference is in progress" });
     }
     const { quantization } = z.object({ quantization: quantizationSchema }).parse(req.body);
     await handleDownloadSse(reply, async () => {
@@ -394,7 +400,9 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
   }>("/download/custom", async (req, reply) => {
     if (!requirePrivilegedAccess(req, reply, { feature: "Sidecar custom model download" })) return;
     if (isInferenceBusy()) {
-      return reply.status(409).send({ error: "Cannot download or switch sidecar models while inference is in progress" });
+      return reply
+        .status(409)
+        .send({ error: "Cannot download or switch sidecar models while inference is in progress" });
     }
     const body = z
       .object({
@@ -481,7 +489,11 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
         debugLog("[debug/game/scene-analysis:sidecar] user prompt:\n%s", userPrompt);
       }
 
-      const raw = await analyzeScene(systemPrompt, userPrompt, createResponseAbortSignal(reply, "Sidecar scene analysis"));
+      const raw = await analyzeScene(
+        systemPrompt,
+        userPrompt,
+        createResponseAbortSignal(reply, "Sidecar scene analysis"),
+      );
       if (debugLogsEnabled) {
         debugLog("[debug/game/scene-analysis:sidecar] parsed model response:\n%s", JSON.stringify(raw, null, 2));
       }
@@ -516,13 +528,18 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
 
       if (body.context.useSpotifyMusic) {
         result.music = null;
-      } else if (!body.context.generateMusic) {
+      } else {
+        // Scoring runs even with music generation enabled (#5161): generated
+        // context tracks are ordinary scoreable library entries now, and the
+        // analyzer no longer writes free-text music prompts.
         const scoredMusic = scoreMusic({
           state: (body.context.currentState as GameActiveState) ?? "exploration",
           weather: result.weather ?? body.context.currentWeather ?? null,
           timeOfDay: result.timeOfDay ?? body.context.currentTimeOfDay ?? null,
           musicGenre: result.musicGenre,
           musicIntensity: result.musicIntensity,
+          locationSlug: musicAreaSlug(body.context.currentLocation),
+          enemyTier: body.context.enemyTier,
           currentMusic: body.context.currentMusic ?? null,
           recentMusic: body.context.recentMusic ?? null,
           availableMusic: musicTags,

@@ -9,7 +9,12 @@ import {
   isProviderLocalUrlsEnabled,
 } from "../../config/runtime-config.js";
 import { requestHeadersWithIdentityEncoding, safeFetch, type SafeFetchOptions } from "../../utils/security.js";
-import type { GenerationParameterSendKey, GenerationParameterSendMap } from "@marinara-engine/shared";
+import {
+  estimateTextTokens,
+  sliceTextToTokenBudget,
+  type GenerationParameterSendKey,
+  type GenerationParameterSendMap,
+} from "@marinara-engine/shared";
 
 /**
  * Shared undici Agent settings. The headers timeout (time to first byte) follows
@@ -49,9 +54,7 @@ export function llmFetch(
     maxResponseBytes: 50 * 1024 * 1024,
     agentOptions:
       init?.agentOptions ??
-      (requestTimeoutMs
-        ? { bodyTimeout: requestTimeoutMs, headersTimeout: requestTimeoutMs }
-        : llmAgentOptions()),
+      (requestTimeoutMs ? { bodyTimeout: requestTimeoutMs, headersTimeout: requestTimeoutMs } : llmAgentOptions()),
     bufferResponse,
     decodeCompressedResponse: init?.decodeCompressedResponse ?? bufferResponse,
   });
@@ -59,6 +62,70 @@ export function llmFetch(
 
 export function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * Structured HTTP failure from a provider call. Plain `Error`s only carry the status in their
+ * message text, so a 429 is not distinguishable from any other failure without regexing strings.
+ * Providers throw this on `!response.ok` so retry/throttle logic above them can detect a rate
+ * limit and honour `Retry-After`.
+ */
+export class LLMHttpError extends Error {
+  readonly status: number;
+  readonly retryAfterMs?: number;
+  constructor(message: string, options: { status: number; retryAfterMs?: number }) {
+    super(message);
+    this.name = "LLMHttpError";
+    this.status = options.status;
+    this.retryAfterMs = options.retryAfterMs;
+  }
+}
+
+/**
+ * Parse an HTTP `Retry-After` header into milliseconds. Accepts either a delta-seconds integer
+ * (`"12"`) or an HTTP date (`"Wed, 21 Oct 2026 07:28:00 GMT"`). Returns undefined when absent or
+ * unparseable so callers fall back to their own backoff.
+ */
+export function parseRetryAfterMs(headerValue: string | null | undefined): number | undefined {
+  if (!headerValue) return undefined;
+  const trimmed = headerValue.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const seconds = Number.parseInt(trimmed, 10);
+    return Number.isFinite(seconds) ? seconds * 1000 : undefined;
+  }
+  const dateMs = Date.parse(trimmed);
+  if (Number.isNaN(dateMs)) return undefined;
+  const deltaMs = dateMs - Date.now();
+  return deltaMs > 0 ? deltaMs : 0;
+}
+
+/** Read the status + Retry-After off a Response and build a typed rate-limit-aware error. */
+export function llmHttpErrorFromResponse(message: string, response: Response): LLMHttpError {
+  return new LLMHttpError(message, {
+    status: response.status,
+    retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")),
+  });
+}
+
+/** Accept either an OpenAI-compatible API base URL or its full embeddings endpoint. */
+export function resolveEmbeddingEndpointUrl(baseUrl: string): string {
+  const endpoint = new URL(baseUrl.trim());
+  const pathname = endpoint.pathname.replace(/\/+$/u, "");
+  endpoint.pathname = /\/embeddings$/iu.test(pathname) ? pathname : `${pathname}/embeddings`;
+  return endpoint.toString();
+}
+
+/**
+ * True when an error is a provider rate-limit / transient-overload the caller should pause and
+ * retry rather than surface: HTTP 429 (rate limited) or 529 (Anthropic "overloaded").
+ */
+export function isRateLimitError(error: unknown): error is LLMHttpError {
+  if (!(error instanceof LLMHttpError)) return false;
+  // 429 (rate limited) and 529 (Anthropic "overloaded") are always retryable. Some gateways signal
+  // intentional throttling with 503 plus a Retry-After; treat that as retryable too, but let a bare
+  // 503 (likely a real outage, not throttling) propagate.
+  if (error.status === 429 || error.status === 529) return true;
+  return error.status === 503 && typeof error.retryAfterMs === "number";
 }
 
 export interface ChatMessage {
@@ -115,6 +182,8 @@ export interface ChatOptions {
   maxTokens?: number;
   /** Total context window limit for prompt + completion tokens. */
   maxContext?: number;
+  /** Managed context must fail visibly instead of silently trimming scene history or instructions. */
+  preserveContext?: boolean;
   topP?: number;
   topK?: number;
   minP?: number;
@@ -156,6 +225,12 @@ export interface ChatOptions {
   serviceTier?: "flex" | "priority" | null;
   /** Abort signal — when triggered, the in-flight LLM request should be cancelled. */
   signal?: AbortSignal;
+  /**
+   * Invoked when a rate-limit-aware retry pauses before re-attempting the request (proxy 429 /
+   * per-connection throttle). Callers (e.g. Professor Mari) use this to surface a "paused,
+   * resuming in Ns" indicator instead of appearing to hang.
+   */
+  onRateLimitPause?: (info: { attempt: number; delayMs: number; reason: "rate_limit" | "throttle" }) => void;
   /** Callback to receive the full response parts (for providers that return structured metadata like Gemini thought signatures) */
   onResponseParts?: (parts: unknown[]) => void;
   /** OpenRouter: preferred provider for model routing */
@@ -223,9 +298,11 @@ export interface ContextFitResult {
   trimmed: boolean;
 }
 
-type ContextFitOptions = Pick<ChatOptions, "maxContext" | "maxTokens" | "tools" | "suppressModelParameters">;
+type ContextFitOptions = Pick<
+  ChatOptions,
+  "maxContext" | "maxTokens" | "tools" | "responseFormat" | "suppressModelParameters" | "preserveContext"
+>;
 
-const CHARS_PER_TOKEN = 4;
 const MESSAGE_OVERHEAD_TOKENS = 6;
 const IMAGE_TOKEN_ESTIMATE = 256;
 const MIN_FILE_TOKEN_ESTIMATE = 1_500;
@@ -234,7 +311,6 @@ const CONTEXT_SAFETY_MARGIN_RATIO = 0.02;
 const MIN_INPUT_BUDGET_TOKENS = 128;
 const MIN_OUTPUT_BUDGET_TOKENS = 128;
 const OUTPUT_BUDGET_REDUCTION_HEADROOM_TOKENS = 64;
-const MIN_CONTENT_CHARS = 48;
 const TRUNCATION_MARKER = "\n\n[Truncated to fit context window]";
 
 function normalizePositiveInteger(value: unknown): number | undefined {
@@ -258,9 +334,7 @@ function minDefined(...values: Array<number | undefined>): number | undefined {
   return result;
 }
 
-function estimateTextTokens(text: string): number {
-  return Math.ceil(Array.from(text).length / CHARS_PER_TOKEN);
-}
+export { estimateTextTokens };
 
 function estimateStructuredTokens(value: unknown): number {
   try {
@@ -297,13 +371,34 @@ function estimateMessageTokens(message: ChatMessage): number {
     total += message.media.reduce((sum, media) => sum + estimateFileTokens({ data: media.data }), 0);
   }
   if (message.providerMetadata) {
-    total += Math.min(estimateStructuredTokens(message.providerMetadata), 512);
+    const { reasoning_content, reasoning, reasoning_details, geminiParts, encryptedReasoning, ...opaqueMetadata } =
+      message.providerMetadata;
+    if (typeof reasoning_content === "string") total += estimateTextTokens(reasoning_content);
+    if (typeof reasoning === "string") total += estimateTextTokens(reasoning);
+    // Conservatively estimate serialized replay payloads, not their decrypted reasoning-token usage.
+    if (reasoning_details !== undefined) total += estimateStructuredTokens(reasoning_details);
+    if (geminiParts !== undefined) total += estimateStructuredTokens(geminiParts);
+    if (encryptedReasoning !== undefined) total += estimateStructuredTokens(encryptedReasoning);
+    total += Math.min(estimateStructuredTokens(opaqueMetadata), 512);
   }
   return total;
 }
 
-function estimateMessagesTokens(messages: ChatMessage[]): number {
+export function estimateMessagesTokens(messages: ChatMessage[]): number {
   return messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+}
+
+/** Same estimator and reserves as provider fitting, without mutating the request or reducing the reply. */
+export function measureContextBudget(messages: ChatMessage[], options: ContextFitOptions & { maxContext: number }) {
+  const maxContext = normalizePositiveInteger(options.maxContext) ?? 1;
+  const reservedTokens =
+    contextSafetyMargin(maxContext) +
+    estimateToolDefinitionTokens(options.tools) +
+    (options.responseFormat ? estimateStructuredTokens(options.responseFormat) : 0);
+  const maxTokens = normalizePositiveInteger(options.maxTokens) ?? 0;
+  const inputBudget = Math.max(0, maxContext - reservedTokens - maxTokens);
+  const estimatedTokens = estimateMessagesTokens(messages);
+  return { maxContext, reservedTokens, maxTokens, inputBudget, estimatedTokens, fits: estimatedTokens <= inputBudget };
 }
 
 function cloneMessages(messages: ChatMessage[]): ChatMessage[] {
@@ -320,23 +415,13 @@ function cloneMessages(messages: ChatMessage[]): ChatMessage[] {
 }
 
 function truncateContent(content: string, targetTokens: number, preserveStartOnly: boolean): string {
-  const targetChars = Math.max(MIN_CONTENT_CHARS, Math.floor(targetTokens * CHARS_PER_TOKEN));
-  if (Array.from(content).length <= targetChars) return content;
-
-  if (targetChars <= TRUNCATION_MARKER.length + MIN_CONTENT_CHARS) {
-    return Array.from(content).slice(0, targetChars).join("");
-  }
-
-  const availableChars = targetChars - TRUNCATION_MARKER.length;
-  const chars = Array.from(content);
-
-  if (preserveStartOnly) {
-    return chars.slice(0, availableChars).join("") + TRUNCATION_MARKER;
-  }
-
-  const headChars = Math.ceil(availableChars * 0.65);
-  const tailChars = Math.floor(availableChars * 0.35);
-  return chars.slice(0, headChars).join("") + TRUNCATION_MARKER + chars.slice(-tailChars).join("");
+  if (estimateTextTokens(content) <= targetTokens) return content;
+  const availableTokens = Math.floor(targetTokens) - estimateTextTokens(TRUNCATION_MARKER);
+  if (availableTokens <= 0) return sliceTextToTokenBudget(content, targetTokens);
+  if (preserveStartOnly) return sliceTextToTokenBudget(content, availableTokens) + TRUNCATION_MARKER;
+  const head = sliceTextToTokenBudget(content, Math.ceil(availableTokens * 0.65));
+  const tail = sliceTextToTokenBudget(content, availableTokens - estimateTextTokens(head), true);
+  return head + TRUNCATION_MARKER + tail;
 }
 
 function findOldestRemovableConversationBlock(
@@ -403,20 +488,41 @@ export function fitMessagesToContext(
     normalizePositiveInteger(defaultMaxContext),
   );
   const estimatedTokensBefore = estimateMessagesTokens(messages);
-  const toolTokens = estimateToolDefinitionTokens(options.tools);
+  const definitionTokens =
+    estimateToolDefinitionTokens(options.tools) +
+    (options.responseFormat ? estimateStructuredTokens(options.responseFormat) : 0);
 
-  if (!maxContext) {
+  if (maxContext && options.preserveContext) {
+    const budget = measureContextBudget(messages, { ...options, maxContext });
+    if (!budget.fits) {
+      throw new Error(
+        "Advanced Memory: the complete request exceeds the context cap. Reduce fixed prompt content, attachments or the reply reserve, or increase the cap.",
+      );
+    }
     return {
       messages,
+      maxContext,
       maxTokens: requestedMaxTokens,
-      reservedTokens: toolTokens,
+      inputBudget: budget.inputBudget,
+      reservedTokens: budget.reservedTokens,
       estimatedTokensBefore,
       estimatedTokensAfter: estimatedTokensBefore,
       trimmed: false,
     };
   }
 
-  const reservedTokens = contextSafetyMargin(maxContext) + toolTokens;
+  if (!maxContext) {
+    return {
+      messages,
+      maxTokens: requestedMaxTokens,
+      reservedTokens: definitionTokens,
+      estimatedTokensBefore,
+      estimatedTokensAfter: estimatedTokensBefore,
+      trimmed: false,
+    };
+  }
+
+  const reservedTokens = contextSafetyMargin(maxContext) + definitionTokens;
   const usableWindow = Math.max(1, maxContext - reservedTokens);
   const reservedInputFloor = Math.min(MIN_INPUT_BUDGET_TOKENS, Math.max(0, usableWindow - 1));
   let maxTokens =
@@ -613,6 +719,13 @@ export function sanitizeApiError(raw: string, maxLen = 300): string {
  * Every provider must implement the `chat` method as an async generator.
  */
 export abstract class BaseLLMProvider {
+  protected customRequestHeaders: Record<string, string> = {};
+
+  /** Bind validated connection options without exposing credentials through the facade. */
+  public setCustomRequestHeaders(headers: Record<string, string>): void {
+    this.customRequestHeaders = { ...headers };
+  }
+
   constructor(
     protected baseUrl: string,
     protected apiKey: string,
@@ -738,11 +851,8 @@ export abstract class BaseLLMProvider {
   async embed(texts: string[], model: string, signal?: AbortSignal): Promise<number[][]> {
     const timeoutMs = getEmbeddingRequestTimeoutMs();
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${this.apiKey}`,
-    };
-    const res = await llmFetch(`${this.baseUrl}/embeddings`, {
+    const headers = this.embeddingHeaders();
+    const res = await llmFetch(resolveEmbeddingEndpointUrl(this.baseUrl), {
       method: "POST",
       headers,
       body: JSON.stringify({ input: texts, model }),
@@ -752,10 +862,18 @@ export abstract class BaseLLMProvider {
     });
     if (!res.ok) {
       const body = await res.text();
-      throw new Error(`Embedding request failed (${res.status}): ${sanitizeApiError(body)}`);
+      throw llmHttpErrorFromResponse(`Embedding request failed (${res.status}): ${sanitizeApiError(body)}`, res);
     }
     const json = await res.json();
     return parseEmbeddingResponse(json);
+  }
+
+  protected embeddingHeaders(): Record<string, string> {
+    return {
+      ...this.customRequestHeaders,
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${this.apiKey}`,
+    };
   }
 }
 

@@ -1,4 +1,4 @@
-import { getAndroidBridgeToken } from "@/lib/android-bridge";
+import { getAndroidBridgeToken } from "./android-bridge";
 
 export type LocalNotificationPermission = NotificationPermission | "insecure" | "unsupported";
 export type NativeNotificationPermission = "default" | "denied" | "granted" | "unsupported";
@@ -54,7 +54,9 @@ export function getNativeNotificationPermission(): NativeNotificationPermission 
   const bridge = getAndroidNotificationBridge();
   if (typeof bridge?.getNotificationPermission !== "function") return "unsupported";
   const token = getAndroidBridgeToken();
-  return normalizeNativePermission(token ? bridge.getNotificationPermission(token) : bridge.getNotificationPermission());
+  return normalizeNativePermission(
+    token ? bridge.getNotificationPermission(token) : bridge.getNotificationPermission(),
+  );
 }
 
 export async function requestNativeNotificationPermission(): Promise<NativeNotificationPermission> {

@@ -22,6 +22,7 @@ import { seedDefaultRegexScripts } from "./db/seed-regex.js";
 import { buildAssetManifest, ensureAssetDirs } from "./services/game/asset-manifest.service.js";
 import { recoverGalleryImages } from "./services/storage/gallery-recovery.js";
 import { migrateCharacterExtendedDescriptionsToLorebooks } from "./services/lorebook/extended-descriptions-migration.js";
+import { migrateTtsSettingsToAudioConnection } from "./services/connections/tts-audio-connection-migration.js";
 import { migrateLegacyDefaultAgentPrompts } from "./services/agents/default-prompt-migration.js";
 import { APP_VERSION, resetTurnGameRegistry } from "@marinara-engine/shared";
 import { existsSync } from "fs";
@@ -50,21 +51,56 @@ import { migrateLegacyCapabilities } from "./services/capability-packages/legacy
 import { createClientStaticOptions } from "./config/client-static-config.js";
 import { hostValidationHook } from "./middleware/host-validation.js";
 import { androidLocalAuthHook, androidLocalLoginRoute } from "./middleware/android-local-auth.js";
+import { arch, platform, release } from "node:os";
+import { execFileSync } from "node:child_process";
+import { getRuntimeMemorySnapshot } from "./utils/runtime-memory.js";
+import { getLastFreeze } from "./lib/freeze-detector.js";
+import { getPreviousSessionStatus, getUncleanExitHistory } from "./lib/session-postmortem.js";
+import { protectTerminalLogger } from "./lib/logger.js";
 
 const isLite = process.env.MARINARA_LITE === "true" || process.env.MARINARA_LITE === "1";
 const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
 
+function resolveServerOs(): string {
+  const hostPlatform = platform();
+  const hostRelease = release();
+  const hostArch = arch();
+  if (hostPlatform === "darwin") {
+    try {
+      const version = execFileSync("sw_vers", ["-productVersion"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 2_000,
+      }).trim();
+      return `macOS ${version || hostRelease} (${hostArch})`;
+    } catch {
+      return `macOS ${hostRelease} (${hostArch})`;
+    }
+  }
+  if (hostPlatform === "win32") return `Windows ${hostRelease} (${hostArch})`;
+  if (hostPlatform === "android" || process.env.PREFIX?.includes("com.termux")) {
+    return `Android / Termux ${hostRelease} (${hostArch})`;
+  }
+  if (hostPlatform === "linux") return `Linux ${hostRelease} (${hostArch})`;
+  return `${hostPlatform} ${hostRelease} (${hostArch})`;
+}
+
+const SERVER_OS = resolveServerOs();
+
 export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   const hadUserStateBeforeStartup = existsSync(join(getFileStorageDir(), "manifest.json"));
   const app = Fastify({
+    // Restart has its own bounded fallback; normal shutdown must not interrupt active generations.
+    forceCloseConnections: false,
     logger: {
       level: getLogLevel(),
       transport: getNodeEnv() !== "production" ? { target: "pino-pretty", options: { colorize: true } } : undefined,
     },
     logController: new LogController({ disableRequestLogging: isRequestLoggingDisabled() }),
-    bodyLimit: MAX_UPLOAD_BYTES, // Large profile imports can include many base64 avatars.
+    bodyLimit: MAX_UPLOAD_BYTES, // General-route default; transfer routes opt into streamed or unbounded imports.
     ...(https && { https }),
   });
+  protectTerminalLogger(app.log, getNodeEnv() !== "production");
 
   // Reject attacker-controlled DNS names before CORS or loopback trust can
   // treat a rebound browser request as same-origin local traffic.
@@ -138,6 +174,11 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   await seedDefaultRegexScripts(db);
   await migrateLegacyDefaultAgentPrompts(db);
   await migrateCharacterExtendedDescriptionsToLorebooks(db);
+  try {
+    await migrateTtsSettingsToAudioConnection(db);
+  } catch (error) {
+    app.log.warn(error, "TTS audio-connection migration did not complete; it will retry next startup");
+  }
   await seedDefaultBackgrounds();
   await seedDefaultGameAssets();
 
@@ -281,6 +322,20 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
       version: APP_VERSION,
       commit,
       build: getBuildLabel(),
+      serverOs: SERVER_OS,
+      memory: getRuntimeMemorySnapshot(),
+      // Termux background-reliability telemetry (#5655/#5656): the launcher
+      // exports its wake-lock outcome, and the freeze detector records the
+      // most recent host-suspension it observed. Null on non-Termux hosts.
+      wakeLock: process.env.MARINARA_WAKE_LOCK_STATUS || null,
+      lastFreeze: getLastFreeze(),
+      // #5506 diagnostics: how the PREVIOUS session ended. An external kill
+      // (phantom process killer, battery manager, reboot) leaves no in-process
+      // trace, so the next startup's heartbeat postmortem is the witness.
+      // Tri-state by design: "unknown" is reported honestly rather than being
+      // collapsed into a clean shutdown nobody observed.
+      previousSession: getPreviousSessionStatus(),
+      uncleanExitCount: getUncleanExitHistory().length,
       timestamp: new Date().toISOString(),
       capabilityPackages: {
         status: capabilityPackages

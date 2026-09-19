@@ -127,9 +127,12 @@ export function ImportPresetModal({ open, onClose }: Props) {
           }`}
         >
           <Download size="2rem" className={dragOver ? "text-[var(--primary)]" : "text-[var(--muted-foreground)]"} />
-          <p className="text-sm font-medium">{localizeUi("ui.modals.importpresetmodal.dropOneOrMorePresetFilesHereOrClick")}</p>
+          <p className="text-sm font-medium">
+            {localizeUi("ui.modals.importpresetmodal.dropOneOrMorePresetFilesHereOrClick")}
+          </p>
           <span className="flex items-center gap-1 rounded-full bg-[var(--secondary)] px-2.5 py-1 text-xs text-[var(--muted-foreground)]">
-            <FileJson size="0.75rem" /> {localizeUi("ui.modals.importcharactermodal.json")}</span>
+            <FileJson size="0.75rem" /> {localizeUi("ui.modals.importcharactermodal.json")}
+          </span>
         </div>
 
         <input
@@ -146,20 +149,24 @@ export function ImportPresetModal({ open, onClose }: Props) {
 
         {status === "loading" && (
           <div className="flex items-center gap-2 rounded-lg bg-[var(--secondary)] p-3 text-xs">
-            <Loader2 size="0.875rem" className="animate-spin text-[var(--primary)]" /> {localizeUi("ui.modals.importconnectionmodal.importing")}</div>
+            <Loader2 size="0.875rem" className="animate-spin text-[var(--primary)]" />{" "}
+            {localizeUi("ui.modals.importconnectionmodal.importing")}
+          </div>
         )}
         {status === "done" && results.length > 0 && (
           <div className="flex flex-col gap-2">
             <div
               className={`flex items-center gap-2 rounded-lg p-3 text-xs ${
                 results.some((result) => result.success)
-                  ? "bg-emerald-500/10 text-emerald-400"
+                  ? "bg-[var(--primary)]/10 text-[var(--primary)]"
                   : "bg-[var(--destructive)]/10 text-[var(--destructive)]"
               }`}
             >
               {results.some((result) => result.success) ? <CheckCircle size="0.875rem" /> : <XCircle size="0.875rem" />}
-              {results.filter((result) => result.success).length} {localizeUi("ui.modals.importcharactermodal.succeeded")}{" "}
-              {results.filter((result) => !result.success).length} {localizeUi("ui.modals.importcharactermodal.failed")}</div>
+              {results.filter((result) => result.success).length}{" "}
+              {localizeUi("ui.modals.importcharactermodal.succeeded")}{" "}
+              {results.filter((result) => !result.success).length} {localizeUi("ui.modals.importcharactermodal.failed")}
+            </div>
             <div className="max-h-52 overflow-y-auto rounded-lg border border-[var(--border)]">
               {results.map((result) => (
                 <div
@@ -167,7 +174,7 @@ export function ImportPresetModal({ open, onClose }: Props) {
                   className="flex items-start gap-2 border-b border-[var(--border)] px-3 py-2 text-xs last:border-b-0"
                 >
                   {result.success ? (
-                    <CheckCircle size="0.8125rem" className="mt-0.5 shrink-0 text-emerald-400" />
+                    <CheckCircle size="0.8125rem" className="mt-0.5 shrink-0 text-[var(--primary)]" />
                   ) : (
                     <XCircle size="0.8125rem" className="mt-0.5 shrink-0 text-[var(--destructive)]" />
                   )}
@@ -188,7 +195,9 @@ export function ImportPresetModal({ open, onClose }: Props) {
               onClose();
             }}
             className="rounded-lg px-4 py-2 text-xs font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)]"
-          >{localizeUi("capabilities.actions.close")}</button>
+          >
+            {localizeUi("capabilities.actions.close")}
+          </button>
         </div>
       </div>
     </Modal>

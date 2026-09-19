@@ -28,6 +28,7 @@ export function isClaudeAdaptiveOnlyNoSamplingModel(model: string): boolean {
 export function supportsXhighReasoningEffort(model: string): boolean {
   const normalized = model.toLowerCase();
   return (
+    isOpenAIGpt6AstraModel(normalized) ||
     normalized.startsWith("gpt-5.6") ||
     normalized.startsWith("gpt-5.5") ||
     normalized.startsWith("gpt-5.4") ||
@@ -36,8 +37,21 @@ export function supportsXhighReasoningEffort(model: string): boolean {
   );
 }
 
+/**
+ * GLM 5.2 and GLM 5.3 accept `reasoning_effort: "max"` on Z.AI's native
+ * endpoint, so a preset set to Maximum should reach it instead of being
+ * lowered to `high` on the way to the provider.
+ */
+export function isZaiMaxReasoningEffortModel(model: string): boolean {
+  return /(?:^|\/)glm-5\.[23](?:$|[-:])/u.test(model.toLowerCase());
+}
+
 export function isOpenAIGpt56Model(model: string): boolean {
   return model.toLowerCase().startsWith("gpt-5.6");
+}
+
+export function isOpenAIGpt6AstraModel(model: string): boolean {
+  return /^gpt-6-astra(?:$|-)/i.test(model);
 }
 
 export function isOpenAIGpt56SolProAlias(model: string): boolean {
@@ -69,7 +83,11 @@ export function resolveProviderReasoningEffort(args: {
     (providerLower === "anthropic" || providerLower === "claude_subscription") &&
     isClaudeAdaptiveOnlyNoSamplingModel(modelLower);
   const supportsXhigh = supportsXhighReasoningEffort(modelLower);
-  const supportsMax = isOpenAIGpt56Model(modelLower) || isNativeAnthropicAdaptiveOnly;
+  const supportsMax =
+    isOpenAIGpt6AstraModel(modelLower) ||
+    isOpenAIGpt56Model(modelLower) ||
+    isNativeAnthropicAdaptiveOnly ||
+    (providerLower === "zai" && isZaiMaxReasoningEffortModel(modelLower));
 
   if (args.reasoningEffort === "maximum") {
     return supportsMax ? "max" : supportsXhigh ? "xhigh" : "high";
@@ -102,6 +120,8 @@ export const OPENAI_MODELS: KnownModel[] = [
   { id: "gpt-5.6-sol-pro", name: "gpt-5.6-sol-pro (Sol with pro mode)", context: 1050000, maxOutput: 128000 },
   { id: "gpt-5.6-terra", name: "gpt-5.6-terra", context: 1050000, maxOutput: 128000 },
   { id: "gpt-5.6-luna", name: "gpt-5.6-luna", context: 1050000, maxOutput: 128000 },
+  // GPT-6 Astra
+  { id: "gpt-6-astra", name: "gpt-6-astra", context: 1050000, maxOutput: 128000 },
   // GPT-5.5
   { id: "gpt-5.5", name: "gpt-5.5", context: 1050000, maxOutput: 128000 },
   { id: "gpt-5.5-2026-04-23", name: "gpt-5.5-2026-04-23", context: 1050000, maxOutput: 128000 },
@@ -204,7 +224,9 @@ export const OPENAI_MODELS: KnownModel[] = [
 export const ANTHROPIC_MODELS: KnownModel[] = [
   { id: "claude-opus-5", name: "claude-opus-5", context: 1000000, maxOutput: 128000 },
   { id: "claude-sonnet-5", name: "claude-sonnet-5", context: 1000000, maxOutput: 128000 },
+  { id: "claude-fable-5-1", name: "claude-fable-5-1", context: 1000000, maxOutput: 128000 },
   { id: "claude-fable-5", name: "claude-fable-5", context: 1000000, maxOutput: 128000 },
+  { id: "claude-mythos-5-1", name: "claude-mythos-5-1 (limited access)", context: 1000000, maxOutput: 128000 },
   { id: "claude-mythos-5", name: "claude-mythos-5 (limited access)", context: 1000000, maxOutput: 128000 },
   { id: "claude-opus-4-8", name: "claude-opus-4-8", context: 1000000, maxOutput: 128000 },
   { id: "claude-opus-4-7", name: "claude-opus-4-7", context: 1000000, maxOutput: 128000 },
@@ -541,6 +563,8 @@ export const MOONSHOT_MODELS: KnownModel[] = [
 
 // Z.AI / GLM (from #model_zai_select)
 export const ZAI_MODELS: KnownModel[] = [
+  { id: "glm-5.3", name: "glm-5.3", context: 1000000, maxOutput: 128000 },
+  { id: "glm-5.3-flash", name: "glm-5.3-flash", context: 1000000, maxOutput: 128000 },
   { id: "glm-5.2", name: "glm-5.2", context: 1000000, maxOutput: 128000 },
   { id: "glm-5.1", name: "glm-5.1", context: 200_000, maxOutput: 128_000 },
   { id: "glm-5", name: "glm-5", context: 200000, maxOutput: 128000 },
@@ -617,6 +641,13 @@ export const VIDEO_GENERATION_SOURCES: VideoGenSource[] = [
     name: "OpenRouter Video",
     description: "Video generation models exposed through OpenRouter's asynchronous Videos API.",
     defaultBaseUrl: "https://openrouter.ai/api/v1",
+    requiresApiKey: true,
+  },
+  {
+    id: "nanogpt",
+    name: "NanoGPT",
+    description: "Video generation models discovered from NanoGPT's asynchronous Video API.",
+    defaultBaseUrl: "https://nano-gpt.com/api",
     requiresApiKey: true,
   },
   {
@@ -821,6 +852,8 @@ export const ATLAS_CLOUD_VIDEO_MODELS: KnownModel[] = [
 
 const IMAGE_GEN_MODELS: KnownModel[] = [
   // OpenAI
+  { id: "gpt-image-2.5-flare", name: "GPT Image 2.5 Flare", context: 0, maxOutput: 0 },
+  { id: "gpt-image-2.5-sunburst", name: "GPT Image 2.5 Sunburst", context: 0, maxOutput: 0 },
   { id: "gpt-image-2", name: "GPT Image 2", context: 0, maxOutput: 0 },
   { id: "gpt-image-1.5", name: "GPT Image 1.5", context: 0, maxOutput: 0 },
   { id: "chatgpt-image-latest", name: "ChatGPT Image Latest", context: 0, maxOutput: 0 },
@@ -876,9 +909,12 @@ const IMAGE_GEN_MODELS: KnownModel[] = [
   ...ZAI_IMAGE_MODELS,
   ...ATLAS_CLOUD_IMAGE_MODELS,
   // NovelAI
-  { id: "nai-diffusion-4-curated-preview", name: "NAI Diffusion 4 Curated", context: 0, maxOutput: 0 },
-  { id: "nai-diffusion-4-5-full", name: "NAI Diffusion 4.5 Full", context: 0, maxOutput: 0 },
   { id: "nai-diffusion-3", name: "NAI Diffusion 3 (Anime V3)", context: 0, maxOutput: 0 },
+  { id: "nai-diffusion-4-curated-preview", name: "NAI Diffusion 4 Curated", context: 0, maxOutput: 0 },
+  { id: "nai-diffusion-4-5-curated", name: "NAI Diffusion 4.5 Curated", context: 0, maxOutput: 0 },
+  { id: "nai-diffusion-4-5-full", name: "NAI Diffusion 4.5 Full", context: 0, maxOutput: 0 },
+  { id: "nai-diffusion-5-curated", name: "NAI Diffusion 5 Curated", context: 0, maxOutput: 0 },
+  { id: "nai-diffusion-5-full", name: "NAI Diffusion 5 Full", context: 0, maxOutput: 0 },
   // Pollinations (model-free, but include as placeholder)
   { id: "pollinations", name: "Pollinations (Auto)", context: 0, maxOutput: 0 },
 ];
@@ -899,13 +935,39 @@ const VIDEO_GEN_MODELS: KnownModel[] = [
   ...ATLAS_CLOUD_VIDEO_MODELS,
 ];
 
+// Seed catalog only — each source's real model/voice lists are fetched at
+// runtime through the TTS discovery endpoints (/api/tts/models, /api/tts/voices).
+const AUDIO_GEN_MODELS: KnownModel[] = [
+  // ElevenLabs
+  { id: "eleven_multilingual_v2", name: "Eleven Multilingual v2", context: 0, maxOutput: 0 },
+  { id: "eleven_turbo_v2_5", name: "Eleven Turbo v2.5", context: 0, maxOutput: 0 },
+  { id: "eleven_flash_v2_5", name: "Eleven Flash v2.5", context: 0, maxOutput: 0 },
+  // OpenAI
+  { id: "gpt-4o-mini-tts", name: "GPT-4o Mini TTS", context: 0, maxOutput: 0 },
+  { id: "tts-1", name: "TTS-1", context: 0, maxOutput: 0 },
+  { id: "tts-1-hd", name: "TTS-1 HD", context: 0, maxOutput: 0 },
+  // PocketTTS (local)
+  { id: "pocket-tts", name: "PocketTTS", context: 0, maxOutput: 0 },
+  // xAI
+  { id: "grok-tts", name: "Grok TTS", context: 0, maxOutput: 0 },
+];
+
 export function inferVideoSource(model: string, baseUrl: string): string {
   const m = model.toLowerCase();
   const u = baseUrl.toLowerCase();
+  let hostname = "";
+  try {
+    hostname = new URL(baseUrl).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+    // Keep inference best-effort for incomplete custom URLs while they are edited.
+  }
   if (m === "swarmui" || u.includes(":7801") || u.includes("swarmui")) return "swarmui";
   if (m === "comfyui" || u.includes(":8188") || u.includes("comfyui")) return "comfyui";
   if (m === "atlas" || u.includes("atlascloud.ai")) return "atlas";
   if (m === "seedance" || m.startsWith("seedance-") || u.includes("seedance2.ai")) return "seedance";
+  if (m === "nanogpt" || hostname === "nano-gpt.com" || hostname.endsWith(".nano-gpt.com")) {
+    return "nanogpt";
+  }
   if (m === "openrouter" || u.includes("openrouter.ai")) return "openrouter";
   if (m.includes("/") && (m.includes("veo") || m.includes("wan"))) return "openrouter";
   if (m === "google_veo" || m === "veo" || /^veo-[\d.]+/.test(m)) return "google_veo";
@@ -921,6 +983,12 @@ export function inferVideoSource(model: string, baseUrl: string): string {
 export function inferImageSource(model: string, baseUrl: string): string {
   const m = model.toLowerCase();
   const u = baseUrl.toLowerCase();
+  let hostname = "";
+  try {
+    hostname = new URL(baseUrl).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+    // Keep inference best-effort for incomplete custom URLs while they are edited.
+  }
   if (
     m === "openai" ||
     m === "stability" ||
@@ -944,7 +1012,7 @@ export function inferImageSource(model: string, baseUrl: string): string {
     return m;
   }
   if (m === "drawthings") return "automatic1111";
-  if (u.includes("nano-gpt.com")) return "nanogpt";
+  if (hostname === "nano-gpt.com" || hostname.endsWith(".nano-gpt.com")) return "nanogpt";
   if (u.includes("openrouter.ai")) return "openrouter";
   if (u.includes("api.x.ai") || u.includes("x.ai")) return "xai";
   if (u.includes("venice.ai")) return "venice";
@@ -988,10 +1056,12 @@ export const MODEL_LISTS: Record<APIProvider, KnownModel[]> = {
   nanogpt: [], // NanoGPT aggregator — models fetched dynamically via API
   xai: XAI_MODELS,
   arli: [], // Arli AI — models fetched dynamically via the /models endpoint
+  zai: ZAI_MODELS,
   // Seed OAI-compatible endpoints with the OpenAI catalog; remote /models still merge on top.
   custom: [...OPENAI_MODELS, ...ZAI_MODELS],
   image_generation: IMAGE_GEN_MODELS,
   video_generation: VIDEO_GEN_MODELS,
+  audio: AUDIO_GEN_MODELS,
 };
 
 const OPENAI_COMPATIBLE_AGGREGATOR_MODELS: KnownModel[] = [

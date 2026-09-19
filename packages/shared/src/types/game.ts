@@ -4,6 +4,7 @@
 import type { GenerationParameters } from "./prompt.js";
 import type { CombatItemEffect, CombatMechanic, CombatDialogueCue } from "./combat-encounter.js";
 import type { SpotifySourceType } from "./spotify.js";
+import type { SpatialMapDraftSize, SpatialMapGroundingMode } from "./spatial-context.js";
 
 /** The four main states a game can be in during a session. */
 export type GameActiveState = "exploration" | "dialogue" | "combat" | "travel_rest";
@@ -23,6 +24,24 @@ export type GameSessionStatus = "setup" | "active" | "concluded";
 
 /** Which system owns the campaign-scale map when a new game begins. */
 export type GameWorldMapMode = "standard" | "hierarchical";
+
+export const GAME_SPATIAL_MAP_DRAFT_PRESET_TARGETS: Readonly<Record<SpatialMapDraftSize, number>> = {
+  small: 8,
+  medium: 16,
+  large: 28,
+};
+
+/** Keep the exact target authoritative while preserving the matching draft-size bucket. */
+export function resolveGameSpatialMapDraftOptions(
+  size: SpatialMapDraftSize | undefined,
+  targetLocationCount: number | undefined,
+): { size: SpatialMapDraftSize; targetLocationCount: number } {
+  const target = targetLocationCount ?? GAME_SPATIAL_MAP_DRAFT_PRESET_TARGETS[size ?? "medium"];
+  return {
+    size: target <= 8 ? "small" : target <= 16 ? "medium" : "large",
+    targetLocationCount: target,
+  };
+}
 
 /** Spotify source constraints for Game Mode DJ selection. */
 export type GameSpotifySourceType = SpotifySourceType;
@@ -189,6 +208,12 @@ export interface GameSetupConfig {
   spatialMapInstructions?: string;
   /** Campaign-scale map authority selected during New Game. Older saves default to "standard". */
   gameWorldMapMode?: GameWorldMapMode;
+  /** Size bucket selected for the initial World Maps AI draft. */
+  spatialMapDraftSize?: SpatialMapDraftSize;
+  /** Exact number of places requested for the initial World Maps AI draft. */
+  spatialMapTargetLocationCount?: number;
+  /** Sources the initial World Maps AI draft may use. */
+  spatialMapGroundingMode?: SpatialMapGroundingMode;
   /** Character ID to use as GM (only when gmMode is "character") */
   gmCharacterId?: string | null;
   /** Party member IDs; library character IDs or `npc:<slug>` tracked-NPC IDs. */
@@ -207,6 +232,8 @@ export interface GameSetupConfig {
   experienceConfig?: Record<string, unknown>;
   /** Enable installed agents and agent-driven Game Mode features for this game. */
   enableAgents?: boolean;
+  /** Let the GM offer timed reaction prompts. Defaults to true. */
+  enableQuickTimeEvents?: boolean;
   /** Enable automatic sprite generation for characters using image model */
   enableSpriteGeneration?: boolean;
   /** Ask the configured prompt model to rewrite Game Illustrator prompts before image generation. */
@@ -215,6 +242,12 @@ export interface GameSetupConfig {
   imageConnectionId?: string;
   /** Connection ID for video generation (animated scene clips from generated illustrations). */
   videoConnectionId?: string;
+  /** Connection ID for audio generation (speech, game sound effects, and music). */
+  audioConnectionId?: string;
+  /** Generate scene sound effects for this game (requires a capable audio connection). Defaults to true. */
+  enableGameSoundEffects?: boolean;
+  /** Generate scene music for this game (requires a capable audio connection). Defaults to true. */
+  enableGameMusic?: boolean;
   /** Automatically create storyboard keyframe illustrations after completed GM turns. */
   gameStoryboardAutoIllustrationsEnabled?: boolean;
   /** Automatically create storyboard keyframe videos after completed GM turns. */
@@ -241,6 +274,8 @@ export interface GameSetupConfig {
   imageStyleProfileId?: string | null;
   /** Lorebook IDs to activate for this game */
   activeLorebookIds?: string[];
+  /** Entries explicitly selected for world generation, additive to ordinary lore. */
+  activeLorebookEntryIds?: string[];
   /** Enable custom HUD widgets (model designs them at game start and updates during play) */
   enableCustomWidgets?: boolean;
   /** User-defined starting HUD widgets. When present, these replace model-designed setup widgets. */
@@ -259,6 +294,9 @@ export interface GameSetupConfig {
   enableLorebookKeeper?: boolean;
   /** Language for all narration and dialogue (e.g. "English", "Japanese", "Spanish") */
   language?: string;
+  /** Translate displayed narration from the first completed game turn. */
+  autoTranslate?: boolean;
+  translationOutputTargetLang?: string;
   /** Optional generation parameter overrides applied from the moment the game is created. */
   generationParameters?: Partial<GenerationParameters>;
   /** Prompt preset whose Game prompt should drive the GM instruction block. */
@@ -298,6 +336,8 @@ export interface GameInitialSetupConnectionSnapshot {
 
 /** Creation-time display names for local resources referenced by the setup. */
 export interface GameInitialSetupLabels {
+  experienceName?: string;
+  experienceSeedKey?: string;
   characterNames?: Record<string, string>;
   lorebookNames?: Record<string, string>;
   promptPresetNames?: Record<string, string>;
@@ -317,6 +357,7 @@ export interface GameInitialSetupSnapshot {
     scene?: GameInitialSetupConnectionSnapshot | null;
     image?: GameInitialSetupConnectionSnapshot | null;
     video?: GameInitialSetupConnectionSnapshot | null;
+    audio?: GameInitialSetupConnectionSnapshot | null;
   };
   labels?: GameInitialSetupLabels;
   createdAt: string;
@@ -358,6 +399,79 @@ export interface SkillCheckResult {
    * non-d20 systems (pool systems like V20) reach the dice card intact.
    */
   dice?: string;
+}
+
+// ── The sighted dice pool (opt-in, last) ──
+
+/** The seven sizes the engine pre-throws. Anything else is an overflow, not a pool miss. */
+export type GameDicePoolSize = "d4" | "d6" | "d8" | "d10" | "d12" | "d20" | "d100";
+
+/**
+ * One chat's dice pool as it stood for one turn.
+ *
+ * Stored per (chat, message, swipe) in `game_dice_pools` rather than in the game-state
+ * snapshot or in chat metadata, for reasons that are load-bearing: the snapshot is only
+ * written when a tracker agent runs, so with agents off no row exists at all; its writer
+ * is a delete-then-insert from an explicit field list, so any column a caller does not
+ * name is silently lost; and metadata is client-writable and not per-swipe, so a swipe
+ * would spend dice and never give them back.
+ */
+export interface GameDicePool {
+  /** On-disk revision. A row of another revision is refused, never half-read. */
+  v: 1;
+  /** Accepted turns this pool has lived through. Advisory; the aging clock is per size. */
+  turn: number;
+  /** Each size's queue, head first. Consumption is from the head, refill at the tail. */
+  values: Record<GameDicePoolSize, number[]>;
+  /** Accepted turns each size has gone unspent, which is what bounds the frozen head. */
+  idle: Record<GameDicePoolSize, number>;
+}
+
+/** One value the engine actually spent, in the order it spent it. */
+export interface GameDicePoolConsumption {
+  size: GameDicePoolSize;
+  /** Zero-based index into the size's queue. The slot NAME in a tag is one-based. */
+  slot: number;
+  /** The value spent. The engine's record, not the model's claim. */
+  value: number;
+  /** Which tag of the turn spent it, in reading order, so the ledger reads as a sequence. */
+  tagIndex: number;
+}
+
+/**
+ * What the model wrote in `pool=` or `rolls=` disagreeing with what the engine spent.
+ *
+ * Recorded and never obeyed. The slot name is a checksum, not an instruction: the engine
+ * spends the next unconsumed value of that size in reading order whatever the tag says,
+ * so a mismatch changes the log and the notice and changes no number at all.
+ */
+export interface GameDicePoolMismatch {
+  /**
+   * `slot`: a slot other than the one spent, which covers a skipped slot and a reordered
+   * one alike. `value`: a number other than the one spent. `reuse`: a slot this turn had
+   * already spent.
+   *
+   * There is deliberately no attribute-order kind. The design re-grades "declaration
+   * before value" as a weak signal with no defensive worth — for a thinking model the DC
+   * is chosen in reasoning tokens long before any attribute is emitted — and the engine's
+   * own record writes `pool=` last, so a positional rule would flag the engine's own
+   * shape on every turn. A signal that fires on the correct answer is noise.
+   */
+  kind: "slot" | "value" | "reuse";
+  size: GameDicePoolSize;
+  /** What the engine spent, zero-based. */
+  slot: number;
+  /** What the model claimed, verbatim and truncated, for the log line. */
+  wrote?: string;
+}
+
+/** The head values the prompt shows, at the configured window. One entry per size. */
+export type GameDicePoolView = Array<{ size: GameDicePoolSize; values: number[] }>;
+
+/** A parsed `pool="d6:1|2|3"` value: the size, and its slots as zero-based indices. */
+export interface GameDicePoolSlotName {
+  size: GameDicePoolSize;
+  slots: number[];
 }
 
 // ── Combat ──
@@ -485,6 +599,9 @@ export interface GameCombatStateSnapshot {
   dialogueCues: CombatDialogueCue[];
   /** ID of the assistant message whose `[combat:]` tag opened this encounter. */
   startMessageId: string | null;
+  /** Encounter tier for context-bound combat music (#5161). Optional so
+   *  snapshots from older clients stay valid. */
+  musicTier?: string | null;
 }
 
 /** Post-combat summary handed to the GM for narration. */

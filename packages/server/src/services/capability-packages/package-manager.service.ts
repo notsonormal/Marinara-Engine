@@ -1,21 +1,30 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import AdmZip from "adm-zip";
+import { z } from "zod";
 import {
   APP_VERSION,
-  capabilityCatalogSchema,
+  parseCapabilityCatalogWithCompat,
   capabilityPackageManifestSchema,
   compareCapabilityPackageVersions,
   getCapabilityApiCompatibilityIssue,
+  GM_VERB_TABLE_ASSET_PATH,
+  GM_VERB_TABLE_MAX_BYTES,
   isInstalledCapabilityReady,
   installedCapabilityRegistrySchema,
+  installedCapabilityPackageSchema,
   packagedAgentDefinitionsSchema,
+  capabilityReleaseNotesSchema,
   type CapabilityCatalog,
   type CapabilityCatalogPackage,
+  type StampedCapabilityCatalog,
+  type StampedCapabilityCatalogPackage,
   type PackagedAgentDefinition,
   type CapabilityPackageUpdate,
+  type CapabilityPackageVersionNote,
+  type CapabilityReleaseNotes,
   type InstalledCapabilityPackage,
 } from "@marinara-engine/shared";
 import { DATA_DIR } from "../../utils/data-dir.js";
@@ -128,28 +137,86 @@ export function resolveCapabilityCatalogUrl(
   return match ? `${catalogRoot}/v${Number(match[1])}/catalog.json` : `${catalogRoot}/catalog.json`;
 }
 const CATALOG_URL = resolveCapabilityCatalogUrl();
+
+// Packages the catalog repo marks staging-only are cut from the published lanes
+// and emitted into an overlay under catalog/preview/ instead (Marinara-Agents
+// scripts/catalog-incomplete.mjs). Promotion copies staging to main verbatim, so
+// that overlay EXISTS on main and serves 200 there — nothing on the catalog side
+// hides it. The only thing keeping an unreleased package away from a stable user
+// is this Engine declining to build the URL.
+const PREVIEW_CATALOG_SEGMENT = "preview";
+
+/** Whether this Engine may read the staging preview overlay.
+ *
+ *  Deliberately NOT `resolveOfficialAgentBranch() === "staging"`. That helper is
+ *  deny-list shaped — anything that is not `main`, `hotfix/*`, or a release tag
+ *  resolves to "staging" — so a checkout on a branch named `master` (which the
+ *  launchers themselves treat as a mainline name) would qualify. Being wrong
+ *  there merely hands someone a slightly newer package list; being wrong HERE
+ *  shows unreleased packages to a stable user, so this gate takes an exact
+ *  opt-in. Detached checkouts report no branch and are excluded, which costs a
+ *  detached staging tester their preview — the fail-hidden direction, and the
+ *  same way those checkouts already resolve for the published catalog. */
+export function isPreviewCatalogChannel(engineBranch: string | null = getBuildBranch()): boolean {
+  return engineBranch === "staging";
+}
+
+/** URL of the staging preview overlay, or null when this Engine must not read one.
+ *
+ *  Returns null rather than a URL for callers to filter later, so a stable Engine
+ *  never holds a preview URL at all and no later code path can fetch one by
+ *  mistake. Mirrors resolveCapabilityCatalogUrl's lane derivation, including its
+ *  fallback to the legacy alias for a non-release version string. */
+export function resolvePreviewCatalogUrl(
+  engineVersion: string = APP_VERSION,
+  configuredUrl: string | undefined = process.env.MARINARA_AGENT_CATALOG_URL,
+  previewChannel: boolean = isPreviewCatalogChannel(),
+): string | null {
+  // An explicit override IS the whole catalog. Synthesising a preview sibling for
+  // someone's local or forked catalog would fetch a URL they never pointed us at.
+  if (configuredUrl?.trim()) return null;
+  if (!previewChannel) return null;
+  // Only ever the staging branch: isPreviewCatalogChannel already required it.
+  const previewRoot = `${officialCatalogRoot("staging")}/${PREVIEW_CATALOG_SEGMENT}`;
+  const match = ENGINE_RELEASE_VERSION_PATTERN.exec(engineVersion.trim());
+  return match ? `${previewRoot}/v${Number(match[1])}/catalog.json` : `${previewRoot}/catalog.json`;
+}
+
+/** URL of the release-notes sidecar for a catalog, or null when none can be derived.
+ *
+ *  Release notes are published as `notes.json` beside the `catalog.json` they
+ *  describe, in every lane and in the preview overlay. Deriving the sibling keeps
+ *  this working for the official lanes, a fork, and a local file server without a
+ *  second environment variable.
+ *
+ *  A configured catalog URL that does not end in `/catalog.json` yields null rather
+ *  than a guess. Appending `notes.json` to an arbitrary operator-supplied path would
+ *  fetch a URL nobody pointed us at. */
+export function resolveCapabilityReleaseNotesUrl(catalogUrl: string | null): string | null {
+  if (!catalogUrl) return null;
+  const trimmed = catalogUrl.trim();
+  if (!trimmed.endsWith("/catalog.json")) return null;
+  return `${trimmed.slice(0, -"catalog.json".length)}notes.json`;
+}
+
+const RELEASE_NOTES_URL = resolveCapabilityReleaseNotesUrl(CATALOG_URL);
+const RELEASE_NOTES_TTL_MS = 5 * 60 * 1000;
+
+const PREVIEW_CATALOG_URL = resolvePreviewCatalogUrl();
 const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 const MAX_EXPANDED_BYTES = 250 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 8_192;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
-const BROWSER_TAB_ASSET_CONTENT_TYPES = new Map([
+const PACKAGE_ASSET_CONTENT_TYPES = new Map([
   [".gif", "image/gif"],
   [".jpeg", "image/jpeg"],
   [".jpg", "image/jpeg"],
   [".png", "image/png"],
   [".webp", "image/webp"],
+  // Tilemap/atlas metadata for contributions.assets. Passive data only — anything
+  // active (svg, html, js) stays out of this map: it would execute same-origin.
+  [".json", "application/json; charset=utf-8"],
 ]);
-interface VerifiedBrowserTabAsset {
-  packageId: string;
-  expectedBytes: number;
-  expectedSha256: string;
-  dev: bigint;
-  ino: bigint;
-  size: bigint;
-  mtimeNs: bigint;
-  ctimeNs: bigint;
-}
-const verifiedBrowserTabAssets = new Map<string, VerifiedBrowserTabAsset>();
 const KNOWN_INCOMPATIBLE_RUNTIMES = new Map<string, string>([
   ...["1.0.0", "1.0.3", "1.0.6"].map(
     (version) =>
@@ -185,9 +252,13 @@ export function validatePackageArchiveEntries(zip: AdmZip, maximumExpandedBytes 
   let expandedBytes = 0;
   for (const item of entries) {
     const name = normalizeArchivePath(item.entryName);
-    if (names.has(name)) throw new Error(`Package contains duplicate file ${name}`);
+    // Case-insensitive: NTFS/APFS collapse case, so `Tiles.PNG` and `tiles.png`
+    // would extract onto one on-disk file and one of the two declared hashes
+    // could never verify again.
+    const nameKey = name.toLowerCase();
+    if (names.has(nameKey)) throw new Error(`Package contains duplicate file ${name}`);
     if (isSymlink(item)) throw new Error("Package links are not allowed");
-    names.add(name);
+    names.add(nameKey);
     expandedBytes += item.header.size;
     if (expandedBytes > maximumExpandedBytes) throw new Error("Expanded package is too large");
   }
@@ -209,7 +280,10 @@ function runtimeBlockReason(installed: InstalledCapabilityPackage): string | nul
   );
 }
 
-function assertNotDowngrade(current: InstalledCapabilityPackage | undefined, nextVersion: string) {
+function assertNotDowngrade(
+  current: Pick<InstalledCapabilityPackage, "id" | "version"> | undefined,
+  nextVersion: string,
+) {
   if (current && compareCapabilityPackageVersions(nextVersion, current.version) < 0) {
     throw new Error(
       `Installed ${current.id} ${current.version} is newer than catalog version ${nextVersion}; refusing to downgrade`,
@@ -217,19 +291,52 @@ function assertNotDowngrade(current: InstalledCapabilityPackage | undefined, nex
   }
 }
 
-async function readRegistry() {
+const rawRegistrySchema = installedCapabilityRegistrySchema.extend({ packages: z.array(z.unknown()) });
+const installedVersionSchema = installedCapabilityPackageSchema.pick({ id: true, version: true });
+
+async function readRawRegistry() {
   try {
-    return installedCapabilityRegistrySchema.parse(JSON.parse(await readFile(REGISTRY, "utf8")));
+    return rawRegistrySchema.parse(JSON.parse(await readFile(REGISTRY, "utf8")));
   } catch (error) {
     if (!existsSync(REGISTRY)) return { schemaVersion: 1 as const, packages: [] };
     throw error;
   }
 }
 
+async function readRegistry() {
+  const raw = await readRawRegistry();
+  return {
+    ...raw,
+    packages: raw.packages.flatMap((entry) => {
+      const parsed = installedCapabilityPackageSchema.strict().safeParse(entry);
+      if (parsed.success) return [parsed.data];
+      logger.warn("[capability] Skipping an unsupported installed package record: %s", parsed.error.message);
+      return [];
+    }),
+  };
+}
+
+async function readInstalledVersion(packageId: string) {
+  for (const entry of (await readRawRegistry()).packages) {
+    const parsed = installedVersionSchema.safeParse(entry);
+    if (parsed.success && parsed.data.id === packageId) return parsed.data;
+  }
+}
+
 async function writeRegistry(packages: InstalledCapabilityPackage[]) {
   await mkdir(ROOT, { recursive: true });
+  // Operational reads omit unsupported manifests, but writes must retain their raw records.
+  // Re-read here so an unrelated readiness/update write cannot erase an unseen sibling.
+  const ids = new Set(packages.map((item) => item.id));
+  const unsupported = (await readRawRegistry()).packages.filter(
+    (entry) =>
+      !installedCapabilityPackageSchema.strict().safeParse(entry).success &&
+      !(entry && typeof entry === "object" && "id" in entry && typeof entry.id === "string" && ids.has(entry.id)),
+  );
   const temporary = `${REGISTRY}.tmp-${process.pid}-${Date.now()}`;
-  await writeFile(temporary, JSON.stringify({ schemaVersion: 1, packages }, null, 2), { mode: 0o600 });
+  await writeFile(temporary, JSON.stringify({ schemaVersion: 1, packages: [...packages, ...unsupported] }, null, 2), {
+    mode: 0o600,
+  });
   await rename(temporary, REGISTRY);
 }
 
@@ -436,6 +543,28 @@ async function readInstalledAgentDefinitions(installed: InstalledCapabilityPacka
   return packagedAgentDefinitionsSchema.parse(JSON.parse(await readFile(file, "utf8")));
 }
 
+async function hydratePreviousManifest(installed: InstalledCapabilityPackage): Promise<InstalledCapabilityPackage> {
+  if (installed.previousManifest || !installed.previousVersion) return installed;
+  const manifestFile = inside(VERSIONS, join(VERSIONS, installed.id, installed.previousVersion, "manifest.json"));
+  if (!existsSync(manifestFile)) return installed;
+  const previousManifest = capabilityPackageManifestSchema.parse(JSON.parse(await readFile(manifestFile, "utf8")));
+  if (previousManifest.id !== installed.id || previousManifest.version !== installed.previousVersion) return installed;
+  return { ...installed, previousManifest };
+}
+
+async function resolveServableInstalledPackage(
+  installed: InstalledCapabilityPackage,
+): Promise<InstalledCapabilityPackage | null> {
+  if (isInstalledCapabilityReady(installed)) return installed;
+  const hydrated = await hydratePreviousManifest(installed);
+  if (hydrated.status !== "restart-required" || !hydrated.previousVersion || !hydrated.previousManifest) return null;
+  return {
+    ...hydrated,
+    version: hydrated.previousVersion,
+    manifest: hydrated.previousManifest,
+  };
+}
+
 type VerifiedInstalledPackageFile = { file: string; data: Buffer };
 
 async function readVerifiedInstalledPackageFile(
@@ -479,59 +608,6 @@ async function verifyInstalledPackageFile(
   return (await readVerifiedInstalledPackageFile(installed, relativePath)).file;
 }
 
-function invalidateBrowserTabAssetVerifications(packageId: string) {
-  for (const [key, cached] of verifiedBrowserTabAssets) {
-    if (cached.packageId === packageId) verifiedBrowserTabAssets.delete(key);
-  }
-}
-
-async function verifyBrowserTabAsset(installed: InstalledCapabilityPackage, relativePath: string): Promise<string> {
-  const normalized = normalizeArchivePath(relativePath);
-  const declaration = installed.manifest.files.find((item) => normalizeArchivePath(item.path) === normalized);
-  if (!declaration) throw new Error(`Package ${installed.id} requested undeclared file ${normalized}`);
-  const file = inside(VERSIONS, join(VERSIONS, installed.id, installed.version, normalized));
-  const key = `${installed.id}\0${installed.version}\0${normalized}`;
-  const before = await stat(file, { bigint: true });
-  const cached = verifiedBrowserTabAssets.get(key);
-  if (
-    cached &&
-    cached.expectedBytes === declaration.bytes &&
-    cached.expectedSha256 === declaration.sha256 &&
-    cached.dev === before.dev &&
-    cached.ino === before.ino &&
-    cached.size === before.size &&
-    cached.mtimeNs === before.mtimeNs &&
-    cached.ctimeNs === before.ctimeNs
-  ) {
-    return file;
-  }
-  const data = await readFile(file);
-  const after = await stat(file, { bigint: true });
-  if (
-    before.dev !== after.dev ||
-    before.ino !== after.ino ||
-    before.size !== after.size ||
-    before.mtimeNs !== after.mtimeNs ||
-    before.ctimeNs !== after.ctimeNs ||
-    data.byteLength !== declaration.bytes ||
-    createHash("sha256").update(data).digest("hex") !== declaration.sha256
-  ) {
-    verifiedBrowserTabAssets.delete(key);
-    throw new Error(`Installed package ${installed.id} failed integrity verification for ${normalized}`);
-  }
-  verifiedBrowserTabAssets.set(key, {
-    packageId: installed.id,
-    expectedBytes: declaration.bytes,
-    expectedSha256: declaration.sha256,
-    dev: after.dev,
-    ino: after.ino,
-    size: after.size,
-    mtimeNs: after.mtimeNs,
-    ctimeNs: after.ctimeNs,
-  });
-  return file;
-}
-
 async function verifyInstalledPackageFiles(
   installed: InstalledCapabilityPackage,
 ): Promise<Map<string, VerifiedInstalledPackageFile>> {
@@ -571,6 +647,22 @@ export function findCompatibleCapabilityPackageUpdates(
   });
 }
 
+/** Decorate pending updates with the notes published for their target version.
+ *
+ *  Pure and separate from the fetch so the mapping is testable without a network,
+ *  and so a notes document that is absent, unreadable, or missing this package
+ *  provably returns the update list unchanged. */
+export function attachCapabilityReleaseNotes(
+  updates: CapabilityPackageUpdate[],
+  notes: CapabilityReleaseNotes | null,
+): CapabilityPackageUpdate[] {
+  if (!notes) return updates;
+  return updates.map((update) => {
+    const note = notes.packages[update.id]?.versions.find((entry) => entry.version === update.version);
+    return note ? { ...update, releaseNotes: note.notes, releaseHighlight: note.highlight } : update;
+  });
+}
+
 export function findPendingCapabilityPackageUpdates(
   installedPackages: InstalledCapabilityPackage[],
   catalog: CapabilityCatalog,
@@ -593,7 +685,7 @@ async function installCatalogPackage(entry: CapabilityCatalogPackage, activateDu
   const { manifest, artifact } = entry;
   const installIssue = getCapabilityPackageInstallIssue(manifest);
   if (installIssue) throw new Error(installIssue);
-  const initiallyInstalled = (await readRegistry()).packages.find((item) => item.id === manifest.id);
+  const initiallyInstalled = await readInstalledVersion(manifest.id);
   assertNotDowngrade(initiallyInstalled, manifest.version);
   const capabilityApiIssue = getCapabilityApiCompatibilityIssue(manifest);
   if (capabilityApiIssue) throw new Error(capabilityApiIssue);
@@ -618,6 +710,12 @@ async function installCatalogPackage(entry: CapabilityCatalogPackage, activateDu
   const declaredFiles = new Map(installedManifest.files.map((file) => [normalizeArchivePath(file.path), file]));
   if (declaredFiles.size !== installedManifest.files.length)
     throw new Error("Package manifest declares duplicate files");
+  // Case-folded too: on the case-insensitive filesystems this app ships to,
+  // case-only "distinct" declarations extract onto a single file and the
+  // losing declaration's hash can never verify (review finding on #5091).
+  const caseFoldedPaths = new Set(installedManifest.files.map((file) => normalizeArchivePath(file.path).toLowerCase()));
+  if (caseFoldedPaths.size !== installedManifest.files.length)
+    throw new Error("Package manifest declares files that collide on case-insensitive filesystems");
   const payloadEntries = entries.filter((item) => item.entryName !== "manifest.json");
   if (payloadEntries.length !== declaredFiles.size) throw new Error("Package contains undeclared or missing files");
   const verifiedFiles = new Map<string, Buffer>();
@@ -669,10 +767,16 @@ async function installCatalogPackage(entry: CapabilityCatalogPackage, activateDu
     await mkdir(dirname(destination), { recursive: true });
     await rm(destination, { recursive: true, force: true });
     await rename(temporary, destination);
-    invalidateBrowserTabAssetVerifications(manifest.id);
     const registry = await readRegistry();
-    const previous = registry.packages.find((item) => item.id === manifest.id);
-    assertNotDowngrade(previous, manifest.version);
+    const registryPrevious = registry.packages.find((item) => item.id === manifest.id);
+    const previous = registryPrevious ? await hydratePreviousManifest(registryPrevious) : undefined;
+    assertNotDowngrade(await readInstalledVersion(manifest.id), manifest.version);
+    const activePrevious =
+      previous?.status === "restart-required" && previous.previousVersion && previous.previousManifest
+        ? { version: previous.previousVersion, manifest: previous.previousManifest }
+        : previous
+          ? { version: previous.version, manifest: previous.manifest }
+          : null;
     const installed: InstalledCapabilityPackage = {
       id: manifest.id,
       version: manifest.version,
@@ -683,7 +787,9 @@ async function installCatalogPackage(entry: CapabilityCatalogPackage, activateDu
       readiness: manifest.entrypoints.server ? "pending" : "ready",
       readinessError: null,
       legacy: false,
-      ...(previous && previous.version !== manifest.version ? { previousVersion: previous.version } : {}),
+      ...(activePrevious && activePrevious.version !== manifest.version
+        ? { previousVersion: activePrevious.version, previousManifest: activePrevious.manifest }
+        : {}),
     };
     await writeRegistry([...registry.packages.filter((item) => item.id !== manifest.id), installed]);
     try {
@@ -697,42 +803,207 @@ async function installCatalogPackage(entry: CapabilityCatalogPackage, activateDu
   }
 }
 
-export const capabilityPackageManager = {
-  async catalog(fetchCatalog: typeof safeFetch = safeFetch): Promise<CapabilityCatalog> {
-    const response = await fetchCatalog(CATALOG_URL, {
-      policy: { allowedProtocols: ["https:"] },
-      maxResponseBytes: 2 * 1024 * 1024,
-      allowedContentTypes: ["application/json", "text/plain"],
-      // The fixed catalog remains size-capped and must pass its Zod schema even
-      // when a network intermediary strips the Content-Type header.
-      allowMissingContentType: true,
-      decodeCompressedResponse: true,
-      headers: {
-        Accept: "application/json, text/plain;q=0.9",
-        "User-Agent": `MarinaraEngine/${APP_VERSION}`,
-      },
-      signal: AbortSignal.timeout(15_000),
-      agentOptions: { bodyTimeout: 15_000, headersTimeout: 15_000 },
+function fetchCatalogDocument(url: string, fetchCatalog: typeof safeFetch) {
+  return fetchCatalog(url, {
+    policy: { allowedProtocols: ["https:"] },
+    maxResponseBytes: 2 * 1024 * 1024,
+    allowedContentTypes: ["application/json", "text/plain"],
+    // The fixed catalog remains size-capped and must pass its Zod schema even
+    // when a network intermediary strips the Content-Type header. text/plain is
+    // also what raw.githubusercontent.com answers a missing overlay with, so the
+    // absent-overlay case reaches the status check instead of being rejected as
+    // a disallowed content type.
+    allowMissingContentType: true,
+    decodeCompressedResponse: true,
+    headers: {
+      Accept: "application/json, text/plain;q=0.9",
+      "User-Agent": `MarinaraEngine/${APP_VERSION}`,
+    },
+    signal: AbortSignal.timeout(15_000),
+    agentOptions: { bodyTimeout: 15_000, headersTimeout: 15_000 },
+  });
+}
+
+/** Sort the merged catalog deterministically regardless of the server's locale. */
+const CATALOG_SORT_COLLATOR = new Intl.Collator("en");
+
+/** Staging-only entries from the preview overlay, or [] — never throws.
+ *
+ *  The overlay is absent whenever no package is marked staging-only, which is its
+ *  normal steady state, and raw.githubusercontent.com answers that with a 404.
+ *  catalog() has no cache and no stale fallback, so letting anything here
+ *  propagate would blank the Agents browser and the update prompter for every
+ *  package at once — an unreleased package is never worth that. */
+async function fetchPreviewCatalogPackages(
+  previewCatalogUrl: string | null,
+  fetchCatalog: typeof safeFetch,
+): Promise<CapabilityCatalogPackage[]> {
+  if (!previewCatalogUrl) return [];
+  try {
+    const response = await fetchCatalogDocument(previewCatalogUrl, fetchCatalog);
+    if (response.status === 404) {
+      logger.debug("No Agent preview overlay is published at %s", previewCatalogUrl);
+      return [];
+    }
+    if (!response.ok) {
+      logger.warn("Agent preview overlay request failed with HTTP %d", response.status);
+      return [];
+    }
+    const { catalog, droppedEntries, droppedIds } = parseCapabilityCatalogWithCompat(await response.json());
+    if (droppedEntries > 0) {
+      logger.warn(
+        "Skipped %d Agent preview overlay entr%s this Engine version cannot parse: %s",
+        droppedEntries,
+        droppedEntries === 1 ? "y" : "ies",
+        droppedIds.join(", "),
+      );
+    }
+    return catalog.packages.filter((entry) => {
+      // Dropped rather than fatal, unlike the published path: a tampered stable
+      // catalog must stop everything, but one bad preview entry must not.
+      const sourceIssue = getCapabilityPackageArtifactSourceIssue(entry, previewCatalogUrl);
+      if (sourceIssue) logger.warn("Ignoring an Agent preview overlay entry: %s", sourceIssue);
+      return !sourceIssue;
     });
+  } catch (error) {
+    logger.warn(error, "Could not read the Agent preview overlay; continuing with the published catalog");
+    return [];
+  }
+}
+
+/** Cached merged notes document, or null when nothing could be read.
+ *
+ *  One cache serves both the update prompt and the catalog detail sheet, so opening
+ *  Download Agents right after dismissing a prompt costs no second request. */
+let releaseNotesCache: { at: number; notes: CapabilityReleaseNotes | null } | null = null;
+
+/** Read one notes document. Never throws and never rejects: notes are decoration.
+ *
+ *  Absent (404), unreachable, malformed, or over a cap all mean the same thing to
+ *  every caller — no notes — and must leave installing and updating exactly as they
+ *  behave on a catalog that publishes none. */
+async function fetchReleaseNotesDocument(
+  url: string,
+  fetchNotes: typeof safeFetch,
+): Promise<CapabilityReleaseNotes | null> {
+  try {
+    const response = await fetchCatalogDocument(url, fetchNotes);
+    if (response.status === 404) {
+      logger.debug("No Agent release notes are published at %s", url);
+      return null;
+    }
+    if (!response.ok) {
+      logger.warn("Agent release notes request failed with HTTP %d", response.status);
+      return null;
+    }
+    const parsed = capabilityReleaseNotesSchema.safeParse(await response.json());
+    if (!parsed.success) {
+      logger.warn("Ignoring an Agent release notes document this Engine cannot parse: %s", parsed.error.message);
+      return null;
+    }
+    return parsed.data;
+  } catch (error) {
+    logger.warn(error, "Could not read Agent release notes; continuing without them");
+    return null;
+  }
+}
+
+async function readReleaseNotes(
+  fetchNotes: typeof safeFetch = safeFetch,
+  notesUrl: string | null = RELEASE_NOTES_URL,
+  previewNotesUrl: string | null = resolveCapabilityReleaseNotesUrl(PREVIEW_CATALOG_URL),
+): Promise<CapabilityReleaseNotes | null> {
+  if (releaseNotesCache && Date.now() - releaseNotesCache.at < RELEASE_NOTES_TTL_MS) return releaseNotesCache.notes;
+  if (!notesUrl) {
+    releaseNotesCache = { at: Date.now(), notes: null };
+    return null;
+  }
+  const published = await fetchReleaseNotesDocument(notesUrl, fetchNotes);
+  // Preview-overlay packages publish their notes in the overlay's own sidecar. A
+  // published id always wins, mirroring how catalog() resolves the same collision.
+  const preview = previewNotesUrl ? await fetchReleaseNotesDocument(previewNotesUrl, fetchNotes) : null;
+  const notes =
+    published || preview
+      ? { schemaVersion: 1 as const, packages: { ...(preview?.packages ?? {}), ...(published?.packages ?? {}) } }
+      : null;
+  releaseNotesCache = { at: Date.now(), notes };
+  return notes;
+}
+
+/** Test seam: drops the cached notes document so a regression can serve a new one. */
+export function resetCapabilityReleaseNotesCache() {
+  releaseNotesCache = null;
+}
+
+export const capabilityPackageManager = {
+  async catalog(
+    fetchCatalog: typeof safeFetch = safeFetch,
+    previewCatalogUrl: string | null = PREVIEW_CATALOG_URL,
+  ): Promise<StampedCapabilityCatalog> {
+    const response = await fetchCatalogDocument(CATALOG_URL, fetchCatalog);
     if (!response.ok) throw new Error(`Catalog request failed with HTTP ${response.status}`);
-    const catalog = capabilityCatalogSchema.parse(await response.json());
+    // Per-entry tolerant: a catalog entry built for a NEWER Engine (unknown
+    // manifest keys under this Engine's strict schemas) is dropped with a log
+    // instead of failing the whole document — all-or-nothing parsing would
+    // brick browsing, install, and updates for every package at once.
+    const { catalog, droppedEntries, droppedIds } = parseCapabilityCatalogWithCompat(await response.json());
+    if (droppedEntries > 0) {
+      logger.warn(
+        "Skipped %d Agent catalog entr%s this Engine version cannot parse (likely built for a newer Engine): %s",
+        droppedEntries,
+        droppedEntries === 1 ? "y" : "ies",
+        droppedIds.join(", "),
+      );
+    }
     for (const entry of catalog.packages) {
       const sourceIssue = getCapabilityPackageArtifactSourceIssue(entry, CATALOG_URL);
       if (sourceIssue) throw new Error(sourceIssue);
     }
+    const publishedIds = new Set(catalog.packages.map((entry) => entry.manifest.id));
+    const previewPackages = (await fetchPreviewCatalogPackages(previewCatalogUrl, fetchCatalog)).filter((entry) => {
+      // The overlay only ever holds packages the published lanes do NOT carry, so
+      // an id in both means the catalog build is inconsistent. Keep what stable
+      // users already receive and carry on rather than failing the catalog.
+      if (!publishedIds.has(entry.manifest.id)) return true;
+      logger.warn(
+        "Agent preview overlay also lists published package %s; keeping the published entry",
+        entry.manifest.id,
+      );
+      return false;
+    });
+    const decorate = (
+      entry: CapabilityCatalogPackage,
+      sourceUrl: string,
+      preview: boolean,
+    ): StampedCapabilityCatalogPackage => ({
+      ...entry,
+      // Assigned here from the source URL and nowhere else. `preview` is absent
+      // from the strict downloaded-entry schema, so a published or custom
+      // catalog cannot ship an entry that claims preview provenance for itself
+      // and then ride through this spread.
+      ...(preview ? { preview: true as const } : {}),
+      iconUrl: resolveCapabilityPackageIconUrl(entry, sourceUrl),
+      artifact: {
+        ...entry.artifact,
+        url: resolveCapabilityPackageArtifactUrl(entry, sourceUrl),
+      },
+    });
+
     return {
       ...catalog,
       provenance: { kind: isOfficialCatalogUrl(CATALOG_URL) ? "official" : "custom", url: CATALOG_URL },
-      packages: catalog.packages
+      // Re-sorted because the two documents are each sorted only within
+      // themselves and the client renders catalog order as-is.
+      packages: [
+        ...catalog.packages.map((entry) => decorate(entry, CATALOG_URL, false)),
+        ...(previewCatalogUrl ? previewPackages.map((entry) => decorate(entry, previewCatalogUrl, true)) : []),
+      ]
         .filter((entry) => !NON_DOWNLOADABLE_CORE_PACKAGE_IDS.has(entry.manifest.id))
-        .map((entry) => ({
-          ...entry,
-          iconUrl: resolveCapabilityPackageIconUrl(entry, CATALOG_URL),
-          artifact: {
-            ...entry.artifact,
-            url: resolveCapabilityPackageArtifactUrl(entry, CATALOG_URL),
-          },
-        })),
+        .sort(
+          (left, right) =>
+            CATALOG_SORT_COLLATOR.compare(left.manifest.name, right.manifest.name) ||
+            CATALOG_SORT_COLLATOR.compare(left.manifest.id, right.manifest.id),
+        ),
     };
   },
 
@@ -742,12 +1013,11 @@ export const capabilityPackageManager = {
     if (removed.length === 0) return [];
     await writeRegistry(registry.packages.filter((item) => !NON_DOWNLOADABLE_CORE_PACKAGE_IDS.has(item.id)));
     await Promise.all(removed.map((item) => rm(join(VERSIONS, item.id), { recursive: true, force: true })));
-    for (const item of removed) invalidateBrowserTabAssetVerifications(item.id);
     return removed.map((item) => item.id);
   },
 
   async installed() {
-    return (await readRegistry()).packages;
+    return Promise.all((await readRegistry()).packages.map(hydratePreviousManifest));
   },
 
   async diagnostics() {
@@ -772,8 +1042,11 @@ export const capabilityPackageManager = {
     const definitions = [];
     const ids = new Set<string>();
     for (const installed of registry.packages) {
-      if (!isInstalledCapabilityReady(installed)) continue;
-      const parsed = await readInstalledAgentDefinitions(installed);
+      // A restart-required update still has its previous package runtime active. Keep
+      // its agent definitions visible until restart, just like the active client module.
+      const servable = await resolveServableInstalledPackage(installed);
+      if (!servable) continue;
+      const parsed = await readInstalledAgentDefinitions(servable);
       for (const definition of parsed) {
         if (ids.has(definition.id)) throw new Error(`Agent ${definition.id} is provided by more than one package`);
         ids.add(definition.id);
@@ -815,34 +1088,167 @@ export const capabilityPackageManager = {
 
   async clientEntrypoint(packageId: string) {
     const installed = (await readRegistry()).packages.find((item) => item.id === packageId);
-    if (!installed || !isInstalledCapabilityReady(installed)) return null;
-    const entrypoint = installed.manifest.entrypoints.client;
+    if (!installed) return null;
+    const servable = await resolveServableInstalledPackage(installed);
+    if (!servable) return null;
+    const entrypoint = servable.manifest.entrypoints.client;
     if (!entrypoint) return null;
+    // The manifest-recorded hash doubles as a strong HTTP validator (ETag): it
+    // is the same value the read below re-verifies the bytes against.
+    const declaration = servable.manifest.files.find(
+      (item) => normalizeArchivePath(item.path) === normalizeArchivePath(entrypoint),
+    );
+    if (!declaration) return null;
+    // The client path verifies by reading on EVERY request — return the
+    // verified bytes so the route serves exactly what was hashed instead of
+    // re-reading the file a second time.
+    const verified = await readVerifiedInstalledPackageFile(servable, entrypoint);
     return {
-      installed,
-      file: await verifyInstalledPackageFile(installed, entrypoint),
+      installed: servable,
+      sha256: declaration.sha256,
+      file: verified.file,
+      data: verified.data,
     };
   },
 
-  async browserTabAsset(packageId: string, assetPath: string) {
+  /** Resolve a servable package asset: a path declared either as a Home
+   *  browser-tab icon or in the general `contributions.assets.paths` allowlist.
+   *  The union is the ONLY thing this generalization changes — containment,
+   *  files[] membership, the passive content-type allowlist, and the hash +
+   *  TOCTOU re-verification below it are identical for both sources. */
+  async packageAsset(packageId: string, assetPath: string) {
     const installed = (await readRegistry()).packages.find((item) => item.id === packageId);
-    if (!installed || !isInstalledCapabilityReady(installed)) return null;
-    let normalizedPath: string;
-    try {
-      normalizedPath = normalizeArchivePath(assetPath);
-    } catch {
+    if (!installed) return null;
+    const servable = await resolveServableInstalledPackage(installed);
+    if (!servable) return null;
+    // Every normalization below treats an unsafe path — requested OR declared —
+    // as simply "not servable" (404). Declared paths are manifest-controlled,
+    // and a single throwing declaration must not 500 the whole asset surface.
+    const tryNormalize = (path: string): string | null => {
+      try {
+        return normalizeArchivePath(path);
+      } catch {
+        return null;
+      }
+    };
+    const normalizedPath = tryNormalize(assetPath);
+    if (!normalizedPath) return null;
+    // The in-package manifest is metadata about the artifact, never an asset —
+    // it cannot be hash-pinned by itself, so refuse it outright.
+    if (normalizedPath === "manifest.json") return null;
+    const iconPaths = servable.manifest.contributions?.homeBrowserTab?.iconPaths ?? [];
+    const declaredAssetPaths = servable.manifest.contributions?.assets?.paths ?? [];
+    const allowed = [...iconPaths, ...declaredAssetPaths].some((path) => tryNormalize(path) === normalizedPath);
+    if (!allowed) return null;
+    const declaration = servable.manifest.files.find((item) => tryNormalize(item.path) === normalizedPath);
+    if (!declaration) return null;
+    const contentType = PACKAGE_ASSET_CONTENT_TYPES.get(extname(normalizedPath).toLowerCase());
+    if (!contentType) return null;
+    // Every serve reads, hashes, and returns the verified bytes through the
+    // same realpath + lstat chain the client entrypoint uses — a stat-only
+    // fast path let a write between verification and the route's own read send
+    // bytes that were never hashed (review finding on #5092). 304 revalidation
+    // means bodies are rarely sent, so per-request hashing costs little.
+    // NOTE: an on-disk integrity failure below still THROWS (lifecycle
+    // regression pins it) — tampering must be loud, not a quiet 404. Only
+    // manifest-shape problems above degrade to "not servable".
+    const verified = await readVerifiedInstalledPackageFile(servable, normalizedPath);
+    return {
+      installed: servable,
+      contentType,
+      sha256: declaration.sha256,
+      file: verified.file,
+      /** The exact bytes that were hash-verified; always present. */
+      data: verified.data,
+    };
+  },
+
+  /** The verified bytes of a package's declared GM verb table (#5798), or null when this package has
+   *  no verbs the Engine may act on. The whole gate chain lives here because
+   *  `readVerifiedInstalledPackageFile` is module-private and this is the one narrow export the verb
+   *  runtime gets — it never receives an `InstalledCapabilityPackage`, so nothing else about a
+   *  package leaks through the seam.
+   *
+   *  Readiness rather than servability: `packageAsset` falls back to the PREVIOUS version's manifest
+   *  for a `restart-required` package, which would keep serving an old vocabulary the running Engine
+   *  no longer matches. `isInstalledCapabilityReady` is the same gate the agent definitions use, so
+   *  after an update that needs a restart the verbs stop resolving until one — a log line, and the
+   *  turn is otherwise untouched.
+   *
+   *  The failure tiers ARE the contract, and the turn survives all of them:
+   *    - not installed / not ready / no table declared → null, quietly. The overwhelmingly common
+   *      case is a package that simply has no verbs.
+   *    - a table declared without `chat-write`, declared but unlisted in `files[]`, or larger than
+   *      the ceiling → null + `logger.warn`. Each is a packaging mistake whose only symptom would
+   *      otherwise be verbs that silently never appear.
+   *    - hash/TOCTOU failure → null + `logger.error` naming tampering. Loud on purpose: the bytes on
+   *      disk are not the bytes that were installed.
+   *
+   *  The `chat-write` gate sits ahead of the read rather than in the caller so an unpermitted
+   *  package's bytes are never loaded at all — and it is checked AFTER the declaration test so a
+   *  package with no table stays silent while a package that ships one and forgot the permission is
+   *  told. This is the first place a declared capability permission is enforced anywhere in the
+   *  Engine; it widens what `chat-write` means for packages that already hold it (#5798). */
+  async gmVerbTableSource(packageId: string): Promise<Buffer | null> {
+    const installed = (await readRegistry()).packages.find((item) => item.id === packageId);
+    if (!installed) return null;
+    if (!isInstalledCapabilityReady(installed)) {
+      logger.info(
+        "[capability/gm-verbs] Package %s is not ready (status=%s); its verbs stay unavailable until restart",
+        packageId,
+        installed.status,
+      );
       return null;
     }
-    const iconPaths = installed.manifest.contributions?.homeBrowserTab?.iconPaths ?? [];
-    if (!iconPaths.some((path) => normalizeArchivePath(path) === normalizedPath)) return null;
-    if (!installed.manifest.files.some((item) => normalizeArchivePath(item.path) === normalizedPath)) return null;
-    const contentType = BROWSER_TAB_ASSET_CONTENT_TYPES.get(extname(normalizedPath).toLowerCase());
-    if (!contentType) return null;
-    return {
-      installed,
-      contentType,
-      file: await verifyBrowserTabAsset(installed, normalizedPath),
+    const tryNormalize = (path: string): string | null => {
+      try {
+        return normalizeArchivePath(path);
+      } catch {
+        return null;
+      }
     };
+    const declaredAssetPaths = installed.manifest.contributions?.assets?.paths ?? [];
+    if (!declaredAssetPaths.some((path) => tryNormalize(path) === GM_VERB_TABLE_ASSET_PATH)) return null;
+    if (!installed.manifest.permissions.includes("chat-write")) {
+      logger.warn(
+        "[capability/gm-verbs] Package %s declares %s without the chat-write permission; its verbs are refused",
+        packageId,
+        GM_VERB_TABLE_ASSET_PATH,
+      );
+      return null;
+    }
+    const declaration = installed.manifest.files.find((item) => tryNormalize(item.path) === GM_VERB_TABLE_ASSET_PATH);
+    if (!declaration) {
+      // Declared as an asset but never hash-pinned. The manifest schema only checks the other
+      // direction, so this is silent everywhere else in the pipeline.
+      logger.warn(
+        "[capability/gm-verbs] Package %s declares %s as an asset but does not list it in files[]",
+        packageId,
+        GM_VERB_TABLE_ASSET_PATH,
+      );
+      return null;
+    }
+    // Checked against the DECLARED size, before the read: `files[].bytes` permits up to 100 MB and
+    // nothing else caps an asset ahead of loading it into memory.
+    if (declaration.bytes > GM_VERB_TABLE_MAX_BYTES) {
+      logger.warn(
+        "[capability/gm-verbs] Package %s declares a %d-byte verb table over the %d-byte ceiling; refused unread",
+        packageId,
+        declaration.bytes,
+        GM_VERB_TABLE_MAX_BYTES,
+      );
+      return null;
+    }
+    try {
+      return (await readVerifiedInstalledPackageFile(installed, GM_VERB_TABLE_ASSET_PATH)).data;
+    } catch (error) {
+      logger.error(
+        error,
+        "[capability/gm-verbs] Verb table for %s failed integrity verification — the file on disk is not the file that was installed",
+        packageId,
+      );
+      return null;
+    }
   },
 
   async markRuntimeStatus(
@@ -886,11 +1292,11 @@ export const capabilityPackageManager = {
       readiness: "pending",
       readinessError: null,
       previousVersion: undefined,
+      previousManifest: undefined,
     };
     if (runtimeBlockReason(restored)) return null;
     registry.packages[index] = restored;
     await writeRegistry(registry.packages);
-    invalidateBrowserTabAssetVerifications(packageId);
     const server = manifest.entrypoints.server;
     return server
       ? {
@@ -917,7 +1323,11 @@ export const capabilityPackageManager = {
       return { migrated: false, legacy: false, complete: true };
     }
 
-    const catalog = await this.catalog();
+    // Published lanes only (preview overlay explicitly not fetched): this loop
+    // installs and activates EVERY entry it is handed, unattended, at startup.
+    // Merging staging-only packages in here would silently install every
+    // unfinished package on a tester's machine the first time they upgrade.
+    const catalog = await this.catalog(safeFetch, null);
     const installedById = new Map((await this.installed()).map((item) => [item.id, item]));
     for (const entry of catalog.packages) {
       if (installedById.get(entry.manifest.id)?.version === entry.manifest.version) continue;
@@ -943,7 +1353,9 @@ export const capabilityPackageManager = {
 
     const alreadyInstalled = (await this.installed()).some((item) => item.id === "noodle");
     if (!alreadyInstalled) {
-      const catalog = await this.catalog();
+      // Published lanes only, for the same reason as migrateLegacyAvailability:
+      // this path auto-installs what it finds without asking.
+      const catalog = await this.catalog(safeFetch, null);
       const entry = catalog.packages.find((candidate) => candidate.manifest.id === "noodle");
       if (!entry) {
         // Engine and Agents are published independently. Do not turn the short
@@ -975,7 +1387,26 @@ export const capabilityPackageManager = {
     const declinedVersions = Object.fromEntries(
       Object.entries(decisions.declined).map(([id, decision]) => [id, decision.version]),
     );
-    return findPendingCapabilityPackageUpdates(installedPackages, catalog, declinedVersions);
+    const updates = findPendingCapabilityPackageUpdates(installedPackages, catalog, declinedVersions);
+    if (updates.length === 0) return updates;
+    // Decoration only: a notes document that is absent or unreadable must leave
+    // this list exactly as an Engine without the feature would return it.
+    return attachCapabilityReleaseNotes(updates, await readReleaseNotes());
+  },
+
+  /** Published notes for one package, newest first, or [] when none exist.
+   *
+   *  Sorted here rather than trusted: the official build emits newest-first, but a
+   *  custom catalog is under no such obligation and the history sheet renders this
+   *  order as-is. */
+  async releaseNotes(
+    packageId: string,
+    fetchNotes: typeof safeFetch = safeFetch,
+  ): Promise<CapabilityPackageVersionNote[]> {
+    const notes = await readReleaseNotes(fetchNotes);
+    return [...(notes?.packages[packageId]?.versions ?? [])].sort((left, right) =>
+      compareCapabilityPackageVersions(right.version, left.version),
+    );
   },
 
   async declineUpdate(packageId: string, version: string) {
@@ -1013,7 +1444,6 @@ export const capabilityPackageManager = {
     }
     await writeRegistry(registry.packages.filter((item) => item.id !== packageId));
     await rm(join(VERSIONS, packageId), { recursive: true, force: true });
-    invalidateBrowserTabAssetVerifications(packageId);
     try {
       await clearDeclinedUpdate(packageId);
     } catch (error) {

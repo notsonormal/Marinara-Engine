@@ -34,7 +34,7 @@ Replace `192.168.1.42` with your own host IP address.
 
 5. Sign in if the browser asks for the Basic Auth username and password. If you see an **Access blocked** page instead, finish step 2 on the host first.
 
-On ordinary desktop installs, the same computer (`127.0.0.1`) does not need a password. APK-managed Android installs add a private localhost login so another Android app cannot impersonate Marinara. Other devices are blocked until you set up access control (Basic Auth or an IP allowlist). Each option is explained in [Remote Access](REMOTE_ACCESS.md).
+On ordinary desktop installs, the same computer (`127.0.0.1`) does not need a password. APK-managed Android installs add a private localhost login so another Android app cannot impersonate Marinara, but the Android wrapper creates and uses that credential automatically. Other devices are blocked until you set up access control (Basic Auth or an IP allowlist). Each option is explained in [Remote Access](REMOTE_ACCESS.md).
 
 If the two devices are not on the same network, a tool like Tailscale can help. Tailscale gives each device a stable private address. You can then connect from anywhere without exposing Marinara to the public internet. If you cannot connect, see [Troubleshooting](TROUBLESHOOTING.md).
 
@@ -42,9 +42,9 @@ If the two devices are not on the same network, a tool like Tailscale can help. 
 
 There is no separate native mobile app. On a phone or tablet, you use the same web app in a browser. Most mobile browsers offer an **Add to Home Screen** or **Install App** option that makes it feel like a real app, with no browser bar. This is called a PWA (Progressive Web App, a website you can install like an app).
 
-On Android, you can also install an APK, the installable app file for Android. It runs Marinara locally on the phone. See [Android Installation](installation/android-termux.md). On iPhone and iPad, see the [iOS PWA Guide](installation/ios-pwa.md).
+On Android, you can also [download the latest APK directly](https://github.com/Pasta-Devs/Marinara-Engine/releases/latest/download/marinara-engine-android.apk). It runs Marinara locally on the phone through Termux. Installing it does not require a signing key, password, or local-access secret; see [Android Installation](installation/android-termux.md) for the Android permission prompts. On iPhone and iPad, see the [iOS PWA Guide](installation/ios-pwa.md).
 
-The Android wrapper signs in automatically when it opens its APK-managed Termux server. To use another browser on that phone, open `/android-login`, run `cat ~/.marinara-engine/android-secret` in Termux, and paste the displayed secret. The local `mari` CLI reads that same launcher-managed secret automatically. Manual Termux installs keep the normal localhost and network-access rules.
+The Android wrapper signs in automatically in the app or your browser. Select **Open in browser** on its launcher and tap **Retry connection**; use **Install / Start Marinara** when the server is stopped. This choice is remembered. In the app, **Settings > General > App Behavior > Open Android launcher (app or browser)** returns to that choice. Update both the APK and Engine to use the automatic browser handoff. Older APKs still offer manual sign-in at `/android-login`. The local `mari` CLI reads the launcher-managed secret automatically, and manual Termux installs retain normal localhost rules.
 
 ## What are the three chat modes?
 
@@ -59,6 +59,16 @@ Each mode has its own getting-started guide. Start with the mode you want, then 
 ## How do I change the timezone used by Conversation schedules?
 
 Open a Conversation and choose **Schedule timezone** in Chat Settings, or choose it while creating schedules in the Conversation setup flow. Marinara starts with the timezone reported by your device, but you can select any supported IANA timezone or choose **Use device** to reset it. This is one global preference for all Conversation chats, including server-side autonomous messages, and it syncs to other devices connected to the same Marinara server.
+
+## Does each Conversation chat have its own schedule?
+
+No. A schedule belongs to the character, and every Conversation chat with that character uses the same one. Edit it in **Character Editor -> Convo -> Weekly schedule**, or from the schedule controls in Chat Settings; either way the change applies everywhere.
+
+To get instant replies in one chat, open its Chat Settings and turn **Conversation schedules** off. That switch is per chat. The character stays available in that chat, keeps its schedule, and your other chats do not change. An active manual status override still takes precedence and applies in that chat, including an override such as **dnd**.
+
+Existing chats that never used schedules stay off until you turn them on. New chats you start with a character that has a schedule use it from the start.
+
+A manual status override also belongs to the character. If you set a character to **online** in one chat, the character is online in every chat. Use **clear** to remove the override.
 
 ## Do I need an API key to use Marinara?
 
@@ -112,11 +122,11 @@ For the full feature, see [Lorebooks](lorebooks/overview.md).
 
 ## What is an agent?
 
-An **agent** is an optional AI helper that runs during a chat to do a focused job. Examples include tracking the current scene, watching writing quality, adding maps or calls, or running a Conversation table game. Fresh installations have no optional agents. Open the **Agents** panel, click **Download Agents**, read an item's details, and install it. Then enable compatible agents per chat in **Chat Settings**. When an installed official package has a compatible update, Marinara asks before downloading it. Choosing **No** keeps the current version and leaves **Update** available in Download Agents for later. If the host is offline or verification fails, the installed version keeps working. The catalog also handles complete package removal. See [Agents](agents/agents-overview.md) and the public [Marinara-Agents repository](https://github.com/Pasta-Devs/Marinara-Agents).
+An **agent** is an optional AI helper that runs during a chat to do a focused job. Examples include tracking the current scene, watching writing quality, adding maps or calls, or running a Conversation table game. Fresh installations have no optional agents. Open the **Agents** panel, click **Download Agents**, read an item's details, and install it. Then enable compatible agents per chat in **Chat Settings**. When an installed official package has a compatible update, Marinara asks before downloading it and lists what each update changed when the package publishes release notes. A dot marks a version the publisher flagged as a change you will notice. Choosing **No** keeps the current version and leaves **Update** available in Download Agents for later. If the host is offline or verification fails, the installed version keeps working. The catalog also handles complete package removal. See [Agents](agents/agents-overview.md) and the public [Marinara-Agents repository](https://github.com/Pasta-Devs/Marinara-Agents).
 
 ## How do I set up Noodle?
 
-Noodle is Marinara's local, fictional social network for your characters. First open **Agents** → **Download Agents** and install **Noodle & NoodleR**, then restart Marinara when prompted. Open **Home** → **Noodle**, enter its **Settings**, invite characters or character folders, choose a generation connection under **Refresh**, then select **Refresh now** to generate the first activity. You can also set automatic refresh times, image generation, random users, and carryover into your chats.
+Noodle is Marinara's local, fictional social network for your characters. First open **Agents** → **Download Agents** and install **Noodle**, then restart Marinara when prompted. Open **Home** → **Noodle**, enter its **Settings**, invite characters or character folders, choose a generation connection under **Refresh**, then select **Refresh now** to generate the first activity. You can also set automatic refresh times, image generation, random users, and carryover into your chats.
 
 See [Noodle: The In-App Social Timeline](noodle/overview.md) and [Noodle Settings and Chat Carryover](noodle/settings.md) for the full guides.
 
@@ -126,6 +136,8 @@ AI models can only hold so much text at once, so old messages fall out of view i
 
 - **Memory Recall** searches earlier messages and quietly adds the most relevant bits back into the prompt. Turn it on in **Chat Settings** under **Memory Recall**.
 - Summaries compress old messages into short recaps. Roleplay chats use **Chat Summary**, and Conversation chats use **Automatic Summarization**.
+
+For automatic Roleplay context management, enable **Advanced Memory Recall (Alpha)** in **Chat Settings → Memory Recall**. It keeps recent history, maintains bounded continuity, and selectively recalls older scenes within your chosen estimated context cap. Setup, progress and editing stay in the drawer. Older Individual group chats may need one-time confirmation of each character's knowledge range.
 
 For setup and details, see [Memory and Summaries](agents/memory.md).
 

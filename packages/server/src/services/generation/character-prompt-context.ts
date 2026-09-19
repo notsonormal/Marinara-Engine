@@ -3,6 +3,7 @@ import {
   nameToXmlTag,
   normalizeRpgStatPools,
   resolveMacros,
+  templateReferencesAnyMacro,
   type CharacterMacroProfile,
   type MacroContext,
   type RPGStatsConfig,
@@ -14,6 +15,7 @@ import { cardPromptText } from "../prompt/card-text.js";
 export type CharacterPromptInfo = {
   id: string;
   name: string;
+  world?: string;
   description: string;
   personality: string;
   scenario: string;
@@ -145,6 +147,7 @@ export async function loadCharacterPromptInfo({
     charInfo.push({
       id: cid,
       name: charData.name ?? "Unknown",
+      world: cardPromptText(charData.extensions?.world) || undefined,
       description,
       personality: cardPromptText(charData.personality),
       scenario,
@@ -216,15 +219,8 @@ function contentIncludesResolvedField(content: string, fieldValue: string): bool
   return marker.length > 0 && content.includes(marker);
 }
 
-function macroAliasPattern(alias: string): RegExp {
-  return new RegExp(`\\{\\{[\\s\\S]*?\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b[\\s\\S]*?\\}\\}`, "i");
-}
-
 function sourceReferencesAnyMacro(sources: readonly string[], aliases: readonly string[]): boolean {
-  return aliases.some((alias) => {
-    const pattern = macroAliasPattern(alias);
-    return sources.some((source) => pattern.test(source));
-  });
+  return sources.some((source) => templateReferencesAnyMacro(source, aliases));
 }
 
 export function injectIdentityFallbackMessages(args: {

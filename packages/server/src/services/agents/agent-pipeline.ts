@@ -21,6 +21,7 @@ import {
 } from "./agent-executor.js";
 import { logger } from "../../lib/logger.js";
 import { createAgentConcurrencyLimiter, settleAgentJobsWithConcurrencyLimit } from "./agent-concurrency.js";
+import { getCustomLorebookReadBehindMessages } from "../../routes/generate/lorebook-keeper-utils.js";
 export { settleAgentJobsWithConcurrencyLimit } from "./agent-concurrency.js";
 
 /** A fully resolved agent ready for execution. */
@@ -31,6 +32,8 @@ export interface ResolvedAgent extends AgentExecConfig {
   maxParallelJobs?: number;
   /** Optional tool context for agents that need function calling (e.g., Spotify). */
   toolContext?: AgentToolContext;
+  /** Request-local context identity used to keep incompatible agent batches separate. */
+  batchContextKey?: string;
 }
 
 export interface AgentInjection {
@@ -41,6 +44,11 @@ export interface AgentInjection {
 
 export type AgentContextResolver = (
   agent: AgentExecConfig,
+  context: AgentContext,
+) => AgentContext | Promise<AgentContext>;
+
+export type AgentPhaseContextPreparer = (
+  agents: AgentExecConfig[],
   context: AgentContext,
 ) => AgentContext | Promise<AgentContext>;
 
@@ -68,16 +76,14 @@ export function normalizeAgentMaxParallelJobs(value: unknown): number {
 }
 
 /**
- * Group agents by shared provider+model so they can be batched.
- * We use the provider reference + model string as the key.
+ * Group agents by shared provider, model, and compatible request context so they can be batched.
  */
 function groupByProviderModel(agents: ResolvedAgent[]): AgentGroup[] {
   const groups = new Map<string, AgentGroup>();
 
   for (const agent of agents) {
-    // Use a composite key: object reference hash + model
-    // Two agents share a group if they have the same provider instance and model
-    const key = `${providerKey(agent.provider)}::${agent.model}::${postProcessingDataKey(agent)}`;
+    // Two agents share a group only when their provider, model, and resolved context are compatible.
+    const key = `${providerKey(agent.provider)}::${agent.model}::${agentBatchDataKey(agent)}`;
     let group = groups.get(key);
     if (!group) {
       group = {
@@ -127,12 +133,16 @@ function providerKey(provider: BaseLLMProvider): number {
   return id;
 }
 
-function postProcessingDataKey(agent: ResolvedAgent): string {
-  if (agent.phase !== "post_processing") return "default";
+function agentBatchDataKey(agent: ResolvedAgent): string {
+  const batchContextKey = agent.batchContextKey ?? "default-context";
+  if (agent.phase !== "post_processing") return batchContextKey;
+  const readBehind = getCustomLorebookReadBehindMessages(agent.settings);
   return [
     getAgentBatchLane(agent),
     agent.settings.includePreGenInjections === true ? "pre-gen" : "no-pre-gen",
     agent.settings.includeParallelResults === true ? "parallel" : "no-parallel",
+    `read-behind-${readBehind}`,
+    batchContextKey,
   ].join(":");
 }
 
@@ -280,13 +290,17 @@ async function executePhase(
   if (phaseAgents.length === 0) return [];
 
   const groups = groupByProviderModel(phaseAgents).flatMap(splitGroupForParallelJobs);
+  const groupLimit = context.sequentialExecution ? 1 : AGENT_PHASE_MAX_CONCURRENT_GROUPS;
   const connectionLimits = new Map<number, number>();
   for (const group of groups) {
     const key = providerKey(group.provider);
     connectionLimits.set(key, Math.min(connectionLimits.get(key) ?? group.maxParallelJobs, group.maxParallelJobs));
   }
   const connectionLimiters = new Map(
-    Array.from(connectionLimits, ([key, limit]) => [key, createAgentConcurrencyLimiter(limit)]),
+    Array.from(connectionLimits, ([key, limit]) => [
+      key,
+      createAgentConcurrencyLimiter(context.sequentialExecution ? 1 : limit),
+    ]),
   );
 
   logger.debug(
@@ -306,7 +320,7 @@ async function executePhase(
     );
   }
 
-  const settled = await settleAgentJobsWithConcurrencyLimit(groups, AGENT_PHASE_MAX_CONCURRENT_GROUPS, (group) =>
+  const settled = await settleAgentJobsWithConcurrencyLimit(groups, groupLimit, (group) =>
     executeGroup(group, context, connectionLimiters.get(providerKey(group.provider))!, onResult, resolveAgentContext),
   );
 
@@ -453,6 +467,7 @@ export function createAgentPipeline(
   baseContext: AgentContext,
   onResult?: AgentResultCallback,
   resolveAgentContext?: AgentContextResolver,
+  preparePostContext?: AgentPhaseContextPreparer,
 ) {
   const allResults: AgentResult[] = [];
   const preGenerationInjections: AgentInjection[] = [];
@@ -497,8 +512,12 @@ export function createAgentPipeline(
      */
     async postGenerate(
       mainResponse: string,
-      options: { preGenInjections?: AgentInjection[]; parallelResults?: AgentResult[] } = {},
+      options: {
+        preGenInjections?: AgentInjection[];
+        parallelResults?: AgentResult[];
+      } = {},
     ): Promise<AgentResult[]> {
+      const postAgents = agents.filter((agent) => agent.phase === "post_processing");
       const fullContext: AgentContext = {
         ...baseContext,
         mainResponse,
@@ -506,7 +525,8 @@ export function createAgentPipeline(
         parallelResults: options.parallelResults ?? parallelPhaseResults,
       };
 
-      return runPostProcessingAgents(agents, fullContext, wrappedOnResult, resolveAgentContext);
+      const preparedContext = preparePostContext ? await preparePostContext(postAgents, fullContext) : fullContext;
+      return runPostProcessingAgents(postAgents, preparedContext, wrappedOnResult, resolveAgentContext);
     },
 
     /** All results collected so far. */

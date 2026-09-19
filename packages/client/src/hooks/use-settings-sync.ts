@@ -22,6 +22,8 @@ import {
 import { api } from "../lib/api-client";
 import { normalizeConversationTimeZone } from "../lib/conversation-time-zone";
 import {
+  normalizeTrackerPanelCollapsedSections,
+  normalizeTrackerPanelSectionOrder,
   normalizeTrackerPanelSizeProfile,
   normalizeTrackerStatDisplayMode,
   normalizeTrackerTemperatureUnit,
@@ -42,6 +44,7 @@ type ServerSettingsPayload = SyncedSettingsObject & { __updatedAt?: number };
 type ParsedSettings = Partial<SyncedSettingsObject> & Record<string, unknown>;
 
 const LOCAL_ONLY_SETTING_KEYS = [
+  "appAccentPulseMode",
   "fontSize",
   "chatFontSize",
   "trackerPanelOpen",
@@ -104,6 +107,8 @@ function parseServerSettingsValue(value: string): {
   const updatedAt =
     typeof payload.__updatedAt === "number" && Number.isFinite(payload.__updatedAt) ? payload.__updatedAt : null;
   delete payload.__updatedAt;
+  payload.imageCharacterSheetWidth ??= payload.imageBackgroundWidth ?? 1280;
+  payload.imageCharacterSheetHeight ??= payload.imageBackgroundHeight ?? 720;
   return { settings: payload, updatedAt };
 }
 
@@ -208,6 +213,38 @@ export function useSettingsSync() {
                 );
                 delete parsed.settings.trackerPanelWidth;
               }
+              // The synced blob predates every section added after it was written, so a
+              // server order captured before a new tracker section shipped would hide
+              // that section forever — `migrate` only normalizes the browser-local copy,
+              // and the `setState` below overwrites it. `staleSyncedShape` forces the
+              // corrected value back to the server; without it the stale array survives
+              // and re-arrives on every other device.
+              let staleSyncedShape = false;
+              if ("trackerPanelSectionOrder" in parsed.settings) {
+                const normalizedOrder = normalizeTrackerPanelSectionOrder(parsed.settings.trackerPanelSectionOrder);
+                if (!Array.isArray(parsed.settings.trackerPanelSectionOrder)) {
+                  staleSyncedShape = true;
+                } else if (
+                  parsed.settings.trackerPanelSectionOrder.length !== normalizedOrder.length ||
+                  normalizedOrder.some(
+                    (section, index) => parsed.settings.trackerPanelSectionOrder?.[index] !== section,
+                  )
+                ) {
+                  staleSyncedShape = true;
+                }
+                parsed.settings.trackerPanelSectionOrder = normalizedOrder;
+              }
+              if ("trackerPanelCollapsedSections" in parsed.settings) {
+                const normalizedCollapsed = normalizeTrackerPanelCollapsedSections(
+                  parsed.settings.trackerPanelCollapsedSections,
+                );
+                if (
+                  JSON.stringify(parsed.settings.trackerPanelCollapsedSections) !== JSON.stringify(normalizedCollapsed)
+                ) {
+                  staleSyncedShape = true;
+                }
+                parsed.settings.trackerPanelCollapsedSections = normalizedCollapsed;
+              }
               if ("trackerPanelThoughtBubbleDisplay" in parsed.settings) {
                 parsed.settings.trackerPanelThoughtBubbleDisplay = normalizeTrackerThoughtBubbleDisplay(
                   parsed.settings.trackerPanelThoughtBubbleDisplay,
@@ -274,9 +311,10 @@ export function useSettingsSync() {
                 useUIStore.setState(parsed.settings);
                 lastPushed = serialize();
                 if (serverUpdatedAt !== null) writeLocalUpdatedAt(serverUpdatedAt);
-                if (hadLocalOnlySettings || hadMissingSyncedSettings) {
+                if (hadLocalOnlySettings || hadMissingSyncedSettings || staleSyncedShape) {
                   try {
-                    const rewriteUpdatedAt = hadMissingSyncedSettings ? Date.now() : (serverUpdatedAt ?? Date.now());
+                    const rewriteUpdatedAt =
+                      hadMissingSyncedSettings || staleSyncedShape ? Date.now() : (serverUpdatedAt ?? Date.now());
                     await api.put(SETTINGS_PATH, {
                       value: buildServerSettingsValue(pickSyncedSettings(useUIStore.getState()), rewriteUpdatedAt),
                     });
@@ -311,7 +349,10 @@ export function useSettingsSync() {
         // Server unreachable at startup — run with local state only.
         lastPushed = serialize();
       } finally {
-        if (!disposed) ready = true;
+        if (!disposed) {
+          ready = true;
+          useUIStore.setState({ settingsSyncReady: true });
+        }
       }
     })();
 

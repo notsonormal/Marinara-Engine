@@ -113,7 +113,11 @@ import { SpriteFrameEditor } from "../ui/SpriteFrameEditor";
 import { SpriteWandCleanupEditor } from "../ui/SpriteWandCleanupEditor";
 import { ExportFormatDialog, type ExportFormatChoice } from "../ui/ExportFormatDialog";
 import { Modal } from "../ui/Modal";
-import { EditorTabRail } from "../ui/EditorTabRail";
+import { EditorTabNavigation } from "../ui/EditorTabNavigation";
+import { useEditorSections } from "../../hooks/use-editor-sections";
+import { useEditorLeaveSave } from "../../hooks/use-editor-leave-save";
+import { LazyEditorSection } from "../ui/LazyEditorSection";
+import { leaveWithoutSaving } from "../../lib/editor-leave";
 import { EditorSectionAnchor, EditorSectionJumps } from "../ui/EditorSectionJumps";
 import { SettingsSwitch } from "../panels/settings/SettingControls";
 import {
@@ -166,10 +170,6 @@ const PERSONA_CARD_SECTIONS = [
   { id: "persona-card-scenario", label: "Scenario" },
 ] as const;
 
-function formatPersonaTextTokens(value: string): string {
-  return formatEstimatedTokens(estimateTextTokens(value));
-}
-
 const PERSONA_METADATA_HELP =
   "Use metadata for identity, sharing, and library organization. Name is injected as your persona name, creator/version help track authorship and revisions, tags make the persona searchable, and creator notes stay private.";
 
@@ -211,6 +211,7 @@ interface PersonaFormData {
   phoneticName: string;
   creator: string;
   personaVersion: string;
+  versioningEnabled: boolean;
   creatorNotes: string;
   description: string;
   personality: string;
@@ -321,6 +322,7 @@ function personaFormFromPersona(persona: Persona): PersonaFormData {
     phoneticName: persona.phoneticName ?? "",
     creator: persona.creator ?? "",
     personaVersion: persona.personaVersion ?? "1.0",
+    versioningEnabled: persona.versioningEnabled !== false,
     creatorNotes: persona.creatorNotes ?? "",
     description: persona.description,
     personality: persona.personality ?? "",
@@ -545,8 +547,9 @@ function PersonaGalleryTab({
               key={tab.id}
               type="button"
               onClick={() => setMediaTab(tab.id)}
+              aria-pressed={active}
               className={cn(
-                "flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors",
+                "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors",
                 active
                   ? "bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm"
                   : "text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]",
@@ -1237,6 +1240,7 @@ function createCharacterDataFromPersona(formData: PersonaFormData): CharacterDat
       depth_prompt: { prompt: "", depth: 4, role: "system" },
       backstory: formData.backstory ?? "",
       appearance: formData.appearance ?? "",
+      versioningEnabled: formData.versioningEnabled,
       phoneticName: formData.phoneticName.trim() || undefined,
       nameColor: formData.nameColor || undefined,
       dialogueColor: formData.dialogueColor || undefined,
@@ -1276,6 +1280,12 @@ export function PersonaEditor() {
   // what asynchronous save/upload continuations read, so reconciliation never
   // depends on a render having happened; the state is what re-renders the UI.
   const [formData, setFormDataState] = useState<PersonaFormData | null>(null);
+  const { contentRef, scrollToSection } = useEditorSections(
+    personaId,
+    !!formData,
+    personaInitialTab ?? "metadata",
+    setActiveTab,
+  );
   const formDataRef = useRef<PersonaFormData | null>(null);
   const [baselineForm, setBaselineFormState] = useState<PersonaFormData | null>(null);
   const baselineFormRef = useRef<PersonaFormData | null>(null);
@@ -1302,7 +1312,7 @@ export function PersonaEditor() {
   const [mutationKind, setMutationKind] = useState<PersonaMutationKind | null>(null);
   const formatQuotes = useQuoteFormatter();
   const setEditorDirty = useUIStore((s) => s.setEditorDirty);
-  const [showUnsavedWarning, setShowUnsavedWarning] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const commitFormData = useCallback((next: PersonaFormData | null) => {
@@ -1348,10 +1358,7 @@ export function PersonaEditor() {
 
   /** True while the completion still belongs to the mounted editor session.
    *  Anything else may touch caches but not local state. */
-  const isCurrentEditorSession = useCallback(
-    (session: string) => editorSessionRef.current === session,
-    [],
-  );
+  const isCurrentEditorSession = useCallback((session: string) => editorSessionRef.current === session, []);
   const imageGenerationAvailable =
     Array.isArray(connectionsList) &&
     (connectionsList as Array<{ provider?: string }>).some((connection) => connection.provider === "image_generation");
@@ -1568,8 +1575,7 @@ export function PersonaEditor() {
       previousAvatarPreview: string | null;
       previousAvatarCrop: AvatarCrop | null;
     }) => {
-      const stillCurrent = () =>
-        isCurrentEditorSession(session) && mutationTokenRef.current === operationToken;
+      const stillCurrent = () => isCurrentEditorSession(session) && mutationTokenRef.current === operationToken;
       if (!stillCurrent()) return false;
 
       // The pending image is its own crop owner, so the incoming picture is never
@@ -1741,13 +1747,12 @@ export function PersonaEditor() {
     if (!deleteToken) return;
     try {
       await deletePersona.mutateAsync(deletedPersonaId);
-      if (isCurrentEditorSession(session) && loadedPersonaIdRef.current === deletedPersonaId) closeDetail();
+      if (isCurrentEditorSession(session) && loadedPersonaIdRef.current === deletedPersonaId)
+        leaveWithoutSaving(closeDetail);
     } catch (error) {
       if (!isCurrentEditorSession(session) || loadedPersonaIdRef.current !== deletedPersonaId) return;
       console.error("[PersonaEditor] Delete failed:", error);
-      toast.error(
-        formatFirstApiValidationIssue(error, localizeUi("ui.personas.personaeditor.failedToDeletePersona")),
-      );
+      toast.error(formatFirstApiValidationIssue(error, localizeUi("ui.personas.personaeditor.failedToDeletePersona")));
     } finally {
       // A failure retains the editor and draft; success closes once above. An old
       // completion cannot clear a newer session's operation token.
@@ -1823,33 +1828,10 @@ export function PersonaEditor() {
   const handleClose = useCallback(() => {
     // Read immediate refs so a local Back click cannot race a write or draft update.
     if (mutationTokenRef.current) return;
-    const draft = formDataRef.current;
-    const baseline = baselineFormRef.current;
-    const dirtyNow =
-      draft !== null && baseline !== null && personaFieldsDifferingFromBaseline(draft, baseline).length > 0;
-    if (dirtyNow) {
-      setShowUnsavedWarning(true);
-      return;
-    }
     closeDetail();
   }, [closeDetail]);
 
-  const keepEditing = useCallback(() => {
-    setShowUnsavedWarning(false);
-  }, []);
-
-  const discardAndNavigate = useCallback(() => {
-    // A write may have started after the warning opened; never discard under it.
-    if (mutationTokenRef.current) return;
-    closeDetail();
-  }, [closeDetail]);
-
-  const handleSaveAndClose = useCallback(async () => {
-    if (mutationTokenRef.current) return;
-    const savedAndClean = await handleSave();
-    // Only close when the save landed and no edit made during it is still unsaved.
-    if (savedAndClean && !mutationTokenRef.current) closeDetail();
-  }, [closeDetail, handleSave]);
+  useEditorLeaveSave(`personaDetailId:${personaId}`, dirty, handleSave, mutationBusy);
 
   if (isLoading || !formData) {
     return (
@@ -1864,7 +1846,7 @@ export function PersonaEditor() {
 
   const headerActionButtonClass = "mari-editor-action inline-flex";
   const saveDisabled = !dirty || mutationBusy;
-  const saveLabel = saving ? "Saving…" : "Save";
+  const saveLabel = localizeUi(saving ? "editor.save.saving" : "editor.save.action");
   const saveButtonClass = cn(
     "mari-editor-action mari-editor-action--primary mari-editor-action--save inline-flex",
     saveDisabled && "cursor-not-allowed opacity-50",
@@ -1969,8 +1951,8 @@ export function PersonaEditor() {
       />
 
       {/* ── Header ── */}
-      <div className="mari-editor-header">
-        <div className="mari-editor-header-main max-md:min-w-full">
+      <div className="mari-editor-header mari-editor-header--with-nav">
+        <div className="mari-editor-header-main mari-editor-header-main--identity">
           <button
             type="button"
             onClick={handleClose}
@@ -2052,58 +2034,30 @@ export function PersonaEditor() {
           </div>
         </div>
 
+        <EditorTabNavigation tabs={TABS} activeId={activeTab} onChange={scrollToSection} />
+
         <div className="mari-editor-actions flex">
-          <button type="button" onClick={handleSave} disabled={saveDisabled} className={saveButtonClass}>
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saveDisabled}
+            className={saveButtonClass}
+            aria-label={saveLabel}
+            title={saveLabel}
+          >
             <Save size="0.9375rem" />
-            <span>{saveLabel}</span>
+            <span className="mari-editor-save-label">{saveLabel}</span>
           </button>
           {headerActions}
         </div>
       </div>
 
-      {/* ── Unsaved changes warning ── */}
-      {showUnsavedWarning && (
-        <div className="flex items-center gap-3 border-b border-amber-500/30 bg-amber-500/10 px-4 py-2.5">
-          <AlertTriangle size="0.9375rem" className="shrink-0 text-amber-500" />
-          <p className="flex-1 text-xs font-medium text-amber-500">
-            {localizeUi("ui.personas.personaeditor.youHaveUnsavedChangesCloseWithoutSaving")}
-          </p>
-          <button
-            type="button"
-            onClick={keepEditing}
-            className="rounded-lg px-3 py-1 text-xs font-medium text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)]"
-          >
-            {localizeUi("ui.personas.personaeditor.keepEditing")}
-          </button>
-          {/* Blocked while a Persona write is in flight: it cannot be cancelled, so
-              "discard" would drop local state while the server still persists it. */}
-          <button
-            type="button"
-            onClick={discardAndNavigate}
-            disabled={mutationBusy}
-            className="rounded-lg bg-amber-500/15 px-3 py-1 text-xs font-medium text-amber-500 transition-all hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-amber-500/15"
-          >
-            {localizeUi("ui.personas.personaeditor.discardClose")}
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleSaveAndClose()}
-            disabled={mutationBusy}
-            className="mari-editor-action mari-editor-action--primary mari-editor-action--compact inline-flex rounded-lg px-3 py-1 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {localizeUi("ui.personas.personaeditor.saveClose")}
-          </button>
-        </div>
-      )}
-
-      {/* ── Body: Tabs + Content ── */}
-      <div className="mari-editor-body @max-5xl:flex-col">
-        <EditorTabRail tabs={TABS} activeId={activeTab} onChange={setActiveTab} />
-
+      {/* ── Body ── */}
+      <div className="mari-editor-body">
         {/* Tab Content */}
-        <div className="mari-editor-content @max-5xl:p-4">
+        <div ref={contentRef} className="mari-editor-content @max-5xl:p-4">
           <div className="mari-editor-content-inner">
-            {activeTab === "metadata" && (
+            <section data-editor-section="metadata">
               <PersonaMetadataTab
                 personaId={personaId}
                 formData={formData}
@@ -2120,47 +2074,53 @@ export function PersonaEditor() {
                 hasUnsavedChanges={dirty}
                 avatarMutationBusy={mutationBusy}
               />
-            )}
-            {activeTab === "card" && <PersonaCardTab formData={formData} updateField={updateField} />}
-            {activeTab === "convo" && (
-              // Key by the edited persona so the Convo fields' transient state resets on
-              // switch — the editor reuses this instance across personas.
+            </section>
+            <section data-editor-section="card">
+              <PersonaCardTab formData={formData} updateField={updateField} />
+            </section>
+            <section data-editor-section="convo">
               <PersonaConvoTab
                 key={personaId ?? "new-persona"}
                 personaId={personaId}
                 formData={formData}
                 updateField={updateField}
               />
-            )}
-            {activeTab === "lorebook" && personaId && (
-              <PersonaLorebookTab personaId={personaId} personaName={formData.name} />
-            )}
-            {activeTab === "colors" && (
+            </section>
+            <LazyEditorSection key={`lorebook:${personaId}`} id="lorebook">
+              {personaId && <PersonaLorebookTab personaId={personaId} personaName={formData.name} />}
+            </LazyEditorSection>
+            <LazyEditorSection key={`sprites:${personaId}`} id="sprites">
+              {personaId && (
+                <PersonaSpritesTab
+                  personaId={personaId}
+                  personaName={formData.name}
+                  defaultAppearance={formData.appearance || formData.description}
+                  defaultAvatarUrl={avatarPreview}
+                  characterSheetImageId={formData.characterSheetImageId}
+                  useCharacterSheetAsReference={formData.useCharacterSheetAsReference}
+                  updateField={updateField}
+                  onCreateCharacterSheet={() => setCharacterSheetGeneratorOpen(true)}
+                />
+              )}
+            </LazyEditorSection>
+            <LazyEditorSection key={`gallery:${personaId}`} id="gallery">
+              {personaId && (
+                <PersonaGalleryTab
+                  personaId={personaId}
+                  personaName={formData.name}
+                  onCreateCharacterSheet={() => setCharacterSheetGeneratorOpen(true)}
+                  editorBusy={mutationBusy}
+                  galleryAvatarPending={mutationKind === "gallery-avatar"}
+                  onSetAvatar={handleSetGalleryAvatar}
+                />
+              )}
+            </LazyEditorSection>
+            <section data-editor-section="colors">
               <PersonaColorsTab formData={formData} updateField={updateField} avatarUrl={avatarPreview} />
-            )}
-            {activeTab === "sprites" && personaId && (
-              <PersonaSpritesTab
-                personaId={personaId}
-                personaName={formData.name}
-                defaultAppearance={formData.appearance || formData.description}
-                defaultAvatarUrl={avatarPreview}
-                characterSheetImageId={formData.characterSheetImageId}
-                useCharacterSheetAsReference={formData.useCharacterSheetAsReference}
-                updateField={updateField}
-                onCreateCharacterSheet={() => setCharacterSheetGeneratorOpen(true)}
-              />
-            )}
-            {activeTab === "gallery" && personaId && (
-              <PersonaGalleryTab
-                personaId={personaId}
-                personaName={formData.name}
-                onCreateCharacterSheet={() => setCharacterSheetGeneratorOpen(true)}
-                editorBusy={mutationBusy}
-                galleryAvatarPending={mutationKind === "gallery-avatar"}
-                onSetAvatar={handleSetGalleryAvatar}
-              />
-            )}
-            {activeTab === "stats" && <PersonaStatsTab formData={formData} updateField={updateField} />}
+            </section>
+            <section data-editor-section="stats">
+              <PersonaStatsTab formData={formData} updateField={updateField} />
+            </section>
           </div>
         </div>
       </div>
@@ -2275,8 +2235,9 @@ function PersonaSpritesTab({
           key={tab.id}
           type="button"
           onClick={() => setCategory(tab.id)}
+          aria-pressed={category === tab.id}
           className={cn(
-            "rounded-lg px-3 py-1.5 text-xs font-medium transition-colors",
+            "rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
             category === tab.id
               ? "bg-[var(--primary)]/15 text-[var(--primary)]"
               : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]",
@@ -3556,22 +3517,6 @@ function PersonaMetadataTab({
         helpText={PERSONA_METADATA_HELP}
       />
 
-      <div className="space-y-1.5">
-        <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--muted-foreground)]">
-          {t("editor.avatar.label")}
-          <HelpTooltip text={t("editor.avatar.persona.help")} />
-        </span>
-        <fieldset disabled={avatarMutationBusy} className="min-w-0 border-0 p-0 disabled:opacity-60">
-          <AvatarReplaceActions
-            hasAvatar={Boolean(avatarPreview)}
-            uploading={avatarUploading}
-            generationAvailable={imageGenerationAvailable}
-            onUpload={onSelectAvatar}
-            onGenerate={onGenerateAvatar}
-          />
-        </fieldset>
-      </div>
-
       {personaId && (
         <div className="flex flex-wrap items-center gap-2 rounded-xl border border-[var(--border)] bg-[var(--secondary)]/70 px-3 py-2">
           <span className="text-[0.625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
@@ -3595,22 +3540,39 @@ function PersonaMetadataTab({
         </div>
       )}
 
-      {avatarPreview && (
-        <fieldset
-          disabled={avatarMutationBusy}
-          className="min-w-0 border-0 p-0 disabled:pointer-events-none disabled:opacity-60"
-        >
-          <AvatarCropWidget
-            src={avatarPreview}
-            alt={formData.name}
-            crop={formData.avatarCrop}
-            onChange={(next) => {
-              if (avatarMutationBusy) return;
-              updateField("avatarCrop", next);
-            }}
+      <div className="space-y-1.5">
+        <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--muted-foreground)]">
+          {t("editor.avatar.label")}
+          <HelpTooltip text={t("editor.avatar.persona.help")} />
+        </span>
+
+        {avatarPreview && (
+          <fieldset
+            disabled={avatarMutationBusy}
+            className="min-w-0 border-0 p-0 disabled:pointer-events-none disabled:opacity-60"
+          >
+            <AvatarCropWidget
+              src={avatarPreview}
+              alt={formData.name}
+              crop={formData.avatarCrop}
+              onChange={(next) => {
+                if (avatarMutationBusy) return;
+                updateField("avatarCrop", next);
+              }}
+            />
+          </fieldset>
+        )}
+
+        <fieldset disabled={avatarMutationBusy} className="min-w-0 border-0 p-0 disabled:opacity-60">
+          <AvatarReplaceActions
+            hasAvatar={Boolean(avatarPreview)}
+            uploading={avatarUploading}
+            generationAvailable={imageGenerationAvailable}
+            onUpload={onSelectAvatar}
+            onGenerate={onGenerateAvatar}
           />
         </fieldset>
-      )}
+      </div>
 
       <div className="grid gap-4 sm:grid-cols-2">
         <label className="space-y-1.5 sm:col-span-2">
@@ -3669,17 +3631,36 @@ function PersonaMetadataTab({
             placeholder={localizeUi("ui.personas.personametadatatab.yourName")}
           />
         </label>
-        <label className="space-y-1.5">
-          <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--muted-foreground)]">
-            {localizeUi("ui.personas.personametadatatab.version")}{" "}
-            <HelpTooltip
-              text={localizeUi("ui.personas.personametadatatab.versionNumberForTrackingChangesToThisPersonaDefinition")}
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+            <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--muted-foreground)]">
+              {localizeUi("ui.personas.personametadatatab.version")}{" "}
+              <HelpTooltip
+                text={localizeUi(
+                  "ui.personas.personametadatatab.versionNumberForTrackingChangesToThisPersonaDefinition",
+                )}
+              />
+            </span>
+            <SettingsSwitch
+              checked={formData.versioningEnabled}
+              onChange={(enabled) => {
+                updateField("versioningEnabled", enabled);
+                if (enabled && !formData.personaVersion.trim()) {
+                  updateField("personaVersion", "1.0");
+                }
+              }}
+              label={localizeUi("ui.cardversionhistory.automaticVersioning")}
+              labelPosition="end"
+              title={localizeUi("ui.cardversionhistory.automaticVersioningDescription")}
+              className="min-h-11 gap-2 rounded-md px-1 py-0"
+              labelClassName="text-xs font-medium text-[var(--muted-foreground)]"
             />
-          </span>
+          </div>
           <input
             value={formData.personaVersion}
             onChange={(e) => updateField("personaVersion", e.target.value)}
-            className="w-full rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-2 text-sm outline-none focus:border-[var(--primary)]/40 focus:ring-1 focus:ring-[var(--primary)]/20"
+            disabled={!formData.versioningEnabled}
+            className="w-full rounded-xl border border-[var(--border)] bg-[var(--secondary)] px-3 py-2 text-sm outline-none focus:border-[var(--primary)]/40 focus:ring-1 focus:ring-[var(--primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
             placeholder="1.0"
           />
           <PersonaVersionHistoryPanel
@@ -3688,7 +3669,7 @@ function PersonaMetadataTab({
             currentAvatarPath={avatarPreview}
             hasUnsavedChanges={hasUnsavedChanges}
           />
-        </label>
+        </div>
       </div>
 
       <div className="space-y-2">
@@ -3923,6 +3904,7 @@ function buildCurrentPersonaSnapshot(formData: PersonaFormData): PersonaCardSnap
     name: formData.name,
     creator: formData.creator,
     personaVersion: formData.personaVersion,
+    versioningEnabled: String(formData.versioningEnabled),
     creatorNotes: formData.creatorNotes,
     description: formData.description,
     personality: formData.personality,
@@ -4441,7 +4423,7 @@ function DescriptionTab({
         className="w-full resize-y rounded-xl border border-[var(--border)] bg-[var(--secondary)] p-4 text-sm leading-relaxed outline-none transition-colors placeholder:text-[var(--muted-foreground)]/40 focus:border-emerald-400/40 focus:ring-1 focus:ring-emerald-400/20"
       />
       <p className="mt-1.5 text-right text-[0.625rem] text-[var(--muted-foreground)]">
-        {formatPersonaTextTokens(formData.description)}
+        {formatEstimatedTokens(estimateTextTokens(formData.description), localizeUi)}
       </p>
     </div>
   );
@@ -4486,6 +4468,7 @@ function TextareaTab({
   placeholder: string;
   rows?: number;
 }) {
+  const { t: localizeUi } = useUiTranslation();
   return (
     <div className="mari-editor-panel space-y-3 p-3">
       <SectionHeader title={title} subtitle={subtitle} helpText={helpText} />
@@ -4499,7 +4482,7 @@ function TextareaTab({
         className="w-full resize-y rounded-xl border border-[var(--border)] bg-[var(--secondary)] p-4 text-sm leading-relaxed outline-none transition-colors placeholder:text-[var(--muted-foreground)]/40 focus:border-emerald-400/40 focus:ring-1 focus:ring-emerald-400/20"
       />
       <p className="mt-1.5 text-right text-[0.625rem] text-[var(--muted-foreground)]">
-        {formatPersonaTextTokens(value)}
+        {formatEstimatedTokens(estimateTextTokens(value), localizeUi)}
       </p>
     </div>
   );

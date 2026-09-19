@@ -6,13 +6,8 @@ import {
   getActivityState,
   getRecentAutonomousClientPresence,
 } from "./autonomous.service.js";
-import {
-  isIntentOnCooldown,
-  resolveIntent,
-  type MessageIntent,
-} from "./intent.service.js";
+import { isIntentOnCooldown, resolveIntent, type MessageIntent } from "./intent.service.js";
 import { getBusyDelay, getEffectiveCurrentStatus, type WeekSchedule } from "./schedule.service.js";
-import { parseConversationStatusOverrides } from "../generation/conversation-context-utils.js";
 import { resolveConversationTimeZone, toZonedWallClockDate } from "./timezone.js";
 
 const SERVER_AUTONOMOUS_INITIAL_DELAY_MS = 20_000;
@@ -174,7 +169,10 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
     const hardFailure = isHardGenerationFailure(error, statusCode);
     const delayMs = hardFailure
       ? Math.min(AUTONOMOUS_FAILURE_MAX_BACKOFF_MS, AUTONOMOUS_HARD_FAILURE_BACKOFF_MS * attempts)
-      : Math.min(AUTONOMOUS_FAILURE_MAX_BACKOFF_MS, AUTONOMOUS_FAILURE_BASE_BACKOFF_MS * 2 ** Math.max(0, attempts - 1));
+      : Math.min(
+          AUTONOMOUS_FAILURE_MAX_BACKOFF_MS,
+          AUTONOMOUS_FAILURE_BASE_BACKOFF_MS * 2 ** Math.max(0, attempts - 1),
+        );
     failureBackoffByChat.set(chatId, {
       attempts,
       nextAllowedAt: Date.now() + delayMs,
@@ -199,13 +197,7 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
   ): Promise<boolean> => {
     const promptTimeZone = resolveConversationTimeZone(chatMeta);
     const promptNow = toZonedWallClockDate(new Date(), promptTimeZone);
-    const { intent, onCooldown, disabled } = resolveAvailableIntent(
-      chatId,
-      characterId,
-      schedule,
-      chatMeta,
-      promptNow,
-    );
+    const { intent, onCooldown, disabled } = resolveAvailableIntent(chatId, characterId, schedule, chatMeta, promptNow);
     if (onCooldown || disabled) {
       clearGenerationInProgress(chatId, claimedAt);
       return false;
@@ -342,15 +334,15 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
       const characterId = result.shouldTrigger ? result.characterIds?.[0] : null;
       if (!characterId) return;
 
-      await chats.inheritFreshConversationSchedules(chat.id);
+      const presence = await chats.resolveConversationPresenceState(chat.id);
       const freshChat = await chats.getById(chat.id);
       if (!freshChat) return;
       const freshMeta = parseMetadata(freshChat.metadata);
       const promptTimeZone = resolveConversationTimeZone(freshMeta);
       const nowInstant = new Date();
       const promptNow = toZonedWallClockDate(nowInstant, promptTimeZone);
-      const freshSchedules = (freshMeta.characterSchedules ?? {}) as Record<string, WeekSchedule>;
-      const statusOverrides = parseConversationStatusOverrides(freshMeta.conversationStatusOverrides);
+      const freshSchedules = presence.schedules;
+      const statusOverrides = presence.statusOverrides;
       const schedule = freshSchedules[characterId] ?? null;
 
       if (schedule) {

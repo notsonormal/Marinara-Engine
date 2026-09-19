@@ -9,7 +9,12 @@ import { basename, join, resolve } from "node:path";
 import { eq } from "../../db/file-query.js";
 import type { DB } from "../../db/connection.js";
 import { flushDB } from "../../db/connection.js";
-import { CASCADES, FILE_BACKED_TABLES } from "../../db/file-backed-store.js";
+import {
+  CASCADE_DANGLING_EXEMPT_PREFIXES,
+  CASCADES,
+  FILE_BACKED_TABLES,
+  getRegisteredFileTable,
+} from "../../db/file-backed-store.js";
 import { getFileTableConfig, isFileTable, type AnyFileColumn, type AnyFileTable } from "../../db/file-schema.js";
 import * as schema from "../../db/schema/index.js";
 import { getFileStorageDir, getMonorepoRoot, isCustomToolScriptEnabled } from "../../config/runtime-config.js";
@@ -20,6 +25,7 @@ import {
   embedLorebookIntoCharacter,
   resolveEmbeddedCharacterId,
   syncCharacterBookFromLorebook,
+  type CharacterBookSyncOutcome,
 } from "../lorebook/character-book-sync.js";
 import {
   createMariInstructionsStorage,
@@ -42,7 +48,10 @@ import {
   homeCustomWidgetSchema,
   normalizeLorebookCategory,
   normalizePersonalExtensionCapabilities,
+  scopedRegexModeSchema,
   type MariDbCommandResult,
+  type MariDbMutationReadBack,
+  type MariDbReadBackMismatch,
   type MariDbReadTruncation,
   type MariDbDiffSummary,
   type MariDbHistoryEntry,
@@ -50,6 +59,7 @@ import {
   type MariDbRowChange,
   type MariDbValidationIssue,
   type MariDbValidationResult,
+  MARI_PERMISSIONS_MODE_SETTINGS_KEY,
 } from "@marinara-engine/shared";
 import { computePersonalExtensionHash } from "../extensions/personal-extension-hash.js";
 import { HomeWidgetCatalogConflictError, replaceHomeWidgetCatalog } from "../home-widget-catalog.service.js";
@@ -158,6 +168,8 @@ type MariAppDataActionEnvelope = Row & {
   action?: unknown;
   cwd?: string;
   sessionId?: string;
+  /** #5725 Permissions Mode: "auto-keep" applies without a pending Keep/Restore card. */
+  reviewPolicy?: "standard" | "auto-keep";
 };
 
 type CodeCommandContext = {
@@ -226,6 +238,8 @@ const BOOLEAN_FLAGS = new Set([
   "tail",
   "use-regex",
 ]);
+const DB_VALUE_FLAGS = new Set(["table", "limit", "offset", "where", "json", "json-file", "file", "reason"]);
+const DB_BOOLEAN_FLAGS = new Set(["apply", "cascade", "dry-run", "help", "parsed"]);
 
 function truncateOutput(value: string, limit = COMMAND_OUTPUT_LIMIT): { text: string; truncated: boolean } {
   if (value.length <= limit) return { text: value, truncated: false };
@@ -364,6 +378,7 @@ const JSON_COLUMNS: Record<string, readonly string[]> = {
   message_swipes: ["extra"],
   memory_chunks: ["embedding"],
   lorebooks: ["scope", "tags"],
+  library_folders: ["itemIds"],
   lorebook_entries: [
     "keys",
     "secondaryKeys",
@@ -405,28 +420,30 @@ const JSON_COLUMNS: Record<string, readonly string[]> = {
   regex_scripts: ["trimStrings", "placement", "targetCharacterIds", "targetPromptPresetIds"],
 };
 
+function buildTableMeta(table: Parameters<typeof getFileTableConfig>[0]): TableMeta {
+  const config = getFileTableConfig(table);
+  const columns = config.columns.map((column) => ({
+    key: column.key,
+    dbName: column.name,
+    column,
+    primary: column.primary,
+    notNull: column.isNotNull,
+  }));
+  return {
+    name: config.name,
+    table,
+    columns,
+    byKey: new Map(columns.map((column) => [column.key, column])),
+    primaryKey: columns.find((column) => column.primary)?.key ?? null,
+  };
+}
+
 function buildTableMetas() {
   const metas = new Map<string, TableMeta>();
   for (const candidate of Object.values(schema)) {
     if (!isFileTable(candidate)) continue;
-    const table = candidate;
-    const config = getFileTableConfig(table);
-    const name = config.name;
-    if (!FILE_BACKED_TABLE_SET.has(name)) continue;
-    const columns = config.columns.map((column) => ({
-      key: column.key,
-      dbName: column.name,
-      column,
-      primary: column.primary,
-      notNull: column.isNotNull,
-    }));
-    metas.set(name, {
-      name,
-      table,
-      columns,
-      byKey: new Map(columns.map((column) => [column.key, column])),
-      primaryKey: columns.find((column) => column.primary)?.key ?? null,
-    });
+    const meta = buildTableMeta(candidate);
+    if (FILE_BACKED_TABLE_SET.has(meta.name)) metas.set(meta.name, meta);
   }
   return metas;
 }
@@ -646,6 +663,26 @@ function knownColumnPatch(meta: TableMeta, row: Row): Row {
   return out;
 }
 
+// #5754 follow-up: the post-apply read-back compares persisted values against
+// what the plan asserted. Key order must not matter for JSON-ish columns, so
+// compare via the file's existing stable serialization (stableJson above)
+// instead of reference or strict equality.
+export function readBackValuesMatch(persisted: unknown, intended: unknown): boolean {
+  if (persisted === intended) return true;
+  return stableJson(persisted ?? null) === stableJson(intended ?? null);
+}
+
+// A capped sample keeps the echoed mismatches token-lean; mismatchCount still
+// reports the true total, and each echoed value is size-capped too - a
+// mismatched lorebook entry body must not flood the command output.
+const READ_BACK_MISMATCH_LIMIT = 5;
+const READ_BACK_VALUE_LIMIT = 300;
+
+function compactReadBackValue(value: unknown): unknown {
+  const text = typeof value === "string" ? value : stableJson(value ?? null);
+  return text.length > READ_BACK_VALUE_LIMIT ? `${text.slice(0, READ_BACK_VALUE_LIMIT)}… (truncated)` : value;
+}
+
 // Thrown by restorePlan (#4852 F2) when a row a Restore would revert was changed by a newer
 // write after this review applied. Caught in restoreAppliedReview so the newer data is left
 // untouched and the pending review survives instead of silently clobbering it.
@@ -685,8 +722,14 @@ function deepMerge(base: unknown, patch: unknown): unknown {
 }
 
 function getMeta(table: string): TableMeta {
-  const meta = TABLE_METAS.get(table);
-  if (!meta) throw new Error(`Unknown file-backed table: ${table}`);
+  let meta = TABLE_METAS.get(table);
+  if (!meta) {
+    // Capability packages register their tables after this module loads (registerTables).
+    const registered = getRegisteredFileTable(table);
+    if (!registered) throw new Error(`Unknown file-backed table: ${table}`);
+    meta = buildTableMeta(registered);
+    TABLE_METAS.set(table, meta);
+  }
   return meta;
 }
 
@@ -760,12 +803,17 @@ function formatCommand(argv: string[] | undefined, fallback: string | undefined)
     .trim();
 }
 
-function parseArgs(args: string[]) {
+function parseArgs(args: string[], knownValueFlags?: ReadonlySet<string>, booleanFlags = BOOLEAN_FLAGS) {
   const positionals: string[] = [];
   const flags = new Map<string, string | boolean>();
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
-    if (!arg.startsWith("--")) {
+    if (arg === "--") {
+      positionals.push(...args.slice(i + 1));
+      break;
+    }
+    const name = arg.slice(2).split("=", 1)[0]!;
+    if (!arg.startsWith("--") || (knownValueFlags && !knownValueFlags.has(name) && !booleanFlags.has(name))) {
       positionals.push(arg);
       continue;
     }
@@ -774,9 +822,8 @@ function parseArgs(args: string[]) {
       flags.set(arg.slice(2, eqIndex), arg.slice(eqIndex + 1));
       continue;
     }
-    const name = arg.slice(2);
     const next = args[i + 1];
-    if (next !== undefined && !next.startsWith("--") && !BOOLEAN_FLAGS.has(name)) {
+    if (next !== undefined && !next.startsWith("--") && !booleanFlags.has(name)) {
       flags.set(name, next);
       i += 1;
     } else {
@@ -862,6 +909,7 @@ function normalizeAppDataActionName(action: string): string {
     .replace(/^themes\./, "theme.")
     .replace(/^personalextensions\./, "personalextension.")
     .replace(/^agents\./, "agent.")
+    .replace(/^chats\./, "chat.")
     .replace(/^presets\./, "preset.")
     .replace(/^promptpresets\./, "preset.");
   const aliases: Record<string, string> = {
@@ -1187,6 +1235,13 @@ export function buildPersonaCreateRow(data: Row, id: string, timestamp: string):
     comment: firstString(data, ["comment"]) ?? "",
     creator: firstString(data, ["creator"]) ?? "",
     personaVersion: firstString(data, ["personaVersion", "persona_version"]) ?? "1.0",
+    versioningEnabled:
+      data.versioningEnabled === false ||
+      data.versioningEnabled === "false" ||
+      data.versioning_enabled === false ||
+      data.versioning_enabled === "false"
+        ? "false"
+        : "true",
     creatorNotes: firstString(data, ["creatorNotes", "creator_notes", "creator-notes"]) ?? "",
     phoneticName: firstString(data, ["phoneticName", "phonetic_name", "phonetic-name"]) ?? "",
     description: firstString(data, ["description"]) ?? "",
@@ -1194,6 +1249,7 @@ export function buildPersonaCreateRow(data: Row, id: string, timestamp: string):
     scenario: firstString(data, ["scenario"]) ?? "",
     backstory: firstString(data, ["backstory"]) ?? "",
     appearance: firstString(data, ["appearance"]) ?? "",
+    useCharacterSheetAsReference: "false",
     isActive: "false",
     nameColor: "",
     dialogueColor: "",
@@ -1297,6 +1353,13 @@ function normalizePromptPresetActionData(input: Row, existing?: Row | null): Row
     wrapFormat:
       firstString(input, ["wrapFormat", "wrap_format"]) ??
       (typeof existing?.wrapFormat === "string" ? existing.wrapFormat : "xml"),
+    scopedRegexMode: scopedRegexModeSchema.parse(
+      input.scopedRegexMode !== undefined
+        ? input.scopedRegexMode
+        : input.scoped_regex_mode !== undefined
+          ? input.scoped_regex_mode
+          : (existing?.scopedRegexMode ?? "disabled"),
+    ),
     defaultChoices: jsonString(input.defaultChoices ?? input.default_choices ?? existing?.defaultChoices, {}),
     isDefault: boolText(
       firstBoolean(input, ["isDefault", "is_default"]) ?? (existing ? existing.isDefault === "true" : false),
@@ -1313,6 +1376,7 @@ function normalizePromptPresetActionData(input: Row, existing?: Row | null): Row
   delete row.variable_groups;
   delete row.variable_values;
   delete row.wrap_format;
+  delete row.scoped_regex_mode;
   delete row.default_choices;
   delete row.is_default;
   delete row.system_key;
@@ -1683,7 +1747,7 @@ function stripPromptPresetChildPayload(row: Row): Row {
 function actionCommandPayload(envelope: MariAppDataActionEnvelope): Row {
   const out: Row = {};
   for (const [key, value] of Object.entries(envelope)) {
-    if (key === "cwd" || key === "sessionId") continue;
+    if (key === "cwd" || key === "sessionId" || key === "reviewPolicy") continue;
     out[key] = typeof value === "string" && value.length > 600 ? truncateStr(value, 600) : value;
   }
   return out;
@@ -2062,6 +2126,7 @@ function summarizeCharacterRow(row: Row): Row {
     id: row.id,
     name: typeof data.name === "string" ? data.name : "(unnamed)",
     comment: row.comment ?? "",
+    summary: typeof data.summary === "string" ? data.summary : "",
     tags: Array.isArray(data.tags) ? data.tags.slice(0, 8) : [],
     avatarPath: row.avatarPath ?? null,
     createdAt: row.createdAt,
@@ -2073,7 +2138,6 @@ function summarizePersonaRow(row: Row): Row {
   return {
     id: row.id,
     name: row.name,
-    isActive: row.isActive === "true",
     comment: row.comment ?? "",
     description: typeof row.description === "string" ? truncateStr(row.description, 120) : "",
     avatarPath: row.avatarPath ?? null,
@@ -2236,6 +2300,7 @@ function summarizeChatRow(row: Row): Row {
 
 const CHARACTER_DATA_HINT_KEYS = new Set([
   "name",
+  "summary",
   "description",
   "personality",
   "scenario",
@@ -2360,6 +2425,7 @@ function buildMinimalCharacterData(
     ? (normalizedBase.extensions as Record<string, unknown>)
     : {};
   const data: Record<string, unknown> = {
+    summary: "",
     description: "",
     personality: "",
     scenario: "",
@@ -2376,6 +2442,7 @@ function buildMinimalCharacterData(
     extensions: { ...baseExtensions },
   };
   const topLevelMap: Array<[string, string]> = [
+    ["summary", "summary"],
     ["description", "description"],
     ["personality", "personality"],
     ["scenario", "scenario"],
@@ -2387,6 +2454,7 @@ function buildMinimalCharacterData(
     const val = flagString(flags, flagName);
     if (val !== undefined) data[fieldName] = val;
   }
+  data.summary = typeof data.summary === "string" ? data.summary.trim().slice(0, 500) : "";
   // backstory and appearance are Marinara extensions stored under data.extensions.*
   const extensions = data.extensions as Record<string, unknown>;
   const extMap: Array<[string, string]> = [
@@ -2416,11 +2484,17 @@ export class MariDbService {
   private history: MariDbHistoryEntry[] = [];
   private writeQueue: Promise<unknown> = Promise.resolve();
   private characterFolderMutationQueue: Promise<void> = Promise.resolve();
+  private lorebookFolderMutationQueue: Promise<void> = Promise.resolve();
   // Per-review serialization queue. keepAppliedReview / restoreAppliedReview / rejectRows each do a
   // read-modify-write over pending.get(id) + the durable sidecar across await points; two concurrent
   // requests for the SAME review id would both read the same record and clobber each other on write.
   // Keyed by id so unrelated reviews stay concurrent; entries self-evict once the queue drains.
   private reviewLocks = new Map<string, Promise<unknown>>();
+  // #5725 Permissions Mode: review policy of the executeAction call currently in
+  // flight. Mutating workspace commands are serialized upstream (the workspace
+  // agent's serializeWorkspaceMutation), so at most one mutating executeAction
+  // is active at a time; reset to "standard" at every executeAction entry.
+  private activeReviewPolicy: "standard" | "auto-keep" = "standard";
 
   constructor(private readonly db: DB) {}
 
@@ -2428,6 +2502,9 @@ export class MariDbService {
     const argv = envelope.argv ?? [];
     const command = formatCommand(argv, envelope.command);
     const sessionId = envelope.sessionId || "mari-cli";
+    // #5725: the CLI path never carries a review policy - a stale "auto-keep"
+    // left by a prior executeAction must not strip cards from CLI mutations.
+    this.activeReviewPolicy = "standard";
     try {
       const group = argv[0];
       if (!group || group === "help" || group === "--help" || group === "-h") {
@@ -2481,6 +2558,10 @@ export class MariDbService {
 
   async executeAction(envelope: MariAppDataActionEnvelope): Promise<MariDbCommandResult> {
     let command = "app_data";
+    // #5725: the Permissions Mode review policy rides the envelope. Mutating
+    // workspace commands are serialized upstream, so a transient field is a
+    // safe way to reach executeMutation without threading every call site.
+    this.activeReviewPolicy = envelope.reviewPolicy === "auto-keep" ? "auto-keep" : "standard";
     try {
       const action = requiredString(envelope, ["action", "type"], "app_data action");
       command = formatAppDataActionCommand(action, envelope);
@@ -2505,6 +2586,7 @@ export class MariDbService {
           return this.executePersonalExtensionAction(key.slice("personalextension.".length), envelope, context);
         }
         if (key.startsWith("agent.")) return this.executeAgentAction(key.slice("agent.".length), envelope, context);
+        if (key.startsWith("chat.")) return this.executeChatAction(key.slice("chat.".length), envelope, context);
         if (key.startsWith("preset.")) return this.executePresetAction(key.slice("preset.".length), envelope, context);
         if (key.startsWith("homewidget."))
           return this.executeHomeWidgetAction(key.slice("homewidget.".length), envelope, context);
@@ -2517,7 +2599,7 @@ export class MariDbService {
           mode: "read",
           command,
           error:
-            "Unsupported app_data action. Use character.*, persona.*, lorebook.*, theme.*, personal_extension.*, agent.*, preset.*, home_widget.*, or instruction.* actions for structured no-shell app-data work.",
+            "Unsupported app_data action. Use character.*, persona.*, lorebook.*, theme.*, personal_extension.*, agent.*, chat.*, preset.*, home_widget.*, or instruction.* actions for structured no-shell app-data work.",
         };
       };
       // Field-aware bounding keeps a single read response within the workspace
@@ -2526,6 +2608,10 @@ export class MariDbService {
     } catch (err) {
       logger.warn(err, "[mari-db] structured app_data action failed");
       return { ok: false, mode: "read", command, error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      // Reset on exit: the transient policy must never outlive the call that
+      // set it (the CLI entry also resets defensively on entry).
+      this.activeReviewPolicy = "standard";
     }
   }
 
@@ -2588,6 +2674,7 @@ export class MariDbService {
             ["data", "card", "character"],
             [
               "name",
+              "summary",
               "description",
               "personality",
               "scenario",
@@ -2645,6 +2732,7 @@ export class MariDbService {
             ["patch", "data", "card", "character"],
             [
               "name",
+              "summary",
               "description",
               "personality",
               "scenario",
@@ -2671,7 +2759,7 @@ export class MariDbService {
           comment === (typeof existing.comment === "string" ? existing.comment : "")
         ) {
           throw new Error(
-            "character.update needs a patch field such as name, description, personality, scenario, firstMes, creatorNotes, backstory, appearance, aboutMe, tags, or comment",
+            "character.update needs a patch field such as name, summary, description, personality, scenario, firstMes, creatorNotes, backstory, appearance, aboutMe, tags, or comment",
           );
         }
         const name =
@@ -2771,8 +2859,8 @@ export class MariDbService {
         };
       }
       case "active": {
-        const row = (await this.rawRows("personas")).find((candidate) => candidate.isActive === "true") ?? null;
-        return { ok: true, mode: "read", command: context.command, output: row ? parseRow("personas", row) : null };
+        // Retain legacy read compatibility without reviving a global selection.
+        return { ok: true, mode: "read", command: context.command, output: null };
       }
       case "get": {
         const id = requiredString(args, ["id", "personaId"], "persona id");
@@ -3372,6 +3460,101 @@ export class MariDbService {
           .slice(0, limit)
           .map(summarizeLorebookRow);
         return { ok: true, mode: "read", command: context.command, output: rows };
+      }
+      case "folder.list": {
+        const lorebookId = requiredString(args, ["lorebookId", "id"], "lorebook id");
+        if (!(await this.getRawById(getMeta("lorebooks"), lorebookId))) {
+          throw new Error(`Lorebook ${lorebookId} not found`);
+        }
+        const rows = (await this.rawRows("lorebook_folders"))
+          .filter((row) => row.lorebookId === lorebookId)
+          .sort((a, b) => Number(a.order ?? 0) - Number(b.order ?? 0))
+          .map((row) => parseRow("lorebook_folders", row));
+        return { ok: true, mode: "read", command: context.command, output: rows };
+      }
+      case "folder.create": {
+        const lorebookId = requiredString(args, ["lorebookId"], "lorebook id");
+        const data = actionDataWithTopLevel(args, ["data", "folder"], ["name", "parentFolderId"]);
+        const name = requiredString(data, ["name"], "folder name");
+        const parentFolderId = firstString(data, ["parentFolderId"]);
+        return this.withLorebookFolderMutationLock(async () => {
+          if (!(await this.getRawById(getMeta("lorebooks"), lorebookId))) {
+            throw new Error(`Lorebook ${lorebookId} not found`);
+          }
+          if (parentFolderId) {
+            const parent = await this.getRawById(getMeta("lorebook_folders"), parentFolderId);
+            if (!parent || parent.lorebookId !== lorebookId) {
+              throw new Error(`Parent folder ${parentFolderId} not found in lorebook ${lorebookId}`);
+            }
+          }
+          const existing = (await this.rawRows("lorebook_folders")).filter((row) => row.lorebookId === lorebookId);
+          const timestamp = now();
+          const id = firstString(args, ["folderId", "id"]) ?? newId();
+          const row: Row = {
+            id,
+            lorebookId,
+            name,
+            enabled: "true",
+            parentFolderId: parentFolderId ?? null,
+            order: existing.reduce((maximum, folder) => Math.max(maximum, Number(folder.order ?? 0)), 0) + 10,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          };
+          return this.executeMutation(
+            {
+              kind: "insert",
+              table: "lorebook_folders",
+              id,
+              row,
+              apply: appDataCreateApply(args),
+              cascade: false,
+              reason: firstString(args, ["reason"]) ?? null,
+              cwd: context.cwd,
+            },
+            context.command,
+            context.sessionId,
+          );
+        });
+      }
+      case "libraryfolder.list": {
+        const rows = (await this.rawRows("library_folders"))
+          .filter((row) => row.scope === "lorebooks")
+          .sort((a, b) => Number(a.sortOrder ?? 0) - Number(b.sortOrder ?? 0))
+          .map((row) => parseRow("library_folders", row));
+        return { ok: true, mode: "read", command: context.command, output: rows };
+      }
+      case "libraryfolder.create": {
+        const data = actionDataWithTopLevel(args, ["data", "folder"], ["name"]);
+        const name = requiredString(data, ["name"], "folder name");
+        return this.withLorebookFolderMutationLock(async () => {
+          const existing = (await this.rawRows("library_folders")).filter((row) => row.scope === "lorebooks");
+          const timestamp = now();
+          const id = firstString(args, ["folderId", "id"]) ?? newId();
+          const row: Row = {
+            id,
+            scope: "lorebooks",
+            name,
+            collapsed: "false",
+            sortOrder: existing.reduce((maximum, folder) => Math.max(maximum, Number(folder.sortOrder ?? -1)), -1) + 1,
+            itemIds: [],
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          };
+          return this.executeMutation(
+            {
+              kind: "insert",
+              table: "library_folders",
+              id,
+              row,
+              apply: appDataCreateApply(args),
+              cascade: false,
+              reason: firstString(args, ["reason"]) ?? null,
+              cwd: context.cwd,
+            },
+            context.command,
+            context.sessionId,
+          );
+        });
       }
       case "create": {
         const data = actionDataWithTopLevel(
@@ -4226,6 +4409,8 @@ export class MariDbService {
             "variableValues",
             "parameters",
             "wrapFormat",
+            "scopedRegexMode",
+            "scoped_regex_mode",
             "defaultChoices",
             "isDefault",
             "author",
@@ -4272,6 +4457,8 @@ export class MariDbService {
             "variableValues",
             "parameters",
             "wrapFormat",
+            "scopedRegexMode",
+            "scoped_regex_mode",
             "defaultChoices",
             "isDefault",
             "author",
@@ -4758,7 +4945,13 @@ export class MariDbService {
   getPendingChangeRaw(
     id: string,
     index: number,
-  ): { table: string; id: string; action: MariDbRowChange["action"]; beforeRaw: Row | null; afterRaw: Row | null } | null {
+  ): {
+    table: string;
+    id: string;
+    action: MariDbRowChange["action"];
+    beforeRaw: Row | null;
+    afterRaw: Row | null;
+  } | null {
     this.ensurePendingHydrated();
     if (!Number.isInteger(index) || index < 0 || index >= PREVIEW_LIMIT) return null;
     const change = this.pending.get(id)?.plan.changes[index];
@@ -4927,7 +5120,13 @@ export class MariDbService {
     id: string,
     selections: Array<{ index: number; table: string; id: string; action: MariDbRowChange["action"] }>,
   ): Promise<
-    | { approval: MariDbPendingApproval | null; history: MariDbHistoryEntry; rejected: number; remaining: number; completed: boolean }
+    | {
+        approval: MariDbPendingApproval | null;
+        history: MariDbHistoryEntry;
+        rejected: number;
+        remaining: number;
+        completed: boolean;
+      }
     | { outcome: "state_changed"; error: string }
     | { outcome: "invalid_selection"; error: string }
     | null
@@ -4940,7 +5139,13 @@ export class MariDbService {
     id: string,
     selections: Array<{ index: number; table: string; id: string; action: MariDbRowChange["action"] }>,
   ): Promise<
-    | { approval: MariDbPendingApproval | null; history: MariDbHistoryEntry; rejected: number; remaining: number; completed: boolean }
+    | {
+        approval: MariDbPendingApproval | null;
+        history: MariDbHistoryEntry;
+        rejected: number;
+        remaining: number;
+        completed: boolean;
+      }
     | { outcome: "state_changed"; error: string }
     | { outcome: "invalid_selection"; error: string }
     | null
@@ -5001,14 +5206,14 @@ export class MariDbService {
       // dangling reference AFTER restoreChanges has committed (leaving the bad row + an unhandled
       // error), so refuse it up front.
       if (change.action === "delete") {
-        const parentLorebookId =
-          typeof change.beforeRaw?.lorebookId === "string" ? change.beforeRaw.lorebookId : null;
+        const parentLorebookId = typeof change.beforeRaw?.lorebookId === "string" ? change.beforeRaw.lorebookId : null;
         const parentLive =
           parentLorebookId !== null && (await this.getRawById(getMeta("lorebooks"), parentLorebookId)) !== null;
         if (!parentLive) {
           return {
             outcome: "invalid_selection",
-            error: "This entry's lorebook was also removed, so it can't be restored on its own. Use Restore to revert the whole change.",
+            error:
+              "This entry's lorebook was also removed, so it can't be restored on its own. Use Restore to revert the whole change.",
           };
         }
       }
@@ -5169,11 +5374,15 @@ export class MariDbService {
 
     for (const cascade of CASCADES) {
       if (table && table !== cascade.child && table !== cascade.parent) continue;
+      // Refs this cascade declares dangling BY DESIGN (#5405: experience-state rows imported
+      // at an anchor the destination chat never had). See CASCADE_DANGLING_EXEMPT_PREFIXES.
+      const exemptPrefix = CASCADE_DANGLING_EXEMPT_PREFIXES[`${cascade.child}.${cascade.childKey}`];
       const parents = new Set(
         (await getRows(cascade.parent)).map((row) => row[cascade.parentKey]).filter((id) => typeof id === "string"),
       );
       for (const child of await getRows(cascade.child)) {
         const ref = child[cascade.childKey];
+        if (typeof ref === "string" && exemptPrefix && ref.startsWith(exemptPrefix)) continue;
         if (typeof ref === "string" && ref && !parents.has(ref)) {
           issues.push({
             level: "error",
@@ -5612,7 +5821,7 @@ export class MariDbService {
         const rawJson = await resolveJsonInput(flags, context.cwd);
         if (!name && !rawJson) {
           throw new Error(
-            "Usage: mari characters create --name <name> [--description <text>] [--personality <text>] [--scenario <text>] [--about-me <text>] [--apply]\n" +
+            "Usage: mari characters create --name <name> [--summary <text>] [--description <text>] [--personality <text>] [--scenario <text>] [--about-me <text>] [--apply]\n" +
               "       or: mari characters create --json '<data_json>' [--json-file <path>] [--apply]",
           );
         }
@@ -5645,7 +5854,7 @@ export class MariDbService {
         const id = parsed.positionals[0];
         if (!id)
           throw new Error(
-            "Usage: mari characters update <id> [--name <name>] [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--creator-notes <text>] [--backstory <text>] [--appearance <text>] [--about-me <text>] [--tags <t1,t2,...>] [--comment <text>] [--json '<data_json>' | --json-file <path>] [--apply] [--reason <text>]",
+            "Usage: mari characters update <id> [--name <name>] [--summary <text>] [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--creator-notes <text>] [--backstory <text>] [--appearance <text>] [--about-me <text>] [--tags <t1,t2,...>] [--comment <text>] [--json '<data_json>' | --json-file <path>] [--apply] [--reason <text>]",
           );
         const existing = await this.getRawById(getMeta("characters"), id);
         if (!existing) throw new Error(`Character ${id} not found`);
@@ -5723,8 +5932,7 @@ export class MariDbService {
         };
       }
       case "active": {
-        const row = (await this.rawRows("personas")).find((r) => r.isActive === "true") ?? null;
-        return { ok: true, mode: "read", command: context.command, output: row ? parseRow("personas", row) : null };
+        return { ok: true, mode: "read", command: context.command, output: null };
       }
       case "get": {
         const id = parsed.positionals[0];
@@ -6492,7 +6700,13 @@ export class MariDbService {
         let selectedMessages: typeof numberedMessages;
         if (last !== null || afterPost !== null) {
           const scopedMessages = last !== null ? numberedMessages.slice(-last) : numberedMessages.slice(afterPost ?? 0);
-          selectedMessages = scopedMessages.slice(offset, limit !== null ? offset + limit : undefined);
+          if (tail) {
+            const offsetMessages =
+              offset > 0 ? scopedMessages.slice(0, Math.max(0, scopedMessages.length - offset)) : scopedMessages;
+            selectedMessages = limit !== null ? offsetMessages.slice(-limit) : offsetMessages;
+          } else {
+            selectedMessages = scopedMessages.slice(offset, limit !== null ? offset + limit : undefined);
+          }
         } else if (tail) {
           const offsetMessages =
             offset > 0 ? numberedMessages.slice(0, Math.max(0, numberedMessages.length - offset)) : numberedMessages;
@@ -6524,6 +6738,52 @@ export class MariDbService {
       default:
         return { ok: false, mode: "read", command: context.command, error: this.chatsHelpText() };
     }
+  }
+
+  private async executeChatAction(
+    sub: string,
+    args: Row,
+    context: { command: string; sessionId: string; cwd?: string },
+  ): Promise<MariDbCommandResult> {
+    const argv = [sub];
+    const fieldRead = Boolean(firstString(args, ["field"]));
+    const addFlag = (flag: string, value: unknown) => {
+      if (value === undefined || value === null || value === "") return;
+      argv.push(`--${flag}`, String(value));
+    };
+
+    if (sub === "list") {
+      addFlag("limit", firstNumber(args, ["limit"]));
+      addFlag("character", firstString(args, ["characterId", "character_id"]));
+    } else if (sub === "get") {
+      argv.push(requiredString(args, ["chatId", "chat_id", "id"], "chat id"));
+    } else if (sub === "messages") {
+      argv.push(requiredString(args, ["chatId", "chat_id", "id"], "chat id"));
+      addFlag("last", firstNumber(args, ["last"]));
+      addFlag("after-post", firstNumber(args, ["afterPost", "after_post"]));
+      const tail = firstBoolean(args, ["tail"]) === true;
+      if (fieldRead && tail) {
+        addFlag("limit", 1);
+      } else if (!fieldRead) {
+        addFlag("limit", firstNumber(args, ["limit"]));
+        addFlag("offset", firstNumber(args, ["offset"]));
+      }
+      if (tail) argv.push("--tail");
+    } else if (sub === "search") {
+      argv.push(requiredString(args, ["query"], "chat search query"));
+      addFlag("limit", firstNumber(args, ["limit"]));
+    }
+
+    const result = await this.executeChatsCommand(argv, context);
+    if (sub !== "messages" || !result.ok || !Array.isArray(result.output)) return result;
+    return {
+      ...result,
+      output: {
+        messages: result.output,
+        returned: result.output.length,
+        offset: fieldRead ? 0 : normalizeOffset(firstNumber(args, ["offset"])),
+      },
+    };
   }
 
   private async executeThemeCommand(
@@ -6634,7 +6894,9 @@ export class MariDbService {
   ): Promise<MariDbCommandResult> {
     const sub = args[0];
     const rest = args.slice(1);
-    const parsed = parseArgs(rest);
+    // Row IDs may start with --. Only actual options are flags; exact option-name
+    // collisions can be passed after the standard -- end-of-options marker.
+    const parsed = parseArgs(rest, DB_VALUE_FLAGS, DB_BOOLEAN_FLAGS);
     if (!sub || sub === "help" || sub === "--help" || sub === "-h" || hasFlag(parsed.flags, "help")) {
       return { ok: true, mode: "read", command: context.command, output: this.helpText() };
     }
@@ -6830,8 +7092,9 @@ export class MariDbService {
   // add/update/delete of an embedded lorebook's entries left the derived copy stale. Safe for
   // standalone lorebooks: syncCharacterBookFromLorebook no-ops when the lorebook isn't embedded, and
   // swallows its own errors, so a sync failure never breaks the mutation.
-  private async syncAffectedCharacterBooks(changes: PlanChange[]): Promise<void> {
+  private async syncAffectedCharacterBooks(changes: PlanChange[]): Promise<CharacterBookSyncOutcome[]> {
     const lorebookIds = new Set<string>();
+    const outcomes: CharacterBookSyncOutcome[] = [];
     const collect = (value: unknown) => {
       if (typeof value === "string" && value) lorebookIds.add(value);
     };
@@ -6851,6 +7114,13 @@ export class MariDbService {
               await embedLorebookIntoCharacter(this.db, change.embeddedCharacterId, change.id);
             } catch (err) {
               logger.error(err, "[mari-db] failed to restore embedded lorebook %s", change.id);
+              // #5793: the derived write could not be confirmed - the
+              // read-back must not report "verified" over it.
+              outcomes.push({
+                status: "failed",
+                lorebookId: change.id,
+                error: err instanceof Error ? err.message : String(err),
+              });
             }
           } else {
             await clearCharacterEmbeddedLorebook(this.db, change.embeddedCharacterId, change.id);
@@ -6861,8 +7131,9 @@ export class MariDbService {
       }
     }
     for (const lorebookId of lorebookIds) {
-      await syncCharacterBookFromLorebook(this.db, lorebookId);
+      outcomes.push(await syncCharacterBookFromLorebook(this.db, lorebookId));
     }
+    return outcomes;
   }
 
   private async executeMutation(
@@ -6900,7 +7171,8 @@ export class MariDbService {
     try {
       await this.captureDeletedLorebookEmbeddings(plan.changes);
       const journalPath = await this.applyPlan(plan);
-      await this.syncAffectedCharacterBooks(plan.changes);
+      const syncOutcomes = await this.syncAffectedCharacterBooks(plan.changes);
+      const readBack = await this.buildReadBack(plan, syncOutcomes);
       const history = await this.recordHistory({
         plan,
         command: storedCommand,
@@ -6908,12 +7180,29 @@ export class MariDbService {
         status: "approved",
         journalPath,
       });
+      // #5725 Accept edits / Bypass: apply without staging a pending
+      // Keep/Restore card. The caller only sets auto-keep for non-delete
+      // actions, so deletions always keep their review; history and the
+      // journal are recorded above either way.
+      if (this.activeReviewPolicy === "auto-keep") {
+        return {
+          ok: true,
+          mode: "apply",
+          command,
+          summary: plan.summary,
+          readBack,
+          validation: plan.validation,
+          approval: { status: "not_required", operationHash: plan.operationHash },
+          journalPath,
+        };
+      }
       const review = await this.createAppliedReview(plan, storedCommand, sessionId, journalPath, history.id);
       return {
         ok: true,
         mode: "apply",
         command,
         summary: plan.summary,
+        readBack,
         validation: plan.validation,
         approval: { status: "pending", id: review.id, operationHash: plan.operationHash },
         journalPath,
@@ -6956,6 +7245,45 @@ export class MariDbService {
     // systemKey identifies Engine-owned presets. Apply this after every planner so raw writes and
     // transforms cannot bypass the structured preset-action boundary.
     protectPromptPresetSystemKeys(changes);
+
+    // #5725: the Permissions Mode governs Mari herself, so she must never be
+    // able to rewrite it - by ANY path, including raw db mutations and
+    // transforms (change-level, so every planner is covered). Only the user's
+    // validated PUT route writes this row.
+    const permissionsModeChanges = changes.filter(
+      (change) => change.table === "app_settings" && change.id === MARI_PERMISSIONS_MODE_SETTINGS_KEY,
+    );
+    if (permissionsModeChanges.length > 0) {
+      issues.push({
+        level: "error",
+        table: "app_settings",
+        id: MARI_PERMISSIONS_MODE_SETTINGS_KEY,
+        message: "The Permissions Mode can only be changed by the user, from the Mari panel or Settings.",
+      });
+    }
+    // Same floor for the per-chat override: a chats-row write whose metadata
+    // changes "mariPermissionsMode" is blocked (deleting a whole chat is not -
+    // that removes the override legitimately).
+    const chatModeMetadataValue = (raw: unknown): unknown => {
+      if (typeof raw !== "string" || !raw) return undefined;
+      try {
+        return (JSON.parse(raw) as Record<string, unknown>).mariPermissionsMode;
+      } catch {
+        return undefined;
+      }
+    };
+    for (const change of changes) {
+      if (change.table !== "chats" || !change.afterRaw) continue;
+      if (chatModeMetadataValue(change.afterRaw.metadata) !== chatModeMetadataValue(change.beforeRaw?.metadata)) {
+        issues.push({
+          level: "error",
+          table: "chats",
+          id: change.id,
+          message:
+            "The chat's Permissions Mode override can only be changed by the user, from the Mari panel or Settings.",
+        });
+      }
+    }
 
     const personalExtensionChanges = changes.filter((change) => change.table === "installed_extensions");
     if (personalExtensionChanges.length > 0 && !request.personalExtensionDraftMutation) {
@@ -7394,6 +7722,15 @@ export class MariDbService {
     return run;
   }
 
+  private withLorebookFolderMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.lorebookFolderMutationQueue.then(operation);
+    this.lorebookFolderMutationQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   // Serialize an operation against all others touching the SAME review id (see reviewLocks). The
   // stored tail never rejects, so a failed operation cannot wedge the id's queue; the next waiter
   // still runs. The tail self-evicts from the map once it is the last holder, so ids do not
@@ -7794,6 +8131,9 @@ export class MariDbService {
       for (const cascade of CASCADES.filter((entry) => entry.child === change.table)) {
         const ref = change.afterRaw?.[cascade.childKey];
         if (typeof ref !== "string" || !ref) continue;
+        // Same by-design exemption the full validate() walk applies (#5405).
+        const exemptPrefix = CASCADE_DANGLING_EXEMPT_PREFIXES[`${cascade.child}.${cascade.childKey}`];
+        if (exemptPrefix && ref.startsWith(exemptPrefix)) continue;
         const parentInsertedOrUpdated = changes.some(
           (entry) =>
             entry.table === cascade.parent && entry.action !== "delete" && entry.afterRaw?.[cascade.parentKey] === ref,
@@ -8285,6 +8625,136 @@ export class MariDbService {
     return entry;
   }
 
+  /**
+   * #5754 follow-up: deterministic post-apply verification. Re-read every
+   * applied row THROUGH THE STORE (the same getRawById layer every read
+   * command uses) and compare the persisted values against the columns the
+   * plan asserted. Runs AFTER applyPlan's flush and after character-book
+   * sync, so it observes the final persisted state. Only a clean "verified"
+   * result may satisfy the workspace verification guard; "mismatch" and
+   * "unavailable" both fall back to demanding a manual confirmatory read -
+   * this can only ever strengthen the silent-persistence-failure protection,
+   * never weaken it. Never throws: an applied mutation must not be reported
+   * as failed because its verification could not run.
+   */
+  private async buildReadBack(
+    plan: Plan,
+    syncOutcomes: CharacterBookSyncOutcome[] = [],
+  ): Promise<MariDbMutationReadBack> {
+    try {
+      const mismatches: MariDbReadBackMismatch[] = [];
+      let mismatchCount = 0;
+      let checkedRows = 0;
+      const noteMismatch = (mismatch: MariDbReadBackMismatch) => {
+        mismatchCount += 1;
+        if (mismatches.length < READ_BACK_MISMATCH_LIMIT) {
+          mismatches.push({
+            ...mismatch,
+            intended: compactReadBackValue(mismatch.intended),
+            persisted: compactReadBackValue(mismatch.persisted),
+          });
+        }
+      };
+      for (const change of plan.changes) {
+        // Cascade child deletions ride the plan with apply:false - the store's
+        // own cascade machinery removes them at apply time - but they are
+        // still asserted outcomes, so the read-back must confirm they are
+        // gone. Any other apply:false row is deliberately unapplied.
+        const cascadeDelete = !change.apply && change.action === "delete" && typeof change.cascadeOf === "string";
+        if (!change.apply && !cascadeDelete) continue;
+        checkedRows += 1;
+        const meta = getMeta(change.table);
+        const persisted = await this.getRawById(meta, change.id);
+        if (change.action === "delete") {
+          if (persisted !== null) {
+            noteMismatch({
+              table: change.table,
+              id: change.id,
+              column: getPrimary(meta),
+              intended: null,
+              persisted: "row still present",
+            });
+          }
+          continue;
+        }
+        if (persisted === null) {
+          noteMismatch({
+            table: change.table,
+            id: change.id,
+            column: getPrimary(meta),
+            intended: "row present",
+            persisted: null,
+          });
+          continue;
+        }
+        const asserted = knownColumnPatch(meta, change.afterRaw ?? {});
+        for (const [column, value] of Object.entries(asserted)) {
+          // The home-widget catalog apply path stamps its own updatedAt at
+          // apply time (replaceHomeWidgetCatalog), so the plan-time value can
+          // never match; every other column of that row is still asserted.
+          if (column === "updatedAt" && change.table === "app_settings" && singleHomeWidgetCatalogChange(plan)) {
+            continue;
+          }
+          if (!readBackValuesMatch(persisted[column], value)) {
+            noteMismatch({ table: change.table, id: change.id, column, intended: value, persisted: persisted[column] });
+          }
+        }
+      }
+      // #5793 review: derived character-book writes are asserted outcomes
+      // too - a "verified" read-back over a silently failed sync would
+      // overstate. Synced books are re-read and compared like planned rows;
+      // a sync that could not confirm its write degrades the whole result to
+      // "unavailable" so the manual-read requirement stays in force.
+      let syncFailure: string | null = null;
+      for (const outcome of syncOutcomes) {
+        if (outcome.status === "failed") {
+          syncFailure = `character-book sync for lorebook ${outcome.lorebookId} could not be confirmed: ${outcome.error}`;
+          continue;
+        }
+        if (outcome.status !== "synced") continue;
+        checkedRows += 1;
+        const meta = getMeta("characters");
+        const persisted = await this.getRawById(meta, outcome.characterId);
+        const persistedBook = (() => {
+          if (persisted === null) return undefined;
+          try {
+            const data = typeof persisted.data === "string" ? JSON.parse(persisted.data) : persisted.data;
+            return isRecord(data) ? data.character_book : undefined;
+          } catch {
+            return undefined;
+          }
+        })();
+        if (persisted === null || !readBackValuesMatch(persistedBook, outcome.expectedBook)) {
+          noteMismatch({
+            table: "characters",
+            id: outcome.characterId,
+            column: "data.character_book",
+            intended: outcome.expectedBook,
+            persisted: persisted === null ? null : persistedBook,
+          });
+        }
+      }
+      // status stays the FIRST key so it leads the serialized readBack object
+      // Mari reads; the workspace GUARD trusts only the engine-written
+      // sentinel at position zero of the command output, never this JSON.
+      // A plan that applied zero rows has nothing observed - report it as
+      // unavailable rather than claiming a verification that never ran.
+      if (checkedRows === 0 && syncFailure === null) {
+        return { status: "unavailable", checkedRows: 0, error: "no applied changes to read back" };
+      }
+      if (mismatchCount > 0) {
+        return { status: "mismatch", checkedRows, mismatchCount, mismatches };
+      }
+      if (syncFailure !== null) {
+        return { status: "unavailable", checkedRows, error: syncFailure };
+      }
+      return { status: "verified", checkedRows };
+    } catch (err) {
+      logger.warn(err, "[mari-db] post-apply read-back unavailable");
+      return { status: "unavailable", checkedRows: 0, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   private async rawRows(table: string): Promise<Row[]> {
     const meta = getMeta(table);
     const rows = (await this.db.select().from(meta.table as any)) as Row[];
@@ -8322,7 +8792,7 @@ export class MariDbService {
       "Customization:       mari themes list|active|get|create|update|set-active",
       "Images/media:        mari images connections|preview|generate|edit|assign|delete|list",
       "Creative data:       mari characters list|get|search|create|update|delete",
-      "Creative data:       mari personas list|active|get|search|create|update|delete",
+      "Creative data:       mari personas list|get|search|create|update|delete",
       "Creative data:       mari lorebooks list|get|get-entry <entry-id>|entries <lorebook-id>|search|create|update <lorebook-id>|add-entry <lorebook-id>|update-entry <entry-id>|delete-entry <entry-id>|link-character|unlink-character|delete",
       "Creative data:       mari presets list|get|sections <preset-id>|get-section <id>|groups|get-group|choice-blocks|get-choice-block|add-section|update-section|delete-section|add-group|update-group|delete-group|add-choice-block|update-choice-block|delete-choice-block|create|update",
       "Chats (read-only):   mari chats list|get|messages|search",
@@ -8338,9 +8808,9 @@ export class MariDbService {
       "Read:  list [--limit <n>] [--search <text>]",
       "Read:  get <id>",
       "Read:  search <query> [--limit <n>]",
-      "Write: create (--name <name> [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--creator-notes <text>] [--backstory <text>] [--appearance <text>] [--about-me <text>] [--tags <t1,t2,...>] [--comment <text>] | --json '<data_json>' | --json-file <path>) [--apply] [--reason <text>]",
+      "Write: create (--name <name> [--summary <text>] [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--creator-notes <text>] [--backstory <text>] [--appearance <text>] [--about-me <text>] [--tags <t1,t2,...>] [--comment <text>] | --json '<data_json>' | --json-file <path>) [--apply] [--reason <text>]",
       "       --backstory, --appearance, and --about-me write to matching data.extensions fields",
-      "Write: update <id> [--name <name>] [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--creator-notes <text>] [--backstory <text>] [--appearance <text>] [--about-me <text>] [--tags <t1,t2,...>] [--comment <text>] [--json '<data_json>' | --json-file <path>] [--apply] [--reason <text>]",
+      "Write: update <id> [--name <name>] [--summary <text>] [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--creator-notes <text>] [--backstory <text>] [--appearance <text>] [--about-me <text>] [--tags <t1,t2,...>] [--comment <text>] [--json '<data_json>' | --json-file <path>] [--apply] [--reason <text>]",
       "Write: delete <id> [--apply] [--reason <text>]",
       "Writes dry-run by default; --apply saves reversible changes and shows a Keep/Restore review card.",
     ].join("\n");
@@ -8350,7 +8820,6 @@ export class MariDbService {
     return [
       "Usage: mari personas <command>",
       "Read:  list [--limit <n>]",
-      "Read:  active",
       "Read:  get <id>",
       "Read:  search <query> [--limit <n>]",
       "Write: create --name <name> [--description <text>] [--personality <text>] [--scenario <text>] [--backstory <text>] [--appearance <text>] [--phonetic-name <text>] [--convo-display-name <text>] [--about-me <text>] [--convo-behavior <text-or-json>] [--comment <text>] [--creator <text>] [--creator-notes <text>] [--apply] [--reason <text>]",
@@ -8437,6 +8906,7 @@ export class MariDbService {
       "Read: list <table>, get <table> <id>, select <table> --where <expr>, search <table|all> <query>, validate [--table <table>]",
       "Where: row.field and row['field'] with comparisons, &&, ||, !, parentheses, and safe string/array methods (includes, startsWith, endsWith, case conversion, trim); arbitrary code and calls are rejected",
       "Write: insert|patch|replace|delete|transform ... (dry-run by default; --apply saves reversible changes and shows a Keep/Restore review card)",
+      "Use -- before positional arguments that match option names, with options first: mari db get --parsed -- characters --apply",
       "Transform scripts use an OS sandbox where supported; on other systems, reviewed local scripts remain available only with MARI_DB_ALLOW_UNSAFE_TRANSFORMS=true.",
       `Known tables: ${FILE_BACKED_TABLES.slice(0, 8).join(", ")} ... (${FILE_BACKED_TABLES.length})`,
       `Journal directory: ${this.journalDir()} (${basename(getFileStorageDir())})`,

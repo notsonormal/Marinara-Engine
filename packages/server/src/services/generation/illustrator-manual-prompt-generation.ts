@@ -1,4 +1,5 @@
 import type { AgentContext } from "@marinara-engine/shared";
+import { NOVELAI_V5_MAX_CHARACTER_PROMPTS } from "../image/character-prompts.js";
 import { logger } from "../../lib/logger.js";
 import { normalizeAgentContextSize, renderAgentPromptTemplate } from "../agents/agent-executor.js";
 import type { ResolvedAgent } from "../agents/agent-pipeline.js";
@@ -25,6 +26,8 @@ export type ManualIllustratorPromptPlan = {
   characters: string[];
   aspectRatio: "portrait" | "landscape" | "square" | "";
   reason: string;
+  /** Raw NovelAI character captions; validated against characters at dispatch time. */
+  characterPrompts: unknown[];
 };
 
 export type ManualIllustratorPromptResult = {
@@ -67,7 +70,7 @@ function normalizeCharacterNames(value: unknown): string[] {
         .filter(Boolean)
         .map((name) => name.slice(0, 120)),
     ),
-  ).slice(0, 16);
+  ).slice(0, NOVELAI_V5_MAX_CHARACTER_PROMPTS);
 }
 
 function normalizeAspectRatio(value: unknown): ManualIllustratorPromptPlan["aspectRatio"] {
@@ -83,14 +86,12 @@ export function normalizeManualIllustratorPromptModeInstruction(promptTemplate: 
     /<(?:output_format|output_schema|response_format|json_schema)\b[^>]*>[\s\S]*?<\/(?:output_format|output_schema|response_format|json_schema)>/giu,
     "",
   );
-  const withoutOutputSchemaFences = withoutTaggedOutputSchemas.replace(
-    /```(?:json)?\s*[\s\S]*?```/giu,
-    (block) =>
-      /\b(?:shouldGenerate|generateBackground)\b|["'](?:prompt|negativePrompt|style|characters|aspectRatio|reason)["']\s*:/iu.test(
-        block,
-      )
-        ? ""
-        : block,
+  const withoutOutputSchemaFences = withoutTaggedOutputSchemas.replace(/```(?:json)?\s*[\s\S]*?```/giu, (block) =>
+    /\b(?:shouldGenerate|generateBackground)\b|["'](?:prompt|negativePrompt|style|characters|aspectRatio|reason)["']\s*:/iu.test(
+      block,
+    )
+      ? ""
+      : block,
   );
   const lines = withoutOutputSchemaFences.split("\n");
   const outputSchemaStart = lines.findIndex((line) => {
@@ -125,9 +126,7 @@ export function normalizeManualIllustratorPromptModeInstruction(promptTemplate: 
         /\b(?:generate|illustrate|create|draw)\b[^\n]{0,100}\bonly\b[^\n]{0,100}\b(?:if|when|for)\b/iu.test(
           normalized,
         ) ||
-        /\bonly\b[^\n]{0,100}\b(?:generate|illustrate|create|draw)\b[^\n]{0,100}\b(?:if|when|for)\b/iu.test(
-          normalized,
-        )
+        /\bonly\b[^\n]{0,100}\b(?:generate|illustrate|create|draw)\b[^\n]{0,100}\b(?:if|when|for)\b/iu.test(normalized)
       ) {
         return false;
       }
@@ -142,9 +141,7 @@ export function normalizeManualIllustratorPromptModeInstruction(promptTemplate: 
         return false;
       }
       if (
-        /\b(?:generation|illustration)\s+(?:decision|cadence|interval|frequency|cooldown)\b/iu.test(
-          normalized,
-        ) ||
+        /\b(?:generation|illustration)\s+(?:decision|cadence|interval|frequency|cooldown)\b/iu.test(normalized) ||
         /\b(?:run|trigger|generate|illustrate)\b[^\n]{0,100}\bevery\s+\d+\b[^\n]{0,60}\b(?:turn|message|response)s?\b/iu.test(
           normalized,
         )
@@ -169,6 +166,7 @@ export function parseManualIllustratorPromptPlan(value: unknown): ManualIllustra
     characters: normalizeCharacterNames(record.characters ?? record.visibleCharacters),
     aspectRatio: normalizeAspectRatio(record.aspectRatio ?? record.aspect_ratio),
     reason: readTrimmedString(record.reason).slice(0, 500),
+    characterPrompts: Array.isArray(record.characterPrompts) ? record.characterPrompts.slice(0, 32) : [],
   };
 }
 
@@ -238,7 +236,9 @@ export function buildManualIllustratorPromptMessages(args: {
   contextSize: unknown;
   selectedPromptTemplate?: string;
   styleInstruction?: string;
+  characterPromptInstruction?: string;
   imagePromptInstructions?: string;
+  request?: string;
 }): ChatMessage[] {
   const promptModeInstruction = normalizeManualIllustratorPromptModeInstruction(args.selectedPromptTemplate ?? "");
   const systemPrompt = [
@@ -254,6 +254,7 @@ export function buildManualIllustratorPromptMessages(args: {
     args.styleInstruction
       ? `Additional Image Style instruction for the image prompt you write: ${args.styleInstruction}\nCombine it with the selected Illustrator prompt mode. It may refine rendering and visual treatment, but it must not replace or weaken the selected format, layout, framing, or text requirements.`
       : "No visual style profile is selected. Infer only the visual treatment supported by the scene context.",
+    args.characterPromptInstruction?.trim() ?? "",
     args.imagePromptInstructions
       ? `<image_prompting_instructions>\nApply these image-backend instructions when writing the provider-ready prompt. They are instructions, not text to copy into the prompt:\n${args.imagePromptInstructions}\n</image_prompting_instructions>`
       : "",
@@ -273,6 +274,7 @@ export function buildManualIllustratorPromptMessages(args: {
   const instruction = [
     "<manual_gallery_illustration_request>",
     "Write the image-model prompt now for the current scene. The Illustration button has already selected the output type.",
+    ...(args.request ? [`Depict this explicit request: ${args.request}`] : []),
     "</manual_gallery_illustration_request>",
   ].join("\n");
   const last = messages.at(-1);
@@ -299,7 +301,9 @@ export async function writeManualIllustratorPromptPlan(args: {
   illustratorAgent: ResolvedAgent;
   context: AgentContext;
   styleInstruction?: string;
+  characterPromptInstruction?: string;
   imagePromptInstructions?: string;
+  request?: string;
   signal?: AbortSignal;
   debugLog?: (message: string, ...args: unknown[]) => void;
 }): Promise<ManualIllustratorPromptResult> {
@@ -314,7 +318,9 @@ export async function writeManualIllustratorPromptPlan(args: {
     contextSize: args.illustratorAgent.settings.contextSize,
     selectedPromptTemplate,
     styleInstruction: args.styleInstruction,
+    characterPromptInstruction: args.characterPromptInstruction,
     imagePromptInstructions: args.imagePromptInstructions,
+    request: args.request,
   });
   args.debugLog?.(
     "[debug/illustrator/manual-illustration-prompt] messages:\n%s",

@@ -5,6 +5,7 @@ import type { FastifyInstance } from "fastify";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
 import { createConnectionsStorage } from "../services/storage/connections.storage.js";
 import { createCharactersStorage } from "../services/storage/characters.storage.js";
+import { resolveChatUserIdentity } from "../services/chat-user-identity.js";
 import { createGameStateStorage } from "../services/storage/game-state.storage.js";
 import { createLorebooksStorage } from "../services/storage/lorebooks.storage.js";
 import { mapSheetAttributesToRPG } from "../services/game/skill-check.service.js";
@@ -25,7 +26,6 @@ import type {
   EncounterLogEntry,
   RPGStatsConfig,
 } from "@marinara-engine/shared";
-import { resolveActivePersonaCandidate } from "./generate/generate-route-utils.js";
 
 // ──────────────────────────────────────────────
 // Helpers
@@ -150,23 +150,20 @@ async function buildCharacterContext(chars: ReturnType<typeof createCharactersSt
 }
 
 /**
- * Build persona context. Prefers the chat-scoped persona (`chat.personaId`)
- * before Conversation-only fallback to the globally active Persona — mirrors
- * the resolution order used elsewhere (see `chats.routes.ts`). Without this, a
- * user who picks a per-chat persona but doesn't have a matching global active
- * persona ends up named "User" in combat because the encounter prompt's
- * `${personaName}` placeholder defaulted to that string.
- *
- * Roleplay and Game skip active-Persona fallback, so both can intentionally
- * remain Persona-less in combat prompts.
+ * Build context from the chat's selected Persona or character identity.
+ * Chats without an explicit identity remain Persona-less in combat prompts.
  */
 async function buildPersonaContext(
   chars: ReturnType<typeof createCharactersStorage>,
   chatPersonaId: string | null,
   chatMode?: string | null,
+  personaCharacterId?: string | null,
 ) {
-  const allPersonas = await chars.listPersonas();
-  const persona = resolveActivePersonaCandidate(allPersonas, chatPersonaId, chatMode);
+  const persona = await resolveChatUserIdentity(chars, {
+    personaId: chatPersonaId,
+    personaCharacterId,
+    mode: chatMode,
+  });
   if (!persona) return { personaName: "User", personaCtx: "No persona information available." };
   let ctx = `Name: ${persona.name}\n`;
   const description = cardPromptText(persona.description);
@@ -181,15 +178,16 @@ async function buildPersonaContext(
   // combat-init AI uses the user-defined HP instead of inventing values.
   // `personaStats` is stored as a JSON string of { enabled, bars, rpgStats? }.
   let personaStats: Record<string, unknown> | null = null;
-  if (persona.personaStats) {
-    if (typeof persona.personaStats === "string") {
+  const personaStatsValue = (persona as typeof persona & { personaStats?: unknown }).personaStats;
+  if (personaStatsValue) {
+    if (typeof personaStatsValue === "string") {
       try {
-        personaStats = JSON.parse(persona.personaStats);
+        personaStats = JSON.parse(personaStatsValue);
       } catch {
         personaStats = null;
       }
     } else {
-      personaStats = persona.personaStats as Record<string, unknown>;
+      personaStats = personaStatsValue as Record<string, unknown>;
     }
   }
   // Only configured maxes are exposed — combat always starts at full HP.
@@ -393,7 +391,7 @@ function buildInitPrompt(
   inst += `  "dialogueCues": [\n`;
   inst += `    {"speaker":"Named ally or named enemy","type":"main|side|extra|thought|whisper","expression":"angry","content":"A short battle line.","trigger":"intro|round|attack|hit|charge|phase_75|phase_50|phase_25|low_hp|victory|defeat","round":2,"everyNRounds":5}\n`;
   inst += `  ],\n`;
-  inst += `  "visuals": {"isBossFight": false, "enemyImagePrompts": [{"name":"Enemy Name","prompt":"portrait prompt"}], "backgroundPrompt": "optional boss arena background prompt", "illustrationPrompt": "optional boss fight splash illustration prompt", "slug": "optional-short-slug"}\n`;
+  inst += `  "visuals": {"isBossFight": false, "encounterTier": "common|miniboss|boss|special", "enemyImagePrompts": [{"name":"Enemy Name","prompt":"portrait prompt"}], "backgroundPrompt": "optional boss arena background prompt", "illustrationPrompt": "optional boss fight splash illustration prompt", "slug": "optional-short-slug"}\n`;
   inst += `}\n\n`;
   inst += `IMPORTANT NOTES:\n`;
   inst += `- attacks: each has "name" and "type" (single-target, AoE, or both). Add cooldown/status/element only when useful.\n`;
@@ -403,6 +401,7 @@ function buildInitPrompt(
   inst += `- mechanics: use sparingly. Boss charge attacks should include interval, counterplay, effectType, and a matching dialogueCue with trigger "charge".\n`;
   inst += `- dialogueCues: optional, short, and only for named allies, named enemies, bosses, or important NPCs. Generic unnamed enemies should not get voiced lines.\n`;
   inst += `- visuals: set isBossFight true only for bosses/story-significant enemies. backgroundPrompt/illustrationPrompt are optional and only for important fights.\n`;
+  inst += `- visuals.encounterTier: classify the whole encounter — "common" for ordinary fights, "miniboss" for elites or named mid-tier threats, "boss" for true bosses, "special" for unique story encounters (rivals, scripted duels, otherworldly events). When unsure, use "common".\n`;
   if (tactical) {
     inst += `- battlefield.formation: pick the arrangement matching how the scene led into combat — ambushed → ambush, encircled → surrounded, holding/defending a position → defense, sudden chance encounter → skirmish, otherwise line.\n`;
     inst += `- class: pick each combatant's tactical role from how they fight — ranged bow/gun users → archer, spellcasters → mage, dedicated healers → healer, fast skirmishers/assassins → rogue, armored defenders → knight, otherwise fighter.\n`;
@@ -591,7 +590,12 @@ export async function encounterRoutes(app: FastifyInstance) {
 
       const characterIds: string[] = JSON.parse(chat.characterIds as string);
       const characterCtx = await buildCharacterContext(chars, characterIds);
-      const { personaName, personaCtx } = await buildPersonaContext(chars, chat.personaId ?? null, chat.mode);
+      const { personaName, personaCtx } = await buildPersonaContext(
+        chars,
+        chat.personaId ?? null,
+        chat.mode,
+        chat.personaCharacterId,
+      );
       let chatMeta: Record<string, unknown> | null = null;
       if (typeof chat.metadata === "string") {
         try {
@@ -702,7 +706,12 @@ export async function encounterRoutes(app: FastifyInstance) {
 
       const characterIds: string[] = JSON.parse(chat.characterIds as string);
       const characterCtx = await buildCharacterContext(chars, characterIds);
-      const { personaName, personaCtx } = await buildPersonaContext(chars, chat.personaId ?? null, chat.mode);
+      const { personaName, personaCtx } = await buildPersonaContext(
+        chars,
+        chat.personaId ?? null,
+        chat.mode,
+        chat.personaCharacterId,
+      );
       const spellbookCtx = await loadSpellbookContext(spellbookId);
 
       const chatMessages = await chats.listMessages(chatId);
@@ -804,7 +813,12 @@ export async function encounterRoutes(app: FastifyInstance) {
 
       const characterIds: string[] = JSON.parse(chat.characterIds as string);
       const characterCtx = await buildCharacterContext(chars, characterIds);
-      const { personaName, personaCtx } = await buildPersonaContext(chars, chat.personaId ?? null, chat.mode);
+      const { personaName, personaCtx } = await buildPersonaContext(
+        chars,
+        chat.personaId ?? null,
+        chat.mode,
+        chat.personaCharacterId,
+      );
 
       const prompt = buildSummaryPrompt(
         personaName,

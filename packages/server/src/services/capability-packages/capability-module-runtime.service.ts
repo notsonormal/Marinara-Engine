@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, InjectOptions, LightMyRequestResponse as InjectResponse } from "fastify";
 import {
   registerTurnGameEngine,
   type AnyTurnGameEngine,
@@ -24,6 +24,7 @@ import {
   type CapabilityConversationCommandRegistration,
 } from "./capability-command-registry.service.js";
 import { registerCapabilityService } from "./capability-service-registry.service.js";
+import { assertCapabilityAgentRuntimeServiceRegistration } from "./capability-agent-runtime.service.js";
 import { createCapabilityLanguageModelHost } from "./capability-language-model.service.js";
 import {
   createCapabilityEmbeddingHost,
@@ -31,7 +32,10 @@ import {
 } from "./capability-embedding.service.js";
 import { createCapabilityPersistenceHost } from "./capability-persistence.service.js";
 import { createCapabilityResourceHost } from "./capability-resources.service.js";
-import { registerCapabilityPrivilegedRoutes } from "./capability-route-registration.service.js";
+import {
+  registerCapabilityPrivilegedRoutes,
+  runCapabilityInternalRoute,
+} from "./capability-route-registration.service.js";
 import {
   registerCapabilityPromptContext,
   type CapabilityPromptContextContributor,
@@ -45,7 +49,7 @@ type CapabilityActivationContext = {
   api: {
     runtime: CapabilityRuntimeHost;
     registerTurnGameEngine(engine: AnyTurnGameEngine): Cleanup;
-  registerConversationCommand(registration: CapabilityConversationCommandRegistration): Cleanup;
+    registerConversationCommand(registration: CapabilityConversationCommandRegistration): Cleanup;
     registerService<T>(key: string, service: T): Cleanup;
     /** Contribute text to each turn's system prompt. Requires the `prompt-context` permission. */
     registerPromptContext(contributor: CapabilityPromptContextContributor): Cleanup;
@@ -53,10 +57,16 @@ type CapabilityActivationContext = {
       routes: import("fastify").FastifyPluginAsync,
       options: { prefix: string },
     ): Promise<Cleanup>;
+    /** Run an active route owned by this package as trusted server work. */
+    runInternalRoute?: (options: InjectOptions | string) => Promise<InjectResponse>;
   };
 };
 
-async function createCapabilityRuntimeHost(app: FastifyInstance, packageId: string): Promise<CapabilityRuntimeHost> {
+async function createCapabilityRuntimeHost(
+  app: FastifyInstance,
+  packageId: string,
+  permissions: readonly string[],
+): Promise<CapabilityRuntimeHost> {
   const agents = app.db ? createAgentsStorage(app.db) : null;
   const config = await agents?.getByType(packageId);
   const embeddings = app.db
@@ -64,6 +74,12 @@ async function createCapabilityRuntimeHost(app: FastifyInstance, packageId: stri
     : createCapabilityEmbeddingHost();
   return Object.freeze({
     embeddings,
+    async resolveEmbeddings() {
+      const config = await agents?.getByType(packageId);
+      return app.db
+        ? createConfiguredCapabilityEmbeddingHost(app.db, config?.connectionId)
+        : createCapabilityEmbeddingHost();
+    },
     async getAgentConfig() {
       const config = await agents?.getByType(packageId);
       return config ? { connectionId: config.connectionId, settings: parseAgentSettingsRecord(config.settings) } : null;
@@ -83,7 +99,7 @@ async function createCapabilityRuntimeHost(app: FastifyInstance, packageId: stri
       debugOverride: (overrideEnabled: boolean, message: string, ...args: CapabilityRuntimeLogArgument[]) =>
         logDebugOverride(overrideEnabled, message, ...args),
     }),
-    persistence: createCapabilityPersistenceHost(app.db),
+    persistence: createCapabilityPersistenceHost(app.db, permissions),
     resources: createCapabilityResourceHost(app.db),
   });
 }
@@ -202,7 +218,7 @@ class CapabilityModuleRuntime {
         dataDir: DATA_DIR,
         package: installed,
         api: {
-          runtime: await createCapabilityRuntimeHost(app, installed.id),
+          runtime: await createCapabilityRuntimeHost(app, installed.id, installed.manifest.permissions ?? []),
           registerTurnGameEngine: (engine) => trackCleanup(registerTurnGameEngine(engine)),
           registerConversationCommand: (registration) => {
             if (registration.handler && !installed.manifest.permissions?.includes("conversation-actions")) {
@@ -212,7 +228,10 @@ class CapabilityModuleRuntime {
             }
             return trackCleanup(registerCapabilityConversationCommand(registration));
           },
-          registerService: (key, service) => trackCleanup(registerCapabilityService(key, service)),
+          registerService: (key, service) => {
+            assertCapabilityAgentRuntimeServiceRegistration(installed.id, installed.manifest.permissions ?? [], key);
+            return trackCleanup(registerCapabilityService(key, service));
+          },
           // Gated on the permission the manifest already declares, so a package can't reach the prompt
           // without asking for it up front. Contract in capability-prompt-context.service.ts.
           registerPromptContext: (contributor) => {
@@ -225,6 +244,7 @@ class CapabilityModuleRuntime {
           },
           registerPrivilegedRoutes: async (routes, options) =>
             trackCleanup(await registerCapabilityPrivilegedRoutes(app, installed, routes, options)),
+          runInternalRoute: (options) => runCapabilityInternalRoute(app, installed.id, options),
         },
       };
       const cleanup = await module.activate(context);

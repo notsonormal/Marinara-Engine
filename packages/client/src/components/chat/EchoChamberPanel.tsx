@@ -19,14 +19,21 @@ import { useAgentStore } from "../../stores/agent.store";
 import { useUIStore } from "../../stores/ui.store";
 import type { EchoChamberSide, EchoChamberSize } from "../../stores/ui.store";
 import { useChatStore } from "../../stores/chat.store";
+import { hasActiveTextSelection } from "../../lib/text-selection";
 import { useChat } from "../../hooks/use-chats";
+import { useAgentConfigs } from "../../hooks/use-agents";
 import { useGenerate } from "../../hooks/use-generate";
 import { api } from "../../lib/api-client";
 import { cn } from "../../lib/utils";
-import { ROLEPLAY_POPOVER_SHELL } from "./roleplay-popover-styles";
-import { getEchoChamberMessageInterval, resolveEchoChamberPersistedBaseline } from "../../lib/echo-chamber-queue";
+import { NEUTRAL_PANEL_SHELL } from "../ui/neutral-surface-styles";
+import {
+  getEchoChamberMessageInterval,
+  normalizeEchoChamberMessageDelaySeconds,
+  resolveEchoChamberPersistedBaseline,
+} from "../../lib/echo-chamber-queue";
 import { resolveEchoChamberTopLayout } from "../../lib/echo-chamber-layout";
 import { useTranslation as useUiTranslation } from "react-i18next";
+import { parseAgentSettingsRecord } from "@marinara-engine/shared";
 
 const NAME_COLORS = [
   "text-red-400",
@@ -202,6 +209,7 @@ export function EchoChamberPanel({ hiddenOnMobile = false }: EchoChamberPanelPro
   const isStreaming = useChatStore((s) => s.isStreaming);
   const streamingChatId = useChatStore((s) => s.streamingChatId);
   const { data: chat } = useChat(activeChatId);
+  const { data: agentConfigs } = useAgentConfigs();
   const { retryAgents } = useGenerate();
   const echoRetryBusy = isAgentProcessing || (isStreaming && streamingChatId === activeChatId);
 
@@ -219,6 +227,10 @@ export function EchoChamberPanel({ hiddenOnMobile = false }: EchoChamberPanelPro
     const activeAgentIds: string[] = Array.isArray(meta.activeAgentIds) ? meta.activeAgentIds : [];
     return activeAgentIds.includes("echo-chamber");
   }, [chat]);
+  const messageDelaySeconds = useMemo(() => {
+    const config = agentConfigs?.find((agent) => agent.type === "echo-chamber");
+    return normalizeEchoChamberMessageDelaySeconds(parseAgentSettingsRecord(config?.settings).messageDelaySeconds);
+  }, [agentConfigs]);
 
   // ── Timed reveal: show one more message after each short chat-like delay ──
   // visibleCount and baseline live in the Zustand store so they survive
@@ -295,12 +307,13 @@ export function EchoChamberPanel({ hiddenOnMobile = false }: EchoChamberPanelPro
       setEchoVisibleCount(baseline);
       return;
     }
-    const id = setTimeout(revealNextEchoMessage, getEchoChamberMessageInterval());
+    const id = setTimeout(revealNextEchoMessage, getEchoChamberMessageInterval(messageDelaySeconds));
     return () => clearTimeout(id);
-  }, [visibleCount, echoMessages.length, baseline, revealNextEchoMessage, setEchoVisibleCount]);
+  }, [visibleCount, echoMessages.length, baseline, messageDelaySeconds, revealNextEchoMessage, setEchoVisibleCount]);
 
   // Auto-scroll when a new message becomes visible
   useEffect(() => {
+    if (hasActiveTextSelection()) return;
     if (scrollRef.current) {
       scrollRef.current.scrollTo({
         top: scrollRef.current.scrollHeight,
@@ -325,7 +338,8 @@ export function EchoChamberPanel({ hiddenOnMobile = false }: EchoChamberPanelPro
 
   // ── Compute position style relative to the chat area container ──
   const [posStyle, setPosStyle] = useState<CSSProperties>({});
-  const isMobile = typeof window !== "undefined" && window.innerWidth < 768;
+  const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.innerWidth < 768);
+  const mobileCollapsed = isMobile && !echoChamberOpen;
   const resizeFromLeft = !isMobile && echoChamberSide.endsWith("right");
   const resizeFromTop = !isMobile && echoChamberSide.startsWith("bottom");
 
@@ -442,7 +456,10 @@ export function EchoChamberPanel({ hiddenOnMobile = false }: EchoChamberPanelPro
   );
 
   useEffect(() => {
-    const clampCurrentSize = () => setPanelSize((size) => (size ? clampPanelSize(size.width, size.height) : null));
+    const clampCurrentSize = () => {
+      setIsMobile(window.innerWidth < 768);
+      setPanelSize((size) => (size ? clampPanelSize(size.width, size.height) : null));
+    };
     window.addEventListener("resize", clampCurrentSize);
     return () => window.removeEventListener("resize", clampCurrentSize);
   }, [clampPanelSize]);
@@ -450,7 +467,7 @@ export function EchoChamberPanel({ hiddenOnMobile = false }: EchoChamberPanelPro
   useEffect(() => {
     if (!echoEnabled) return;
     // On mobile, position below the HUD bar.
-    if (typeof window !== "undefined" && window.innerWidth < 768) {
+    if (isMobile) {
       const update = () => {
         const hudEl = findVisibleHud();
         // Position relative to container, so measure HUD bottom relative to rpg-chat-area
@@ -531,21 +548,21 @@ export function EchoChamberPanel({ hiddenOnMobile = false }: EchoChamberPanelPro
       discoveryObserver?.disconnect();
       window.removeEventListener("resize", scheduleUpdate);
     };
-  }, [echoEnabled, echoChamberSide, trackerPanelEnabled, trackerPanelOpen, trackerPanelSide]);
+  }, [echoEnabled, echoChamberSide, isMobile, trackerPanelEnabled, trackerPanelOpen, trackerPanelSide]);
 
   useEffect(() => {
-    if (!echoEnabled || (isMobile && hiddenOnMobile)) return;
+    if (!echoEnabled || (isMobile && hiddenOnMobile) || mobileCollapsed) return;
 
     let frame = window.requestAnimationFrame(() => {
       frame = window.requestAnimationFrame(() => {
         const scrollEl = scrollRef.current;
-        if (!scrollEl) return;
+        if (!scrollEl || hasActiveTextSelection()) return;
         scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: "auto" });
       });
     });
 
     return () => window.cancelAnimationFrame(frame);
-  }, [echoEnabled, hiddenOnMobile, isMobile]);
+  }, [echoEnabled, hiddenOnMobile, isMobile, mobileCollapsed]);
 
   if (!echoEnabled || (isMobile && hiddenOnMobile)) return null;
   const visibleMessages = echoMessages.slice(0, visibleCount);
@@ -556,9 +573,10 @@ export function EchoChamberPanel({ hiddenOnMobile = false }: EchoChamberPanelPro
     return (
       <button
         type="button"
+        data-roleplay-agent-window="echo"
         onClick={toggleEchoChamber}
         className={cn(
-          ROLEPLAY_POPOVER_SHELL,
+          NEUTRAL_PANEL_SHELL,
           "absolute z-[60] pointer-events-auto inline-flex items-center gap-2 px-2.5 py-1.5 text-[0.6875rem] font-semibold uppercase tracking-wider",
           "text-[var(--marinara-chat-chrome-button-text)] transition-colors hover:text-[var(--marinara-chat-chrome-button-text-hover)]",
         )}
@@ -592,8 +610,9 @@ export function EchoChamberPanel({ hiddenOnMobile = false }: EchoChamberPanelPro
   return (
     <div
       ref={panelRef}
+      data-roleplay-agent-window="echo"
       className={cn(
-        ROLEPLAY_POPOVER_SHELL,
+        NEUTRAL_PANEL_SHELL,
         "absolute z-[60] flex min-w-0 flex-col",
         "pointer-events-auto max-md:w-auto md:w-[14.75rem]",
         !panelSize && "max-md:max-h-28 md:max-h-[22rem]",

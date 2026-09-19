@@ -61,6 +61,10 @@ interface SpriteOverlayProps {
   expressionSpriteOpacity?: number;
   /** Opacity multiplier for roleplay full-body sprites. Falls back to spriteOpacity. */
   fullBodySpriteOpacity?: number;
+  /** Scene-wide size adjustment, applied after individual sprite settings. */
+  spriteScaleMultiplier?: number;
+  /** When supplied, sprites outside this turn's expression results are dimmed. */
+  activeCharacterIds?: readonly string[];
 }
 
 interface CharacterExpressionState {
@@ -147,6 +151,8 @@ export function SpriteOverlay({
   spriteOpacity = 1,
   expressionSpriteOpacity,
   fullBodySpriteOpacity,
+  spriteScaleMultiplier = 1,
+  activeCharacterIds,
 }: SpriteOverlayProps) {
   const { t: localizeUi } = useUiTranslation();
   const stageRef = useRef<HTMLDivElement>(null);
@@ -317,7 +323,7 @@ export function SpriteOverlay({
 
   if (visibleSpriteEntries.length === 0) return null;
 
-  const stageZIndexClass = editing ? "z-[35]" : fullBodyOnly ? "z-[5]" : "z-[5] md:z-[15]";
+  const stageZIndexClass = editing ? "z-[35]" : "z-[5]";
   return (
     <div ref={stageRef} className={`pointer-events-none absolute inset-0 overflow-hidden ${stageZIndexClass}`}>
       {visibleSpriteEntries.map((entry) => (
@@ -337,8 +343,11 @@ export function SpriteOverlay({
           onFinishPlacement={onFinishPlacement}
           fullBodyOnly={fullBodyOnly}
           spriteDisplayModes={[entry.renderMode]}
-          spriteScale={entry.spriteScale}
-          spriteOpacity={entry.spriteOpacity}
+          spriteScale={entry.spriteScale * spriteScaleMultiplier}
+          spriteOpacity={
+            entry.spriteOpacity *
+            (!editing && activeCharacterIds && !activeCharacterIds.includes(entry.characterId) ? 0.45 : 1)
+          }
         />
       ))}
 

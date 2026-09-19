@@ -14,6 +14,8 @@ export interface Persona {
   creator: string;
   /** Human-visible persona card version string. */
   personaVersion: string;
+  /** Retain prior card revisions and automatically advance personaVersion on edits. */
+  versioningEnabled: boolean;
   /** Private notes about intended use, quirks, or recommended settings. */
   creatorNotes: string;
   /** Optional pronunciation override used when this persona name is sent to TTS. */
@@ -33,7 +35,7 @@ export interface Persona {
    *  source-rectangle shape and the legacy zoom+offset shape (kept readable so
    *  previously saved crops display unchanged until the user re-edits). */
   avatarCrop?: AvatarCrop | null;
-  /** Whether this is the currently active persona */
+  /** @deprecated Inert legacy flag. Personas are selected explicitly per chat. */
   isActive: boolean;
   /** Name display color/gradient (CSS value) */
   nameColor: string;

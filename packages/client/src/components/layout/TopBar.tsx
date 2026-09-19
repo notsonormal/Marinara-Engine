@@ -20,7 +20,6 @@ import { cn } from "../../lib/utils";
 import { SpotifyMiniPlayer } from "../spotify/SpotifyMiniPlayer";
 import { YouTubePlayer } from "../chat/YouTubePlayer";
 import { LocalMusicPlayer } from "../chat/LocalMusicPlayer";
-import { MusicDjUnavailablePlayer } from "../music/MusicDjUnavailablePlayer";
 import { useInstalledCapabilityPackages } from "../../hooks/use-capability-packages";
 import { useLocalizedUiText } from "../../localization/use-localized-ui-text";
 import {
@@ -84,15 +83,13 @@ const TOPBAR_FORCE_HOVER_CLASS = "bg-[var(--accent)]";
 const TOPBAR_ACCENT_ICON_CLASS = "mari-topbar-accent-icon mari-accent-animated";
 const CHAT_TOPBAR_GRADIENT_ID = "mari-topbar-chats-gradient";
 
-function isMobileTopbarNavigation() {
-  return typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches;
-}
-
-export function TopBar() {
+export function TopBar({ mobileTopbarNavigation }: { mobileTopbarNavigation: boolean }) {
   const localize = useLocalizedUiText();
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
   const toggleSidebar = useUIStore((s) => s.toggleSidebar);
+  const setSidebarOpen = useUIStore((s) => s.setSidebarOpen);
   const toggleRightPanel = useUIStore((s) => s.toggleRightPanel);
+  const closeRightPanel = useUIStore((s) => s.closeRightPanel);
   const rightPanel = useUIStore((s) => s.rightPanel);
   const rightPanelOpen = useUIStore((s) => s.rightPanelOpen);
   const activeChatId = useChatStore((s) => s.activeChatId);
@@ -108,7 +105,6 @@ export function TopBar() {
   const regexDetailId = useUIStore((s) => s.regexDetailId);
   const botBrowserOpen = useUIStore((s) => s.botBrowserOpen);
   const gameAssetsBrowserOpen = useUIStore((s) => s.gameAssetsBrowserOpen);
-  const musicPlayerEnabled = useUIStore((s) => s.musicPlayerEnabled);
   const characterLibraryOpen = useUIStore((s) => s.characterLibraryOpen);
   const cardLibraryKind = useUIStore((s) => s.cardLibraryKind);
   const headerRef = useRef<HTMLElement | null>(null);
@@ -117,13 +113,10 @@ export function TopBar() {
   const [spotifyDesktopViewport, setSpotifyDesktopViewport] = useState(false);
   const [spotifyUseFloatingFallback, setSpotifyUseFloatingFallback] = useState(false);
   const [hoveredTopbarKey, setHoveredTopbarKey] = useState<string | null>(null);
-  const { data: installedCapabilities = [], isLoading: installedCapabilitiesLoading } =
-    useInstalledCapabilityPackages();
+  const { data: installedCapabilities = [] } = useInstalledCapabilityPackages();
   const musicDjInstalled = installedCapabilities.some(
     (capability) => capability.id === "spotify" && capability.status === "active",
   );
-  const showMusicDjUnavailablePlayer =
-    spotifyDesktopViewport && musicPlayerEnabled && !installedCapabilitiesLoading && !musicDjInstalled;
 
   const isCharactersPanelActive =
     (rightPanelOpen && rightPanel === "characters") ||
@@ -143,8 +136,10 @@ export function TopBar() {
       Boolean(personaDetailId) ||
       (characterLibraryOpen && cardLibraryKind === "personas"),
   };
+  const isMobileOverlayActive = mobileTopbarNavigation && (sidebarOpen || rightPanelOpen);
   const isHomeActive =
     !activeChatId &&
+    !isMobileOverlayActive &&
     !characterDetailId &&
     !lorebookDetailId &&
     !presetDetailId &&
@@ -160,9 +155,9 @@ export function TopBar() {
   const isTopbarHovered = (key: string) => hoveredTopbarKey === key;
 
   const prepareMobileTopbarNavigation = useCallback(() => {
-    if (!isMobileTopbarNavigation()) return;
+    if (!mobileTopbarNavigation) return;
     closeAllDetails();
-  }, [closeAllDetails]);
+  }, [closeAllDetails, mobileTopbarNavigation]);
 
   const handleSidebarClick = useCallback(() => {
     prepareMobileTopbarNavigation();
@@ -176,6 +171,15 @@ export function TopBar() {
     },
     [prepareMobileTopbarNavigation, toggleRightPanel],
   );
+
+  const handleHomeClick = useCallback(() => {
+    window.dispatchEvent(new Event("marinara:home-professor-mari-close"));
+    setActiveChatId(null);
+    closeAllDetails();
+    if (!mobileTopbarNavigation) return;
+    setSidebarOpen(false);
+    closeRightPanel();
+  }, [closeAllDetails, closeRightPanel, mobileTopbarNavigation, setActiveChatId, setSidebarOpen]);
 
   const handleTopbarPointerOver = (event: ReactPointerEvent<HTMLElement>) => {
     if (event.pointerType !== "mouse") return;
@@ -250,6 +254,68 @@ export function TopBar() {
     };
   }, [clearTopbarHover]);
 
+  const chatsActive = sidebarOpen && (!mobileTopbarNavigation || !rightPanelOpen);
+  const chatsButton = (
+    <button
+      key="chats"
+      onClick={handleSidebarClick}
+      aria-pressed={chatsActive}
+      data-tour="sidebar-toggle"
+      data-topbar-hover-key="chats"
+      className={cn(
+        TOPBAR_BUTTON_CLASS,
+        chatsActive
+          ? cn(TOPBAR_ACTIVE_BUTTON_CLASS, !mobileTopbarNavigation && "mari-topbar-chat-gradient-icon")
+          : cn(
+              "text-[var(--muted-foreground)]",
+              !mobileTopbarNavigation && "mari-topbar-chat-gradient-hover",
+              !mobileTopbarNavigation &&
+                isTopbarHovered("chats") &&
+                cn(TOPBAR_FORCE_HOVER_CLASS, "mari-topbar-chat-gradient-icon"),
+            ),
+      )}
+      title={localize("Chats")}
+    >
+      <MessageSquareText size={15} className={TOPBAR_ACCENT_ICON_CLASS}>
+        <defs>
+          <linearGradient id={CHAT_TOPBAR_GRADIENT_ID} x1="2" x2="18" y1="3" y2="18" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stopColor="var(--mari-logo-cyan)" />
+            <stop offset="48%" stopColor="var(--mari-logo-orange)" />
+            <stop offset="100%" stopColor="var(--mari-logo-pink)" />
+          </linearGradient>
+        </defs>
+      </MessageSquareText>
+      {chatsActive && (
+        <span className="mari-topbar-chat-gradient-underline absolute -bottom-0.5 left-1/2 h-0.5 w-3 -translate-x-1/2 rounded-full" />
+      )}
+    </button>
+  );
+
+  const homeButton = (
+    <button
+      key="home"
+      onClick={handleHomeClick}
+      aria-pressed={isHomeActive}
+      data-topbar-hover-key="home"
+      className={cn(
+        TOPBAR_BUTTON_CLASS,
+        isHomeActive
+          ? TOPBAR_ACTIVE_BUTTON_CLASS
+          : cn(
+              "text-[var(--muted-foreground)] hover:text-[var(--marinara-chat-chrome-button-text-hover)]",
+              isTopbarHovered("home") &&
+                cn(TOPBAR_FORCE_HOVER_CLASS, "text-[var(--marinara-chat-chrome-button-text-hover)]"),
+            ),
+      )}
+      title={localize("Home")}
+    >
+      <Home size={15} className={TOPBAR_ACCENT_ICON_CLASS} />
+      {isHomeActive && (
+        <span className="mari-topbar-active-underline absolute -bottom-0.5 left-1/2 h-0.5 w-3 -translate-x-1/2 rounded-full" />
+      )}
+    </button>
+  );
+
   return (
     <header
       ref={headerRef}
@@ -267,70 +333,9 @@ export function TopBar() {
           ref={leftControlsRef}
           className="mari-topbar-left-controls mari-rgb-icon-scope flex shrink-0 items-center gap-2"
         >
-          <button
-            onClick={handleSidebarClick}
-            data-tour="sidebar-toggle"
-            data-topbar-hover-key="chats"
-            className={cn(
-              TOPBAR_BUTTON_CLASS,
-              sidebarOpen
-                ? cn(TOPBAR_ACTIVE_BUTTON_CLASS, "mari-topbar-chat-gradient-icon")
-                : cn(
-                    "mari-topbar-chat-gradient-hover text-[var(--muted-foreground)]",
-                    isTopbarHovered("chats") && cn(TOPBAR_FORCE_HOVER_CLASS, "mari-topbar-chat-gradient-icon"),
-                  ),
-            )}
-            title={localize("Chats")}
-          >
-            <MessageSquareText size={15} className={TOPBAR_ACCENT_ICON_CLASS}>
-              <defs>
-                <linearGradient
-                  id={CHAT_TOPBAR_GRADIENT_ID}
-                  x1="2"
-                  x2="18"
-                  y1="3"
-                  y2="18"
-                  gradientUnits="userSpaceOnUse"
-                >
-                  <stop offset="0%" stopColor="var(--mari-logo-cyan)" />
-                  <stop offset="48%" stopColor="var(--mari-logo-orange)" />
-                  <stop offset="100%" stopColor="var(--mari-logo-pink)" />
-                </linearGradient>
-              </defs>
-            </MessageSquareText>
-            {sidebarOpen && (
-              <span className="mari-topbar-chat-gradient-underline absolute -bottom-0.5 left-1/2 h-0.5 w-3 -translate-x-1/2 rounded-full" />
-            )}
-          </button>
-
-          <button
-            onClick={() => {
-              window.dispatchEvent(new Event("marinara:home-professor-mari-close"));
-              setActiveChatId(null);
-              closeAllDetails();
-            }}
-            data-topbar-hover-key="home"
-            className={cn(
-              TOPBAR_BUTTON_CLASS,
-              isHomeActive
-                ? TOPBAR_ACTIVE_BUTTON_CLASS
-                : cn(
-                    "text-[var(--muted-foreground)] hover:text-[var(--marinara-chat-chrome-button-text-hover)]",
-                    isTopbarHovered("home") &&
-                      cn(TOPBAR_FORCE_HOVER_CLASS, "text-[var(--marinara-chat-chrome-button-text-hover)]"),
-                  ),
-            )}
-            title={localize("Home")}
-          >
-            <Home size={15} className={TOPBAR_ACCENT_ICON_CLASS} />
-            {isHomeActive && (
-              <span className="mari-topbar-active-underline absolute -bottom-0.5 left-1/2 h-0.5 w-3 -translate-x-1/2 rounded-full" />
-            )}
-          </button>
+          {mobileTopbarNavigation ? [homeButton, chatsButton] : [chatsButton, homeButton]}
         </div>
-        {showMusicDjUnavailablePlayer ? (
-          <MusicDjUnavailablePlayer floating={spotifyUseFloatingFallback} />
-        ) : musicDjInstalled ? (
+        {musicDjInstalled ? (
           <>
             {spotifyDesktopViewport && <SpotifyMiniPlayer forceFloating={spotifyUseFloatingFallback} />}
             <YouTubePlayer />
@@ -348,6 +353,7 @@ export function TopBar() {
       >
         <button
           onClick={() => handleRightPanelClick("characters")}
+          aria-pressed={isCharactersPanelActive}
           data-tour="panel-characters"
           data-topbar-hover-key="characters"
           className={cn(
@@ -364,7 +370,10 @@ export function TopBar() {
         >
           <Users size={15} className={TOPBAR_ACCENT_ICON_CLASS} />
           {isCharactersPanelActive && (
-            <span className="mari-topbar-active-underline absolute -bottom-0.5 left-1/2 h-0.5 w-3 -translate-x-1/2 rounded-full" />
+            <span
+              data-component="CharactersTopbarUnderline"
+              className="mari-panel-gradient-surface mari-panel-gradient--characters absolute -bottom-0.5 left-1/2 h-0.5 w-3 -translate-x-1/2 rounded-full"
+            />
           )}
         </button>
 
@@ -375,6 +384,7 @@ export function TopBar() {
             <button
               key={panel}
               onClick={() => handleRightPanelClick(panel)}
+              aria-pressed={isActive}
               data-tour={`panel-${panel}`}
               data-topbar-hover-key={panel}
               className={cn(
